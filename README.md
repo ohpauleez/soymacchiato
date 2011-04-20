@@ -46,6 +46,7 @@ Installation and Usage
  * *Optionally*, symlink this dir, ex: `ln -s /usr/local/soymacciato17-amd64 /usr/local/soymacchiato`
 3. Update your `JAVA_HOME` environment variable in your shell config, then `source` the config.
 4. Update your java related links, ex: `sudo rm /usr/bin/java; sudo ln /usr/local/soymacchiato/bin/java /usr/bin/java`
+ * *Optionally*, you can just put your new java7 directory on your path, ex: `export PATH=/usr/local/soymacchiato17-amd64/bin:$PATH`
 
 
 Contributing
