@@ -51,7 +51,7 @@ Installation and Usage
 
 Contributing
 ------------
-To contribute builds, patches, or resources please file and issue, or fork and send a request.
+To contribute builds, patches, or resources please file an issue, or fork and send a pull request.
 
 
 License Information
