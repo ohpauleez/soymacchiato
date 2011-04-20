@@ -7,7 +7,7 @@ namely, [SoyLatte](http://landonf.bikemonkey.org/static/soylatte/).
 
 Downloading
 -----------
-The SoyMacchiato binaries are bundled in the repo, but can also be downloaded from other sources:  
+The SoyMacchiato binaries can also be downloaded from the following sources:  
 
 *  64-bit JDK for Mac OS X 10.5 (Latest Build): [Latest Build](http://www.pauldee.org/soymacchiato/soymacchiato-amd64-latest.tar.bz2)
 *  64-bit JDK for Mac OS X 10.5: [soymacchiato-amd64-1.0.0](http://www.pauldee.org/soymacchiato/soymacchiato-amd64-1.0.0.tar.bz2)
