@@ -1,0 +1,265 @@
+6953246: JSR 292 should support SAM conversion
+Summary: Conversion function MethodHandles.asInstance; initial slow implementation based on Proxy.
+Reviewed-by: twisti
+
+diff --git a/src/share/classes/java/dyn/MethodHandles.java b/src/share/classes/java/dyn/MethodHandles.java
+--- a/src/share/classes/java/dyn/MethodHandles.java
++++ b/src/share/classes/java/dyn/MethodHandles.java
+@@ -25,15 +25,12 @@
+ 
+ package java.dyn;
+ 
+-import java.lang.reflect.Constructor;
++import java.lang.reflect.*;
+ import sun.dyn.Access;
+ import sun.dyn.MemberName;
+ import sun.dyn.MethodHandleImpl;
+ import sun.dyn.util.VerifyAccess;
+ import sun.dyn.util.Wrapper;
+-import java.lang.reflect.Field;
+-import java.lang.reflect.Method;
+-import java.lang.reflect.Modifier;
+ import java.util.List;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+@@ -1562,4 +1559,107 @@
+     MethodHandle throwException(Class<?> returnType, Class<? extends Throwable> exType) {
+         return MethodHandleImpl.throwException(IMPL_TOKEN, MethodType.methodType(returnType, exType));
+     }
++
++    /**
++     * Produce a wrapper instance of the given "SAM" type which redirects its calls to the given method handle.
++     * A SAM type is a type which declares a single abstract method.
++     * Additionally, it must have either no constructor (as an interface)
++     * or have a public or protected constructor of zero arguments (as a class).
++     * <p>
++     * The resulting instance of the required SAM type will respond to
++     * invocation of the SAM type's single abstract method by calling
++     * the given {@code target} on the incoming arguments,
++     * and returning or throwing whatever the {@code target}
++     * returns or throws.  The invocation will be as if by
++     * {@code target.invokeExact}.
++     * <p>
++     * The method handle may throw an <em>undeclared exception</em>,
++     * which means any checked exception (or other checked throwable)
++     * not declared by the SAM type's single abstract method.
++     * If this happens, the throwable will be wrapped in an instance
++     * of {@link UndeclaredThrowableException} and thrown in that
++     * wrapped form.
++     * <p>
++     * The wrapper instance is guaranteed to be of a non-public
++     * implementation class C in a package containing no classes
++     * or methods except system-defined classes and methods.
++     * The implementation class C will have no public supertypes
++     * or public methods beyond the following:
++     * <ul>
++     * <li>the SAM type itself and any methods in the SAM type
++     * <li>the supertypes of the SAM type (if any) and their methods
++     * <li>{@link Object} and its methods
++     * <li>{@link MethodHandleProvider} and its methods
++     * </ul>
++     * <p>
++     * No stable mapping is promised between the SAM type and
++     * the implementation class C.  Over time, several implementation
++     * classes might be used for the same SAM type.
++     * <p>
++     * This method is not guaranteed to return a distinct
++     * wrapper object for each separate call.  If the JVM is able
++     * to prove that a wrapper has already been created for a given
++     * method handle, or for another method handle with the
++     * same behavior, the JVM may return that wrapper in place of
++     * a new wrapper.
++     * @param target the method handle to invoke from the wrapper
++     * @param samType the desired type of the wrapper, a SAM type
++     * @return a correctly-typed wrapper for the given {@code target}
++     * @throws IllegalArgumentException if the {@code target} throws
++     *         an undeclared exception
++     */
++    // ISSUE: Should we delegate equals/hashCode to the targets?
++    // Not useful unless there is a stable equals/hashCode behavior
++    // for MethodHandle, and for MethodHandleProvider.asMethodHandle.
++    public static
++    <T> T asInstance(MethodHandle target, Class<T> samType) {
++        // POC implementation only; violates the above contract several ways
++        final Method sam = getSamMethod(samType);
++        if (sam == null)
++            throw new IllegalArgumentException("not a SAM type: "+samType.getName());
++        MethodType samMT = MethodType.methodType(sam.getReturnType(), sam.getParameterTypes());
++        if (!samMT.equals(target.type()))
++            throw new IllegalArgumentException("wrong method type");
++        final MethodHandle mh = target;
++        return samType.cast(Proxy.newProxyInstance(
++                samType.getClassLoader(),
++                new Class[]{ samType, MethodHandleProvider.class },
++                new InvocationHandler() {
++                    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
++                        if (method.getDeclaringClass() == MethodHandleProvider.class) {
++                            return method.invoke(mh, args);
++                        }
++                        assert method.equals(sam) : method;
++                        return mh.invokeVarargs(args);
++                    }
++                }));
++    }
++
++    private static
++    Method getSamMethod(Class<?> samType) {
++        Method sam = null;
++        for (Method m : samType.getMethods()) {
++            int mod = m.getModifiers();
++            if (Modifier.isAbstract(mod)) {
++                if (sam != null)
++                    return null;  // too many abstract methods
++                sam = m;
++            }
++        }
++        if (!samType.isInterface() && getSamConstructor(samType) == null)
++            return null;  // wrong kind of constructor
++        return sam;
++    }
++
++    private static
++    Constructor getSamConstructor(Class<?> samType) {
++        for (Constructor c : samType.getDeclaredConstructors()) {
++            if (c.getParameterTypes().length == 0) {
++                int mod = c.getModifiers();
++                if (Modifier.isPublic(mod) || Modifier.isProtected(mod))
++                    return c;
++            }
++        }
++        return null;
++    }
+ }
+diff --git a/test/java/dyn/MethodHandlesTest.java b/test/java/dyn/MethodHandlesTest.java
+--- a/test/java/dyn/MethodHandlesTest.java
++++ b/test/java/dyn/MethodHandlesTest.java
+@@ -265,6 +265,12 @@
+ //            wrap = Wrapper.forWrapperType(dst);
+ //        if (wrap != Wrapper.OBJECT)
+ //            return wrap.wrap(nextArg++);
++        if (param.isInterface()) {
++            for (Class<?> c : param.getClasses()) {
++                if (param.isAssignableFrom(c) && !c.isInterface())
++                    { param = c; break; }
++            }
++        }
+         if (param.isInterface() || param.isAssignableFrom(String.class))
+             return "#"+nextArg();
+         else
+@@ -380,7 +386,7 @@
+     }
+     public static interface IntExample {
+         public void            v0();
+-        static class Impl implements IntExample {
++        public static class Impl implements IntExample {
+             public void        v0()     { called("Int/v0", this); }
+             final String name;
+             public Impl() { name = "Impl#"+nextArg(); }
+@@ -1936,6 +1942,107 @@
+         mh.invokeVarargs(args);
+         assertCalled(name, args);
+     }
++
++    static void runForRunnable() {
++        called("runForRunnable");
++    }
++    private interface Fooable {
++        Object foo(Fooable x, Object y);
++        // this is for randomArg:
++        public class Impl implements Fooable {
++            public Object foo(Fooable x, Object y) {
++                throw new RuntimeException("do not call");
++            }
++            final String name;
++            public Impl() { name = "Fooable#"+nextArg(); }
++            @Override public String toString() { return name; }
++        }
++    }
++    static Object fooForFooable(Fooable x, Object y) {
++        return called("fooForFooable", x, y);
++    }
++    private static class MyCheckedException extends Exception {
++    }
++    private interface WillThrow {
++        void willThrow() throws MyCheckedException;
++    }
++
++    @Test
++    public void testAsInstance() throws Throwable {
++        if (CAN_SKIP_WORKING)  return;
++        Lookup lookup = MethodHandles.lookup();
++        {
++            MethodType mt = MethodType.methodType(void.class);
++            MethodHandle mh = lookup.findStatic(MethodHandlesTest.class, "runForRunnable", mt);
++            Runnable proxy = MethodHandles.asInstance(mh, Runnable.class);
++            proxy.run();
++            assertCalled("runForRunnable");
++        }
++        {
++            MethodType mt = MethodType.methodType(Object.class, Fooable.class, Object.class);
++            MethodHandle mh = lookup.findStatic(MethodHandlesTest.class, "fooForFooable", mt);
++            Fooable proxy = MethodHandles.asInstance(mh, Fooable.class);
++            Object[] args = randomArgs(mt.parameterArray());
++            Object result = proxy.foo((Fooable) args[0], args[1]);
++            assertCalled("fooForFooable", args);
++            assertEquals(result, logEntry("fooForFooable", args));
++        }
++        for (Throwable ex : new Throwable[] { new NullPointerException("ok"),
++                                              new InternalError("ok"),
++                                              new Throwable("fail"),
++                                              new Exception("fail"),
++                                              new MyCheckedException()
++                                            }) {
++            MethodHandle mh = MethodHandles.throwException(void.class, Throwable.class);
++            mh = MethodHandles.insertArguments(mh, 0, ex);
++            WillThrow proxy = MethodHandles.asInstance(mh, WillThrow.class);
++            try {
++                proxy.willThrow();
++                System.out.println("Failed to throw: "+ex);
++                assertTrue(false);
++            } catch (Throwable ex1) {
++                if (verbosity > 2) {
++                    System.out.println("throw "+ex);
++                    System.out.println("catch "+(ex == ex1 ? "UNWRAPPED" : ex1));
++                }
++                if (ex instanceof RuntimeException ||
++                    ex instanceof Error) {
++                    assertSame("must pass unchecked exception out without wrapping", ex, ex1);
++                } else if (ex instanceof MyCheckedException) {
++                    assertSame("must pass declared exception out without wrapping", ex, ex1);
++                } else {
++                    assertNotSame("must pass undeclared checked exception with wrapping", ex, ex1);
++                    UndeclaredThrowableException utex = (UndeclaredThrowableException) ex1;
++                    assertSame(ex, utex.getCause());
++                }
++            }
++        }
++        // Test error checking:
++        MethodHandle genericMH = ValueConversions.varargsArray(0);
++        genericMH = MethodHandles.convertArguments(genericMH, genericMH.type().generic());
++        for (Class<?> sam : new Class[] { Runnable.class,
++                                          Fooable.class,
++                                          Iterable.class }) {
++            try {
++                // Must throw, because none of these guys has generic type.
++                MethodHandles.asInstance(genericMH, sam);
++                System.out.println("Failed to throw");
++                assertTrue(false);
++            } catch (IllegalArgumentException ex) {
++            }
++        }
++        for (Class<?> nonSAM : new Class[] { Object.class,
++                                             String.class,
++                                             CharSequence.class,
++                                             Example.class }) {
++            try {
++                MethodHandles.asInstance(ValueConversions.varargsArray(0), nonSAM);
++                System.out.println("Failed to throw");
++                assertTrue(false);
++            } catch (IllegalArgumentException ex) {
++            }
++        }
++    }
+ }
+ // Local abbreviated copy of sun.dyn.util.ValueConversions
+ class ValueConversions {

@@ -1,0 +1,129 @@
+6969574: invokedynamic call sites deoptimize instead of executing
+Reviewed-by: kvn
+
+diff --git a/src/share/vm/ci/ciEnv.cpp b/src/share/vm/ci/ciEnv.cpp
+--- a/src/share/vm/ci/ciEnv.cpp
++++ b/src/share/vm/ci/ciEnv.cpp
+@@ -728,8 +728,8 @@
+   }
+ 
+   // Get the invoker methodOop from the constant pool.
+-  intptr_t f2_value = cpool->cache()->main_entry_at(index)->f2();
+-  methodOop signature_invoker = methodOop(f2_value);
++  oop f1_value = cpool->cache()->main_entry_at(index)->f1();
++  methodOop signature_invoker = methodOop(f1_value);
+   assert(signature_invoker != NULL && signature_invoker->is_method() && signature_invoker->is_method_handle_invoke(),
+          "correct result from LinkResolver::resolve_invokedynamic");
+ 
+diff --git a/src/share/vm/ci/ciMethod.cpp b/src/share/vm/ci/ciMethod.cpp
+--- a/src/share/vm/ci/ciMethod.cpp
++++ b/src/share/vm/ci/ciMethod.cpp
+@@ -694,30 +694,21 @@
+ // ------------------------------------------------------------------
+ // ciMethod::is_method_handle_invoke
+ //
+-// Return true if the method is a MethodHandle target.
++// Return true if the method is an instance of one of the two
++// signature-polymorphic MethodHandle methods, invokeExact or invokeGeneric.
+ bool ciMethod::is_method_handle_invoke() const {
+-  bool flag = (holder()->name() == ciSymbol::java_dyn_MethodHandle() &&
+-               methodOopDesc::is_method_handle_invoke_name(name()->sid()));
+-#ifdef ASSERT
+-  if (is_loaded()) {
+-    bool flag2 = ((flags().as_int() & JVM_MH_INVOKE_BITS) == JVM_MH_INVOKE_BITS);
+-    {
+-      VM_ENTRY_MARK;
+-      bool flag3 = get_methodOop()->is_method_handle_invoke();
+-      assert(flag2 == flag3, "consistent");
+-      assert(flag  == flag3, "consistent");
+-    }
+-  }
+-#endif //ASSERT
+-  return flag;
++  if (!is_loaded())  return false;
++  VM_ENTRY_MARK;
++  return get_methodOop()->is_method_handle_invoke();
+ }
+ 
+ // ------------------------------------------------------------------
+ // ciMethod::is_method_handle_adapter
+ //
+ // Return true if the method is a generated MethodHandle adapter.
++// These are built by MethodHandleCompiler.
+ bool ciMethod::is_method_handle_adapter() const {
+-  check_is_loaded();
++  if (!is_loaded())  return false;
+   VM_ENTRY_MARK;
+   return get_methodOop()->is_method_handle_adapter();
+ }
+diff --git a/src/share/vm/oops/cpCacheOop.cpp b/src/share/vm/oops/cpCacheOop.cpp
+--- a/src/share/vm/oops/cpCacheOop.cpp
++++ b/src/share/vm/oops/cpCacheOop.cpp
+@@ -168,7 +168,7 @@
+       set_f1(method());
+       needs_vfinal_flag = false;  // _f2 is not an oop
+       assert(!is_vfinal(), "f2 not an oop");
+-      byte_no = 1;  // just a formality
++      byte_no = 1;  // coordinate this with bytecode_number & is_resolved
+       break;
+ 
+     case Bytecodes::_invokespecial:
+diff --git a/src/share/vm/oops/cpCacheOop.hpp b/src/share/vm/oops/cpCacheOop.hpp
+--- a/src/share/vm/oops/cpCacheOop.hpp
++++ b/src/share/vm/oops/cpCacheOop.hpp
+@@ -211,6 +211,7 @@
+       case Bytecodes::_getfield        :    // fall through
+       case Bytecodes::_invokespecial   :    // fall through
+       case Bytecodes::_invokestatic    :    // fall through
++      case Bytecodes::_invokedynamic   :    // fall through
+       case Bytecodes::_invokeinterface : return 1;
+       case Bytecodes::_putstatic       :    // fall through
+       case Bytecodes::_putfield        :    // fall through
+diff --git a/src/share/vm/oops/methodOop.cpp b/src/share/vm/oops/methodOop.cpp
+--- a/src/share/vm/oops/methodOop.cpp
++++ b/src/share/vm/oops/methodOop.cpp
+@@ -851,9 +851,15 @@
+ // MethodHandleCompiler.
+ // Must be consistent with MethodHandleCompiler::get_method_oop().
+ bool methodOopDesc::is_method_handle_adapter() const {
+-  return (is_method_handle_invoke_name(name()) &&
+-          is_synthetic() &&
+-          MethodHandleCompiler::klass_is_method_handle_adapter_holder(method_holder()));
++  if (is_synthetic() &&
++      !is_native() &&   // has code from MethodHandleCompiler
++      is_method_handle_invoke_name(name()) &&
++      MethodHandleCompiler::klass_is_method_handle_adapter_holder(method_holder())) {
++    assert(!is_method_handle_invoke(), "disjoint");
++    return true;
++  } else {
++    return false;
++  }
+ }
+ 
+ methodHandle methodOopDesc::make_invoke_method(KlassHandle holder,
+diff --git a/src/share/vm/prims/methodHandleWalk.cpp b/src/share/vm/prims/methodHandleWalk.cpp
+--- a/src/share/vm/prims/methodHandleWalk.cpp
++++ b/src/share/vm/prims/methodHandleWalk.cpp
+@@ -738,6 +738,12 @@
+ 
+   // bi
+   case Bytecodes::_ldc:
++    assert(Bytecodes::format_bits(op, false) == (Bytecodes::_fmt_b|Bytecodes::_fmt_has_k), "wrong bytecode format");
++    assert((char) index == index, "index does not fit in 8-bit");
++    _bytecode.push(op);
++    _bytecode.push(index);
++    break;
++
+   case Bytecodes::_iload:
+   case Bytecodes::_lload:
+   case Bytecodes::_fload:
+@@ -754,7 +760,8 @@
+     _bytecode.push(index);
+     break;
+ 
+-  // bii
++  // bkk
++  case Bytecodes::_ldc_w:
+   case Bytecodes::_ldc2_w:
+   case Bytecodes::_checkcast:
+     assert(Bytecodes::format_bits(op, false) == Bytecodes::_fmt_bkk, "wrong bytecode format");

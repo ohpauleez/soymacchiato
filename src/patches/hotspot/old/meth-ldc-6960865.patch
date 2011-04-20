@@ -1,0 +1,55 @@
+6960865: ldc of unloaded class throws an assert in ciTypeFlow
+Summary: Support java_mirror for unloaded klasses, arrays as well as instances.  Simplify ciTypeFlow by removing unused path.
+Reviewed-by: ?
+
+diff --git a/src/share/vm/ci/ciInstanceKlass.cpp b/src/share/vm/ci/ciInstanceKlass.cpp
+--- a/src/share/vm/ci/ciInstanceKlass.cpp
++++ b/src/share/vm/ci/ciInstanceKlass.cpp
+@@ -323,12 +323,10 @@
+ // ciInstanceKlass::java_mirror
+ //
+ // Get the instance of java.lang.Class corresponding to this klass.
++// Cache it on this->_java_mirror.
+ ciInstance* ciInstanceKlass::java_mirror() {
+   if (_java_mirror == NULL) {
+-    if (!is_loaded())
+-      _java_mirror = ciEnv::current()->get_unloaded_klass_mirror(this);
+-    else
+-      _java_mirror = ciKlass::java_mirror();
++    _java_mirror = ciKlass::java_mirror();
+   }
+   return _java_mirror;
+ }
+diff --git a/src/share/vm/ci/ciKlass.cpp b/src/share/vm/ci/ciKlass.cpp
+--- a/src/share/vm/ci/ciKlass.cpp
++++ b/src/share/vm/ci/ciKlass.cpp
+@@ -192,8 +192,14 @@
+ 
+ // ------------------------------------------------------------------
+ // ciKlass::java_mirror
++//
++// Get the instance of java.lang.Class corresponding to this klass.
++// If it is an unloaded instance or array klass, return an unloaded
++// mirror object of type Class.
+ ciInstance* ciKlass::java_mirror() {
+   GUARDED_VM_ENTRY(
++    if (!is_loaded())
++      return ciEnv::current()->get_unloaded_klass_mirror(this);
+     oop java_mirror = get_Klass()->java_mirror();
+     return CURRENT_ENV->get_object(java_mirror)->as_instance();
+   )
+diff --git a/src/share/vm/ci/ciTypeFlow.cpp b/src/share/vm/ci/ciTypeFlow.cpp
+--- a/src/share/vm/ci/ciTypeFlow.cpp
++++ b/src/share/vm/ci/ciTypeFlow.cpp
+@@ -712,10 +712,8 @@
+     ciObject* obj = con.as_object();
+     if (obj->is_null_object()) {
+       push_null();
+-    } else if (obj->is_klass()) {
+-      // The type of ldc <class> is java.lang.Class
+-      push_object(outer()->env()->Class_klass());
+     } else {
++      assert(!obj->is_klass(), "must be java_mirror of klass");
+       push_object(obj->klass());
+     }
+   } else {

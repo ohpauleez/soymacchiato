@@ -1,0 +1,984 @@
+diff --git a/src/cpu/x86/vm/frame_x86.cpp b/src/cpu/x86/vm/frame_x86.cpp
+--- a/src/cpu/x86/vm/frame_x86.cpp
++++ b/src/cpu/x86/vm/frame_x86.cpp
+@@ -330,6 +330,14 @@
+   // This is the sp before any possible extension (adapter/locals).
+   intptr_t* unextended_sp = interpreter_frame_sender_sp();
+ 
++  address sender_pc = this->sender_pc();
++  CodeBlob* sender_cb = CodeCache::find_blob_unsafe(sender_pc);
++  assert(sender_cb, "sanity");
++  nmethod* sender_nm = sender_cb->as_nmethod_or_null();
++  if (sender_nm != NULL && sender_nm->is_method_handle_return(sender_pc)) {
++    unextended_sp = (intptr_t*) at(link_offset);
++  }
++
+   // The interpreter and compiler(s) always save EBP/RBP in a known
+   // location on entry. We must record where that location is
+   // so this if EBP/RBP was live on callout from c2 we can find
+@@ -352,7 +360,7 @@
+ #endif // AMD64
+   }
+ #endif /* COMPILER2 */
+-  return frame(sp, unextended_sp, link(), sender_pc());
++  return frame(sp, unextended_sp, link(), sender_pc);
+ }
+ 
+ 
+@@ -375,6 +383,18 @@
+ 
+   intptr_t *saved_fp = (intptr_t*)*(sender_sp - frame::sender_sp_offset);
+ 
++  intptr_t* unextended_sp = sender_sp;
++  // If we are returning to a compiled method handle call site,
++  // the saved_fp will in fact be a saved value of the unextended SP.
++  // The simplest way to tell whether we are returning to such a call
++  // site is as follows:
++  CodeBlob* sender_cb = CodeCache::find_blob_unsafe(sender_pc);
++  assert(sender_cb, "sanity");
++  nmethod* sender_nm = sender_cb->as_nmethod_or_null();
++  if (sender_nm != NULL && sender_nm->is_method_handle_return(sender_pc)) {
++    unextended_sp = saved_fp;
++  }
++
+   if (map->update_map()) {
+     // Tell GC to use argument oopmaps for some runtime stubs that need it.
+     // For C1, the runtime stub might not have oop maps, so set this flag
+@@ -399,7 +419,7 @@
+   }
+ 
+   assert(sender_sp != sp(), "must have changed");
+-  return frame(sender_sp, saved_fp, sender_pc);
++  return frame(sender_sp, unextended_sp, saved_fp, sender_pc);
+ }
+ 
+ frame frame::sender(RegisterMap* map) const {
+diff --git a/src/cpu/x86/vm/methodHandles_x86.cpp b/src/cpu/x86/vm/methodHandles_x86.cpp
+--- a/src/cpu/x86/vm/methodHandles_x86.cpp
++++ b/src/cpu/x86/vm/methodHandles_x86.cpp
+@@ -65,9 +65,9 @@
+   // Verify that argslot lies within (rsp, rbp].
+   Label L_ok, L_bad;
+   __ cmpptr(rax_argslot, rbp);
+-  __ jcc(Assembler::above, L_bad);
++  __ jccb(Assembler::above, L_bad);
+   __ cmpptr(rsp, rax_argslot);
+-  __ jcc(Assembler::below, L_ok);
++  __ jccb(Assembler::below, L_ok);
+   __ bind(L_bad);
+   __ stop(error_message);
+   __ bind(L_ok);
+@@ -136,9 +136,9 @@
+   if (arg_slots.is_register()) {
+     Label L_ok, L_bad;
+     __ cmpptr(arg_slots.as_register(), (int32_t) NULL_WORD);
+-    __ jcc(Assembler::greater, L_bad);
++    __ jccb(Assembler::greater, L_bad);
+     __ testl(arg_slots.as_register(), -stack_move_unit() - 1);
+-    __ jcc(Assembler::zero, L_ok);
++    __ jccb(Assembler::zero, L_ok);
+     __ bind(L_bad);
+     __ stop("assert arg_slots <= 0 and clear low bits");
+     __ bind(L_ok);
+@@ -173,7 +173,7 @@
+     __ movptr(Address(rdx_temp, arg_slots, Address::times_ptr), rbx_temp);
+     __ addptr(rdx_temp, wordSize);
+     __ cmpptr(rdx_temp, rax_argslot);
+-    __ jcc(Assembler::less, loop);
++    __ jccb(Assembler::less, loop);
+   }
+ 
+   // Now move the argslot down, to point to the opened-up space.
+@@ -211,9 +211,9 @@
+     Label L_ok, L_bad;
+     __ lea(rbx_temp, Address(rax_argslot, arg_slots, Address::times_ptr));
+     __ cmpptr(rbx_temp, rbp);
+-    __ jcc(Assembler::above, L_bad);
++    __ jccb(Assembler::above, L_bad);
+     __ cmpptr(rsp, rax_argslot);
+-    __ jcc(Assembler::below, L_ok);
++    __ jccb(Assembler::below, L_ok);
+     __ bind(L_bad);
+     __ stop("deleted argument(s) must fall within current frame");
+     __ bind(L_ok);
+@@ -221,9 +221,9 @@
+   if (arg_slots.is_register()) {
+     Label L_ok, L_bad;
+     __ cmpptr(arg_slots.as_register(), (int32_t) NULL_WORD);
+-    __ jcc(Assembler::less, L_bad);
++    __ jccb(Assembler::less, L_bad);
+     __ testl(arg_slots.as_register(), -stack_move_unit() - 1);
+-    __ jcc(Assembler::zero, L_ok);
++    __ jccb(Assembler::zero, L_ok);
+     __ bind(L_bad);
+     __ stop("assert arg_slots >= 0 and clear low bits");
+     __ bind(L_ok);
+@@ -258,7 +258,7 @@
+     __ movptr(Address(rdx_temp, arg_slots, Address::times_ptr), rbx_temp);
+     __ addptr(rdx_temp, -wordSize);
+     __ cmpptr(rdx_temp, rsp);
+-    __ jcc(Assembler::greaterEqual, loop);
++    __ jccb(Assembler::greaterEqual, loop);
+   }
+ 
+   // Now move the argslot up, to point to the just-copied block.
+@@ -384,11 +384,11 @@
+       // FIXME: fill in _raise_exception_method with a suitable sun.dyn method
+       __ movptr(rbx_method, ExternalAddress((address) &_raise_exception_method));
+       __ testptr(rbx_method, rbx_method);
+-      __ jcc(Assembler::zero, no_method);
++      __ jccb(Assembler::zero, no_method);
+       int jobject_oop_offset = 0;
+       __ movptr(rbx_method, Address(rbx_method, jobject_oop_offset));  // dereference the jobject
+       __ testptr(rbx_method, rbx_method);
+-      __ jcc(Assembler::zero, no_method);
++      __ jccb(Assembler::zero, no_method);
+       __ verify_oop(rbx_method);
+       __ push(rdi_pc);          // and restore caller PC
+       __ jmp(rbx_method_fie);
+@@ -535,16 +535,15 @@
+       if (arg_type == T_OBJECT) {
+         __ movptr(Address(rax_argslot, 0), rbx_temp);
+       } else {
+-        __ load_sized_value(rbx_temp, prim_value_addr,
++        __ load_sized_value(rdx_temp, prim_value_addr,
+                             type2aelembytes(arg_type), is_signed_subword_type(arg_type));
+-        __ movptr(Address(rax_argslot, 0), rbx_temp);
++        __ movptr(Address(rax_argslot, 0), rdx_temp);
+ #ifndef _LP64
+         if (arg_slots == 2) {
+-          __ movl(rbx_temp, prim_value_addr.plus_disp(wordSize));
+-          __ movl(Address(rax_argslot, Interpreter::stackElementSize()), rbx_temp);
++          __ movl(rdx_temp, prim_value_addr.plus_disp(wordSize));
++          __ movl(Address(rax_argslot, Interpreter::stackElementSize()), rdx_temp);
+         }
+ #endif //_LP64
+-        break;
+       }
+ 
+       if (direct_to_method) {
+@@ -586,7 +585,7 @@
+       Label done;
+       __ movptr(rdx_temp, vmarg);
+       __ testl(rdx_temp, rdx_temp);
+-      __ jcc(Assembler::zero, done);          // no cast if null
++      __ jccb(Assembler::zero, done);         // no cast if null
+       __ load_klass(rdx_temp, rdx_temp);
+ 
+       // live at this point:
+@@ -677,24 +676,24 @@
+       // (now we are done with the old MH)
+ 
+       // original 32-bit vmdata word must be of this form:
+-      //    | MBZ:16 | signBitCount:8 | srcDstTypes:8 | conversionOp:8 |
+-      __ xchgl(rcx, rbx_vminfo);                // free rcx for shifts
++      //    | MBZ:6 | signBitCount:8 | srcDstTypes:8 | conversionOp:8 |
++      __ xchgptr(rcx, rbx_vminfo);                // free rcx for shifts
+       __ shll(rdx_temp /*, rcx*/);
+       Label zero_extend, done;
+       __ testl(rcx, CONV_VMINFO_SIGN_FLAG);
+-      __ jcc(Assembler::zero, zero_extend);
++      __ jccb(Assembler::zero, zero_extend);
+ 
+       // this path is taken for int->byte, int->short
+       __ sarl(rdx_temp /*, rcx*/);
+-      __ jmp(done);
++      __ jmpb(done);
+ 
+       __ bind(zero_extend);
+       // this is taken for int->char
+       __ shrl(rdx_temp /*, rcx*/);
+ 
+       __ bind(done);
+-      __ movptr(vmarg, rdx_temp);
+-      __ xchgl(rcx, rbx_vminfo);                // restore rcx_recv
++      __ movl(vmarg, rdx_temp);
++      __ xchgptr(rcx, rbx_vminfo);                // restore rcx_recv
+ 
+       __ jump_to_method_handle_entry(rcx_recv, rdx_temp);
+     }
+@@ -863,7 +862,7 @@
+             // Verify that argslot > destslot, by at least swap_bytes.
+             Label L_ok;
+             __ cmpptr(rax_argslot, rbx_destslot);
+-            __ jcc(Assembler::aboveEqual, L_ok);
++            __ jccb(Assembler::aboveEqual, L_ok);
+             __ stop("source must be above destination (upward rotation)");
+             __ bind(L_ok);
+           }
+@@ -879,7 +878,7 @@
+           __ movptr(Address(rax_argslot, swap_bytes), rdx_temp);
+           __ addptr(rax_argslot, -wordSize);
+           __ cmpptr(rax_argslot, rbx_destslot);
+-          __ jcc(Assembler::aboveEqual, loop);
++          __ jccb(Assembler::aboveEqual, loop);
+         } else {
+           __ addptr(rax_argslot, swap_bytes);
+ #ifdef ASSERT
+@@ -887,7 +886,7 @@
+             // Verify that argslot < destslot, by at least swap_bytes.
+             Label L_ok;
+             __ cmpptr(rax_argslot, rbx_destslot);
+-            __ jcc(Assembler::belowEqual, L_ok);
++            __ jccb(Assembler::belowEqual, L_ok);
+             __ stop("source must be below destination (downward rotation)");
+             __ bind(L_ok);
+           }
+@@ -903,7 +902,7 @@
+           __ movptr(Address(rax_argslot, -swap_bytes), rdx_temp);
+           __ addptr(rax_argslot, wordSize);
+           __ cmpptr(rax_argslot, rbx_destslot);
+-          __ jcc(Assembler::belowEqual, loop);
++          __ jccb(Assembler::belowEqual, loop);
+         }
+ 
+         // pop the original first chunk into the destination slot, now free
+@@ -969,7 +968,7 @@
+       __ addptr(rax_argslot, wordSize);
+       __ addptr(rdx_newarg, wordSize);
+       __ cmpptr(rdx_newarg, rbx_oldarg);
+-      __ jcc(Assembler::less, loop);
++      __ jccb(Assembler::less, loop);
+ 
+       __ pop(rdi);              // restore temp
+ 
+@@ -1121,7 +1120,7 @@
+         }
+         __ addptr(rax_argslot, Interpreter::stackElementSize());
+         __ cmpptr(rax_argslot, rdx_argslot_limit);
+-        __ jcc(Assembler::less, loop);
++        __ jccb(Assembler::less, loop);
+       } else if (length_constant == 0) {
+         __ bind(skip_array_check);
+         // nothing to copy
+diff --git a/src/cpu/x86/vm/runtime_x86_32.cpp b/src/cpu/x86/vm/runtime_x86_32.cpp
+--- a/src/cpu/x86/vm/runtime_x86_32.cpp
++++ b/src/cpu/x86/vm/runtime_x86_32.cpp
+@@ -43,11 +43,11 @@
+ // This code is entered with a jmp.
+ //
+ // Arguments:
+-//   rax,: exception oop
++//   rax: exception oop
+ //   rdx: exception pc
+ //
+ // Results:
+-//   rax,: exception oop
++//   rax: exception oop
+ //   rdx: exception pc in caller or ???
+ //   destination: exception handler of caller
+ //
+@@ -113,17 +113,17 @@
+   __ addptr(rsp, return_off * wordSize);   // Epilog!
+   __ pop(rdx); // Exception pc
+ 
++  // rax: exception handler for given <exception oop/exception pc>
+ 
+-  // rax,: exception handler for given <exception oop/exception pc>
++  // Restore SP from BP if the exception PC is a MethodHandle call.
++  __ cmpl(Address(rcx, JavaThread::is_method_handle_exception_offset()), 0);
++  __ cmovptr(Assembler::notEqual, rsp, rbp);
+ 
+   // We have a handler in rax, (could be deopt blob)
+   // rdx - throwing pc, deopt blob will need it.
+ 
+   __ push(rax);
+ 
+-  // rcx contains handler address
+-
+-  __ get_thread(rcx);           // TLS
+   // Get the exception
+   __ movptr(rax, Address(rcx, JavaThread::exception_oop_offset()));
+   // Get the exception pc in case we are deoptimized
+@@ -137,7 +137,7 @@
+ 
+   __ pop(rcx);
+ 
+-  // rax,: exception oop
++  // rax: exception oop
+   // rcx: exception handler
+   // rdx: exception pc
+   __ jmp (rcx);
+diff --git a/src/cpu/x86/vm/sharedRuntime_x86_64.cpp b/src/cpu/x86/vm/sharedRuntime_x86_64.cpp
+--- a/src/cpu/x86/vm/sharedRuntime_x86_64.cpp
++++ b/src/cpu/x86/vm/sharedRuntime_x86_64.cpp
+@@ -638,6 +638,10 @@
+ 
+   __ movptr(rax, Address(rsp, 0));
+ 
++  // Must preserve original SP for loading incoming arguments because
++  // we need to align the outgoing SP for compiled code.
++  __ movptr(r11, rsp);
++
+   // Cut-out for having no stack args.  Since up to 2 int/oop args are passed
+   // in registers, we will occasionally have no stack args.
+   int comp_words_on_stack = 0;
+@@ -661,6 +665,10 @@
+   // as far as the placement of the call instruction
+   __ push(rax);
+ 
++  // Put saved SP in another register
++  const Register saved_sp = rax;
++  __ movptr(saved_sp, r11);
++
+   // Will jump to the compiled code just as if compiled code was doing it.
+   // Pre-load the register-jump target early, to schedule it better.
+   __ movptr(r11, Address(rbx, in_bytes(methodOopDesc::from_compiled_offset())));
+@@ -680,11 +688,7 @@
+     assert(!regs[i].second()->is_valid() || regs[i].first()->next() == regs[i].second(),
+             "scrambled load targets?");
+     // Load in argument order going down.
+-    // int ld_off = (total_args_passed + comp_words_on_stack -i)*wordSize;
+-    // base ld_off on r13 (sender_sp) as the stack alignment makes offsets from rsp
+-    // unpredictable
+-    int ld_off = ((total_args_passed - 1) - i)*Interpreter::stackElementSize();
+-
++    int ld_off = (total_args_passed - i)*Interpreter::stackElementSize() + Interpreter::value_offset_in_bytes();
+     // Point to interpreter value (vs. tag)
+     int next_off = ld_off - Interpreter::stackElementSize();
+     //
+@@ -699,10 +703,14 @@
+     if (r_1->is_stack()) {
+       // Convert stack slot to an SP offset (+ wordSize to account for return address )
+       int st_off = regs[i].first()->reg2stack()*VMRegImpl::stack_slot_size + wordSize;
++
++      // We can use r13 as a temp here because compiled code doesn't need r13 as an input
++      // and if we end up going thru a c2i because of a miss a reasonable value of r13
++      // will be generated.
+       if (!r_2->is_valid()) {
+         // sign extend???
+-        __ movl(rax, Address(r13, ld_off));
+-        __ movptr(Address(rsp, st_off), rax);
++        __ movl(r13, Address(saved_sp, ld_off));
++        __ movptr(Address(rsp, st_off), r13);
+       } else {
+         //
+         // We are using two optoregs. This can be either T_OBJECT, T_ADDRESS, T_LONG, or T_DOUBLE
+@@ -715,9 +723,9 @@
+         // ld_off is MSW so get LSW
+         const int offset = (sig_bt[i]==T_LONG||sig_bt[i]==T_DOUBLE)?
+                            next_off : ld_off;
+-        __ movq(rax, Address(r13, offset));
++        __ movq(r13, Address(saved_sp, offset));
+         // st_off is LSW (i.e. reg.first())
+-        __ movq(Address(rsp, st_off), rax);
++        __ movq(Address(rsp, st_off), r13);
+       }
+     } else if (r_1->is_Register()) {  // Register argument
+       Register r = r_1->as_Register();
+@@ -732,16 +740,16 @@
+                            next_off : ld_off;
+ 
+         // this can be a misaligned move
+-        __ movq(r, Address(r13, offset));
++        __ movq(r, Address(saved_sp, offset));
+       } else {
+         // sign extend and use a full word?
+-        __ movl(r, Address(r13, ld_off));
++        __ movl(r, Address(saved_sp, ld_off));
+       }
+     } else {
+       if (!r_2->is_valid()) {
+-        __ movflt(r_1->as_XMMRegister(), Address(r13, ld_off));
++        __ movflt(r_1->as_XMMRegister(), Address(saved_sp, ld_off));
+       } else {
+-        __ movdbl(r_1->as_XMMRegister(), Address(r13, next_off));
++        __ movdbl(r_1->as_XMMRegister(), Address(saved_sp, next_off));
+       }
+     }
+   }
+@@ -3319,6 +3327,10 @@
+ 
+   // rax: exception handler
+ 
++  // Restore SP from BP if the exception PC is a MethodHandle call.
++  __ cmpl(Address(r15_thread, JavaThread::is_method_handle_exception_offset()), 0);
++  __ cmovptr(Assembler::notEqual, rsp, rbp);
++
+   // We have a handler in rax (could be deopt blob).
+   __ mov(r8, rax);
+ 
+diff --git a/src/cpu/x86/vm/templateInterpreter_x86_32.cpp b/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
+--- a/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
++++ b/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
+@@ -1488,7 +1488,10 @@
+ 
+   if (interpreter_frame != NULL) {
+ #ifdef ASSERT
+-    assert(caller->unextended_sp() == interpreter_frame->interpreter_frame_sender_sp(), "Frame not properly walkable");
++    if (!EnableMethodHandles)
++      // @@@ FIXME: Should we correct interpreter_frame_sender_sp in the calling sequences?
++      // Probably, since deoptimization doesn't work yet.
++      assert(caller->unextended_sp() == interpreter_frame->interpreter_frame_sender_sp(), "Frame not properly walkable");
+     assert(caller->sp() == interpreter_frame->sender_sp(), "Frame not properly walkable(2)");
+ #endif
+ 
+diff --git a/src/cpu/x86/vm/templateInterpreter_x86_64.cpp b/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
+--- a/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
++++ b/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
+@@ -449,8 +449,12 @@
+   __ addptr(rax, stack_base);
+   __ subptr(rax, stack_size);
+ 
++  // Use the maximum number of pages we might bang.
++  const int max_pages = StackShadowPages > (StackRedPages+StackYellowPages) ? StackShadowPages :
++                                                                              (StackRedPages+StackYellowPages);
++
+   // add in the red and yellow zone sizes
+-  __ addptr(rax, (StackRedPages + StackYellowPages) * page_size);
++  __ addptr(rax, max_pages * page_size);
+ 
+   // check against the current stack bottom
+   __ cmpptr(rsp, rax);
+@@ -1502,8 +1506,10 @@
+          tempcount* Interpreter::stackElementWords() + popframe_extra_args;
+   if (interpreter_frame != NULL) {
+ #ifdef ASSERT
+-    assert(caller->unextended_sp() == interpreter_frame->interpreter_frame_sender_sp(),
+-           "Frame not properly walkable");
++    if (!EnableMethodHandles)
++      // @@@ FIXME: Should we correct interpreter_frame_sender_sp in the calling sequences?
++      // Probably, since deoptimization doesn't work yet.
++      assert(caller->unextended_sp() == interpreter_frame->interpreter_frame_sender_sp(), "Frame not properly walkable");
+     assert(caller->sp() == interpreter_frame->sender_sp(), "Frame not properly walkable(2)");
+ #endif
+ 
+diff --git a/src/share/vm/c1/c1_IR.hpp b/src/share/vm/c1/c1_IR.hpp
+--- a/src/share/vm/c1/c1_IR.hpp
++++ b/src/share/vm/c1/c1_IR.hpp
+@@ -251,8 +251,9 @@
+     DebugToken* expvals = recorder->create_scope_values(expressions());
+     DebugToken* monvals = recorder->create_monitor_values(monitors());
+     // reexecute allowed only for the topmost frame
+-    bool      reexecute = topmost ? should_reexecute() : false;
+-    recorder->describe_scope(pc_offset, scope()->method(), bci(), reexecute, locvals, expvals, monvals);
++    bool reexecute = topmost ? should_reexecute() : false;
++    bool is_method_handle_invoke = false;
++    recorder->describe_scope(pc_offset, scope()->method(), bci(), reexecute, is_method_handle_invoke, locvals, expvals, monvals);
+   }
+ };
+ 
+diff --git a/src/share/vm/ci/ciStreams.cpp b/src/share/vm/ci/ciStreams.cpp
+--- a/src/share/vm/ci/ciStreams.cpp
++++ b/src/share/vm/ci/ciStreams.cpp
+@@ -339,9 +339,9 @@
+ // for checking linkability when retrieving the associated method.
+ ciKlass* ciBytecodeStream::get_declared_method_holder() {
+   bool ignore;
+-  // report as Dynamic for invokedynamic, which is syntactically classless
++  // report as InvokeDynamic for invokedynamic, which is syntactically classless
+   if (cur_bc() == Bytecodes::_invokedynamic)
+-    return CURRENT_ENV->get_klass_by_name(_holder, ciSymbol::java_dyn_Dynamic(), false);
++    return CURRENT_ENV->get_klass_by_name(_holder, ciSymbol::java_dyn_InvokeDynamic(), false);
+   return CURRENT_ENV->get_klass_by_index(_holder, get_method_holder_index(), ignore);
+ }
+ 
+diff --git a/src/share/vm/classfile/javaClasses.hpp b/src/share/vm/classfile/javaClasses.hpp
+--- a/src/share/vm/classfile/javaClasses.hpp
++++ b/src/share/vm/classfile/javaClasses.hpp
+@@ -1084,6 +1084,14 @@
+   static oop            vmmethod(oop site);
+   static void       set_vmmethod(oop site, oop ref);
+ 
++  // Testers
++  static bool is_subclass(klassOop klass) {
++    return Klass::cast(klass)->is_subclass_of(SystemDictionary::CallSite_klass());
++  }
++  static bool is_instance(oop obj) {
++    return obj != NULL && is_subclass(obj->klass());
++  }
++
+   // Accessors for code generation:
+   static int target_offset_in_bytes()           { return _target_offset; }
+   static int type_offset_in_bytes()             { return _type_offset; }
+diff --git a/src/share/vm/classfile/systemDictionary.cpp b/src/share/vm/classfile/systemDictionary.cpp
+--- a/src/share/vm/classfile/systemDictionary.cpp
++++ b/src/share/vm/classfile/systemDictionary.cpp
+@@ -1984,7 +1984,7 @@
+     scan = WKID(meth_group_end+1);
+   }
+   WKID indy_group_start = WK_KLASS_ENUM_NAME(Linkage_klass);
+-  WKID indy_group_end   = WK_KLASS_ENUM_NAME(Dynamic_klass);
++  WKID indy_group_end   = WK_KLASS_ENUM_NAME(InvokeDynamic_klass);
+   initialize_wk_klasses_until(indy_group_start, scan, CHECK);
+   if (EnableInvokeDynamic) {
+     initialize_wk_klasses_through(indy_group_end, scan, CHECK);
+@@ -2340,6 +2340,8 @@
+   SymbolPropertyEntry* spe = invoke_method_table()->find_entry(index, hash, signature);
+   if (spe == NULL || spe->property_oop() == NULL) {
+     // Must create lots of stuff here, but outside of the SystemDictionary lock.
++    if (THREAD->is_Compiler_thread())
++      return NULL;              // do not attempt from within compiler
+     Handle mt = compute_method_handle_type(signature(),
+                                            class_loader, protection_domain,
+                                            CHECK_NULL);
+diff --git a/src/share/vm/classfile/systemDictionary.hpp b/src/share/vm/classfile/systemDictionary.hpp
+--- a/src/share/vm/classfile/systemDictionary.hpp
++++ b/src/share/vm/classfile/systemDictionary.hpp
+@@ -144,7 +144,7 @@
+   template(WrongMethodTypeException_klass, java_dyn_WrongMethodTypeException, Opt) \
+   template(Linkage_klass,                java_dyn_Linkage,               Opt) \
+   template(CallSite_klass,               java_dyn_CallSite,              Opt) \
+-  template(Dynamic_klass,                java_dyn_Dynamic,               Opt) \
++  template(InvokeDynamic_klass,          java_dyn_InvokeDynamic,         Opt) \
+   /* Note: MethodHandle must be first, and Dynamic last in group */           \
+                                                                               \
+   template(vector_klass,                 java_util_Vector,               Pre) \
+diff --git a/src/share/vm/classfile/vmSymbols.hpp b/src/share/vm/classfile/vmSymbols.hpp
+--- a/src/share/vm/classfile/vmSymbols.hpp
++++ b/src/share/vm/classfile/vmSymbols.hpp
+@@ -218,7 +218,7 @@
+   template(base_name,                                 "base")                                     \
+                                                                                                   \
+   /* Support for JSR 292 & invokedynamic (JDK 1.7 and above) */                                   \
+-  template(java_dyn_Dynamic,                          "java/dyn/Dynamic")                         \
++  template(java_dyn_InvokeDynamic,                    "java/dyn/InvokeDynamic")                   \
+   template(java_dyn_Linkage,                          "java/dyn/Linkage")                         \
+   template(java_dyn_CallSite,                         "java/dyn/CallSite")                        \
+   template(java_dyn_MethodHandle,                     "java/dyn/MethodHandle")                    \
+diff --git a/src/share/vm/code/codeBlob.hpp b/src/share/vm/code/codeBlob.hpp
+--- a/src/share/vm/code/codeBlob.hpp
++++ b/src/share/vm/code/codeBlob.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1998-2007 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1998-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -102,6 +102,9 @@
+   virtual bool is_compiled_by_c2() const         { return false; }
+   virtual bool is_compiled_by_c1() const         { return false; }
+ 
++  // Casting
++  nmethod* as_nmethod_or_null()                  { return is_nmethod() ? (nmethod*) this : NULL; }
++
+   // Boundaries
+   address    header_begin() const                { return (address)    this; }
+   address    header_end() const                  { return ((address)   this) + _header_size; };
+diff --git a/src/share/vm/code/debugInfoRec.cpp b/src/share/vm/code/debugInfoRec.cpp
+--- a/src/share/vm/code/debugInfoRec.cpp
++++ b/src/share/vm/code/debugInfoRec.cpp
+@@ -281,6 +281,7 @@
+                                               ciMethod*   method,
+                                               int         bci,
+                                               bool        reexecute,
++                                              bool        is_method_handle_invoke,
+                                               DebugToken* locals,
+                                               DebugToken* expressions,
+                                               DebugToken* monitors) {
+@@ -292,8 +293,9 @@
+   int stream_offset = stream()->position();
+   last_pd->set_scope_decode_offset(stream_offset);
+ 
+-  // Record reexecute bit into pcDesc
++  // Record flags into pcDesc.
+   last_pd->set_should_reexecute(reexecute);
++  last_pd->set_is_method_handle_invoke(is_method_handle_invoke);
+ 
+   // serialize sender stream offest
+   stream()->write_int(sender_stream_offset);
+diff --git a/src/share/vm/code/debugInfoRec.hpp b/src/share/vm/code/debugInfoRec.hpp
+--- a/src/share/vm/code/debugInfoRec.hpp
++++ b/src/share/vm/code/debugInfoRec.hpp
+@@ -88,6 +88,7 @@
+                       ciMethod*   method,
+                       int         bci,
+                       bool        reexecute,
++                      bool        is_method_handle_invoke = false,
+                       DebugToken* locals      = NULL,
+                       DebugToken* expressions = NULL,
+                       DebugToken* monitors    = NULL);
+diff --git a/src/share/vm/code/nmethod.cpp b/src/share/vm/code/nmethod.cpp
+--- a/src/share/vm/code/nmethod.cpp
++++ b/src/share/vm/code/nmethod.cpp
+@@ -1754,6 +1754,14 @@
+          "must end with a sentinel");
+ #endif //ASSERT
+ 
++  // Search for MethodHandle invokes and tag the nmethod.
++  for (int i = 0; i < count; i++) {
++    if (pcs[i].is_method_handle_invoke()) {
++      set_has_method_handle_invokes(true);
++      break;
++    }
++  }
++
+   int size = count * sizeof(PcDesc);
+   assert(scopes_pcs_size() >= size, "oob");
+   memcpy(scopes_pcs_begin(), pcs, size);
+@@ -2021,6 +2029,18 @@
+ 
+ 
+ // -----------------------------------------------------------------------------
++// MethodHandle
++
++bool nmethod::is_method_handle_return(address return_pc) {
++  if (!has_method_handle_invokes())  return false;
++  PcDesc* pd = pc_desc_at(return_pc);
++  if (pd == NULL)
++    return false;
++  return pd->is_method_handle_invoke();
++}
++
++
++// -----------------------------------------------------------------------------
+ // Verification
+ 
+ class VerifyOopsClosure: public OopClosure {
+diff --git a/src/share/vm/code/nmethod.hpp b/src/share/vm/code/nmethod.hpp
+--- a/src/share/vm/code/nmethod.hpp
++++ b/src/share/vm/code/nmethod.hpp
+@@ -81,18 +81,19 @@
+ 
+ struct nmFlags {
+   friend class VMStructs;
+-  unsigned int version:8;                 // version number (0 = first version)
+-  unsigned int level:4;                   // optimization level
+-  unsigned int age:4;                     // age (in # of sweep steps)
++  unsigned int version:8;                    // version number (0 = first version)
++  unsigned int level:4;                      // optimization level
++  unsigned int age:4;                        // age (in # of sweep steps)
+ 
+-  unsigned int state:2;                   // {alive, zombie, unloaded)
++  unsigned int state:2;                      // {alive, zombie, unloaded)
+ 
+-  unsigned int isUncommonRecompiled:1;    // recompiled because of uncommon trap?
+-  unsigned int isToBeRecompiled:1;        // to be recompiled as soon as it matures
+-  unsigned int hasFlushedDependencies:1;  // Used for maintenance of dependencies
+-  unsigned int markedForReclamation:1;    // Used by NMethodSweeper
++  unsigned int isUncommonRecompiled:1;       // recompiled because of uncommon trap?
++  unsigned int isToBeRecompiled:1;           // to be recompiled as soon as it matures
++  unsigned int hasFlushedDependencies:1;     // Used for maintenance of dependencies
++  unsigned int markedForReclamation:1;       // Used by NMethodSweeper
+ 
+-  unsigned int has_unsafe_access:1;       // May fault due to unsafe access.
++  unsigned int has_unsafe_access:1;          // May fault due to unsafe access.
++  unsigned int has_method_handle_invokes:1;  // Has this method MethodHandle invokes?
+ 
+   void clear();
+ };
+@@ -405,6 +406,9 @@
+   bool  has_unsafe_access() const                 { return flags.has_unsafe_access; }
+   void  set_has_unsafe_access(bool z)             { flags.has_unsafe_access = z; }
+ 
++  bool  has_method_handle_invokes() const         { return flags.has_method_handle_invokes; }
++  void  set_has_method_handle_invokes(bool z)     { flags.has_method_handle_invokes = z; }
++
+   int   level() const                             { return flags.level; }
+   void  set_level(int newLevel)                   { check_safepoint(); flags.level = newLevel; }
+ 
+@@ -537,6 +541,9 @@
+   address get_original_pc(const frame* fr) { return *orig_pc_addr(fr); }
+   void    set_original_pc(const frame* fr, address pc) { *orig_pc_addr(fr) = pc; }
+ 
++  // MethodHandle
++  bool is_method_handle_return(address return_pc);
++
+   // jvmti support:
+   void post_compiled_method_load_event();
+ 
+diff --git a/src/share/vm/code/pcDesc.hpp b/src/share/vm/code/pcDesc.hpp
+--- a/src/share/vm/code/pcDesc.hpp
++++ b/src/share/vm/code/pcDesc.hpp
+@@ -38,6 +38,7 @@
+     int word;
+     struct {
+       unsigned int reexecute: 1;
++      unsigned int is_method_handle_invoke: 1;
+     } bits;
+     bool operator ==(const PcDescFlags& other) { return word == other.word; }
+   } _flags;
+@@ -72,6 +73,9 @@
+       _flags == pd->_flags;
+   }
+ 
++  bool     is_method_handle_invoke()       const { return _flags.bits.is_method_handle_invoke;     }
++  void set_is_method_handle_invoke(bool z)       {        _flags.bits.is_method_handle_invoke = z; }
++
+   // Returns the real pc
+   address real_pc(const nmethod* code) const;
+ 
+diff --git a/src/share/vm/compiler/methodLiveness.cpp b/src/share/vm/compiler/methodLiveness.cpp
+--- a/src/share/vm/compiler/methodLiveness.cpp
++++ b/src/share/vm/compiler/methodLiveness.cpp
+@@ -782,6 +782,7 @@
+     case Bytecodes::_invokespecial:
+     case Bytecodes::_invokestatic:
+     case Bytecodes::_invokeinterface:
++    case Bytecodes::_invokedynamic:
+     case Bytecodes::_newarray:
+     case Bytecodes::_anewarray:
+     case Bytecodes::_checkcast:
+diff --git a/src/share/vm/interpreter/bytecode.cpp b/src/share/vm/interpreter/bytecode.cpp
+--- a/src/share/vm/interpreter/bytecode.cpp
++++ b/src/share/vm/interpreter/bytecode.cpp
+@@ -102,7 +102,9 @@
+   KlassHandle resolved_klass;
+   constantPoolHandle constants(THREAD, _method->constants());
+ 
+-  if (adjusted_invoke_code() != Bytecodes::_invokeinterface) {
++  if (adjusted_invoke_code() == Bytecodes::_invokedynamic) {
++    LinkResolver::resolve_dynamic_method(m, resolved_klass, constants, index(), CHECK_(methodHandle()));
++  } else if (adjusted_invoke_code() != Bytecodes::_invokeinterface) {
+     LinkResolver::resolve_method(m, resolved_klass, constants, index(), CHECK_(methodHandle()));
+   } else {
+     LinkResolver::resolve_interface_method(m, resolved_klass, constants, index(), CHECK_(methodHandle()));
+diff --git a/src/share/vm/interpreter/bytecode.hpp b/src/share/vm/interpreter/bytecode.hpp
+--- a/src/share/vm/interpreter/bytecode.hpp
++++ b/src/share/vm/interpreter/bytecode.hpp
+@@ -210,7 +210,8 @@
+   bool is_valid() const                          { return is_invokeinterface() ||
+                                                           is_invokevirtual()   ||
+                                                           is_invokestatic()    ||
+-                                                          is_invokespecial();     }
++                                                          is_invokespecial()   ||
++                                                          is_invokedynamic(); }
+ 
+   // Creation
+   inline friend Bytecode_invoke* Bytecode_invoke_at(methodHandle method, int bci);
+diff --git a/src/share/vm/interpreter/bytecodes.cpp b/src/share/vm/interpreter/bytecodes.cpp
+--- a/src/share/vm/interpreter/bytecodes.cpp
++++ b/src/share/vm/interpreter/bytecodes.cpp
+@@ -357,7 +357,7 @@
+   def(_invokespecial       , "invokespecial"       , "bjj"  , NULL    , T_ILLEGAL, -1, true);
+   def(_invokestatic        , "invokestatic"        , "bjj"  , NULL    , T_ILLEGAL,  0, true);
+   def(_invokeinterface     , "invokeinterface"     , "bjj__", NULL    , T_ILLEGAL, -1, true);
+-  def(_invokedynamic       , "invokedynamic"       , "bjjjj", NULL    , T_ILLEGAL, -1, true );
++  def(_invokedynamic       , "invokedynamic"       , "bjjjj", NULL    , T_ILLEGAL,  0, true );
+   def(_new                 , "new"                 , "bii"  , NULL    , T_OBJECT ,  1, true );
+   def(_newarray            , "newarray"            , "bc"   , NULL    , T_OBJECT ,  0, true );
+   def(_anewarray           , "anewarray"           , "bii"  , NULL    , T_OBJECT ,  0, true );
+diff --git a/src/share/vm/interpreter/interpreter.cpp b/src/share/vm/interpreter/interpreter.cpp
+--- a/src/share/vm/interpreter/interpreter.cpp
++++ b/src/share/vm/interpreter/interpreter.cpp
+@@ -323,7 +323,7 @@
+       // (NOT needed for the old calling convension)
+       if (!is_top_frame) {
+         int index = Bytes::get_native_u4(bcp+1);
+-        method->constants()->cache()->entry_at(index)->set_parameter_size(callee_parameters);
++        method->constants()->cache()->secondary_entry_at(index)->set_parameter_size(callee_parameters);
+       }
+       break;
+     }
+diff --git a/src/share/vm/interpreter/linkResolver.cpp b/src/share/vm/interpreter/linkResolver.cpp
+--- a/src/share/vm/interpreter/linkResolver.cpp
++++ b/src/share/vm/interpreter/linkResolver.cpp
+@@ -75,6 +75,8 @@
+   _selected_method = selected_method;
+   _vtable_index    = vtable_index;
+   if (CompilationPolicy::mustBeCompiled(selected_method)) {
++    // This path is unusual, mostly used by the '-Xcomp' stress test mode.
++
+     // Note: with several active threads, the mustBeCompiled may be true
+     //       while canBeCompiled is false; remove assert
+     // assert(CompilationPolicy::canBeCompiled(selected_method), "cannot compile");
+@@ -82,6 +84,16 @@
+       // don't force compilation, resolve was on behalf of compiler
+       return;
+     }
++    if (instanceKlass::cast(selected_method->method_holder())->is_not_initialized()) {
++      // 'is_not_initialized' means not only '!is_initialized', but also that
++      // initialization has not been started yet ('!being_initialized')
++      // Do not force compilation of methods in uninitialized classes.
++      // Note that doing this would throw an assert later,
++      // in CompileBroker::compile_method.
++      // We sometimes use the link resolver to do reflective lookups
++      // even before classes are initialized.
++      return;
++    }
+     CompileBroker::compile_method(selected_method, InvocationEntryBci,
+                                   methodHandle(), 0, "mustBeCompiled", CHECK);
+   }
+@@ -223,6 +235,18 @@
+   resolve_method(resolved_method, resolved_klass, method_name, method_signature, current_klass, true, CHECK);
+ }
+ 
++void LinkResolver::resolve_dynamic_method(methodHandle& resolved_method, KlassHandle& resolved_klass, constantPoolHandle pool, int index, TRAPS) {
++  // The class is java.dyn.MethodHandle
++  resolved_klass = SystemDictionaryHandles::MethodHandle_klass();
++
++  symbolHandle method_name = vmSymbolHandles::invoke_name();
++
++  symbolHandle method_signature(THREAD, pool->signature_ref_at(index));
++  KlassHandle  current_klass   (THREAD, pool->pool_holder());
++
++  resolve_method(resolved_method, resolved_klass, method_name, method_signature, current_klass, true, CHECK);
++}
++
+ void LinkResolver::resolve_interface_method(methodHandle& resolved_method, KlassHandle& resolved_klass, constantPoolHandle pool, int index, TRAPS) {
+ 
+   // resolve klass
+diff --git a/src/share/vm/interpreter/linkResolver.hpp b/src/share/vm/interpreter/linkResolver.hpp
+--- a/src/share/vm/interpreter/linkResolver.hpp
++++ b/src/share/vm/interpreter/linkResolver.hpp
+@@ -133,6 +133,7 @@
+ 
+   // static resolving for all calls except interface calls
+   static void resolve_method          (methodHandle& method_result, KlassHandle& klass_result, constantPoolHandle pool, int index, TRAPS);
++  static void resolve_dynamic_method  (methodHandle& resolved_method, KlassHandle& resolved_klass, constantPoolHandle pool, int index, TRAPS);
+   static void resolve_interface_method(methodHandle& method_result, KlassHandle& klass_result, constantPoolHandle pool, int index, TRAPS);
+ 
+   // runtime/static resolving for fields
+diff --git a/src/share/vm/opto/doCall.cpp b/src/share/vm/opto/doCall.cpp
+--- a/src/share/vm/opto/doCall.cpp
++++ b/src/share/vm/opto/doCall.cpp
+@@ -308,7 +308,7 @@
+     return true;
+   }
+   if (dest_method->is_method_handle_invoke()
+-      && holder_klass->name() == ciSymbol::java_dyn_Dynamic()) {
++      && holder_klass->name() == ciSymbol::java_dyn_InvokeDynamic()) {
+     // FIXME: NYI
+     uncommon_trap(Deoptimization::Reason_unhandled,
+                   Deoptimization::Action_none,
+diff --git a/src/share/vm/opto/output.cpp b/src/share/vm/opto/output.cpp
+--- a/src/share/vm/opto/output.cpp
++++ b/src/share/vm/opto/output.cpp
+@@ -911,9 +911,10 @@
+     ciMethod* scope_method = method ? method : _method;
+     // Describe the scope here
+     assert(jvms->bci() >= InvocationEntryBci && jvms->bci() <= 0x10000, "must be a valid or entry BCI");
+-    assert(!jvms->should_reexecute() || depth==max_depth, "reexecute allowed only for the youngest");
++    assert(!jvms->should_reexecute() || depth == max_depth, "reexecute allowed only for the youngest");
+     // Now we can describe the scope.
+-    debug_info()->describe_scope(safepoint_pc_offset,scope_method,jvms->bci(),jvms->should_reexecute(),locvals,expvals,monvals);
++    bool is_method_handle_invoke = false;
++    debug_info()->describe_scope(safepoint_pc_offset, scope_method, jvms->bci(), jvms->should_reexecute(), is_method_handle_invoke, locvals, expvals, monvals);
+   } // End jvms loop
+ 
+   // Mark the end of the scope set.
+diff --git a/src/share/vm/opto/runtime.cpp b/src/share/vm/opto/runtime.cpp
+--- a/src/share/vm/opto/runtime.cpp
++++ b/src/share/vm/opto/runtime.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1998-2007 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1998-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -858,6 +858,9 @@
+     thread->set_exception_pc(pc);
+     thread->set_exception_handler_pc(handler_address);
+     thread->set_exception_stack_size(0);
++
++    // Check if the exception PC is a MethodHandle call.
++    thread->set_is_method_handle_exception(nm->is_method_handle_return(pc));
+   }
+ 
+   // Restore correct return pc.  Was saved above.
+diff --git a/src/share/vm/runtime/arguments.cpp b/src/share/vm/runtime/arguments.cpp
+--- a/src/share/vm/runtime/arguments.cpp
++++ b/src/share/vm/runtime/arguments.cpp
+@@ -2699,6 +2699,15 @@
+     }
+     ScavengeRootsInCode = 1;
+   }
++#ifdef COMPILER2
++  if (EnableInvokeDynamic && DoEscapeAnalysis) {
++    // TODO: We need to find rules for invokedynamic and EA.  For now,
++    // simply disable EA by default.
++    if (FLAG_IS_DEFAULT(DoEscapeAnalysis)) {
++      DoEscapeAnalysis = false;
++    }
++  }
++#endif
+ 
+   if (PrintGCDetails) {
+     // Turn on -verbose:gc options as well
+@@ -2722,6 +2731,15 @@
+   // Set flags based on ergonomics.
+   set_ergonomics_flags();
+ 
++#ifdef _LP64
++  // XXX JSR 292 currently does not support compressed oops.
++  if (EnableMethodHandles && UseCompressedOops) {
++    if (FLAG_IS_DEFAULT(UseCompressedOops) || FLAG_IS_ERGO(UseCompressedOops)) {
++      UseCompressedOops = false;
++    }
++  }
++#endif // _LP64
++
+   // Check the GC selections again.
+   if (!check_gc_consistency()) {
+     return JNI_EINVAL;
+diff --git a/src/share/vm/runtime/sharedRuntime.cpp b/src/share/vm/runtime/sharedRuntime.cpp
+--- a/src/share/vm/runtime/sharedRuntime.cpp
++++ b/src/share/vm/runtime/sharedRuntime.cpp
+@@ -802,7 +802,7 @@
+ 
+ #ifdef ASSERT
+   // Check that the receiver klass is of the right subtype and that it is initialized for virtual calls
+-  if (bc != Bytecodes::_invokestatic) {
++  if (bc != Bytecodes::_invokestatic && bc != Bytecodes::_invokedynamic) {
+     assert(receiver.not_null(), "should have thrown exception");
+     KlassHandle receiver_klass (THREAD, receiver->klass());
+     klassOop rk = constants->klass_ref_at(bytecode_index, CHECK_(nullHandle));
+@@ -1027,7 +1027,16 @@
+   frame stub_frame = thread->last_frame();
+   assert(stub_frame.is_runtime_frame(), "sanity check");
+   frame caller_frame = stub_frame.sender(&reg_map);
+-  if (caller_frame.is_interpreted_frame() || caller_frame.is_entry_frame() ) {
++
++  // MethodHandle invokes don't have a CompiledIC and should always
++  // simply redispatch to the callee_target.
++  address   sender_pc = caller_frame.pc();
++  CodeBlob* sender_cb = caller_frame.cb();
++  nmethod*  sender_nm = sender_cb->as_nmethod_or_null();
++
++  if (caller_frame.is_interpreted_frame() ||
++      caller_frame.is_entry_frame() ||
++      (sender_nm != NULL && sender_nm->is_method_handle_return(sender_pc))) {
+     methodOop callee = thread->callee_target();
+     guarantee(callee != NULL && callee->is_method(), "bad handshake");
+     thread->set_vm_result(callee);
+diff --git a/src/share/vm/runtime/thread.cpp b/src/share/vm/runtime/thread.cpp
+--- a/src/share/vm/runtime/thread.cpp
++++ b/src/share/vm/runtime/thread.cpp
+@@ -3055,6 +3055,12 @@
+       warning("java.lang.ArithmeticException has not been initialized");
+       warning("java.lang.StackOverflowError has not been initialized");
+     }
++
++    if (EnableInvokeDynamic) {
++      // JSR 292: An intialized java.dyn.InvokeDynamic is required in
++      // the compiler.
++      initialize_class(vmSymbolHandles::java_dyn_InvokeDynamic(), CHECK_0);
++    }
+   }
+ 
+   // See        : bugid 4211085.
+diff --git a/src/share/vm/runtime/thread.hpp b/src/share/vm/runtime/thread.hpp
+--- a/src/share/vm/runtime/thread.hpp
++++ b/src/share/vm/runtime/thread.hpp
+@@ -760,6 +760,7 @@
+   volatile address _exception_pc;                // PC where exception happened
+   volatile address _exception_handler_pc;        // PC for handler of exception
+   volatile int     _exception_stack_size;        // Size of frame where exception happened
++  volatile int     _is_method_handle_exception;  // True if the current exception PC is at a MethodHandle call.
+ 
+   // support for compilation
+   bool    _is_compiling;                         // is true if a compilation is active inthis thread (one compilation per thread possible)
+@@ -1095,11 +1096,13 @@
+   int      exception_stack_size() const          { return _exception_stack_size; }
+   address  exception_pc() const                  { return _exception_pc; }
+   address  exception_handler_pc() const          { return _exception_handler_pc; }
++  int      is_method_handle_exception() const    { return _is_method_handle_exception; }
+ 
+   void set_exception_oop(oop o)                  { _exception_oop = o; }
+   void set_exception_pc(address a)               { _exception_pc = a; }
+   void set_exception_handler_pc(address a)       { _exception_handler_pc = a; }
+   void set_exception_stack_size(int size)        { _exception_stack_size = size; }
++  void set_is_method_handle_exception(int value) { _is_method_handle_exception = value; }
+ 
+   // Stack overflow support
+   inline size_t stack_available(address cur_sp);
+@@ -1173,6 +1176,7 @@
+   static ByteSize exception_pc_offset()          { return byte_offset_of(JavaThread, _exception_pc        ); }
+   static ByteSize exception_handler_pc_offset()  { return byte_offset_of(JavaThread, _exception_handler_pc); }
+   static ByteSize exception_stack_size_offset()  { return byte_offset_of(JavaThread, _exception_stack_size); }
++  static ByteSize is_method_handle_exception_offset() { return byte_offset_of(JavaThread, _is_method_handle_exception); }
+   static ByteSize stack_guard_state_offset()     { return byte_offset_of(JavaThread, _stack_guard_state   ); }
+   static ByteSize suspend_flags_offset()         { return byte_offset_of(JavaThread, _suspend_flags       ); }
+ 

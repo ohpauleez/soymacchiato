@@ -1,0 +1,877 @@
+
+# HG changeset patch
+# User twisti
+# Date 1265048986 -3600
+# Node ID 18a3892148296128e1dff3d0a445c1b6737f1855
+# Parent 844a9d73ec2244eaaea969f45dd4fbb2ad7c9022
+6921352: JSR 292 needs its own deopt handler
+Summary: We need to introduce a new MH deopt handler so we can easily determine if the deopt happened at a MH call site or not.
+Reviewed-by: never, jrose
+
+--- a/src/cpu/sparc/vm/c1_LIRAssembler_sparc.cpp	Fri Jan 29 22:51:41 2010 -0800
++++ b/src/cpu/sparc/vm/c1_LIRAssembler_sparc.cpp	Mon Feb 01 19:29:46 2010 +0100
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2000-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 2000-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -357,7 +357,7 @@ void LIR_Assembler::monitorexit(LIR_Opr 
+ }
+ 
+ 
+-void LIR_Assembler::emit_exception_handler() {
++int LIR_Assembler::emit_exception_handler() {
+   // if the last instruction is a call (typically to do a throw which
+   // is coming at the end after block reordering) the return address
+   // must still point into the code area in order to avoid assertion
+@@ -373,13 +373,10 @@ void LIR_Assembler::emit_exception_handl
+   if (handler_base == NULL) {
+     // not enough space left for the handler
+     bailout("exception handler overflow");
+-    return;
+-  }
+-#ifdef ASSERT
++    return -1;
++  }
++
+   int offset = code_offset();
+-#endif // ASSERT
+-  compilation()->offsets()->set_value(CodeOffsets::Exceptions, code_offset());
+-
+ 
+   if (compilation()->has_exception_handlers() || compilation()->env()->jvmti_can_post_exceptions()) {
+     __ call(Runtime1::entry_for(Runtime1::handle_exception_id), relocInfo::runtime_call_type);
+@@ -390,11 +387,13 @@ void LIR_Assembler::emit_exception_handl
+   __ delayed()->nop();
+   debug_only(__ stop("should have gone to the caller");)
+   assert(code_offset() - offset <= exception_handler_size, "overflow");
+-
+   __ end_a_stub();
+-}
+-
+-void LIR_Assembler::emit_deopt_handler() {
++
++  return offset;
++}
++
++
++int LIR_Assembler::emit_deopt_handler() {
+   // if the last instruction is a call (typically to do a throw which
+   // is coming at the end after block reordering) the return address
+   // must still point into the code area in order to avoid assertion
+@@ -408,23 +407,18 @@ void LIR_Assembler::emit_deopt_handler()
+   if (handler_base == NULL) {
+     // not enough space left for the handler
+     bailout("deopt handler overflow");
+-    return;
+-  }
+-#ifdef ASSERT
++    return -1;
++  }
++
+   int offset = code_offset();
+-#endif // ASSERT
+-  compilation()->offsets()->set_value(CodeOffsets::Deopt, code_offset());
+-
+   AddressLiteral deopt_blob(SharedRuntime::deopt_blob()->unpack());
+-
+   __ JUMP(deopt_blob, G3_scratch, 0); // sethi;jmp
+   __ delayed()->nop();
+-
+   assert(code_offset() - offset <= deopt_handler_size, "overflow");
+-
+   debug_only(__ stop("should have gone to the caller");)
+-
+   __ end_a_stub();
++
++  return offset;
+ }
+ 
+ 
+--- a/src/cpu/sparc/vm/frame_sparc.cpp	Fri Jan 29 22:51:41 2010 -0800
++++ b/src/cpu/sparc/vm/frame_sparc.cpp	Mon Feb 01 19:29:46 2010 +0100
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -366,8 +366,9 @@ frame::frame(intptr_t* sp, intptr_t* you
+   // as get_original_pc() needs correct value for unextended_sp()
+   if (_pc != NULL) {
+     _cb = CodeCache::find_blob(_pc);
+-    if (_cb != NULL && _cb->is_nmethod() && ((nmethod*)_cb)->is_deopt_pc(_pc)) {
+-      _pc = ((nmethod*)_cb)->get_original_pc(this);
++    address original_pc = nmethod::get_deopt_original_pc(this);
++    if (original_pc != NULL) {
++      _pc = original_pc;
+       _deopt_state = is_deoptimized;
+     } else {
+       _deopt_state = not_deoptimized;
+@@ -519,9 +520,9 @@ void frame::patch_pc(Thread* thread, add
+   _cb = CodeCache::find_blob(pc);
+   *O7_addr() = pc - pc_return_offset;
+   _cb = CodeCache::find_blob(_pc);
+-  if (_cb != NULL && _cb->is_nmethod() && ((nmethod*)_cb)->is_deopt_pc(_pc)) {
+-    address orig = ((nmethod*)_cb)->get_original_pc(this);
+-    assert(orig == _pc, "expected original to be stored before patching");
++  address original_pc = nmethod::get_deopt_original_pc(this);
++  if (original_pc != NULL) {
++    assert(original_pc == _pc, "expected original to be stored before patching");
+     _deopt_state = is_deoptimized;
+   } else {
+     _deopt_state = not_deoptimized;
+--- a/src/cpu/x86/vm/c1_LIRAssembler_x86.cpp	Fri Jan 29 22:51:41 2010 -0800
++++ b/src/cpu/x86/vm/c1_LIRAssembler_x86.cpp	Mon Feb 01 19:29:46 2010 +0100
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2000-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 2000-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -418,13 +418,12 @@ int LIR_Assembler::initial_frame_size_in
+ }
+ 
+ 
+-void LIR_Assembler::emit_exception_handler() {
++int LIR_Assembler::emit_exception_handler() {
+   // if the last instruction is a call (typically to do a throw which
+   // is coming at the end after block reordering) the return address
+   // must still point into the code area in order to avoid assertion
+   // failures when searching for the corresponding bci => add a nop
+   // (was bug 5/14/1999 - gri)
+-
+   __ nop();
+ 
+   // generate code for exception handler
+@@ -432,13 +431,10 @@ void LIR_Assembler::emit_exception_handl
+   if (handler_base == NULL) {
+     // not enough space left for the handler
+     bailout("exception handler overflow");
+-    return;
+-  }
+-#ifdef ASSERT
++    return -1;
++  }
++
+   int offset = code_offset();
+-#endif // ASSERT
+-
+-  compilation()->offsets()->set_value(CodeOffsets::Exceptions, code_offset());
+ 
+   // if the method does not have an exception handler, then there is
+   // no reason to search for one
+@@ -474,19 +470,19 @@ void LIR_Assembler::emit_exception_handl
+   // unwind activation and forward exception to caller
+   // rax,: exception
+   __ jump(RuntimeAddress(Runtime1::entry_for(Runtime1::unwind_exception_id)));
+-
+   assert(code_offset() - offset <= exception_handler_size, "overflow");
+-
+   __ end_a_stub();
+-}
+-
+-void LIR_Assembler::emit_deopt_handler() {
++
++  return offset;
++}
++
++
++int LIR_Assembler::emit_deopt_handler() {
+   // if the last instruction is a call (typically to do a throw which
+   // is coming at the end after block reordering) the return address
+   // must still point into the code area in order to avoid assertion
+   // failures when searching for the corresponding bci => add a nop
+   // (was bug 5/14/1999 - gri)
+-
+   __ nop();
+ 
+   // generate code for exception handler
+@@ -494,23 +490,17 @@ void LIR_Assembler::emit_deopt_handler()
+   if (handler_base == NULL) {
+     // not enough space left for the handler
+     bailout("deopt handler overflow");
+-    return;
+-  }
+-#ifdef ASSERT
++    return -1;
++  }
++
+   int offset = code_offset();
+-#endif // ASSERT
+-
+-  compilation()->offsets()->set_value(CodeOffsets::Deopt, code_offset());
+-
+   InternalAddress here(__ pc());
+   __ pushptr(here.addr());
+-
+   __ jump(RuntimeAddress(SharedRuntime::deopt_blob()->unpack()));
+-
+   assert(code_offset() - offset <= deopt_handler_size, "overflow");
+-
+   __ end_a_stub();
+ 
++  return offset;
+ }
+ 
+ 
+--- a/src/cpu/x86/vm/frame_x86.cpp	Fri Jan 29 22:51:41 2010 -0800
++++ b/src/cpu/x86/vm/frame_x86.cpp	Mon Feb 01 19:29:46 2010 +0100
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -222,9 +222,9 @@ void frame::patch_pc(Thread* thread, add
+   }
+   ((address *)sp())[-1] = pc;
+   _cb = CodeCache::find_blob(pc);
+-  if (_cb != NULL && _cb->is_nmethod() && ((nmethod*)_cb)->is_deopt_pc(_pc)) {
+-    address orig = (((nmethod*)_cb)->get_original_pc(this));
+-    assert(orig == _pc, "expected original to be stored before patching");
++  address original_pc = nmethod::get_deopt_original_pc(this);
++  if (original_pc != NULL) {
++    assert(original_pc == _pc, "expected original PC to be stored before patching");
+     _deopt_state = is_deoptimized;
+     // leave _pc as is
+   } else {
+@@ -323,19 +323,61 @@ frame frame::sender_for_entry_frame(Regi
+   return fr;
+ }
+ 
++
++//------------------------------------------------------------------------------
++// frame::verify_deopt_original_pc
++//
++// Verifies the calculated original PC of a deoptimization PC for the
++// given unextended SP.  The unextended SP might also be the saved SP
++// for MethodHandle call sites.
++#if ASSERT
++void frame::verify_deopt_original_pc(nmethod* nm, intptr_t* unextended_sp, bool is_method_handle_return) {
++  frame fr;
++
++  // This is ugly but it's better than to change {get,set}_original_pc
++  // to take an SP value as argument.  And it's only a debugging
++  // method anyway.
++  fr._unextended_sp = unextended_sp;
++
++  address original_pc = nm->get_original_pc(&fr);
++  assert(nm->code_contains(original_pc), "original PC must be in nmethod");
++  assert(nm->is_method_handle_return(original_pc) == is_method_handle_return, "must be");
++}
++#endif
++
++
++//------------------------------------------------------------------------------
++// frame::sender_for_interpreter_frame
+ frame frame::sender_for_interpreter_frame(RegisterMap* map) const {
+-  // sp is the raw sp from the sender after adapter or interpreter extension
+-  intptr_t* sp = (intptr_t*) addr_at(sender_sp_offset);
++  // SP is the raw SP from the sender after adapter or interpreter
++  // extension.
++  intptr_t* sender_sp = this->sender_sp();
+ 
+   // This is the sp before any possible extension (adapter/locals).
+   intptr_t* unextended_sp = interpreter_frame_sender_sp();
++
++  // Stored FP.
++  intptr_t* saved_fp = link();
+ 
+   address sender_pc = this->sender_pc();
+   CodeBlob* sender_cb = CodeCache::find_blob_unsafe(sender_pc);
+   assert(sender_cb, "sanity");
+   nmethod* sender_nm = sender_cb->as_nmethod_or_null();
+-  if (sender_nm != NULL && sender_nm->is_method_handle_return(sender_pc)) {
+-    unextended_sp = (intptr_t*) at(link_offset);
++
++  if (sender_nm != NULL) {
++    // If the sender PC is a deoptimization point, get the original
++    // PC.  For MethodHandle call site the unextended_sp is stored in
++    // saved_fp.
++    if (sender_nm->is_deopt_mh_entry(sender_pc)) {
++      DEBUG_ONLY(verify_deopt_mh_original_pc(sender_nm, saved_fp));
++      unextended_sp = saved_fp;
++    }
++    else if (sender_nm->is_deopt_entry(sender_pc)) {
++      DEBUG_ONLY(verify_deopt_original_pc(sender_nm, unextended_sp));
++    }
++    else if (sender_nm->is_method_handle_return(sender_pc)) {
++      unextended_sp = saved_fp;
++    }
+   }
+ 
+   // The interpreter and compiler(s) always save EBP/RBP in a known
+@@ -359,40 +401,51 @@ frame frame::sender_for_interpreter_fram
+     }
+ #endif // AMD64
+   }
+-#endif /* COMPILER2 */
+-  return frame(sp, unextended_sp, link(), sender_pc);
+-}
+-
+-
+-//------------------------------sender_for_compiled_frame-----------------------
++#endif // COMPILER2
++
++  return frame(sender_sp, unextended_sp, saved_fp, sender_pc);
++}
++
++
++//------------------------------------------------------------------------------
++// frame::sender_for_compiled_frame
+ frame frame::sender_for_compiled_frame(RegisterMap* map) const {
+   assert(map != NULL, "map must be set");
+-  const bool c1_compiled = _cb->is_compiled_by_c1();
+ 
+   // frame owned by optimizing compiler
+-  intptr_t* sender_sp = NULL;
+-
+   assert(_cb->frame_size() >= 0, "must have non-zero frame size");
+-  sender_sp = unextended_sp() + _cb->frame_size();
++  intptr_t* sender_sp = unextended_sp() + _cb->frame_size();
++  intptr_t* unextended_sp = sender_sp;
+ 
+   // On Intel the return_address is always the word on the stack
+   address sender_pc = (address) *(sender_sp-1);
+ 
+-  // This is the saved value of ebp which may or may not really be an fp.
+-  // it is only an fp if the sender is an interpreter frame (or c1?)
+-
+-  intptr_t *saved_fp = (intptr_t*)*(sender_sp - frame::sender_sp_offset);
+-
+-  intptr_t* unextended_sp = sender_sp;
+-  // If we are returning to a compiled method handle call site,
+-  // the saved_fp will in fact be a saved value of the unextended SP.
+-  // The simplest way to tell whether we are returning to such a call
+-  // site is as follows:
++  // This is the saved value of EBP which may or may not really be an FP.
++  // It is only an FP if the sender is an interpreter frame (or C1?).
++  intptr_t* saved_fp = (intptr_t*) *(sender_sp - frame::sender_sp_offset);
++
++  // If we are returning to a compiled MethodHandle call site, the
++  // saved_fp will in fact be a saved value of the unextended SP.  The
++  // simplest way to tell whether we are returning to such a call site
++  // is as follows:
+   CodeBlob* sender_cb = CodeCache::find_blob_unsafe(sender_pc);
+   assert(sender_cb, "sanity");
+   nmethod* sender_nm = sender_cb->as_nmethod_or_null();
+-  if (sender_nm != NULL && sender_nm->is_method_handle_return(sender_pc)) {
+-    unextended_sp = saved_fp;
++
++  if (sender_nm != NULL) {
++    // If the sender PC is a deoptimization point, get the original
++    // PC.  For MethodHandle call site the unextended_sp is stored in
++    // saved_fp.
++    if (sender_nm->is_deopt_mh_entry(sender_pc)) {
++      DEBUG_ONLY(verify_deopt_mh_original_pc(sender_nm, saved_fp));
++      unextended_sp = saved_fp;
++    }
++    else if (sender_nm->is_deopt_entry(sender_pc)) {
++      DEBUG_ONLY(verify_deopt_original_pc(sender_nm, unextended_sp));
++    }
++    else if (sender_nm->is_method_handle_return(sender_pc)) {
++      unextended_sp = saved_fp;
++    }
+   }
+ 
+   if (map->update_map()) {
+@@ -403,7 +456,7 @@ frame frame::sender_for_compiled_frame(R
+     if (_cb->oop_maps() != NULL) {
+       OopMapSet::update_register_map(this, map);
+     }
+-    // Since the prolog does the save and restore of epb there is no oopmap
++    // Since the prolog does the save and restore of EBP there is no oopmap
+     // for it so we must fill in its location as if there was an oopmap entry
+     // since if our caller was compiled code there could be live jvm state in it.
+     map->set_location(rbp->as_VMReg(), (address) (sender_sp - frame::sender_sp_offset));
+@@ -422,6 +475,9 @@ frame frame::sender_for_compiled_frame(R
+   return frame(sender_sp, unextended_sp, saved_fp, sender_pc);
+ }
+ 
++
++//------------------------------------------------------------------------------
++// frame::sender
+ frame frame::sender(RegisterMap* map) const {
+   // Default is we done have to follow them. The sender_for_xxx will
+   // update it accordingly
+--- a/src/cpu/x86/vm/frame_x86.hpp	Fri Jan 29 22:51:41 2010 -0800
++++ b/src/cpu/x86/vm/frame_x86.hpp	Mon Feb 01 19:29:46 2010 +0100
+@@ -163,6 +163,14 @@
+     return (intptr_t*) addr_at(offset);
+   }
+ 
++#if ASSERT
++  // Used in frame::sender_for_{interpreter,compiled}_frame
++  static void verify_deopt_original_pc(   nmethod* nm, intptr_t* unextended_sp, bool is_method_handle_return = false);
++  static void verify_deopt_mh_original_pc(nmethod* nm, intptr_t* unextended_sp) {
++    verify_deopt_original_pc(nm, unextended_sp, true);
++  }
++#endif
++
+  public:
+   // Constructors
+ 
+--- a/src/cpu/x86/vm/frame_x86.inline.hpp	Fri Jan 29 22:51:41 2010 -0800
++++ b/src/cpu/x86/vm/frame_x86.inline.hpp	Mon Feb 01 19:29:46 2010 +0100
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -35,32 +35,35 @@ inline frame::frame() {
+   _deopt_state = unknown;
+ }
+ 
+-inline frame:: frame(intptr_t* sp, intptr_t* fp, address pc) {
++inline frame::frame(intptr_t* sp, intptr_t* fp, address pc) {
+   _sp = sp;
+   _unextended_sp = sp;
+   _fp = fp;
+   _pc = pc;
+   assert(pc != NULL, "no pc?");
+   _cb = CodeCache::find_blob(pc);
+-  _deopt_state = not_deoptimized;
+-  if (_cb != NULL && _cb->is_nmethod() && ((nmethod*)_cb)->is_deopt_pc(_pc)) {
+-    _pc = (((nmethod*)_cb)->get_original_pc(this));
+-    _deopt_state = is_deoptimized;
+-  } else {
+-    _deopt_state = not_deoptimized;
+-  }
+-}
+-
+-inline frame:: frame(intptr_t* sp, intptr_t* unextended_sp, intptr_t* fp, address pc) {
++
++  address original_pc = nmethod::get_deopt_original_pc(this);
++  if (original_pc != NULL) {
++    _pc = original_pc;
++    _deopt_state = is_deoptimized;
++  } else {
++    _deopt_state = not_deoptimized;
++  }
++}
++
++inline frame::frame(intptr_t* sp, intptr_t* unextended_sp, intptr_t* fp, address pc) {
+   _sp = sp;
+   _unextended_sp = unextended_sp;
+   _fp = fp;
+   _pc = pc;
+   assert(pc != NULL, "no pc?");
+   _cb = CodeCache::find_blob(pc);
+-  _deopt_state = not_deoptimized;
+-  if (_cb != NULL && _cb->is_nmethod() && ((nmethod*)_cb)->is_deopt_pc(_pc)) {
+-    _pc = (((nmethod*)_cb)->get_original_pc(this));
++
++  address original_pc = nmethod::get_deopt_original_pc(this);
++  if (original_pc != NULL) {
++    _pc = original_pc;
++    assert(((nmethod*)_cb)->code_contains(_pc), "original PC must be in nmethod");
+     _deopt_state = is_deoptimized;
+   } else {
+     _deopt_state = not_deoptimized;
+@@ -86,9 +89,9 @@ inline frame::frame(intptr_t* sp, intptr
+ 
+   _cb = CodeCache::find_blob(_pc);
+ 
+-  _deopt_state = not_deoptimized;
+-  if (_cb != NULL && _cb->is_nmethod() && ((nmethod*)_cb)->is_deopt_pc(_pc)) {
+-    _pc = (((nmethod*)_cb)->get_original_pc(this));
++  address original_pc = nmethod::get_deopt_original_pc(this);
++  if (original_pc != NULL) {
++    _pc = original_pc;
+     _deopt_state = is_deoptimized;
+   } else {
+     _deopt_state = not_deoptimized;
+--- a/src/share/vm/asm/codeBuffer.hpp	Fri Jan 29 22:51:41 2010 -0800
++++ b/src/share/vm/asm/codeBuffer.hpp	Mon Feb 01 19:29:46 2010 +0100
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -39,6 +39,7 @@ public:
+                  Dtrace_trap = OSR_Entry,  // dtrace probes can never have an OSR entry so reuse it
+                  Exceptions,     // Offset where exception handler lives
+                  Deopt,          // Offset where deopt handler lives
++                 DeoptMH,        // Offset where MethodHandle deopt handler lives
+                  max_Entries };
+ 
+   // special value to note codeBlobs where profile (forte) stack walking is
+@@ -51,12 +52,13 @@ private:
+ 
+ public:
+   CodeOffsets() {
+-    _values[Entry] = 0;
++    _values[Entry         ] = 0;
+     _values[Verified_Entry] = 0;
+     _values[Frame_Complete] = frame_never_safe;
+-    _values[OSR_Entry] = 0;
+-    _values[Exceptions] = -1;
+-    _values[Deopt] = -1;
++    _values[OSR_Entry     ] = 0;
++    _values[Exceptions    ] = -1;
++    _values[Deopt         ] = -1;
++    _values[DeoptMH       ] = -1;
+   }
+ 
+   int value(Entries e) { return _values[e]; }
+--- a/src/share/vm/c1/c1_Compilation.cpp	Fri Jan 29 22:51:41 2010 -0800
++++ b/src/share/vm/c1/c1_Compilation.cpp	Mon Feb 01 19:29:46 2010 +0100
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -205,6 +205,8 @@ void Compilation::emit_code_epilog(LIR_A
+ void Compilation::emit_code_epilog(LIR_Assembler* assembler) {
+   CHECK_BAILOUT();
+ 
++  CodeOffsets* code_offsets = assembler->offsets();
++
+   // generate code or slow cases
+   assembler->emit_slow_case_stubs();
+   CHECK_BAILOUT();
+@@ -213,10 +215,18 @@ void Compilation::emit_code_epilog(LIR_A
+   assembler->emit_exception_entries(exception_info_list());
+   CHECK_BAILOUT();
+ 
+-  // generate code for exception handler
+-  assembler->emit_exception_handler();
+-  CHECK_BAILOUT();
+-  assembler->emit_deopt_handler();
++  // Generate code for exception handler.
++  code_offsets->set_value(CodeOffsets::Exceptions, assembler->emit_exception_handler());
++  CHECK_BAILOUT();
++
++  // Generate code for deopt handler.
++  code_offsets->set_value(CodeOffsets::Deopt, assembler->emit_deopt_handler());
++  CHECK_BAILOUT();
++
++  // Generate code for MethodHandle deopt handler.  We can use the
++  // same code as for the normal deopt handler, we just need a
++  // different entry point address.
++  code_offsets->set_value(CodeOffsets::DeoptMH, assembler->emit_deopt_handler());
+   CHECK_BAILOUT();
+ 
+   // done
+--- a/src/share/vm/c1/c1_LIRAssembler.hpp	Fri Jan 29 22:51:41 2010 -0800
++++ b/src/share/vm/c1/c1_LIRAssembler.hpp	Mon Feb 01 19:29:46 2010 +0100
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2000-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 2000-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -133,9 +133,9 @@ class LIR_Assembler: public CompilationR
+   void add_call_info_here(CodeEmitInfo* info)                              { add_call_info(code_offset(), info); }
+ 
+   // code patterns
+-  void emit_exception_handler();
++  int  emit_exception_handler();
+   void emit_exception_entries(ExceptionInfoList* info_list);
+-  void emit_deopt_handler();
++  int  emit_deopt_handler();
+ 
+   void emit_code(BlockList* hir);
+   void emit_block(BlockBegin* block);
+--- a/src/share/vm/code/nmethod.cpp	Fri Jan 29 22:51:41 2010 -0800
++++ b/src/share/vm/code/nmethod.cpp	Mon Feb 01 19:29:46 2010 +0100
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -593,6 +593,7 @@ nmethod::nmethod(
+     // values something that will never match a pc like the nmethod vtable entry
+     _exception_offset        = 0;
+     _deoptimize_offset       = 0;
++    _deoptimize_mh_offset    = 0;
+     _orig_pc_offset          = 0;
+ #ifdef HAVE_DTRACE_H
+     _trap_offset             = 0;
+@@ -683,6 +684,7 @@ nmethod::nmethod(
+     // values something that will never match a pc like the nmethod vtable entry
+     _exception_offset        = 0;
+     _deoptimize_offset       = 0;
++    _deoptimize_mh_offset    = 0;
+     _trap_offset             = offsets->value(CodeOffsets::Dtrace_trap);
+     _orig_pc_offset          = 0;
+     _stub_offset             = data_offset();
+@@ -795,6 +797,7 @@ nmethod::nmethod(
+     // Exception handler and deopt handler are in the stub section
+     _exception_offset        = _stub_offset + offsets->value(CodeOffsets::Exceptions);
+     _deoptimize_offset       = _stub_offset + offsets->value(CodeOffsets::Deopt);
++    _deoptimize_mh_offset    = _stub_offset + offsets->value(CodeOffsets::DeoptMH);
+     _consts_offset           = instructions_offset() + code_buffer->total_offset_of(code_buffer->consts()->start());
+     _scopes_data_offset      = data_offset();
+     _scopes_pcs_offset       = _scopes_data_offset   + round_to(debug_info->data_size         (), oopSize);
+@@ -2037,9 +2040,21 @@ void nmethodLocker::unlock_nmethod(nmeth
+   guarantee(nm->_lock_count >= 0, "unmatched nmethod lock/unlock");
+ }
+ 
+-bool nmethod::is_deopt_pc(address pc) {
+-  bool ret =  pc == deopt_handler_begin();
+-  return ret;
++
++// -----------------------------------------------------------------------------
++// nmethod::get_deopt_original_pc
++//
++// Return the original PC for the given PC if:
++// (a) the given PC belongs to a nmethod and
++// (b) it is a deopt PC
++address nmethod::get_deopt_original_pc(const frame* fr) {
++  if (fr->cb() == NULL)  return NULL;
++
++  nmethod* nm = fr->cb()->as_nmethod_or_null();
++  if (nm != NULL && nm->is_deopt_pc(fr->pc()))
++    return nm->get_original_pc(fr);
++
++  return NULL;
+ }
+ 
+ 
+@@ -2410,6 +2425,8 @@ void nmethod::print_nmethod_labels(outpu
+   if (block_begin == verified_entry_point())    stream->print_cr("[Verified Entry Point]");
+   if (block_begin == exception_begin())         stream->print_cr("[Exception Handler]");
+   if (block_begin == stub_begin())              stream->print_cr("[Stub Code]");
++  if (block_begin == deopt_handler_begin())     stream->print_cr("[Deopt Handler Code]");
++  if (block_begin == deopt_mh_handler_begin())  stream->print_cr("[Deopt MH Handler Code]");
+   if (block_begin == consts_begin())            stream->print_cr("[Constants]");
+   if (block_begin == entry_point()) {
+     methodHandle m = method();
+--- a/src/share/vm/code/nmethod.hpp	Fri Jan 29 22:51:41 2010 -0800
++++ b/src/share/vm/code/nmethod.hpp	Mon Feb 01 19:29:46 2010 +0100
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -148,8 +148,12 @@ class nmethod : public CodeBlob {
+ 
+   // Offsets for different nmethod parts
+   int _exception_offset;
+-  // All deoptee's will resume execution at this location described by this offset
++  // All deoptee's will resume execution at this location described by
++  // this offset.
+   int _deoptimize_offset;
++  // All deoptee's at a MethodHandle call site will resume execution
++  // at this location described by this offset.
++  int _deoptimize_mh_offset;
+ #ifdef HAVE_DTRACE_H
+   int _trap_offset;
+ #endif // def HAVE_DTRACE_H
+@@ -332,24 +336,25 @@ class nmethod : public CodeBlob {
+   bool is_compiled_by_c2() const;
+ 
+   // boundaries for different parts
+-  address code_begin         () const             { return _entry_point; }
+-  address code_end           () const             { return           header_begin() + _stub_offset          ; }
+-  address exception_begin    () const             { return           header_begin() + _exception_offset     ; }
+-  address deopt_handler_begin() const             { return           header_begin() + _deoptimize_offset    ; }
+-  address stub_begin         () const             { return           header_begin() + _stub_offset          ; }
+-  address stub_end           () const             { return           header_begin() + _consts_offset        ; }
+-  address consts_begin       () const             { return           header_begin() + _consts_offset        ; }
+-  address consts_end         () const             { return           header_begin() + _scopes_data_offset   ; }
+-  address scopes_data_begin  () const             { return           header_begin() + _scopes_data_offset   ; }
+-  address scopes_data_end    () const             { return           header_begin() + _scopes_pcs_offset    ; }
+-  PcDesc* scopes_pcs_begin   () const             { return (PcDesc*)(header_begin() + _scopes_pcs_offset   ); }
+-  PcDesc* scopes_pcs_end     () const             { return (PcDesc*)(header_begin() + _dependencies_offset); }
+-  address dependencies_begin () const             { return           header_begin() + _dependencies_offset ; }
+-  address dependencies_end   () const             { return           header_begin() + _handler_table_offset ; }
+-  address handler_table_begin() const             { return           header_begin() + _handler_table_offset ; }
+-  address handler_table_end  () const             { return           header_begin() + _nul_chk_table_offset   ; }
+-  address nul_chk_table_begin() const             { return           header_begin() + _nul_chk_table_offset ; }
+-  address nul_chk_table_end  () const             { return           header_begin() + _nmethod_end_offset   ; }
++  address code_begin            () const          { return _entry_point; }
++  address code_end              () const          { return           header_begin() + _stub_offset          ; }
++  address exception_begin       () const          { return           header_begin() + _exception_offset     ; }
++  address deopt_handler_begin   () const          { return           header_begin() + _deoptimize_offset    ; }
++  address deopt_mh_handler_begin() const          { return           header_begin() + _deoptimize_mh_offset ; }
++  address stub_begin            () const          { return           header_begin() + _stub_offset          ; }
++  address stub_end              () const          { return           header_begin() + _consts_offset        ; }
++  address consts_begin          () const          { return           header_begin() + _consts_offset        ; }
++  address consts_end            () const          { return           header_begin() + _scopes_data_offset   ; }
++  address scopes_data_begin     () const          { return           header_begin() + _scopes_data_offset   ; }
++  address scopes_data_end       () const          { return           header_begin() + _scopes_pcs_offset    ; }
++  PcDesc* scopes_pcs_begin      () const          { return (PcDesc*)(header_begin() + _scopes_pcs_offset   ); }
++  PcDesc* scopes_pcs_end        () const          { return (PcDesc*)(header_begin() + _dependencies_offset) ; }
++  address dependencies_begin    () const          { return           header_begin() + _dependencies_offset  ; }
++  address dependencies_end      () const          { return           header_begin() + _handler_table_offset ; }
++  address handler_table_begin   () const          { return           header_begin() + _handler_table_offset ; }
++  address handler_table_end     () const          { return           header_begin() + _nul_chk_table_offset ; }
++  address nul_chk_table_begin   () const          { return           header_begin() + _nul_chk_table_offset ; }
++  address nul_chk_table_end     () const          { return           header_begin() + _nmethod_end_offset   ; }
+ 
+   int code_size         () const                  { return      code_end         () -      code_begin         (); }
+   int stub_size         () const                  { return      stub_end         () -      stub_begin         (); }
+@@ -524,7 +529,7 @@ class nmethod : public CodeBlob {
+  private:
+   ScopeDesc* scope_desc_in(address begin, address end);
+ 
+-  address* orig_pc_addr(const frame* fr ) { return (address*) ((address)fr->unextended_sp() + _orig_pc_offset); }
++  address* orig_pc_addr(const frame* fr) { return (address*) ((address)fr->unextended_sp() + _orig_pc_offset); }
+ 
+   PcDesc* find_pc_desc_internal(address pc, bool approximate);
+ 
+@@ -547,12 +552,16 @@ class nmethod : public CodeBlob {
+   void copy_scopes_pcs(PcDesc* pcs, int count);
+   void copy_scopes_data(address buffer, int size);
+ 
+-  // deopt
+-  // return true is the pc is one would expect if the frame is being deopted.
+-  bool is_deopt_pc(address pc);
++  // Deopt
++  // Return true is the PC is one would expect if the frame is being deopted.
++  bool is_deopt_pc      (address pc) { return is_deopt_entry(pc) || is_deopt_mh_entry(pc); }
++  bool is_deopt_entry   (address pc) { return pc == deopt_handler_begin(); }
++  bool is_deopt_mh_entry(address pc) { return pc == deopt_mh_handler_begin(); }
+   // Accessor/mutator for the original pc of a frame before a frame was deopted.
+   address get_original_pc(const frame* fr) { return *orig_pc_addr(fr); }
+   void    set_original_pc(const frame* fr, address pc) { *orig_pc_addr(fr) = pc; }
++
++  static address get_deopt_original_pc(const frame* fr);
+ 
+   // MethodHandle
+   bool is_method_handle_return(address return_pc);
+--- a/src/share/vm/opto/output.cpp	Fri Jan 29 22:51:41 2010 -0800
++++ b/src/share/vm/opto/output.cpp	Mon Feb 01 19:29:46 2010 +0100
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1998-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1998-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -1430,6 +1430,10 @@ void Compile::Fill_buffer() {
+     _code_offsets.set_value(CodeOffsets::Exceptions, emit_exception_handler(*cb));
+     // Emit the deopt handler code.
+     _code_offsets.set_value(CodeOffsets::Deopt, emit_deopt_handler(*cb));
++    // Emit the MethodHandle deopt handler code.  We can use the same
++    // code as for the normal deopt handler, we just need a different
++    // entry point address.
++    _code_offsets.set_value(CodeOffsets::DeoptMH, emit_deopt_handler(*cb));
+   }
+ 
+   // One last check for failed CodeBuffer::expand:
+--- a/src/share/vm/runtime/deoptimization.cpp	Fri Jan 29 22:51:41 2010 -0800
++++ b/src/share/vm/runtime/deoptimization.cpp	Mon Feb 01 19:29:46 2010 +0100
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -234,6 +234,12 @@ Deoptimization::UnrollBlock* Deoptimizat
+   // Verify we have the right vframeArray
+   assert(cb->frame_size() >= 0, "Unexpected frame size");
+   intptr_t* unpack_sp = stub_frame.sp() + cb->frame_size();
++
++  // If the deopt call site is a MethodHandle invoke call site we have
++  // to adjust the unpack_sp.
++  nmethod* deoptee_nm = deoptee.cb()->as_nmethod_or_null();
++  if (deoptee_nm != NULL && deoptee_nm->is_method_handle_return(deoptee.pc()))
++    unpack_sp = deoptee.unextended_sp();
+ 
+ #ifdef ASSERT
+   assert(cb->is_deoptimization_stub() || cb->is_uncommon_trap_stub(), "just checking");
+--- a/src/share/vm/runtime/frame.cpp	Fri Jan 29 22:51:41 2010 -0800
++++ b/src/share/vm/runtime/frame.cpp	Mon Feb 01 19:29:46 2010 +0100
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -107,7 +107,11 @@ void RegisterMap::print() const {
+ 
+ address frame::raw_pc() const {
+   if (is_deoptimized_frame()) {
+-    return ((nmethod*) cb())->deopt_handler_begin() - pc_return_offset;
++    nmethod* nm = cb()->as_nmethod_or_null();
++    if (nm->is_method_handle_return(pc()))
++      return nm->deopt_mh_handler_begin() - pc_return_offset;
++    else
++      return nm->deopt_handler_begin() - pc_return_offset;
+   } else {
+     return (pc() - pc_return_offset);
+   }
+@@ -269,10 +273,16 @@ void frame::deoptimize(JavaThread* threa
+   } // NeedsDeoptSuspend
+ 
+ 
+-  address deopt = nm->deopt_handler_begin();
++  // If the call site is a MethodHandle call site use the MH deopt
++  // handler.
++  address deopt = nm->is_method_handle_return(pc()) ?
++    nm->deopt_mh_handler_begin() :
++    nm->deopt_handler_begin();
++
+   // Save the original pc before we patch in the new one
+   nm->set_original_pc(this, pc());
+   patch_pc(thread, deopt);
++
+ #ifdef ASSERT
+   {
+     RegisterMap map(thread, false);
+--- a/src/share/vm/runtime/sharedRuntime.cpp	Fri Jan 29 22:51:41 2010 -0800
++++ b/src/share/vm/runtime/sharedRuntime.cpp	Mon Feb 01 19:29:46 2010 +0100
+@@ -1033,10 +1033,20 @@ JRT_BLOCK_ENTRY(address, SharedRuntime::
+   address   sender_pc = caller_frame.pc();
+   CodeBlob* sender_cb = caller_frame.cb();
+   nmethod*  sender_nm = sender_cb->as_nmethod_or_null();
++  bool is_mh_invoke_via_adapter = false;  // Direct c2c call or via adapter?
++  if (sender_nm != NULL && sender_nm->is_method_handle_return(sender_pc)) {
++    // If the callee_target is set, then we have come here via an i2c
++    // adapter.
++    methodOop callee = thread->callee_target();
++    if (callee != NULL) {
++      assert(callee->is_method(), "sanity");
++      is_mh_invoke_via_adapter = true;
++    }
++  }
+ 
+   if (caller_frame.is_interpreted_frame() ||
+-      caller_frame.is_entry_frame() ||
+-      (sender_nm != NULL && sender_nm->is_method_handle_return(sender_pc))) {
++      caller_frame.is_entry_frame()       ||
++      is_mh_invoke_via_adapter) {
+     methodOop callee = thread->callee_target();
+     guarantee(callee != NULL && callee->is_method(), "bad handshake");
+     thread->set_vm_result(callee);
+@@ -1417,7 +1427,7 @@ IRT_LEAF(void, SharedRuntime::fixup_call
+         if (callee == cb || callee->is_adapter_blob()) {
+           // static call or optimized virtual
+           if (TraceCallFixup) {
+-            tty->print("fixup callsite at " INTPTR_FORMAT " to compiled code for", caller_pc);
++            tty->print("fixup callsite           at " INTPTR_FORMAT " to compiled code for", caller_pc);
+             moop->print_short_name(tty);
+             tty->print_cr(" to " INTPTR_FORMAT, entry_point);
+           }
+@@ -1433,7 +1443,7 @@ IRT_LEAF(void, SharedRuntime::fixup_call
+         }
+       } else {
+           if (TraceCallFixup) {
+-            tty->print("already patched  callsite at " INTPTR_FORMAT " to compiled code for", caller_pc);
++            tty->print("already patched callsite at " INTPTR_FORMAT " to compiled code for", caller_pc);
+             moop->print_short_name(tty);
+             tty->print_cr(" to " INTPTR_FORMAT, entry_point);
+           }
+

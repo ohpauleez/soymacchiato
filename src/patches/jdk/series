@@ -1,0 +1,28 @@
+# base = 20e1db4dfb30 in http://hg.openjdk.java.net/bsd-port/bsd-port/jdk [2011-04-09]
+
+# pushed to jdk7/hotspot-comp; will be deleted when they get to bsd-port:
+meth-enable-6817525.patch       #-/meth #+20e1db4dfb30
+cval-7019529.patch              #-/meth #+20e1db4dfb30
+
+# review pending before push to hotspot-comp:
+
+# non-pushed files are under review or development, or merely experimental:
+meth-ing-7034977.patch          #-/meth #+20e1db4dfb30
+meth-review-7032323.patch       #-/meth #+20e1db4dfb30
+meth-doc-7014005.patch          #-/meth #+20e1db4dfb30
+meth-conv-6939861.patch         #-/meth #+20e1db4dfb30
+meth.patch                      #-/meth #+20e1db4dfb30
+
+# experimental work that is not likely to get in for JDK 7
+indy-bsm-postjdk7.patch         #-/indy #+20e1db4dfb30 #-testable
+
+# Keep these separate, for debugging and review:
+indy.pack.patch                 #-/indy #+20e1db4dfb30 #-buildable
+dyncast.patch   #+dyncast       #-/dyncast
+inti.patch      #+inti          #-/inti #-buildable
+callcc_old.patch #+callcc_old   #-/callcc_old
+continuation.patch #+continuation #-/continuation #+48ea27542bbe
+tailc.patch     #+tailc         #-/tailc
+anonk.patch                     #-/anonk #+48ea27542bbe
+
+coro.patch      #+coro          #-/coro #+e7f4e53b2893

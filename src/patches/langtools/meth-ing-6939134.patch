@@ -1,0 +1,465 @@
+6939134: JSR 292 adjustments to method handle invocation
+Summary: split MethodHandle.invoke into invokeExact and invokeGeneric
+Reviewed-by: twisti
+
+Mark the special signature-polymorphic methods and classes with @PolymorphicSignature.
+
+The JSR 292 EG has decided to split MethodHandle.invoke into two
+methods, invokeExact and invokeGeneric.  Adjust javac so that it uses
+an empty attribute 'PolyMorphicSignature' to recognize which methods
+are signature-polymorphic.  Drive emission of this attribute from
+a package-private annotation (@PolymorphicSignature).  Remove
+hard-coded recognition of MethodHandle.invoke and InvokeDynamic.
+
+For the relevant parts of the language specification, see:
+  http://wikis.sun.com/display/mlvm/InterfaceDynamic
+
+diff --git a/src/share/classes/com/sun/tools/javac/code/Flags.java b/src/share/classes/com/sun/tools/javac/code/Flags.java
+--- a/src/share/classes/com/sun/tools/javac/code/Flags.java
++++ b/src/share/classes/com/sun/tools/javac/code/Flags.java
+@@ -230,6 +230,12 @@
+      */
+     public static final long PROPRIETARY = 1L<<38;
+ 
++    /**
++     * Flag that marks a signature-polymorphic invoke method.
++     * (These occur inside java.dyn.MethodHandle.)
++     */
++    public static final long POLYMORPHIC_SIGNATURE = 1L<<39;
++
+     /** Modifier masks.
+      */
+     public static final int
+diff --git a/src/share/classes/com/sun/tools/javac/code/Source.java b/src/share/classes/com/sun/tools/javac/code/Source.java
+--- a/src/share/classes/com/sun/tools/javac/code/Source.java
++++ b/src/share/classes/com/sun/tools/javac/code/Source.java
+@@ -168,6 +168,10 @@
+     public boolean allowStringsInSwitch() {
+         return compareTo(JDK1_7) >= 0;
+     }
++    // JSR 292: recognize @PolymorphicSignature on java/dyn names
++    public boolean allowPolymorphicSignature() {
++        return compareTo(JDK1_7) >= 0;
++    }
+     public static SourceVersion toSourceVersion(Source source) {
+         switch(source) {
+         case JDK1_2:
+diff --git a/src/share/classes/com/sun/tools/javac/code/Symtab.java b/src/share/classes/com/sun/tools/javac/code/Symtab.java
+--- a/src/share/classes/com/sun/tools/javac/code/Symtab.java
++++ b/src/share/classes/com/sun/tools/javac/code/Symtab.java
+@@ -120,6 +120,7 @@
+     public final Type cloneableType;
+     public final Type serializableType;
+     public final Type methodHandleType;
++    public final Type polymorphicSignatureType;
+     public final Type invokeDynamicType;
+     public final Type throwableType;
+     public final Type errorType;
+@@ -291,24 +292,6 @@
+         }
+     }
+ 
+-    public void synthesizeMHTypeIfMissing(final Type type) {
+-        final Completer completer = type.tsym.completer;
+-        if (completer != null) {
+-            type.tsym.completer = new Completer() {
+-                public void complete(Symbol sym) throws CompletionFailure {
+-                    try {
+-                        completer.complete(sym);
+-                    } catch (CompletionFailure e) {
+-                        sym.flags_field |= (PUBLIC | ABSTRACT);
+-                        ((ClassType) sym.type).supertype_field = objectType;
+-                        // do not bother to create MH.type if not visibly declared
+-                        // this sym just accumulates invoke(...) methods
+-                    }
+-                }
+-            };
+-        }
+-    }
+-
+     public void synthesizeBoxTypeIfMissing(final Type type) {
+         ClassSymbol sym = reader.enterClass(boxedName[type.tag]);
+         final Completer completer = sym.completer;
+@@ -426,6 +409,7 @@
+         throwableType = enterClass("java.lang.Throwable");
+         serializableType = enterClass("java.io.Serializable");
+         methodHandleType = enterClass("java.dyn.MethodHandle");
++        polymorphicSignatureType = enterClass("java.dyn.MethodHandle$PolymorphicSignature");
+         invokeDynamicType = enterClass("java.dyn.InvokeDynamic");
+         errorType = enterClass("java.lang.Error");
+         illegalArgumentExceptionType = enterClass("java.lang.IllegalArgumentException");
+@@ -463,8 +447,7 @@
+ 
+         synthesizeEmptyInterfaceIfMissing(cloneableType);
+         synthesizeEmptyInterfaceIfMissing(serializableType);
+-        synthesizeMHTypeIfMissing(methodHandleType);
+-        synthesizeMHTypeIfMissing(invokeDynamicType);
++        synthesizeEmptyInterfaceIfMissing(polymorphicSignatureType);
+         synthesizeBoxTypeIfMissing(doubleType);
+         synthesizeBoxTypeIfMissing(floatType);
+         synthesizeBoxTypeIfMissing(voidType);
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Attr.java b/src/share/classes/com/sun/tools/javac/comp/Attr.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Attr.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Attr.java
+@@ -120,7 +120,6 @@
+         relax = (options.get("-retrofit") != null ||
+                  options.get("-relax") != null);
+         useBeforeDeclarationWarning = options.get("useBeforeDeclarationWarning") != null;
+-        allowInvokedynamic = options.get("invokedynamic") != null;
+         enableSunApiLintControl = options.get("enableSunApiLintControl") != null;
+     }
+ 
+@@ -153,10 +152,6 @@
+      */
+     boolean allowAnonOuterThis;
+ 
+-    /** Switch: allow invokedynamic syntax
+-     */
+-    boolean allowInvokedynamic;
+-
+     /**
+      * Switch: warn about use of variable before declaration?
+      * RFE: 6425594
+@@ -1387,9 +1382,15 @@
+             // as a special case, MethodHandle.<T>invoke(abc) and InvokeDynamic.<T>foo(abc)
+             // has type <T>, and T can be a primitive type.
+             if (tree.meth.getTag() == JCTree.SELECT && !typeargtypes.isEmpty()) {
+-              Type selt = ((JCFieldAccess) tree.meth).selected.type;
+-              if ((selt == syms.methodHandleType && methName == names.invoke) || selt == syms.invokeDynamicType) {
++              JCFieldAccess mfield = (JCFieldAccess) tree.meth;
++              if ((mfield.selected.type.tsym != null &&
++                   (mfield.selected.type.tsym.flags() & POLYMORPHIC_SIGNATURE) != 0)
++                  ||
++                  (mfield.sym != null &&
++                   (mfield.sym.flags() & POLYMORPHIC_SIGNATURE) != 0)) {
+                   assert types.isSameType(restype, typeargtypes.head) : mtype;
++                  assert mfield.selected.type == syms.methodHandleType
++                      || mfield.selected.type == syms.invokeDynamicType;
+                   typeargtypesNonRefOK = true;
+               }
+             }
+diff --git a/src/share/classes/com/sun/tools/javac/comp/MemberEnter.java b/src/share/classes/com/sun/tools/javac/comp/MemberEnter.java
+--- a/src/share/classes/com/sun/tools/javac/comp/MemberEnter.java
++++ b/src/share/classes/com/sun/tools/javac/comp/MemberEnter.java
+@@ -768,6 +768,12 @@
+                 && s.owner.kind != MTH
+                 && types.isSameType(c.type, syms.deprecatedType))
+                 s.flags_field |= Flags.DEPRECATED;
++            // Internally to java.dyn, a @PolymorphicSignature annotation
++            // translates to a classfile attribute.
++            if (!c.type.isErroneous()
++                && types.isSameType(c.type, syms.polymorphicSignatureType)) {
++                s.flags_field |= Flags.POLYMORPHIC_SIGNATURE;
++            }
+             if (!annotated.add(a.type.tsym))
+                 log.error(a.pos, "duplicate.annotation");
+         }
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Resolve.java b/src/share/classes/com/sun/tools/javac/comp/Resolve.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Resolve.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Resolve.java
+@@ -67,7 +67,7 @@
+     JCDiagnostic.Factory diags;
+     public final boolean boxingEnabled; // = source.allowBoxing();
+     public final boolean varargsEnabled; // = source.allowVarargs();
+-    public final boolean allowInvokedynamic; // = options.get("invokedynamic");
++    public final boolean allowPolymorphicSignature;
+     private final boolean debugResolve;
+ 
+     public static Resolve instance(Context context) {
+@@ -105,7 +105,7 @@
+         varargsEnabled = source.allowVarargs();
+         Options options = Options.instance(context);
+         debugResolve = options.get("debugresolve") != null;
+-        allowInvokedynamic = options.get("invokedynamic") != null;
++        allowPolymorphicSignature = source.allowPolymorphicSignature() || options.get("invokedynamic") != null;
+     }
+ 
+     /** error symbols, which are returned when resolution fails
+@@ -301,6 +301,7 @@
+                         boolean useVarargs,
+                         Warner warn)
+         throws Infer.InferenceException {
++        assert ((m.flags() & (POLYMORPHIC_SIGNATURE|HYPOTHETICAL)) != POLYMORPHIC_SIGNATURE);
+         if (useVarargs && (m.flags() & VARARGS) == 0) return null;
+         Type mt = types.memberType(site, m);
+ 
+@@ -575,6 +576,14 @@
+         if (sym.kind == ERR) return bestSoFar;
+         if (!sym.isInheritedIn(site.tsym, types)) return bestSoFar;
+         assert sym.kind < AMBIGUOUS;
++        if ((sym.flags() & POLYMORPHIC_SIGNATURE) != 0 && allowPolymorphicSignature) {
++            assert(site.tag == CLASS);
++            // Never match a MethodHandle.invoke directly.
++            if (useVarargs | allowBoxing | operator)
++                return bestSoFar;
++            // Supply an exactly-typed implicit method instead.
++            sym = findPolymorphicSignatureInstance(env, sym.owner.type, sym.name, (MethodSymbol) sym, argtypes, typeargtypes);
++        }
+         try {
+             if (rawInstantiate(env, site, sym, argtypes, typeargtypes,
+                                allowBoxing, useVarargs, Warner.noWarnings) == null) {
+@@ -745,6 +754,14 @@
+                       boolean allowBoxing,
+                       boolean useVarargs,
+                       boolean operator) {
++        Symbol bestSoFar = methodNotFound;
++        if ((site.tsym.flags() & POLYMORPHIC_SIGNATURE) != 0 &&
++            allowPolymorphicSignature &&
++            site.tag == CLASS &&
++            !(useVarargs | allowBoxing | operator)) {
++            // supply an exactly-typed implicit method in java.dyn.InvokeDynamic
++            bestSoFar = findPolymorphicSignatureInstance(env, site, name, null, argtypes, typeargtypes);
++        }
+         return findMethod(env,
+                           site,
+                           name,
+@@ -752,7 +769,7 @@
+                           typeargtypes,
+                           site.tsym.type,
+                           true,
+-                          methodNotFound,
++                          bestSoFar,
+                           allowBoxing,
+                           useVarargs,
+                           operator);
+@@ -894,13 +911,14 @@
+      *  @param argtypes  The method's value arguments.
+      *  @param typeargtypes The method's type arguments
+      */
+-    Symbol findImplicitMethod(Env<AttrContext> env,
+-                              Type site,
+-                              Name name,
+-                              List<Type> argtypes,
+-                              List<Type> typeargtypes) {
+-        assert allowInvokedynamic;
+-        assert site == syms.invokeDynamicType || (site == syms.methodHandleType && name == names.invoke);
++    Symbol findPolymorphicSignatureInstance(Env<AttrContext> env,
++                                            Type site,
++                                            Name name,
++                                            MethodSymbol spMethod,  // sig. poly. method or null if none
++                                            List<Type> argtypes,
++                                            List<Type> typeargtypes) {
++        assert allowPolymorphicSignature;
++        //assert site == syms.invokeDynamicType || site == syms.methodHandleType : site;
+         ClassSymbol c = (ClassSymbol) site.tsym;
+         Scope implicit = c.members().next;
+         if (implicit == null) {
+@@ -915,12 +933,22 @@
+                 return methodNotFound;
+         }
+         List<Type> paramtypes = Type.map(argtypes, implicitArgType);
++        long flags;
++        List<Type> exType;
++        if (spMethod != null) {
++            exType = spMethod.getThrownTypes();
++            flags = spMethod.flags() & AccessFlags;
++        } else {
++            // make it throw all exceptions
++            //assert(site == syms.invokeDynamicType);
++            exType = List.of(syms.throwableType);
++            flags = PUBLIC | STATIC;
++        }
+         MethodType mtype = new MethodType(paramtypes,
+                                           restype,
+-                                          List.<Type>nil(),
++                                          exType,
+                                           syms.methodClass);
+-        int flags = PUBLIC | ABSTRACT;
+-        if (site == syms.invokeDynamicType)  flags |= STATIC;
++        flags |= ABSTRACT | HYPOTHETICAL | POLYMORPHIC_SIGNATURE;
+         Symbol m = null;
+         for (Scope.Entry e = implicit.lookup(name);
+              e.scope != null;
+@@ -1335,14 +1363,6 @@
+             methodResolutionCache.put(steps.head, sym);
+             steps = steps.tail;
+         }
+-        if (sym.kind >= AMBIGUOUS &&
+-            allowInvokedynamic &&
+-            (site == syms.invokeDynamicType ||
+-             site == syms.methodHandleType && name == names.invoke)) {
+-            // lookup failed; supply an exactly-typed implicit method
+-            sym = findImplicitMethod(env, site, name, argtypes, typeargtypes);
+-            env.info.varArgs = false;
+-        }
+         if (sym.kind >= AMBIGUOUS) {//if nothing is found return the 'first' error
+             MethodResolutionPhase errPhase =
+                     firstErroneousResolutionPhase();
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java b/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
+@@ -1098,6 +1098,12 @@
+                 }
+             },
+ 
++            new AttributeReader(names.PolymorphicSignature, V45_3/*S.B.V51*/, CLASS_OR_MEMBER_ATTRIBUTE) {
++                void read(Symbol sym, int attrLen) {
++                    sym.flags_field |= POLYMORPHIC_SIGNATURE;
++                }
++            },
++
+ 
+             // The following attributes for a Code attribute are not currently handled
+             // StackMapTable
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/ClassWriter.java b/src/share/classes/com/sun/tools/javac/jvm/ClassWriter.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/ClassWriter.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/ClassWriter.java
+@@ -651,6 +651,13 @@
+             endAttr(alenIdx);
+             acount++;
+         }
++        if ((flags & POLYMORPHIC_SIGNATURE) != 0) {
++            if (target.majorVersion < 51)
++                throw new AssertionError("PolymorphicSignature attributes in java/dyn must be written with -target 7 (required major version is 51, current is"+target.majorVersion+")");
++            int alenIdx = writeAttr(names.PolymorphicSignature);
++            endAttr(alenIdx);
++            acount++;
++        }
+         return acount;
+     }
+ 
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/Gen.java b/src/share/classes/com/sun/tools/javac/jvm/Gen.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Gen.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/Gen.java
+@@ -121,7 +121,7 @@
+             : options.get("-g:vars") != null;
+         genCrt = options.get("-Xjcov") != null;
+         debugCode = options.get("debugcode") != null;
+-        allowInvokedynamic = options.get("invokedynamic") != null;
++        allowInvokedynamic = target.hasInvokedynamic() || options.get("invokedynamic") != null;
+ 
+         generateIproxies =
+             target.requiresIproxy() ||
+diff --git a/src/share/classes/com/sun/tools/javac/main/Main.java b/src/share/classes/com/sun/tools/javac/main/Main.java
+--- a/src/share/classes/com/sun/tools/javac/main/Main.java
++++ b/src/share/classes/com/sun/tools/javac/main/Main.java
+@@ -278,9 +278,6 @@
+                 }
+             }
+         }
+-        if (target.hasInvokedynamic()) {
+-            options.put("invokedynamic",  "invokedynamic");
+-        }
+ 
+         // handle this here so it works even if no other options given
+         String showClass = options.get("showClass");
+diff --git a/src/share/classes/com/sun/tools/javac/util/Names.java b/src/share/classes/com/sun/tools/javac/util/Names.java
+--- a/src/share/classes/com/sun/tools/javac/util/Names.java
++++ b/src/share/classes/com/sun/tools/javac/util/Names.java
+@@ -103,6 +103,7 @@
+     public final Name RuntimeInvisibleTypeAnnotations;
+     public final Name RuntimeVisibleParameterAnnotations;
+     public final Name RuntimeInvisibleParameterAnnotations;
++    public final Name PolymorphicSignature;
+     public final Name Value;
+     public final Name EnclosingMethod;
+     public final Name desiredAssertionStatus;
+@@ -115,7 +116,6 @@
+     public final Name value;
+     public final Name getMessage;
+     public final Name getClass;
+-    public final Name invoke;
+     public final Name TYPE;
+     public final Name TYPE_USE;
+     public final Name TYPE_PARAMETER;
+@@ -213,6 +213,7 @@
+         RuntimeInvisibleTypeAnnotations = fromString("RuntimeInvisibleTypeAnnotations");
+         RuntimeVisibleParameterAnnotations = fromString("RuntimeVisibleParameterAnnotations");
+         RuntimeInvisibleParameterAnnotations = fromString("RuntimeInvisibleParameterAnnotations");
++        PolymorphicSignature = fromString("PolymorphicSignature");
+         Value = fromString("Value");
+         EnclosingMethod = fromString("EnclosingMethod");
+ 
+@@ -227,7 +228,6 @@
+         value = fromString("value");
+         getMessage = fromString("getMessage");
+         getClass = fromString("getClass");
+-        invoke = fromString("invoke");
+ 
+         TYPE = fromString("TYPE");
+         TYPE_USE = fromString("TYPE_USE");
+diff --git a/test/tools/javac/meth/InvokeDyn.java b/test/tools/javac/meth/InvokeDyn.java
+--- a/test/tools/javac/meth/InvokeDyn.java
++++ b/test/tools/javac/meth/InvokeDyn.java
+@@ -47,7 +47,7 @@
+ import java.dyn.InvokeDynamic;
+ 
+ public class InvokeDyn {
+-    void test() {
++    void test() throws Throwable {
+         Object x = "hello";
+         InvokeDynamic.greet(x, "world", 123);
+         InvokeDynamic.greet(x, "mundus", 456);
+diff --git a/test/tools/javac/meth/InvokeMH.java b/test/tools/javac/meth/InvokeMH.java
+--- a/test/tools/javac/meth/InvokeMH.java
++++ b/test/tools/javac/meth/InvokeMH.java
+@@ -48,28 +48,56 @@
+     void test(MethodHandle mh_SiO,
+               MethodHandle mh_vS,
+               MethodHandle mh_vi,
+-              MethodHandle mh_vv) {
++              MethodHandle mh_vv) throws Throwable {
+         Object o; String s; int i;  // for return type testing
+ 
+         // next five must have sig = (String,int)Object
+-        mh_SiO.invoke("world", 123);
+-        mh_SiO.invoke("mundus", 456);
++        mh_SiO.invokeExact("world", 123);
++        mh_SiO.invokeExact("mundus", 456);
+         Object k = "kosmos";
+-        mh_SiO.invoke((String)k, 789);
+-        o = mh_SiO.invoke((String)null, 000);
+-        o = mh_SiO.<Object>invoke("arda", -123);
++        mh_SiO.invokeExact((String)k, 789);
++        o = mh_SiO.invokeExact((String)null, 000);
++        o = mh_SiO.<Object>invokeExact("arda", -123);
+ 
+         // sig = ()String
+-        s = mh_vS.<String>invoke();
++        s = mh_vS.<String>invokeExact();
+ 
+         // sig = ()int
+-        i = mh_vi.<int>invoke();
+-        o = mh_vi.<int>invoke();
+-        //s = mh_vi.<int>invoke(); //BAD
+-        mh_vi.<int>invoke();
++        i = mh_vi.<int>invokeExact();
++        o = mh_vi.<int>invokeExact();
++        //s = mh_vi.<int>invokeExact(); //BAD
++        mh_vi.<int>invokeExact();
+ 
+         // sig = ()void
+-        //o = mh_vv.<void>invoke(); //BAD
+-        mh_vv.<void>invoke();
++        //o = mh_vv.<void>invokeExact(); //BAD
++        mh_vv.<void>invokeExact();
++    }
++
++    void testGen(MethodHandle mh_SiO,
++                 MethodHandle mh_vS,
++                 MethodHandle mh_vi,
++                 MethodHandle mh_vv) throws Throwable {
++        Object o; String s; int i;  // for return type testing
++
++        // next five must have sig = (*,*)*
++        mh_SiO.invokeGeneric((Object)"world", (Object)123);
++        mh_SiO.<void>invokeGeneric((Object)"mundus", (Object)456);
++        Object k = "kosmos";
++        mh_SiO.invokeGeneric(k, 789);
++        o = mh_SiO.invokeGeneric(null, 000);
++        o = mh_SiO.<Object>invokeGeneric("arda", -123);
++
++        // sig = ()String
++        o = mh_vS.invokeGeneric();
++
++        // sig = ()int
++        i = mh_vi.<int>invokeGeneric();
++        o = mh_vi.invokeGeneric();
++        //s = mh_vi.<int>invokeGeneric(); //BAD
++        mh_vi.<void>invokeGeneric();
++
++        // sig = ()void
++        //o = mh_vv.<void>invokeGeneric(); //BAD
++        o = mh_vv.invokeGeneric();
+     }
+ }

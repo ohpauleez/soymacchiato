@@ -1,0 +1,131 @@
+diff --git a/src/cpu/x86/vm/c1_Runtime1_x86.cpp b/src/cpu/x86/vm/c1_Runtime1_x86.cpp
+--- a/src/cpu/x86/vm/c1_Runtime1_x86.cpp
++++ b/src/cpu/x86/vm/c1_Runtime1_x86.cpp
+@@ -781,7 +781,7 @@
+ 
+   // Restore SP from BP if the exception PC is a MethodHandle call site.
+   NOT_LP64(__ get_thread(thread);)
+-  __ cmpl(Address(thread, JavaThread::is_method_handle_exception_offset()), 0);
++  __ cmpl(Address(thread, JavaThread::is_method_handle_return_offset()), 0);
+   __ cmovptr(Assembler::notEqual, rsp, rbp);
+ 
+   // continue at exception handler (return address removed)
+diff --git a/src/cpu/x86/vm/runtime_x86_32.cpp b/src/cpu/x86/vm/runtime_x86_32.cpp
+--- a/src/cpu/x86/vm/runtime_x86_32.cpp
++++ b/src/cpu/x86/vm/runtime_x86_32.cpp
+@@ -115,8 +115,8 @@
+ 
+   // rax: exception handler for given <exception oop/exception pc>
+ 
+-  // Restore SP from BP if the exception PC is a MethodHandle call.
+-  __ cmpl(Address(rcx, JavaThread::is_method_handle_exception_offset()), 0);
++  // Restore SP from BP if the exception PC is a MethodHandle call site.
++  __ cmpl(Address(rcx, JavaThread::is_method_handle_return_offset()), 0);
+   __ cmovptr(Assembler::notEqual, rsp, rbp);
+ 
+   // We have a handler in rax, (could be deopt blob)
+diff --git a/src/cpu/x86/vm/sharedRuntime_x86_64.cpp b/src/cpu/x86/vm/sharedRuntime_x86_64.cpp
+--- a/src/cpu/x86/vm/sharedRuntime_x86_64.cpp
++++ b/src/cpu/x86/vm/sharedRuntime_x86_64.cpp
+@@ -3328,8 +3328,8 @@
+ 
+   // rax: exception handler
+ 
+-  // Restore SP from BP if the exception PC is a MethodHandle call.
+-  __ cmpl(Address(r15_thread, JavaThread::is_method_handle_exception_offset()), 0);
++  // Restore SP from BP if the exception PC is a MethodHandle call site.
++  __ cmpl(Address(r15_thread, JavaThread::is_method_handle_return_offset()), 0);
+   __ cmovptr(Assembler::notEqual, rsp, rbp);
+ 
+   // We have a handler in rax (could be deopt blob).
+diff --git a/src/cpu/x86/vm/stubGenerator_x86_32.cpp b/src/cpu/x86/vm/stubGenerator_x86_32.cpp
+--- a/src/cpu/x86/vm/stubGenerator_x86_32.cpp
++++ b/src/cpu/x86/vm/stubGenerator_x86_32.cpp
+@@ -430,7 +430,7 @@
+     __ verify_oop(exception_oop);
+ 
+     // Restore SP from BP if the exception PC is a MethodHandle call site.
+-    __ cmpl(Address(thread, JavaThread::is_method_handle_exception_offset()), 0);
++    __ cmpl(Address(thread, JavaThread::is_method_handle_return_offset()), 0);
+     __ cmovptr(Assembler::notEqual, rsp, rbp);
+ 
+     // continue at exception handler (return address removed)
+diff --git a/src/share/vm/opto/runtime.cpp b/src/share/vm/opto/runtime.cpp
+--- a/src/share/vm/opto/runtime.cpp
++++ b/src/share/vm/opto/runtime.cpp
+@@ -865,7 +865,7 @@
+     thread->set_exception_stack_size(0);
+ 
+     // Check if the exception PC is a MethodHandle call site.
+-    thread->set_is_method_handle_exception(nm->is_method_handle_return(pc));
++    thread->set_is_method_handle_return(nm->is_method_handle_return(pc));
+   }
+ 
+   // Restore correct return pc.  Was saved above.
+diff --git a/src/share/vm/runtime/sharedRuntime.cpp b/src/share/vm/runtime/sharedRuntime.cpp
+--- a/src/share/vm/runtime/sharedRuntime.cpp
++++ b/src/share/vm/runtime/sharedRuntime.cpp
+@@ -259,13 +259,16 @@
+ address SharedRuntime::raw_exception_handler_for_return_address(JavaThread* thread, address return_address) {
+   assert(frame::verify_return_pc(return_address), "must be a return pc");
+ 
++  // Reset MethodHandle flag.
++  thread->set_is_method_handle_return(false);
++
+   // the fastest case first
+   CodeBlob* blob = CodeCache::find_blob(return_address);
+   if (blob != NULL && blob->is_nmethod()) {
+     nmethod* code = (nmethod*)blob;
+     assert(code != NULL, "nmethod must be present");
+     // Check if the return address is a MethodHandle call site.
+-    thread->set_is_method_handle_exception(code->is_method_handle_return(return_address));
++    thread->set_is_method_handle_return(code->is_method_handle_return(return_address));
+     // native nmethods don't have exception handlers
+     assert(!code->is_native_method(), "no exception handler");
+     assert(code->header_begin() != code->exception_begin(), "no exception handler");
+@@ -292,7 +295,7 @@
+       nmethod* code = (nmethod*)blob;
+       assert(code != NULL, "nmethod must be present");
+       // Check if the return address is a MethodHandle call site.
+-      thread->set_is_method_handle_exception(code->is_method_handle_return(return_address));
++      thread->set_is_method_handle_return(code->is_method_handle_return(return_address));
+       assert(code->header_begin() != code->exception_begin(), "no exception handler");
+       return code->exception_begin();
+     }
+diff --git a/src/share/vm/runtime/thread.hpp b/src/share/vm/runtime/thread.hpp
+--- a/src/share/vm/runtime/thread.hpp
++++ b/src/share/vm/runtime/thread.hpp
+@@ -772,7 +772,7 @@
+   volatile address _exception_pc;                // PC where exception happened
+   volatile address _exception_handler_pc;        // PC for handler of exception
+   volatile int     _exception_stack_size;        // Size of frame where exception happened
+-  volatile int     _is_method_handle_exception;  // True if the current exception PC is at a MethodHandle call.
++  volatile int     _is_method_handle_return;     // true (== 1) if the current exception PC is a MethodHandle call site.
+ 
+   // support for compilation
+   bool    _is_compiling;                         // is true if a compilation is active inthis thread (one compilation per thread possible)
+@@ -1108,13 +1108,13 @@
+   int      exception_stack_size() const          { return _exception_stack_size; }
+   address  exception_pc() const                  { return _exception_pc; }
+   address  exception_handler_pc() const          { return _exception_handler_pc; }
+-  int      is_method_handle_exception() const    { return _is_method_handle_exception; }
++  bool     is_method_handle_return() const       { return _is_method_handle_return == 1; }
+ 
+   void set_exception_oop(oop o)                  { _exception_oop = o; }
+   void set_exception_pc(address a)               { _exception_pc = a; }
+   void set_exception_handler_pc(address a)       { _exception_handler_pc = a; }
+   void set_exception_stack_size(int size)        { _exception_stack_size = size; }
+-  void set_is_method_handle_exception(int value) { _is_method_handle_exception = value; }
++  void set_is_method_handle_return(bool value)   { _is_method_handle_return = value ? 1 : 0; }
+ 
+   // Stack overflow support
+   inline size_t stack_available(address cur_sp);
+@@ -1188,7 +1188,7 @@
+   static ByteSize exception_pc_offset()          { return byte_offset_of(JavaThread, _exception_pc        ); }
+   static ByteSize exception_handler_pc_offset()  { return byte_offset_of(JavaThread, _exception_handler_pc); }
+   static ByteSize exception_stack_size_offset()  { return byte_offset_of(JavaThread, _exception_stack_size); }
+-  static ByteSize is_method_handle_exception_offset() { return byte_offset_of(JavaThread, _is_method_handle_exception); }
++  static ByteSize is_method_handle_return_offset() { return byte_offset_of(JavaThread, _is_method_handle_return); }
+   static ByteSize stack_guard_state_offset()     { return byte_offset_of(JavaThread, _stack_guard_state   ); }
+   static ByteSize suspend_flags_offset()         { return byte_offset_of(JavaThread, _suspend_flags       ); }
+ 

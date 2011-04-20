@@ -1,0 +1,3708 @@
+diff --git a/src/cpu/x86/vm/assembler_x86.cpp b/src/cpu/x86/vm/assembler_x86.cpp
+--- a/src/cpu/x86/vm/assembler_x86.cpp
++++ b/src/cpu/x86/vm/assembler_x86.cpp
+@@ -5554,7 +5554,7 @@
+ 
+   push_CPU_state();   // keeps alignment at 16 bytes
+   lea(c_rarg0, ExternalAddress((address) msg));
+-  call_VM_leaf(CAST_FROM_FN_PTR(address, warning), c_rarg0);
++  call_VM_leaf(CAST_FROM_FN_PTR(address, warning_fixed_args), c_rarg0);
+   pop_CPU_state();
+   pop(rsp);
+ }
+diff --git a/src/cpu/x86/vm/assembler_x86.hpp b/src/cpu/x86/vm/assembler_x86.hpp
+--- a/src/cpu/x86/vm/assembler_x86.hpp
++++ b/src/cpu/x86/vm/assembler_x86.hpp
+@@ -660,7 +660,7 @@
+ 
+ 
+   // Instruction prefixes
+-  void prefix(Prefix p);
++public:  void prefix(Prefix p);
+ 
+   public:
+ 
+diff --git a/src/cpu/x86/vm/frame_x86.cpp b/src/cpu/x86/vm/frame_x86.cpp
+--- a/src/cpu/x86/vm/frame_x86.cpp
++++ b/src/cpu/x86/vm/frame_x86.cpp
+@@ -305,7 +305,8 @@
+ }
+ 
+ BasicObjectLock* frame::interpreter_frame_monitor_end() const {
+-  BasicObjectLock* result = (BasicObjectLock*) *addr_at(interpreter_frame_monitor_block_top_offset);
++  intptr_t* original = *(intptr_t**)addr_at(interpreter_frame_monitor_block_top_offset);
++  BasicObjectLock* result = (BasicObjectLock*) (original + _displacement);
+   // make sure the pointer points inside the frame
+   assert(sp() <= (intptr_t*) result, "monitor end should be above the stack pointer");
+   assert((intptr_t*) result < fp(),  "monitor end should be strictly below the frame pointer");
+@@ -370,10 +371,10 @@
+   intptr_t* sender_sp = this->sender_sp();
+ 
+   // This is the sp before any possible extension (adapter/locals).
+-  intptr_t* unextended_sp = interpreter_frame_sender_sp();
++  intptr_t* unextended_sp = interpreter_frame_sender_sp() + _displacement;
+ 
+   // Stored FP.
+-  intptr_t* saved_fp = link();
++  intptr_t* saved_fp = link() + _displacement;
+ 
+   address sender_pc = this->sender_pc();
+   CodeBlob* sender_cb = CodeCache::find_blob_unsafe(sender_pc);
+@@ -419,7 +420,7 @@
+   }
+ #endif // COMPILER2
+ 
+-  return frame(sender_sp, unextended_sp, saved_fp, sender_pc);
++  return frame(sender_sp, unextended_sp, saved_fp, sender_pc, _displacement);
+ }
+ 
+ 
+@@ -438,7 +439,7 @@
+ 
+   // This is the saved value of EBP which may or may not really be an FP.
+   // It is only an FP if the sender is an interpreter frame (or C1?).
+-  intptr_t* saved_fp = (intptr_t*) *(sender_sp - frame::sender_sp_offset);
++  intptr_t* saved_fp = (intptr_t*) *(sender_sp - frame::sender_sp_offset) + _displacement;
+ 
+   // If we are returning to a compiled MethodHandle call site, the
+   // saved_fp will in fact be a saved value of the unextended SP.  The
+@@ -488,7 +489,7 @@
+   }
+ 
+   assert(sender_sp != sp(), "must have changed");
+-  return frame(sender_sp, unextended_sp, saved_fp, sender_pc);
++  return frame(sender_sp, unextended_sp, saved_fp, sender_pc, _displacement);
+ }
+ 
+ 
+@@ -508,7 +509,7 @@
+   }
+   // Must be native-compiled frame, i.e. the marshaling code for native
+   // methods that exists in the core system.
+-  return frame(sender_sp(), link(), sender_pc());
++  return frame(sender_sp(), link(), sender_pc(), _displacement);
+ }
+ 
+ 
+diff --git a/src/cpu/x86/vm/frame_x86.hpp b/src/cpu/x86/vm/frame_x86.hpp
+--- a/src/cpu/x86/vm/frame_x86.hpp
++++ b/src/cpu/x86/vm/frame_x86.hpp
+@@ -182,8 +182,12 @@
+ 
+   frame(intptr_t* sp, intptr_t* fp, address pc);
+ 
++  frame(intptr_t* sp, intptr_t* fp, address pc, intptr_t displacement);
++
+   frame(intptr_t* sp, intptr_t* unextended_sp, intptr_t* fp, address pc);
+ 
++  frame(intptr_t* sp, intptr_t* unextended_sp, intptr_t* fp, address pc, intptr_t displacement);
++
+   frame(intptr_t* sp, intptr_t* fp);
+ 
+   // accessors for the instance variables
+diff --git a/src/cpu/x86/vm/frame_x86.inline.hpp b/src/cpu/x86/vm/frame_x86.inline.hpp
+--- a/src/cpu/x86/vm/frame_x86.inline.hpp
++++ b/src/cpu/x86/vm/frame_x86.inline.hpp
+@@ -36,6 +36,7 @@
+   _fp = NULL;
+   _cb = NULL;
+   _deopt_state = unknown;
++  _displacement = 0;
+ }
+ 
+ inline frame::frame(intptr_t* sp, intptr_t* fp, address pc) {
+@@ -53,6 +54,25 @@
+   } else {
+     _deopt_state = not_deoptimized;
+   }
++  _displacement = 0;
++}
++
++inline frame::frame(intptr_t* sp, intptr_t* fp, address pc, intptr_t displacement) {
++  _sp = sp;
++  _unextended_sp = sp;
++  _fp = fp;
++  _pc = pc;
++  assert(pc != NULL, "no pc?");
++  _cb = CodeCache::find_blob(pc);
++
++  address original_pc = nmethod::get_deopt_original_pc(this);
++  if (original_pc != NULL) {
++    _pc = original_pc;
++    _deopt_state = is_deoptimized;
++  } else {
++    _deopt_state = not_deoptimized;
++  }
++  _displacement = displacement;
+ }
+ 
+ inline frame::frame(intptr_t* sp, intptr_t* unextended_sp, intptr_t* fp, address pc) {
+@@ -71,6 +91,26 @@
+   } else {
+     _deopt_state = not_deoptimized;
+   }
++  _displacement = 0;
++}
++
++inline frame::frame(intptr_t* sp, intptr_t* unextended_sp, intptr_t* fp, address pc, intptr_t displacement) {
++  _sp = sp;
++  _unextended_sp = unextended_sp;
++  _fp = fp;
++  _pc = pc;
++  assert(pc != NULL, "no pc?");
++  _cb = CodeCache::find_blob(pc);
++
++  address original_pc = nmethod::get_deopt_original_pc(this);
++  if (original_pc != NULL) {
++    _pc = original_pc;
++    assert(((nmethod*)_cb)->code_contains(_pc), "original PC must be in nmethod");
++    _deopt_state = is_deoptimized;
++  } else {
++    _deopt_state = not_deoptimized;
++  }
++  _displacement = displacement;
+ }
+ 
+ inline frame::frame(intptr_t* sp, intptr_t* fp) {
+@@ -99,6 +139,7 @@
+   } else {
+     _deopt_state = not_deoptimized;
+   }
++  _displacement = 0;
+ }
+ 
+ // Accessors
+@@ -202,7 +243,7 @@
+ }
+ 
+ inline intptr_t* frame::interpreter_frame_last_sp() const {
+-  return *(intptr_t**)addr_at(interpreter_frame_last_sp_offset);
++  return *(intptr_t**)addr_at(interpreter_frame_last_sp_offset) + _displacement;
+ }
+ 
+ inline intptr_t* frame::interpreter_frame_bcx_addr() const {
+@@ -268,7 +309,7 @@
+ // Entry frames
+ 
+ inline JavaCallWrapper* frame::entry_frame_call_wrapper() const {
+- return (JavaCallWrapper*)at(entry_frame_call_wrapper_offset);
++ return (JavaCallWrapper*)((intptr_t*)at(entry_frame_call_wrapper_offset) + _displacement);
+ }
+ 
+ 
+diff --git a/src/cpu/x86/vm/sharedRuntime_x86_32.cpp b/src/cpu/x86/vm/sharedRuntime_x86_32.cpp
+--- a/src/cpu/x86/vm/sharedRuntime_x86_32.cpp
++++ b/src/cpu/x86/vm/sharedRuntime_x86_32.cpp
+@@ -41,6 +41,8 @@
+ #include "opto/runtime.hpp"
+ #endif
+ 
++#include "runtime/coroutine.hpp"
++
+ #define __ masm->
+ #ifdef COMPILER2
+ UncommonTrapBlob   *SharedRuntime::_uncommon_trap_blob;
+@@ -1156,6 +1158,9 @@
+   }
+ }
+ 
++void create_prepareSwitch_contents(MacroAssembler *masm, int start, OopMapSet* oop_maps, int &stack_slots, int total_in_args, BasicType *in_sig_bt, VMRegPair *in_regs, BasicType ret_type);
++void create_switchTo_contents(MacroAssembler *masm, int start, OopMapSet* oop_maps, int &stack_slots, int total_in_args, BasicType *in_sig_bt, VMRegPair *in_regs, BasicType ret_type, bool terminate);
++
+ // ---------------------------------------------------------------------------
+ // Generate a native wrapper for a given method.  The method takes arguments
+ // in the Java compiled code convention, marshals them to the native
+@@ -1353,6 +1358,18 @@
+     // need a 5 byte instruction to allow MT safe patching to non-entrant
+     __ fat_nop();
+   }
++  
++  // the coroutine support methods have a hand-coded fast version that will handle the most common cases
++  if (method->intrinsic_id() == vmIntrinsics::_prepareSwitch) {
++    create_prepareSwitch_contents(masm, start, oop_maps, stack_slots, total_in_args, in_sig_bt, in_regs, ret_type);
++  } else if (method->intrinsic_id() == vmIntrinsics::_switchTo) {
++    create_switchTo_contents(masm, start, oop_maps, stack_slots, total_in_args, in_sig_bt, in_regs, ret_type, false);
++  } else if (method->intrinsic_id() == vmIntrinsics::_switchToAndTerminate) {
++    create_switchTo_contents(masm, start, oop_maps, stack_slots, total_in_args, in_sig_bt, in_regs, ret_type, true);
++  } else if (method->intrinsic_id() == vmIntrinsics::_switchToAndExit) {
++    create_switchTo_contents(masm, start, oop_maps, stack_slots, total_in_args, in_sig_bt, in_regs, ret_type, true);
++  }
++
+ 
+   // Generate a new frame for the wrapper.
+   __ enter();
+@@ -3052,3 +3069,384 @@
+   generate_uncommon_trap_blob();
+ #endif // COMPILER2
+ }
++
++void stop_if(MacroAssembler *masm, Assembler::Condition condition, const char* message) {
++  Label skip;
++  __ jcc(masm->negate_condition(condition), skip);
++
++  __ warn(message);
++  __ int3();
++
++  __ bind(skip);
++}
++
++void stop_if_null(MacroAssembler *masm, Register reg, const char* message) {
++  __ testptr(reg, reg);
++  stop_if(masm, Assembler::zero, message);
++}
++
++void stop_if_null(MacroAssembler *masm, Address adr, const char* message) {
++  __ cmpptr(adr, 0);
++  stop_if(masm, Assembler::zero, message);
++}
++
++void check_heap_internal(const char* msg) {
++  tty->print("check(%s) ", msg);
++  os::check_heap(true);
++}
++
++void check_heap(MacroAssembler *masm, const char* msg) {
++  __ pusha();
++  __ push((int)msg);
++  __ call(RuntimeAddress((address)check_heap_internal));
++  __ addptr(rsp, HeapWordSize);
++  __ popa();
++}
++
++
++void create_prepareSwitch_contents(MacroAssembler *masm, int start, OopMapSet* oop_maps, int &stack_slots, int total_in_args, 
++                                   BasicType *in_sig_bt, VMRegPair *in_regs, BasicType ret_type) {
++  assert(total_in_args == 1, "wrong number of arguments");
++
++  Label slow_case;
++
++  Register target_stack = rdx;
++  Register current_coroutine = rax;
++  {
++    Register target_coroutine = rdi;
++    // check that we're dealing with sane objects...
++    DEBUG_ONLY(stop_if_null(masm, rcx, "null new_coroutine in prepareSwitch"));
++    __ movptr(target_coroutine, Address(rcx, java_dyn_CoroutineBase::get_data_offset()));
++    __ testptr(target_coroutine, target_coroutine);
++    __ jcc(Assembler::zero, slow_case);
++
++    Label complex;
++    __ cmpl(Address(target_coroutine, Coroutine::state_offset()), Coroutine::_onstack);
++    __ jcc(Assembler::notEqual, complex);
++
++    // in the most trivial case the target coroutine is on-stack, no preparation is required
++    __ ret(0);
++
++    __ bind(complex);
++
++    __ movptr(target_stack, Address(target_coroutine, Coroutine::stack_offset()));
++    DEBUG_ONLY(stop_if_null(masm, target_stack, "Coroutine with NULL stack in prepareSwitch"));
++
++    __ movptr(current_coroutine, Address(target_stack, CoroutineStack::current_coroutine_offset()));
++    Label stack_occupied;
++    __ testptr(current_coroutine, current_coroutine);
++    __ jcc(Assembler::notZero, stack_occupied);
++
++    // the target stack is free, no preparation is required
++    __ ret(0);
++
++    __ bind(stack_occupied);
++  }
++  Register current_data = rdi;
++  __ movptr(current_data, Address(current_coroutine, Coroutine::data_offset()));
++  DEBUG_ONLY(stop_if_null(masm, current_data, "NULL current data in prepareSwitch"));
++
++  Label state_current;
++  __ cmpl(Address(current_coroutine, Coroutine::state_offset()), Coroutine::_onstack);
++  __ jcc(Assembler::notEqual, state_current);
++
++  Register temp = rsi;
++  __ movptr(temp, Address(target_stack, CoroutineStack::stack_base_offset()));
++  __ subptr(temp, Address(target_stack, CoroutineStack::last_sp_offset()));
++  __ shrl(temp, LogHeapWordSize);
++  __ addl(temp, COROUTINE_DATA_OVERSIZE);
++
++  __ cmpl(temp, Address(current_data, CoroutineData::capacity_offset()));
++  __ jcc(Assembler::above, slow_case);
++
++  __ ret(0);
++
++  __ bind(state_current);
++
++#ifdef ASSERT
++  __ cmpl(Address(current_coroutine, Coroutine::state_offset()), Coroutine::_current);
++  stop_if(masm, Assembler::notEqual, "invalid current Coroutine state in prepareSwitch");
++#endif
++
++  __ movptr(temp, Address(target_stack, CoroutineStack::stack_base_offset()));
++  __ subptr(temp, rsp);
++  __ shrl(temp, LogHeapWordSize);
++  __ addl(temp, COROUTINE_DATA_OVERSIZE);
++
++  __ cmpl(temp, Address(current_data, CoroutineData::capacity_offset()));
++  __ jcc(Assembler::above, slow_case);
++
++  __ ret(0);
++
++  __ bind(slow_case);
++}
++
++void create_switchTo_contents(MacroAssembler *masm, int start, OopMapSet* oop_maps, int &stack_slots, int total_in_args, 
++                              BasicType *in_sig_bt, VMRegPair *in_regs, BasicType ret_type, bool terminate) {
++  assert(total_in_args == 2, "wrong number of arguments");
++
++  if (terminate) {
++    __ get_thread(rax);
++    __ movptr(Address(rax, JavaThread::coroutine_temp_offset()), rcx);
++  }
++
++  Register target_coroutine = rdx;
++  // check that we're dealing with sane objects...
++  DEBUG_ONLY(stop_if_null(masm, target_coroutine, "null new_coroutine"));
++  __ movptr(target_coroutine, Address(target_coroutine, java_dyn_CoroutineBase::get_data_offset()));
++  DEBUG_ONLY(stop_if_null(masm, target_coroutine, "new_coroutine without data"));
++
++  {
++    //////////////////////////////////////////////////////////////////////////
++    // store information into the old coroutine's object
++    //
++    // valid registers: rcx = old Coroutine, rdx = target Coroutine
++
++    Register old_coroutine = rcx;
++    Register old_stack = rdi;
++    Register temp = rsi;
++    
++    // check that we're dealing with sane objects...
++    DEBUG_ONLY(stop_if_null(masm, old_coroutine, "null old_coroutine"));
++    __ movptr(old_coroutine, Address(old_coroutine, java_dyn_CoroutineBase::get_data_offset()));
++    DEBUG_ONLY(stop_if_null(masm, target_coroutine, "old_coroutine without data"));
++
++    __ movptr(old_stack, Address(old_coroutine, Coroutine::stack_offset()));
++
++#ifdef _WINDOWS
++    // rescue the SEH pointer
++    __ prefix(Assembler::FS_segment);
++    __ movptr(temp, Address(noreg, 0x00));
++    __ movptr(Address(old_coroutine, Coroutine::last_SEH_offset()), temp);
++#endif
++
++    Register thread = rax;
++    __ get_thread(thread);
++
++    __ movl(Address(old_coroutine, Coroutine::state_offset()) , Coroutine::_onstack);
++
++    // rescue old handle and resource areas
++    __ movptr(temp, Address(thread, Thread::handle_area_offset()));
++    __ movptr(Address(old_coroutine, Coroutine::handle_area_offset()), temp);
++    __ movptr(temp, Address(thread, Thread::resource_area_offset()));
++    __ movptr(Address(old_coroutine, Coroutine::resource_area_offset()), temp);
++    __ movptr(temp, Address(thread, Thread::last_handle_mark_offset()));
++    __ movptr(Address(old_coroutine, Coroutine::last_handle_mark_offset()), temp);
++
++    // push the current IP and frame pointer onto the stack
++    __ push(rbp);
++
++    __ movptr(Address(old_stack, CoroutineStack::last_sp_offset()), rsp);
++  }
++
++  Label perform_switch;
++  Label copy_new_contents;
++  {
++    //////////////////////////////////////////////////////////////////////////
++    // determine if we need to:
++    // * only perform the switch (perform_switch) or
++    // * only copy the new contents into the stack and perform the switch (copy_new_contents) or
++    // * do everything
++    //
++    // valid registers: rcx = old Coroutine, rdx = target Coroutine
++
++    // get the CoroutineStack
++
++    Register temp = rsi;
++    __ movptr(temp, Address(target_coroutine, Coroutine::stack_offset()));
++    __ movptr(temp, Address(temp, CoroutineStack::current_coroutine_offset()));
++
++    // if the current coroutine of the target stack is the target coroutine we're good to go
++    __ cmpptr(target_coroutine, temp);
++    __ jcc(Assembler::equal, perform_switch);
++
++    // if the target stack has no current coroutine we can skip the rescuing
++    __ testptr(temp, temp);
++    __ jcc(Assembler::zero, copy_new_contents);
++  }
++
++  {
++    //////////////////////////////////////////////////////////////////////////
++    // copy the contents of the stack into a CoroutineData object
++    //
++    // valid registers: rdx = target Coroutine
++
++    Register current_coroutine = rax;
++    Register current_data= rdi;
++    Register target_stack = rbx;
++
++    // get the current coroutine of the target stack
++    __ movptr(target_stack, Address(target_coroutine, Coroutine::stack_offset()));
++    DEBUG_ONLY(stop_if_null(masm, target_stack, "null stack in target coroutine"));
++    __ movptr(current_coroutine, Address(target_stack, CoroutineStack::current_coroutine_offset()));
++    DEBUG_ONLY(stop_if_null(masm, current_coroutine, "null current coroutine"));
++    __ movptr(current_data, Address(current_coroutine, Coroutine::data_offset()));
++    DEBUG_ONLY(stop_if_null(masm, current_data, "null current coroutine data"));
++
++#ifdef ASSERT
++    __ cmpl(Address(current_coroutine, Coroutine::state_offset()), Coroutine::_onstack);
++    stop_if(masm, Assembler::notEqual, "wrong coroutine data state (save)");
++#endif
++
++    Register counter = rcx;
++
++    __ movptr(counter, Address(target_stack, CoroutineStack::stack_base_offset()));
++    __ subptr(counter, Address(target_stack, CoroutineStack::last_sp_offset()));
++    __ shrptr(counter, LogHeapWordSize);
++
++#ifdef ASSERT
++    __ cmpl(counter, Address(current_data, CoroutineData::capacity_offset()));
++    stop_if(masm, Assembler::above, "CoroutineData too small in switchTo");
++#endif
++
++    __ movl(Address(current_coroutine, Coroutine::state_offset()), Coroutine::_stored);
++
++    {
++      Register temp = rsi;
++      __ movl(Address(current_data, CoroutineData::size_offset()), counter);
++      __ movl(temp, Address(current_data, CoroutineData::capacity_offset()));
++
++      // let dest point to the last heap word of the CoroutineData
++      Register dest = rdi;
++      __ lea(dest, Address(current_data, temp, Address::times_ptr, in_bytes(CoroutineData::content_offset()) - HeapWordSize));
++      current_data = noreg;
++    }
++
++    // let source point to the last stack word
++    Register source = rsi;
++    __ movl(source, Address(target_stack, CoroutineStack::stack_base_offset()));
++    __ subptr(source, HeapWordSize);
++
++    __ std();
++    __ rep_mov();
++    __ cld();
++
++#ifdef ASSERT
++    __ addptr(source, HeapWordSize);
++    __ cmpptr(source, Address(target_stack, CoroutineStack::last_sp_offset()));
++    stop_if(masm, Assembler::notEqual, "invalid last sp");
++#endif
++
++  }
++
++  __ bind(copy_new_contents);
++
++  {
++    //////////////////////////////////////////////////////////////////////////
++    // copy the contents of the target's CoroutineData to the stack
++    //
++    // valid registers: rdx = target Coroutine
++
++    Register temp = rax;
++    Register target_data = rbx;
++
++    // make the target coroutine the current coroutine of the stack
++    __ movptr(temp, Address(target_coroutine, Coroutine::stack_offset()));
++    __ movptr(Address(temp, CoroutineStack::current_coroutine_offset()), target_coroutine);
++
++    __ movptr(target_data, Address(target_coroutine, Coroutine::data_offset()));
++
++#ifdef ASSERT
++    __ cmpl(Address(target_coroutine, Coroutine::state_offset()), Coroutine::_stored);
++    stop_if(masm, Assembler::notEqual, "wrong coroutine data state (restore)");
++#endif
++
++    __ movl(Address(target_coroutine, Coroutine::state_offset()), Coroutine::_onstack);
++
++    Register counter = rcx;
++    Register source = rsi;
++    Register dest = rdi;
++
++    __ movl(counter, Address(target_data, CoroutineData::size_offset()));
++    __ movl(temp, Address(target_data, CoroutineData::capacity_offset()));
++
++    // let source point to the last heap word of the CoroutineData
++    __ lea(source, Address(target_data, temp, Address::times_ptr, in_bytes(CoroutineData::content_offset()) - HeapWordSize));
++
++    // let dest point to the last stack word
++    __ movptr(temp, Address(target_coroutine, Coroutine::stack_offset()));
++    __ movl(dest, Address(temp, CoroutineStack::stack_base_offset()));
++    __ subptr(dest, HeapWordSize);
++
++    __ std();
++    __ rep_mov();
++    __ cld();
++
++    __ addptr(dest, HeapWordSize);
++    __ movptr(Address(temp, CoroutineStack::last_sp_offset()), dest);
++
++  }
++  __ bind(perform_switch);
++
++  {
++    //////////////////////////////////////////////////////////////////////////
++    // perform the switch to the new stack
++    //
++    // valid registers: rdx = target Coroutine
++
++    Register target_stack = rbx;
++    __ movptr(target_stack, Address(target_coroutine, Coroutine::stack_offset()));
++
++    __ movl(Address(target_coroutine, Coroutine::state_offset()), Coroutine::_current);
++
++    Register temp = rsi;
++    Register temp2 = rdi;
++    {
++      Register thread = rax;
++      __ get_thread(rax);
++      // set new handle and resource areas
++      __ movptr(temp, Address(target_coroutine, Coroutine::handle_area_offset()));
++      __ movptr(Address(target_coroutine, Coroutine::handle_area_offset()), (intptr_t)NULL_WORD);                // TODO is this really needed?
++      __ movptr(Address(thread, Thread::handle_area_offset()), temp);
++      __ movptr(temp, Address(target_coroutine, Coroutine::resource_area_offset()));
++      __ movptr(Address(target_coroutine, Coroutine::resource_area_offset()), (intptr_t)NULL_WORD);              // TODO is this really needed?
++      __ movptr(Address(thread, Thread::resource_area_offset()), temp);
++      __ movptr(temp, Address(target_coroutine, Coroutine::last_handle_mark_offset()));
++      __ movptr(Address(target_coroutine, Coroutine::last_handle_mark_offset()), (intptr_t)NULL_WORD);              // TODO is this really needed?
++      __ movptr(Address(thread, Thread::last_handle_mark_offset()), temp);
++
++      // update the thread's stack base and size
++      __ movptr(temp, Address(target_stack, CoroutineStack::stack_base_offset()));
++      __ movptr(Address(thread, JavaThread::stack_base_offset()), temp);
++      __ movl(temp2, Address(target_stack, CoroutineStack::stack_size_offset()));
++      __ movl(Address(thread, JavaThread::stack_size_offset()), temp2);
++    }
++#ifdef _WINDOWS
++    {
++      Register tib = rax;
++      // get the linear address of the TIB (thread info block)
++      __ prefix(Assembler::FS_segment);
++      __ movptr(tib, Address(noreg, 0x18));
++
++      // update the TIB stack base and top
++      __ movptr(Address(tib, 4), temp);
++      __ subptr(temp, temp2);
++      __ movptr(Address(tib, 8), temp);
++
++      // exchange the TIB structured exception handler pointer
++      __ movptr(temp, Address(target_coroutine, Coroutine::last_SEH_offset()));
++      __ movptr(Address(tib, 0), temp);
++    }
++#endif
++    // restore the stack pointer
++    __ movptr(temp, Address(target_stack, CoroutineStack::last_sp_offset()));
++    __ movptr(rsp, temp);
++
++    __ pop(rbp);
++    
++    if (!terminate) {
++      //////////////////////////////////////////////////////////////////////////
++      // normal case (resume immediately)
++      __ ret(0);        // <-- this will jump to the stored IP of the target coroutine
++      
++    } else {
++      //////////////////////////////////////////////////////////////////////////
++      // slow case (terminate old coroutine)
++      __ get_thread(rax);
++      __ movptr(rcx, Address(rax, JavaThread::coroutine_temp_offset()));
++      __ movptr(Address(rax, JavaThread::coroutine_temp_offset()), (intptr_t)NULL_WORD);
++      __ movptr(rdx, (intptr_t)NULL_WORD);
++      
++    }
++  }
++}
+diff --git a/src/cpu/x86/vm/sharedRuntime_x86_64.cpp b/src/cpu/x86/vm/sharedRuntime_x86_64.cpp
+--- a/src/cpu/x86/vm/sharedRuntime_x86_64.cpp
++++ b/src/cpu/x86/vm/sharedRuntime_x86_64.cpp
+@@ -41,6 +41,8 @@
+ #include "opto/runtime.hpp"
+ #endif
+ 
++#include "runtime/coroutine.hpp"
++
+ DeoptimizationBlob *SharedRuntime::_deopt_blob;
+ #ifdef COMPILER2
+ UncommonTrapBlob   *SharedRuntime::_uncommon_trap_blob;
+@@ -1173,6 +1175,10 @@
+     }
+ }
+ 
++void create_prepareSwitch_contents(MacroAssembler *masm, int start, OopMapSet* oop_maps, int &stack_slots, int total_in_args, BasicType *in_sig_bt, VMRegPair *in_regs, BasicType ret_type);
++void create_switchTo_contents(MacroAssembler *masm, int start, OopMapSet* oop_maps, int &stack_slots, int total_in_args, BasicType *in_sig_bt, VMRegPair *in_regs, BasicType ret_type, bool terminate);
++
++
+ // ---------------------------------------------------------------------------
+ // Generate a native wrapper for a given method.  The method takes arguments
+ // in the Java compiled code convention, marshals them to the native
+@@ -1334,6 +1340,17 @@
+     __ fat_nop();
+   }
+ 
++  // the coroutine support methods have a hand-coded fast version that will handle the most common cases
++  if (method->intrinsic_id() == vmIntrinsics::_prepareSwitch) {
++    create_prepareSwitch_contents(masm, start, oop_maps, stack_slots, total_in_args, in_sig_bt, in_regs, ret_type);
++  } else if (method->intrinsic_id() == vmIntrinsics::_switchTo) {
++    create_switchTo_contents(masm, start, oop_maps, stack_slots, total_in_args, in_sig_bt, in_regs, ret_type, false);
++  } else if (method->intrinsic_id() == vmIntrinsics::_switchToAndTerminate) {
++    create_switchTo_contents(masm, start, oop_maps, stack_slots, total_in_args, in_sig_bt, in_regs, ret_type, true);
++  } else if (method->intrinsic_id() == vmIntrinsics::_switchToAndExit) {
++    create_switchTo_contents(masm, start, oop_maps, stack_slots, total_in_args, in_sig_bt, in_regs, ret_type, true);
++  }
++
+   // Generate a new frame for the wrapper.
+   __ enter();
+   // -2 because return address is already present and so is saved rbp
+@@ -3351,3 +3368,467 @@
+   _exception_blob =  ExceptionBlob::create(&buffer, oop_maps, SimpleRuntimeFrame::framesize >> 1);
+ }
+ #endif // COMPILER2
++
++
++void stop_if(MacroAssembler *masm, Assembler::Condition condition, const char* message) {
++  Label skip;
++  __ jcc(masm->negate_condition(condition), skip);
++
++  __ stop(message);
++  __ int3();
++
++  __ bind(skip);
++}
++
++void stop_if_null(MacroAssembler *masm, Register reg, const char* message) {
++  __ testptr(reg, reg);
++  stop_if(masm, Assembler::zero, message);
++}
++
++void stop_if_null(MacroAssembler *masm, Address adr, const char* message) {
++  __ cmpptr(adr, 0);
++  stop_if(masm, Assembler::zero, message);
++}
++
++void create_prepareSwitch_contents(MacroAssembler *masm, int start, OopMapSet* oop_maps, int &stack_slots, int total_in_args, 
++                                   BasicType *in_sig_bt, VMRegPair *in_regs, BasicType ret_type) {
++  assert(total_in_args == 1, "wrong number of arguments");
++
++  Label slow_case;
++
++  Register target;
++  Register target_stack;
++  if (in_regs[0].first() == rsi->as_VMReg()) {
++    target = rsi;
++    target_stack = rdx;
++  } else if (in_regs[0].first() == rdx->as_VMReg()) {
++    target = rdx;
++    target_stack = rsi;
++  } else {
++    ShouldNotReachHere();
++  }
++
++  Register current_coroutine = rax;
++  {
++    Register target_coroutine = rdi;
++    // check that we're dealing with sane objects...
++    DEBUG_ONLY(stop_if_null(masm, target, "null new_coroutine in prepareSwitch"));
++    __ movptr(target_coroutine, Address(target, java_dyn_CoroutineBase::get_data_offset()));
++    DEBUG_ONLY(stop_if_null(masm, target_coroutine, "new_coroutine without data in prepareSwitch"));
++
++    Label complex;
++    __ cmpl(Address(target_coroutine, Coroutine::state_offset()), Coroutine::_onstack);
++    __ jcc(Assembler::notEqual, complex);
++
++    // in the most trivial case the target coroutine is on-stack, no preparation is required
++    __ ret(0);
++
++    __ bind(complex);
++
++    __ movptr(target_stack, Address(target_coroutine, Coroutine::stack_offset()));
++    DEBUG_ONLY(stop_if_null(masm, target_stack, "Coroutine with NULL stack in prepareSwitch"));
++
++    __ movptr(current_coroutine, Address(target_stack, CoroutineStack::current_coroutine_offset()));
++    Label stack_occupied;
++    __ testptr(current_coroutine, current_coroutine);
++    __ jcc(Assembler::notZero, stack_occupied);
++
++    // the target stack is free, no preparation is required
++    __ ret(0);
++
++    __ bind(stack_occupied);
++  }
++  Register current_data = rdi;
++  __ movptr(current_data, Address(current_coroutine, Coroutine::data_offset()));
++  DEBUG_ONLY(stop_if_null(masm, current_data, "NULL current data in prepareSwitch"));
++
++  Label state_current;
++  __ cmpl(Address(current_coroutine, Coroutine::state_offset()), Coroutine::_onstack);
++  __ jcc(Assembler::notEqual, state_current);
++
++  Register temp = r8;
++  __ movptr(temp, Address(target_stack, CoroutineStack::stack_base_offset()));
++  __ subptr(temp, Address(target_stack, CoroutineStack::last_sp_offset()));
++  __ shrl(temp, LogHeapWordSize);
++  __ addl(temp, COROUTINE_DATA_OVERSIZE);
++
++  __ cmpl(temp, Address(current_data, CoroutineData::capacity_offset()));
++  __ jcc(Assembler::above, slow_case);
++
++  __ ret(0);
++
++  __ bind(state_current);
++
++#ifdef ASSERT
++  __ cmpl(Address(current_coroutine, Coroutine::state_offset()), Coroutine::_current);
++  stop_if(masm, Assembler::notEqual, "invalid current Coroutine state in prepareSwitch");
++#endif
++
++  __ movptr(temp, Address(target_stack, CoroutineStack::stack_base_offset()));
++  __ subptr(temp, rsp);
++  __ shrl(temp, LogHeapWordSize);
++  __ addl(temp, COROUTINE_DATA_OVERSIZE);
++
++  __ cmpl(temp, Address(current_data, CoroutineData::capacity_offset()));
++  __ jcc(Assembler::above, slow_case);
++
++  __ ret(0);
++
++  __ bind(slow_case);
++}
++
++MacroAssembler* debug_line(MacroAssembler* masm, int l) {
++/*    masm->movptr(r13, Address(rdx, Coroutine::stack_offset()));
++    masm->movptr(r13, Address(r13, CoroutineStack::stack_base_offset()));
++    masm->subptr(r13, HeapWordSize);
++    masm->movptr(Address(r13, -16), 0);
++
++*/    masm->movl(r13, l);
++    return masm;
++}
++
++void coroutine_start(Coroutine* coroutine, jobject coroutineObj);
++
++void create_switchTo_contents(MacroAssembler *masm, int start, OopMapSet* oop_maps, int &stack_slots, int total_in_args, 
++                              BasicType *in_sig_bt, VMRegPair *in_regs, BasicType ret_type, bool terminate) {
++  assert(total_in_args == 2, "wrong number of arguments");
++
++  if (j_rarg0 != rsi) {
++    __ movptr(rsi, j_rarg0);
++  }
++  if (j_rarg1 != rdx) {
++    __ movptr(rdx, j_rarg1);
++  }
++
++  // push the current IP and frame pointer onto the stack
++  __ push(rbp);
++  
++  Register thread = r15;
++  Register target_coroutine = rdx;
++  // check that we're dealing with sane objects...
++  DEBUG_ONLY(stop_if_null(masm, target_coroutine, "null new_coroutine"));
++  __ movptr(target_coroutine, Address(target_coroutine, java_dyn_CoroutineBase::get_data_offset()));
++  DEBUG_ONLY(stop_if_null(masm, target_coroutine, "new_coroutine without data"));
++
++  /*
++#ifdef ASSERT
++#undef __
++#define __ debug_line(masm, __LINE__)->
++#endif
++*/
++  {
++    //////////////////////////////////////////////////////////////////////////
++    // store information into the old coroutine's object
++    //
++    // valid registers: rsi = old Coroutine, rdx = target Coroutine
++
++    Register old_coroutine_obj = rsi;
++    Register old_coroutine = r9;
++    Register old_stack = r10;
++    Register temp = r8;
++    
++    // check that we're dealing with sane objects...
++    DEBUG_ONLY(stop_if_null(masm, old_coroutine_obj, "null old_coroutine"));
++    __ movptr(old_coroutine, Address(old_coroutine_obj, java_dyn_CoroutineBase::get_data_offset()));
++    DEBUG_ONLY(stop_if_null(masm, old_coroutine, "old_coroutine without data"));
++
++    // saving r12 is not necessary - it is restored by reinit_heapbase()
++//    __ movq(Address(old_coroutine, Coroutine::storage_offset() + in_ByteSize(0 * HeapWordSize)), r12);
++//    __ movq(Address(old_coroutine, Coroutine::storage_offset() + in_ByteSize(1 * HeapWordSize)), r14);
++
++    __ movptr(old_stack, Address(old_coroutine, Coroutine::stack_offset()));
++
++#ifdef ASSERT
++    __ cmpb(Address(old_stack, CoroutineStack::locked_offset()), 0);
++    stop_if(masm, Assembler::notEqual, "locked stack1!");
++#endif
++
++#if defined(_WINDOWS)
++    // rescue the SEH pointer
++    __ prefix(Assembler::GS_segment);
++    __ movptr(temp, Address(noreg, 0x00));
++    __ movptr(Address(old_coroutine, Coroutine::last_SEH_offset()), temp);
++#endif
++
++    __ movl(Address(old_coroutine, Coroutine::state_offset()) , Coroutine::_onstack);
++
++    // rescue old handle and resource areas
++    __ movptr(temp, Address(thread, Thread::handle_area_offset()));
++    __ movptr(Address(old_coroutine, Coroutine::handle_area_offset()), temp);
++    __ movptr(temp, Address(thread, Thread::resource_area_offset()));
++    __ movptr(Address(old_coroutine, Coroutine::resource_area_offset()), temp);
++    __ movptr(temp, Address(thread, Thread::last_handle_mark_offset()));
++    __ movptr(Address(old_coroutine, Coroutine::last_handle_mark_offset()), temp);
++#ifdef ASSERT
++    __ movl(temp, Address(thread, JavaThread::java_call_counter_offset()));
++    __ movl(Address(old_coroutine, Coroutine::java_call_counter_offset()), temp);
++#endif
++
++    __ movptr(Address(old_stack, CoroutineStack::last_sp_offset()), rsp);
++  }
++  Label perform_switch;
++  Label copy_new_contents;
++  Register target_stack = r12;  
++  __ movptr(target_stack, Address(target_coroutine, Coroutine::stack_offset()));
++
++#ifdef ASSERT
++  __ cmpb(Address(target_stack, CoroutineStack::locked_offset()), 0);
++  stop_if(masm, Assembler::notEqual, "locked stack2!");
++#endif
++
++  {
++    //////////////////////////////////////////////////////////////////////////
++    // determine if we need to:
++    // * only perform the switch (perform_switch) or
++    // * only copy the new contents into the stack and perform the switch (copy_new_contents) or
++    // * do everything
++    //
++    // valid registers: rdx = target Coroutine
++
++    // get the CoroutineStack
++
++    Register temp = r8;
++    __ movptr(temp, Address(target_stack, CoroutineStack::current_coroutine_offset()));
++
++    // if the current coroutine of the target stack is the target coroutine we're good to go
++    __ cmpptr(target_coroutine, temp);
++    __ jcc(Assembler::equal, perform_switch);
++
++    // if the target stack has no current coroutine we can skip the rescuing
++    __ testptr(temp, temp);
++    __ jcc(Assembler::zero, copy_new_contents);
++  }
++
++  {
++    //////////////////////////////////////////////////////////////////////////
++    // copy the contents of the stack into a CoroutineData object
++    //
++    // valid registers: rdx = target Coroutine
++
++    Register current_coroutine = r8;
++    Register current_data= r9;
++
++    // get the current coroutine of the target stack
++    __ movptr(target_stack, Address(target_coroutine, Coroutine::stack_offset()));
++    DEBUG_ONLY(stop_if_null(masm, target_stack, "null stack in target coroutine"));
++    __ movptr(current_coroutine, Address(target_stack, CoroutineStack::current_coroutine_offset()));
++    DEBUG_ONLY(stop_if_null(masm, current_coroutine, "null current coroutine"));
++    __ movptr(current_data, Address(current_coroutine, Coroutine::data_offset()));
++    DEBUG_ONLY(stop_if_null(masm, current_data, "null current coroutine data"));
++
++#ifdef ASSERT
++    __ cmpl(Address(current_coroutine, Coroutine::state_offset()), Coroutine::_onstack);
++    stop_if(masm, Assembler::notEqual, "wrong coroutine data state (save)");
++#endif
++
++    Register counter = rcx;
++
++    __ movptr(counter, Address(target_stack, CoroutineStack::stack_base_offset()));
++    __ subptr(counter, Address(target_stack, CoroutineStack::last_sp_offset()));
++    __ shrptr(counter, LogHeapWordSize);
++
++#ifdef ASSERT
++    __ cmpl(counter, Address(current_data, CoroutineData::capacity_offset()));
++    stop_if(masm, Assembler::above, "CoroutineData too small in switchTo");
++#endif
++
++    __ movl(Address(current_coroutine, Coroutine::state_offset()), Coroutine::_stored);
++
++    __ movptr(r10, rsi);
++    
++    Register temp = rsi;
++    __ movl(Address(current_data, CoroutineData::size_offset()), counter);
++    __ movl(temp, Address(current_data, CoroutineData::capacity_offset()));
++
++    // let dest point to the last heap word of the CoroutineData
++    Register dest = rdi;
++    __ lea(dest, Address(current_data, temp, Address::times_ptr, in_bytes(CoroutineData::content_offset()) - HeapWordSize));
++
++    // let source point to the last stack word
++    Register source = rsi;
++    __ movptr(source, Address(target_stack, CoroutineStack::stack_base_offset()));
++    __ subptr(source, HeapWordSize);
++
++    __ std();
++    __ rep_mov();
++    __ cld();
++
++    
++#ifdef ASSERT
++    __ addptr(source, HeapWordSize);
++    __ cmpptr(source, Address(target_stack, CoroutineStack::last_sp_offset()));
++    stop_if(masm, Assembler::notEqual, "invalid last sp");
++#endif
++
++#ifdef ASSERT
++    __ cmpb(Address(target_stack, CoroutineStack::locked_offset()), 0);
++    stop_if(masm, Assembler::notEqual, "locked stack3!");
++#endif
++
++    __ movptr(rsi, r10);
++  }
++
++  __ bind(copy_new_contents);
++  //return;
++
++  {
++    //////////////////////////////////////////////////////////////////////////
++    // copy the contents of the target's CoroutineData to the stack
++    //
++    // valid registers: rdx = target Coroutine
++
++    Register temp = r8;
++    Register target_data = rbx;
++
++    // make the target coroutine the current coroutine of the stack
++    __ movptr(Address(target_stack, CoroutineStack::current_coroutine_offset()), target_coroutine);
++    __ movptr(target_data, Address(target_coroutine, Coroutine::data_offset()));
++
++#ifdef ASSERT
++    __ cmpl(Address(target_coroutine, Coroutine::state_offset()), Coroutine::_stored);
++    stop_if(masm, Assembler::notEqual, "wrong coroutine data state (restore)");
++#endif
++
++    __ movl(Address(target_coroutine, Coroutine::state_offset()), Coroutine::_onstack);
++
++    Register counter = rcx;
++    Register source = rsi;
++    Register dest = rdi;
++
++#ifdef ASSERT
++    __ cmpb(Address(target_stack, CoroutineStack::locked_offset()), 0);
++    stop_if(masm, Assembler::notEqual, "locked stack4!");
++#endif
++    
++    __ movptr(r10, rsi);
++
++    __ movl(counter, Address(target_data, CoroutineData::size_offset()));
++    __ movl(temp, Address(target_data, CoroutineData::capacity_offset()));
++
++    // let source point to the last heap word of the CoroutineData
++    __ lea(source, Address(target_data, temp, Address::times_ptr, in_bytes(CoroutineData::content_offset()) - HeapWordSize));
++
++    // let dest point to the last stack word
++    __ movptr(temp, Address(target_coroutine, Coroutine::stack_offset()));
++    __ movptr(dest, Address(temp, CoroutineStack::stack_base_offset()));
++    __ subptr(dest, HeapWordSize);
++
++    __ std();
++    __ rep_mov();
++    __ cld();
++
++    __ addptr(dest, HeapWordSize);
++    __ movptr(Address(temp, CoroutineStack::last_sp_offset()), dest);
++    
++#ifdef ASSERT
++    __ cmpb(Address(target_stack, CoroutineStack::locked_offset()), 0);
++    stop_if(masm, Assembler::notEqual, "locked stack5!");
++#endif
++
++    __ movptr(rsi, r10);
++  }
++  __ bind(perform_switch);
++
++  {
++    //////////////////////////////////////////////////////////////////////////
++    // perform the switch to the new stack
++    //
++    // valid registers: rdx = target Coroutine
++
++    __ movl(Address(target_coroutine, Coroutine::state_offset()), Coroutine::_current);
++
++    Register temp = r8;
++    Register temp2 = r9;
++    {
++      Register thread = r15;
++      // set new handle and resource areas
++      __ movptr(temp, Address(target_coroutine, Coroutine::handle_area_offset()));
++      __ movptr(Address(thread, Thread::handle_area_offset()), temp);
++      __ movptr(temp, Address(target_coroutine, Coroutine::resource_area_offset()));
++      __ movptr(Address(thread, Thread::resource_area_offset()), temp);
++      __ movptr(temp, Address(target_coroutine, Coroutine::last_handle_mark_offset()));
++      __ movptr(Address(thread, Thread::last_handle_mark_offset()), temp);
++
++#ifdef ASSERT
++      __ movl(temp, Address(target_coroutine, Coroutine::java_call_counter_offset()));
++      __ movl(Address(thread, JavaThread::java_call_counter_offset()), temp);
++
++      __ movptr(Address(target_coroutine, Coroutine::handle_area_offset()), (intptr_t)NULL_WORD);
++      __ movptr(Address(target_coroutine, Coroutine::resource_area_offset()), (intptr_t)NULL_WORD);
++      __ movptr(Address(target_coroutine, Coroutine::last_handle_mark_offset()), (intptr_t)NULL_WORD);
++      __ movl(Address(target_coroutine, Coroutine::java_call_counter_offset()), 0);
++#endif
++
++      // update the thread's stack base and size
++      __ movptr(temp, Address(target_stack, CoroutineStack::stack_base_offset()));
++      __ movptr(Address(thread, JavaThread::stack_base_offset()), temp);
++      __ movl(temp2, Address(target_stack, CoroutineStack::stack_size_offset()));
++      __ movl(Address(thread, JavaThread::stack_size_offset()), temp2);
++    }
++#if defined(_WINDOWS)
++    {
++      Register tib = rax;
++      // get the linear address of the TIB (thread info block)
++      __ prefix(Assembler::GS_segment);
++      __ movptr(tib, Address(noreg, 0x30));
++
++      // update the TIB stack base and top
++      __ movptr(Address(tib, 0x8), temp);
++      __ subptr(temp, temp2);
++      __ movptr(Address(tib, 0x10), temp);
++
++      // exchange the TIB structured exception handler pointer
++      __ movptr(temp, Address(target_coroutine, Coroutine::last_SEH_offset()));
++      __ movptr(Address(tib, 0), temp);
++    }
++#endif
++    // restore the stack pointer
++    __ movptr(temp, Address(target_stack, CoroutineStack::last_sp_offset()));
++    __ movptr(rsp, temp);
++
++
++#ifdef ASSERT
++    __ cmpb(Address(target_stack, CoroutineStack::locked_offset()), 0);
++    stop_if(masm, Assembler::notEqual, "locked stack6!");
++#endif
++
++    __ pop(rbp);
++
++    __ int3();
++    
++    if (!terminate) {
++      //////////////////////////////////////////////////////////////////////////
++      // normal case (resume immediately)
++
++      // this will reset r12
++      __ reinit_heapbase();
++//    __ movq(r12, Address(target_coroutine, Coroutine::storage_offset() + in_ByteSize(0 * HeapWordSize)));
++//    __ movq(r14, Address(target_coroutine, Coroutine::storage_offset() + in_ByteSize(1 * HeapWordSize)));
++
++      Label normal;
++      __ lea(rcx, RuntimeAddress((unsigned char*)coroutine_start));
++      __ cmpq(Address(rsp, 0), rcx);
++      __ jcc(Assembler::notEqual, normal);
++
++      __ movq(c_rarg0, Address(rsp, HeapWordSize * 2));
++      __ movq(c_rarg1, Address(rsp, HeapWordSize * 3));
++
++      __ bind(normal);
++      __ ret(0);        // <-- this will jump to the stored IP of the target coroutine
++      
++    } else {
++      //////////////////////////////////////////////////////////////////////////
++      // slow case (terminate old coroutine)
++
++      // this will reset r12
++      __ reinit_heapbase();
++//    __ movq(r12, Address(target_coroutine, Coroutine::storage_offset() + in_ByteSize(0 * HeapWordSize)));
++//    __ movq(r14, Address(target_coroutine, Coroutine::storage_offset() + in_ByteSize(1 * HeapWordSize)));
++
++      if (j_rarg0 != rsi) {
++        __ movptr(j_rarg0, rsi);
++      }
++      __ movptr(j_rarg1, 0);
++    }
++  }
++}
+diff --git a/src/os/windows/vm/os_windows.cpp b/src/os/windows/vm/os_windows.cpp
+--- a/src/os/windows/vm/os_windows.cpp
++++ b/src/os/windows/vm/os_windows.cpp
+@@ -2277,7 +2277,7 @@
+     bool in_java = thread->thread_state() == _thread_in_Java;
+ 
+     // Handle potential stack overflows up front.
+-    if (exception_code == EXCEPTION_STACK_OVERFLOW) {
++    if (exception_code == EXCEPTION_STACK_OVERFLOW || exception_code == EXCEPTION_GUARD_PAGE) {
+       if (os::uses_stack_guard_pages()) {
+ #ifdef _M_IA64
+         //
+diff --git a/src/os_cpu/bsd_x86/vm/threadLS_bsd_x86.cpp b/src/os_cpu/bsd_x86/vm/threadLS_bsd_x86.cpp
+--- a/src/os_cpu/bsd_x86/vm/threadLS_bsd_x86.cpp
++++ b/src/os_cpu/bsd_x86/vm/threadLS_bsd_x86.cpp
+@@ -90,3 +90,25 @@
+   }
+ #endif // !AMD64
+ }
++
++void ThreadLocalStorage::pd_add_coroutine_stack(Thread* thread, address stack_base, size_t stack_size) {
++#ifndef AMD64
++  for (address p = stack_base - stack_size; p < stack_base; p += PAGE_SIZE) {
++    assert(thread == NULL || _sp_map[(uintptr_t)p >> PAGE_SHIFT] == NULL ||
++           thread == _sp_map[(uintptr_t)p >> PAGE_SHIFT],
++           "coroutine exited without detaching from VM??");
++    _sp_map[(uintptr_t)p >> PAGE_SHIFT] = thread;
++  }
++#endif // !AMD64
++}
++
++
++void ThreadLocalStorage::pd_remove_coroutine_stack(Thread* thread, address stack_base, size_t stack_size) {
++#ifndef AMD64
++  for (address p = stack_base - stack_size; p < stack_base; p += PAGE_SIZE) {
++    assert(thread == _sp_map[(uintptr_t)p >> PAGE_SHIFT],
++           "coroutine exited without detaching from VM??");
++    _sp_map[(uintptr_t)p >> PAGE_SHIFT] = NULL;
++  }
++#endif // !AMD64
++}
+diff --git a/src/os_cpu/linux_x86/vm/threadLS_linux_x86.cpp b/src/os_cpu/linux_x86/vm/threadLS_linux_x86.cpp
+--- a/src/os_cpu/linux_x86/vm/threadLS_linux_x86.cpp
++++ b/src/os_cpu/linux_x86/vm/threadLS_linux_x86.cpp
+@@ -90,3 +90,26 @@
+   }
+ #endif // !AMD64
+ }
++
++void ThreadLocalStorage::pd_add_coroutine_stack(Thread* thread, address stack_base, size_t stack_size) {
++#ifndef AMD64
++  for (address p = stack_base - stack_size; p < stack_base; p += PAGE_SIZE) {
++    assert(thread == NULL || _sp_map[(uintptr_t)p >> PAGE_SHIFT] == NULL ||
++           thread == _sp_map[(uintptr_t)p >> PAGE_SHIFT],
++           "coroutine exited without detaching from VM??");
++    _sp_map[(uintptr_t)p >> PAGE_SHIFT] = thread;
++  }
++#endif // !AMD64
++}
++
++
++void ThreadLocalStorage::pd_remove_coroutine_stack(Thread* thread, address stack_base, size_t stack_size) {
++#ifndef AMD64
++  for (address p = stack_base - stack_size; p < stack_base; p += PAGE_SIZE) {
++    assert(thread == _sp_map[(uintptr_t)p >> PAGE_SHIFT],
++           "coroutine exited without detaching from VM??");
++    _sp_map[(uintptr_t)p >> PAGE_SHIFT] = NULL;
++  }
++#endif // !AMD64
++}
++
+diff --git a/src/os_cpu/windows_x86/vm/threadLS_windows_x86.cpp b/src/os_cpu/windows_x86/vm/threadLS_windows_x86.cpp
+--- a/src/os_cpu/windows_x86/vm/threadLS_windows_x86.cpp
++++ b/src/os_cpu/windows_x86/vm/threadLS_windows_x86.cpp
+@@ -47,3 +47,12 @@
+ void ThreadLocalStorage::pd_set_thread(Thread* thread)  {
+   os::thread_local_storage_at_put(ThreadLocalStorage::thread_index(), thread);
+ }
++
++
++void ThreadLocalStorage::pd_add_coroutine_stack(Thread* thread, address stack_base, size_t stack_size) {
++  // nothing to do
++}
++
++void ThreadLocalStorage::pd_remove_coroutine_stack(Thread* thread, address stack_base, size_t stack_size) {
++  // nothing to do
++}
+diff --git a/src/share/vm/adlc/output_h.cpp b/src/share/vm/adlc/output_h.cpp
+--- a/src/share/vm/adlc/output_h.cpp
++++ b/src/share/vm/adlc/output_h.cpp
+@@ -1897,6 +1897,7 @@
+     else if (instr->is_tls_instruction()) {
+       // Special hack for tlsLoadP
+       fprintf(fp,"  const Type            *bottom_type() const { return TypeRawPtr::BOTTOM; } // tlsLoadP\n");
++      fprintf(fp,"  bool is_tlsLoadP() const { return true; } // tlsLoadP\n");
+     }
+     else if ( instr->is_ideal_if() ) {
+       fprintf(fp,"  const Type            *bottom_type() const { return TypeTuple::IFBOTH; } // matched IfNode\n");
+diff --git a/src/share/vm/classfile/javaClasses.cpp b/src/share/vm/classfile/javaClasses.cpp
+--- a/src/share/vm/classfile/javaClasses.cpp
++++ b/src/share/vm/classfile/javaClasses.cpp
+@@ -2778,6 +2778,99 @@
+   }
+ }
+ 
++/* stack manipulation */
++
++int java_dyn_CoroutineBase::data_offset = 0;
++int java_dyn_CoroutineBase::context_offset = 0;
++
++void java_dyn_CoroutineBase::compute_offsets() {
++  klassOop k = SystemDictionary::coroutine_base_klass();
++  if (k != NULL) {
++    compute_offset(data_offset,    k, vmSymbols::data_name(),    vmSymbols::long_signature());
++    compute_offset(context_offset, k, vmSymbols::context_name(), vmSymbols::object_signature());
++  }
++}
++
++jlong java_dyn_CoroutineBase::data(oop obj) {
++  return obj->long_field(data_offset);
++}
++
++void java_dyn_CoroutineBase::set_data(oop obj, jlong value) {
++  obj->long_field_put(data_offset, value);
++}
++
++oop java_dyn_CoroutineBase::context(oop obj) {
++  return obj->obj_field(context_offset);
++}
++
++void java_dyn_CoroutineBase::set_context(oop obj, oop value) {
++  obj->obj_field_put(context_offset, value);
++}
++
++
++int java_dyn_CoroutineFrame::method_offset = 0;
++int java_dyn_CoroutineFrame::bci_offset = 0;
++int java_dyn_CoroutineFrame::localCount_offset = 0;
++int java_dyn_CoroutineFrame::expressionCount_offset = 0;
++int java_dyn_CoroutineFrame::scalarValues_offset = 0;
++int java_dyn_CoroutineFrame::objectValues_offset = 0;
++
++
++void java_dyn_CoroutineFrame::compute_offsets() {
++  klassOop k = SystemDictionary::coroutine_frame_klass();
++  if (k != NULL) {
++    compute_offset(method_offset,           k, vmSymbols::method_name(),          vmSymbols::reflect_method_signature());
++    compute_offset(bci_offset,              k, vmSymbols::bci_name(),             vmSymbols::int_signature());
++    compute_offset(localCount_offset,       k, vmSymbols::localCount_name(),      vmSymbols::int_signature());
++    compute_offset(expressionCount_offset,  k, vmSymbols::expressionCount_name(), vmSymbols::int_signature());
++    compute_offset(scalarValues_offset,     k, vmSymbols::scalarValues_name(),    vmSymbols::long_array_signature());
++    compute_offset(objectValues_offset,     k, vmSymbols::objectValues_name(),    vmSymbols::object_array_signature());
++  }
++}
++
++oop java_dyn_CoroutineFrame::method(oop obj) {
++  return obj->obj_field(method_offset);
++}
++void java_dyn_CoroutineFrame::set_method(oop obj, oop value) {
++  obj->obj_field_put(method_offset, value);
++}
++
++jint java_dyn_CoroutineFrame::bci(oop obj) {
++  return obj->int_field(bci_offset);
++}
++void java_dyn_CoroutineFrame::set_bci(oop obj, jint value) {
++  obj->int_field_put(bci_offset, value);
++}
++
++jint java_dyn_CoroutineFrame::localCount(oop obj) {
++  return obj->int_field(localCount_offset);
++}
++void java_dyn_CoroutineFrame::set_localCount(oop obj, jint value) {
++  obj->int_field_put(localCount_offset, value);
++}
++
++jint java_dyn_CoroutineFrame::expressionCount(oop obj) {
++  return obj->int_field(expressionCount_offset);
++}
++void java_dyn_CoroutineFrame::set_expressionCount(oop obj, jint value) {
++  obj->int_field_put(expressionCount_offset, value);
++}
++
++typeArrayOop java_dyn_CoroutineFrame::scalarValues(oop obj) {
++  return (typeArrayOop)obj->obj_field(scalarValues_offset);
++}
++void java_dyn_CoroutineFrame::set_scalarValues(oop obj, typeArrayOop value) {
++  obj->obj_field_put(scalarValues_offset, value);
++}
++
++objArrayOop java_dyn_CoroutineFrame::objectValues(oop obj) {
++  return (objArrayOop)obj->obj_field(objectValues_offset);
++}
++void java_dyn_CoroutineFrame::set_objectValues(oop obj, objArrayOop value) {
++  obj->obj_field_put(objectValues_offset, value);
++}
++
++
+ void java_util_concurrent_locks_AbstractOwnableSynchronizer::initialize(TRAPS) {
+   if (_owner_offset != 0) return;
+ 
+@@ -2901,6 +2994,9 @@
+ 
+   // generated interpreter code wants to know about the offsets we just computed:
+   AbstractAssembler::update_delayed_values();
++
++  java_dyn_CoroutineBase::compute_offsets();
++  java_dyn_CoroutineFrame::compute_offsets();
+ }
+ 
+ #ifndef PRODUCT
+diff --git a/src/share/vm/classfile/javaClasses.hpp b/src/share/vm/classfile/javaClasses.hpp
+--- a/src/share/vm/classfile/javaClasses.hpp
++++ b/src/share/vm/classfile/javaClasses.hpp
+@@ -1269,6 +1269,68 @@
+   static oop  get_owner_threadObj(oop obj);
+ };
+ 
++class java_dyn_CoroutineBase: AllStatic {
++private:
++  // Note that to reduce dependencies on the JDK we compute these offsets at run-time.
++  static int data_offset;
++  static int context_offset;
++
++  static void compute_offsets();
++
++public:
++  // Accessors
++  static jlong data(oop obj);
++  static void set_data(oop obj, jlong value);
++
++  static oop context(oop obj);
++  static void set_context(oop obj, oop value);
++
++  static int get_data_offset()    { return data_offset; }
++  static int get_context_offset() { return context_offset; }
++
++  // Debugging
++  friend class JavaClasses;
++};
++
++class java_dyn_CoroutineFrame: AllStatic {
++private:
++  // Note that to reduce dependencies on the JDK we compute these offsets at run-time.
++  static int method_offset;
++  static int bci_offset;
++
++  static int localCount_offset;
++  static int expressionCount_offset;
++
++  static int scalarValues_offset;
++  static int objectValues_offset;
++
++  static void compute_offsets();
++
++public:
++  // Accessors
++  static oop method(oop obj);
++  static void set_method(oop obj, oop value);
++
++  static jint bci(oop obj);
++  static void set_bci(oop obj, jint value);
++
++  static jint localCount(oop obj);
++  static void set_localCount(oop obj, jint value);
++
++  static jint expressionCount(oop obj);
++  static void set_expressionCount(oop obj, jint value);
++
++  static typeArrayOop scalarValues(oop obj);
++  static void set_scalarValues(oop obj, typeArrayOop value);
++
++  static objArrayOop objectValues(oop obj);
++  static void set_objectValues(oop obj, objArrayOop value);
++
++  // Debugging
++  friend class JavaClasses;
++};
++
++
+ // Interface to hard-coded offset checking
+ 
+ class JavaClasses : AllStatic {
+diff --git a/src/share/vm/classfile/systemDictionary.hpp b/src/share/vm/classfile/systemDictionary.hpp
+--- a/src/share/vm/classfile/systemDictionary.hpp
++++ b/src/share/vm/classfile/systemDictionary.hpp
+@@ -181,6 +181,11 @@
+   template(Short_klass,                  java_lang_Short,                Pre) \
+   template(Integer_klass,                java_lang_Integer,              Pre) \
+   template(Long_klass,                   java_lang_Long,                 Pre) \
++                                                                              \
++  /* Stack manipulation classes */                                            \
++  template(coroutine_support_klass,      java_dyn_CoroutineSupport,      Opt) \
++  template(coroutine_base_klass,         java_dyn_CoroutineBase,         Opt) \
++  template(coroutine_frame_klass,        java_dyn_CoroutineFrame,        Opt) \
+   /*end*/
+ 
+ 
+diff --git a/src/share/vm/classfile/vmSymbols.hpp b/src/share/vm/classfile/vmSymbols.hpp
+--- a/src/share/vm/classfile/vmSymbols.hpp
++++ b/src/share/vm/classfile/vmSymbols.hpp
+@@ -374,6 +374,7 @@
+   template(void_float_signature,                      "()F")                                      \
+   template(void_double_signature,                     "()D")                                      \
+   template(int_void_signature,                        "(I)V")                                     \
++  template(long_void_signature,                       "(J)V")                                     \
+   template(int_int_signature,                         "(I)I")                                     \
+   template(char_char_signature,                       "(C)C")                                     \
+   template(short_short_signature,                     "(S)S")                                     \
+@@ -482,7 +483,7 @@
+   template(createGarbageCollectorMBean_signature,      "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/management/GarbageCollectorMBean;") \
+   template(trigger_name,                               "trigger")                                                 \
+   template(clear_name,                                 "clear")                                                   \
+-  template(trigger_method_signature,                   "(ILjava/lang/management/MemoryUsage;)V")                                                 \
++  template(trigger_method_signature,                   "(ILjava/lang/management/MemoryUsage;)V")                  \
+   template(startAgent_name,                            "startAgent")                                              \
+   template(java_lang_management_ThreadInfo_constructor_signature, "(Ljava/lang/Thread;ILjava/lang/Object;Ljava/lang/Thread;JJJJ[Ljava/lang/StackTraceElement;)V") \
+   template(java_lang_management_ThreadInfo_with_locks_constructor_signature, "(Ljava/lang/Thread;ILjava/lang/Object;Ljava/lang/Thread;JJJJ[Ljava/lang/StackTraceElement;[Ljava/lang/Object;[I[Ljava/lang/Object;)V") \
+@@ -500,7 +501,7 @@
+   template(addThreadDumpForMonitors_name,              "addThreadDumpForMonitors")                                \
+   template(addThreadDumpForSynchronizers_name,         "addThreadDumpForSynchronizers")                           \
+   template(addThreadDumpForMonitors_signature,         "(Ljava/lang/management/ThreadInfo;[Ljava/lang/Object;[I)V") \
+-  template(addThreadDumpForSynchronizers_signature,    "(Ljava/lang/management/ThreadInfo;[Ljava/lang/Object;)V")   \
++  template(addThreadDumpForSynchronizers_signature,    "(Ljava/lang/management/ThreadInfo;[Ljava/lang/Object;)V") \
+                                                                                                                   \
+   /* JVMTI/java.lang.instrument support and VM Attach mechanism */                                                \
+   template(sun_misc_VMSupport,                         "sun/misc/VMSupport")                                      \
+@@ -510,6 +511,26 @@
+   template(serializePropertiesToByteArray_signature,   "()[B")                                                    \
+   template(serializeAgentPropertiesToByteArray_name,   "serializeAgentPropertiesToByteArray")                     \
+   template(classRedefinedCount_name,                   "classRedefinedCount")                                     \
++                                                                                                                  \
++  /* coroutine support */                                                                                         \
++  template(java_dyn_CoroutineSupport,                  "java/dyn/CoroutineSupport")                               \
++  template(java_dyn_CoroutineBase,                     "java/dyn/CoroutineBase")                                  \
++  template(java_dyn_CoroutineFrame,                    "java/dyn/CoroutineFrame")                                 \
++  template(java_dyn_CoroutineExitException,            "java/dyn/CoroutineExitException")                         \
++  template(data_name,                                  "data")                                                    \
++  template(stack_name,                                 "stack")                                                   \
++  template(current_name,                               "current")                                                 \
++  template(java_dyn_CoroutineBase_signature,           "Ljava/dyn/CoroutineBase;")                                \
++  template(reflect_method_signature,                   "Ljava/lang/reflect/Method;")                              \
++  template(startInternal_method_name,                  "startInternal")                                           \
++  template(method_name,                                "method")                                                  \
++  template(bci_name,                                   "bci")                                                     \
++  template(localCount_name,                            "localCount")                                              \
++  template(expressionCount_name,                       "expressionCount")                                         \
++  template(scalarValues_name,                          "scalarValues")                                            \
++  template(objectValues_name,                          "objectValues")                                            \
++  template(long_array_signature,                       "[J")                                                      \
++  template(object_array_signature,                     "[Ljava/lang/Object;")                                     \
+   /*end*/
+ 
+ 
+@@ -850,9 +871,22 @@
+    do_name(     prefetchReadStatic_name,                         "prefetchReadStatic")                                  \
+   do_intrinsic(_prefetchWriteStatic,      sun_misc_Unsafe,        prefetchWriteStatic_name, prefetch_signature,  F_SN)  \
+    do_name(     prefetchWriteStatic_name,                        "prefetchWriteStatic")                                 \
++                                                                                                                        \
+     /*== LAST_COMPILER_INLINE*/                                                                                         \
+     /*the compiler does have special inlining code for these; bytecode inline is just fine */                           \
+                                                                                                                         \
++  /* coroutine intrinsics */                                                                                            \
++  do_intrinsic(_prepareSwitch,            java_dyn_CoroutineSupport, prepareSwitch_name, prepareSwitch_signature, F_SN) \
++   do_name(     prepareSwitch_name,                               "prepareSwitch")                                      \
++   do_signature(prepareSwitch_signature,                          "(Ljava/dyn/CoroutineBase;)V")                        \
++  do_intrinsic(_switchTo,                 java_dyn_CoroutineSupport, switchTo_name, switchTo_signature, F_SN)           \
++   do_name(     switchTo_name,                                    "switchTo")                                           \
++   do_signature(switchTo_signature,                               "(Ljava/dyn/CoroutineBase;Ljava/dyn/CoroutineBase;)V") \
++  do_intrinsic(_switchToAndTerminate,     java_dyn_CoroutineSupport, switchToAndTerminate_name, switchTo_signature, F_SN) \
++   do_name(     switchToAndTerminate_name,                        "switchToAndTerminate")                               \
++  do_intrinsic(_switchToAndExit,          java_dyn_CoroutineSupport, switchToAndExit_name, switchTo_signature, F_SN)    \
++   do_name(     switchToAndExit_name,                             "switchToAndExit")                                    \
++                                                                                                                        \
+   do_intrinsic(_fillInStackTrace,         java_lang_Throwable, fillInStackTrace_name, void_throwable_signature,  F_RNY) \
+                                                                                                                           \
+   do_intrinsic(_StringBuilder_void,   java_lang_StringBuilder, object_initializer_name, void_method_signature,     F_R)   \
+diff --git a/src/share/vm/compiler/oopMap.cpp b/src/share/vm/compiler/oopMap.cpp
+--- a/src/share/vm/compiler/oopMap.cpp
++++ b/src/share/vm/compiler/oopMap.cpp
+@@ -200,6 +200,13 @@
+   }
+ }
+ 
++
++void OopMap::set_thread_ptr(VMReg reg) {
++  set_xxx(reg, OopMapValue::thread_ptr_value, VMRegImpl::Bad());
++}
++
++
++
+ // OopMapSet
+ 
+ OopMapSet::OopMapSet() {
+@@ -555,6 +562,9 @@
+     st->print("Derived_oop_" );
+     optional->print_on(st);
+     break;
++  case OopMapValue::thread_ptr_value:
++    st->print("ThreadPtr");
++    break;
+   default:
+     ShouldNotReachHere();
+   }
+diff --git a/src/share/vm/compiler/oopMap.hpp b/src/share/vm/compiler/oopMap.hpp
+--- a/src/share/vm/compiler/oopMap.hpp
++++ b/src/share/vm/compiler/oopMap.hpp
+@@ -37,6 +37,7 @@
+ //   Dead        - Dead; can be Zapped for debugging
+ //   CalleeXX    - Callee saved; also describes which caller register is saved
+ //   DerivedXX   - A derived oop; original oop is described.
++//   ThreadPtr   - A current thread pointer
+ //
+ // OopMapValue describes a single OopMap entry
+ 
+@@ -54,7 +55,7 @@
+ 
+ public:
+   // Constants
+-  enum { type_bits                = 5,
++  enum { type_bits                = 6,
+          register_bits            = BitsPerShort - type_bits };
+ 
+   enum { type_shift               = 0,
+@@ -71,7 +72,8 @@
+          value_value = 2,
+          narrowoop_value = 4,
+          callee_saved_value = 8,
+-         derived_oop_value= 16 };
++         derived_oop_value= 16,
++         thread_ptr_value = 32};
+ 
+   // Constructors
+   OopMapValue () { set_value(0); set_content_reg(VMRegImpl::Bad()); }
+@@ -100,12 +102,14 @@
+   bool is_narrowoop()           { return mask_bits(value(), type_mask_in_place) == narrowoop_value; }
+   bool is_callee_saved()      { return mask_bits(value(), type_mask_in_place) == callee_saved_value; }
+   bool is_derived_oop()       { return mask_bits(value(), type_mask_in_place) == derived_oop_value; }
++  bool is_thread_ptr()        { return mask_bits(value(), type_mask_in_place) == thread_ptr_value; }
+ 
+   void set_oop()              { set_value((value() & register_mask_in_place) | oop_value); }
+   void set_value()            { set_value((value() & register_mask_in_place) | value_value); }
+   void set_narrowoop()          { set_value((value() & register_mask_in_place) | narrowoop_value); }
+   void set_callee_saved()     { set_value((value() & register_mask_in_place) | callee_saved_value); }
+   void set_derived_oop()      { set_value((value() & register_mask_in_place) | derived_oop_value); }
++  void set_thread_ptr()       { set_value((value() & register_mask_in_place) | thread_ptr_value); }
+ 
+   VMReg reg() const { return VMRegImpl::as_VMReg(mask_bits(value(), register_mask_in_place) >> register_shift); }
+   oop_types type() const      { return (oop_types)mask_bits(value(), type_mask_in_place); }
+@@ -185,6 +189,7 @@
+   void set_dead ( VMReg local);
+   void set_callee_saved( VMReg local, VMReg caller_machine_register );
+   void set_derived_oop ( VMReg local, VMReg derived_from_local_register );
++  void set_thread_ptr  ( VMReg local);
+   void set_xxx(VMReg reg, OopMapValue::oop_types x, VMReg optional);
+ 
+   int heap_size() const;
+diff --git a/src/share/vm/interpreter/interpreterRuntime.cpp b/src/share/vm/interpreter/interpreterRuntime.cpp
+--- a/src/share/vm/interpreter/interpreterRuntime.cpp
++++ b/src/share/vm/interpreter/interpreterRuntime.cpp
+@@ -894,6 +894,7 @@
+   assert(fr.is_interpreted_frame(), "must come from interpreter");
+   methodHandle method(thread, fr.interpreter_frame_method());
+   int bci = method->bci_from(cur_bcp);
++  assert(method() == fr.interpreter_frame_method(), "what?");
+   methodOopDesc::build_interpreter_method_data(method, THREAD);
+   if (HAS_PENDING_EXCEPTION) {
+     assert((PENDING_EXCEPTION->is_a(SystemDictionary::OutOfMemoryError_klass())), "we expect only an OOM error here");
+diff --git a/src/share/vm/oops/methodOop.cpp b/src/share/vm/oops/methodOop.cpp
+--- a/src/share/vm/oops/methodOop.cpp
++++ b/src/share/vm/oops/methodOop.cpp
+@@ -168,7 +168,8 @@
+ #ifdef ASSERT
+   bool has_capability = myThread->is_VM_thread() ||
+                         myThread->is_ConcurrentGC_thread() ||
+-                        myThread->is_GC_task_thread();
++                        myThread->is_GC_task_thread() ||
++                        (myThread->is_Java_thread() && ((JavaThread*)myThread)->thread_state() == _thread_in_vm);
+ 
+   if (!has_capability) {
+     if (!VerifyStack && !VerifyLastFrame) {
+diff --git a/src/share/vm/opto/buildOopMap.cpp b/src/share/vm/opto/buildOopMap.cpp
+--- a/src/share/vm/opto/buildOopMap.cpp
++++ b/src/share/vm/opto/buildOopMap.cpp
+@@ -364,15 +364,72 @@
+       }
+ 
+     } else {
+-      // Other - some reaching non-oop value
+-      omap->set_value( r);
++      bool is_thread_ptr = false;
++      if (def->bottom_type() == TypeRawPtr::BOTTOM) {
++        // Peek through copies
+ #ifdef ASSERT
+-      if( t->isa_rawptr() && C->cfg()->_raw_oops.member(def) ) {
+-        def->dump();
+-        n->dump();
+-        assert(false, "there should be a oop in OopMap instead of a live raw oop at safepoint");
++        bool is_not_thread_ptr = false;
++#endif
++        Unique_Node_List worklist;
++        Unique_Node_List visited;
++        worklist.push(def);
++        while (worklist.size() > 0) {
++          Node* n = worklist.pop();
++          if (visited.member(n)) {
++            continue;
++          }
++          visited.push(n);
++
++          if (n->is_Mach() && n->as_Mach()->is_tlsLoadP()) {
++            is_thread_ptr = true;
++#ifdef ASSERT
++            continue;
++#else
++            break;
++#endif
++          }
++
++          uint copy_in_idx = n->is_Copy();
++          if (copy_in_idx != 0) {
++            Node* copy_in = n->in(copy_in_idx);
++            worklist.push(copy_in);
++            continue;
++          }
++
++          if (n->is_Phi()) {
++            PhiNode* phi = n->as_Phi();
++            for (uint i = 1; i < phi->req(); ++i) {
++              worklist.push(phi->in(i));
++            }
++            continue;
++          }
++#ifdef ASSERT
++          is_not_thread_ptr = true;
++#else
++          break;
++#endif
++        }
++#ifdef ASSERT
++        // To conservatively check for an accidental mixup of a
++        // thread pointer and a non-thread-pointer in the compiler.
++        assert(is_thread_ptr ^ is_not_thread_ptr, "thread pointer and non-thread-pointer mixed up");
++#endif
++        if (is_thread_ptr) {
++          assert(r->is_reg() || r->is_stack(), "thread pointer not in a reg or stack");
++          omap->set_thread_ptr(r);
++        }
+       }
++      if (!is_thread_ptr) {
++        // Other - some reaching non-oop value
++        omap->set_value( r);
++#ifdef ASSERT
++        if( t->isa_rawptr() && C->cfg()->_raw_oops.member(def) ) {
++          def->dump();
++          n->dump();
++          assert(false, "there should be a oop in OopMap instead of a live raw oop at safepoint");
++        }
+ #endif
++      }
+     }
+ 
+   }
+diff --git a/src/share/vm/opto/machnode.hpp b/src/share/vm/opto/machnode.hpp
+--- a/src/share/vm/opto/machnode.hpp
++++ b/src/share/vm/opto/machnode.hpp
+@@ -244,6 +244,12 @@
+   virtual const class Type *bottom_type() const { return _opnds[0]->type(); }
+   virtual uint ideal_reg() const { const Type *t = _opnds[0]->type(); return t == TypeInt::CC ? Op_RegFlags : Matcher::base2reg[t->base()]; }
+ 
++  // tlsLoadP is the mach node that represents the (current) thread
++  // pointer. Returns true iff this node is a tlsLoadP node. Used to
++  // compute the locations of the thread pointer in the compiled code
++  // as part of the oopmap.
++  virtual bool is_tlsLoadP() const { return false; }
++
+   // If this is a memory op, return the base pointer and fixed offset.
+   // If there are no such, return NULL.  If there are multiple addresses
+   // or the address is indeterminate (rare cases) then return (Node*)-1,
+diff --git a/src/share/vm/prims/jni.cpp b/src/share/vm/prims/jni.cpp
+--- a/src/share/vm/prims/jni.cpp
++++ b/src/share/vm/prims/jni.cpp
+@@ -3468,7 +3468,7 @@
+   thread->set_thread_state(_thread_in_vm);
+   // Must do this before initialize_thread_local_storage
+   thread->record_stack_base_and_size();
+-
++  thread->initialize_coroutine_support();
+   thread->initialize_thread_local_storage();
+ 
+   if (!os::create_attached_thread(thread)) {
+diff --git a/src/share/vm/prims/nativeLookup.cpp b/src/share/vm/prims/nativeLookup.cpp
+--- a/src/share/vm/prims/nativeLookup.cpp
++++ b/src/share/vm/prims/nativeLookup.cpp
+@@ -105,6 +105,7 @@
+ }
+ 
+ extern "C" {
++  void JNICALL JVM_RegisterCoroutineSupportMethods(JNIEnv* env, jclass corocls);
+   void JNICALL JVM_RegisterUnsafeMethods(JNIEnv *env, jclass unsafecls);
+   void JNICALL JVM_RegisterMethodHandleMethods(JNIEnv *env, jclass unsafecls);
+   void JNICALL JVM_RegisterPerfMethods(JNIEnv *env, jclass perfclass);
+@@ -123,6 +124,9 @@
+       return CAST_FROM_FN_PTR(address, JVM_SetPrimitiveFieldValues);
+     }
+   }
++  if (strstr(jni_name, "Java_java_dyn_CoroutineSupport_registerNatives") != NULL) {
++    return CAST_FROM_FN_PTR(address, JVM_RegisterCoroutineSupportMethods);
++  }
+   if (strstr(jni_name, "Java_sun_misc_Unsafe_registerNatives") != NULL) {
+     return CAST_FROM_FN_PTR(address, JVM_RegisterUnsafeMethods);
+   }
+diff --git a/src/share/vm/prims/unsafe.cpp b/src/share/vm/prims/unsafe.cpp
+--- a/src/share/vm/prims/unsafe.cpp
++++ b/src/share/vm/prims/unsafe.cpp
+@@ -27,6 +27,7 @@
+ #include "memory/allocation.inline.hpp"
+ #include "prims/jni.h"
+ #include "prims/jvm.h"
++#include "runtime/coroutine.hpp"
+ #include "runtime/globals.hpp"
+ #include "runtime/interfaceSupport.hpp"
+ #include "runtime/reflection.hpp"
+@@ -1180,6 +1181,405 @@
+   Prefetch::write(addr, (intx)offset);
+ UNSAFE_END
+ 
++jlong CoroutineSupport_getThreadCoroutine(JNIEnv* env, jclass klass) {
++  DEBUG_CORO_PRINT("CoroutineSupport_getThreadCoroutine\n");
++
++  JavaThread* THREAD = JavaThread::thread_from_jni_environment(env);
++  Coroutine* list = THREAD->coroutine_list();
++  assert(list != NULL, "thread isn't initialized for coroutines");
++
++  return (jlong)list;
++}
++
++jlong CoroutineSupport_createCoroutineStack(JNIEnv* env, jclass klass, jlong stack_size) {
++  DEBUG_CORO_PRINT("CoroutineSupport_createCoroutineStack\n");
++
++  JavaThread* THREAD = JavaThread::thread_from_jni_environment(env);
++  CoroutineStack* list = THREAD->coroutine_stack_list();
++  assert(list != NULL, "thread isn't initialized for coroutines");
++
++  if (stack_size == 0 || stack_size < -1) {
++    ThreadInVMfromNative tivm(THREAD);
++    THROW_MSG_0(vmSymbols::java_lang_IllegalArgumentException(), "invalid stack size");
++  }
++
++  CoroutineStack* stack = CoroutineStack::create_stack(THREAD, stack_size);
++  if (stack == NULL) {
++    ThreadInVMfromNative tivm(THREAD);
++    THROW_0(vmSymbols::java_lang_OutOfMemoryError());
++  }
++  ThreadLocalStorage::add_coroutine_stack(THREAD, stack->stack_base(), stack->stack_size());
++  stack->insert_into_list(list);
++  return (jlong)stack;
++}
++
++void CoroutineSupport_freeCoroutineStack(JNIEnv* env, jclass klass, jlong stackLong) {
++#ifdef DEBUG_COROUTINES
++  tty->print("CoroutineSupport_freeCoroutineStack\n");
++#endif
++  assert(stackLong != 0, "cannot free NULL stack");
++  JavaThread* THREAD = JavaThread::thread_from_jni_environment(env);
++  {
++    ThreadInVMfromNative tivm(THREAD);
++    CoroutineStack* stack = (CoroutineStack*)stackLong;
++    assert(!stack->is_thread_stack(), "cannot free thread stack");
++    stack->remove_from_list(THREAD->coroutine_stack_list());
++    ThreadLocalStorage::remove_coroutine_stack(THREAD, stack->stack_base(), stack->stack_size());
++    CoroutineStack::free_stack(stack);
++  }
++}
++
++void CoroutineSupport_prepareSwitch(JNIEnv* env, jclass klass, jobject target_coroutine) {
++  JavaThread* THREAD = JavaThread::thread_from_jni_environment(env);
++
++  assert(target_coroutine != NULL, "NULL Java Coroutine in prepareSwitch");
++  Coroutine* coro = (Coroutine*)java_dyn_CoroutineBase::data(JNIHandles::resolve(target_coroutine));
++  if (coro == NULL) {
++    ThreadInVMfromNative tivm(THREAD);
++    THROW_MSG(vmSymbols::java_lang_IllegalArgumentException(), "coroutine has already ended");
++  }
++
++  assert(coro->stack() != NULL, "NULL stack in prepareSwitch");
++  Coroutine* current = coro->stack()->current_coroutine();
++  assert(current != NULL, "NULL current coroutine in prepareSwitch");
++
++  switch(current->state()) {
++    case Coroutine::_current:
++      {
++        intptr_t t = 0;
++        intptr_t size = (intptr_t*)current->stack()->stack_base() - &t;
++        CoroutineData* new_data = CoroutineData::create_data((size + COROUTINE_DATA_OVERSIZE) * 2);
++        if (new_data == NULL) {
++          ThreadInVMfromNative tivm(THREAD);
++          THROW_MSG(vmSymbols::java_lang_OutOfMemoryError(), "cannot create CoroutineData object");
++        }
++        CoroutineData::free_data(current->data());
++        current->set_data(new_data);
++        break;
++      }
++    case Coroutine::_onstack:
++      {
++        intptr_t size = (intptr_t*)current->stack()->stack_base() - (intptr_t*)current->stack()->last_sp();
++        CoroutineData* new_data = CoroutineData::create_data((size + COROUTINE_DATA_OVERSIZE) * 2);
++        if (new_data == NULL) {
++          ThreadInVMfromNative tivm(THREAD);
++          THROW_MSG(vmSymbols::java_lang_OutOfMemoryError(), "cannot create CoroutineData object");
++        }
++        CoroutineData::free_data(current->data());
++        current->set_data(new_data);
++        break;
++      }
++      break;
++    default:
++      ShouldNotReachHere();
++      break;
++  }
++}
++
++void CoroutineSupport_switchTo(JNIEnv* env, jclass klass, jobject old_coroutine, jobject target_coroutine) {
++  ShouldNotReachHere();
++}
++
++void CoroutineSupport_switchToAndTerminate(JNIEnv* env, jclass klass, jobject old_coroutine, jobject target_coroutine) {
++  JavaThread* THREAD = JavaThread::thread_from_jni_environment(env);
++
++  assert(old_coroutine != NULL, "NULL old CoroutineBase in switchToAndTerminate");
++  assert(target_coroutine == NULL, "expecting NULL");
++
++  oop old_oop = JNIHandles::resolve(old_coroutine);
++  Coroutine* coro = (Coroutine*)java_dyn_CoroutineBase::data(old_oop);
++  assert(coro != NULL, "NULL old coroutine in switchToAndTerminate");
++
++  java_dyn_CoroutineBase::set_data(old_oop, 0);
++
++  {
++    ThreadCoroutineListGuard guard(THREAD);
++    coro->remove_from_list(guard.get());
++  }
++  Coroutine::free_coroutine(coro);
++}
++
++void CoroutineSupport_switchToAndExit(JNIEnv* env, jclass klass, jobject old_coroutine, jobject target_coroutine) {
++  JavaThread* THREAD = JavaThread::thread_from_jni_environment(env);
++
++  {
++    ThreadInVMfromNative tivm(THREAD);
++    HandleMark mark(THREAD);
++    THROW(vmSymbols::java_dyn_CoroutineExitException());
++  }
++}
++
++jlong CoroutineSupport_createCoroutine(JNIEnv* env, jclass klass, jobject coroutine, jlong stack) {
++  DEBUG_CORO_PRINT("CoroutineSupport_createCoroutine\n");
++
++  JavaThread* THREAD = JavaThread::thread_from_jni_environment(env);
++
++  ThreadInVMfromNative tivm(THREAD);
++  assert(coroutine != NULL, "cannot create coroutine with NULL Coroutine object");
++  assert(stack != 0, "cannot create coroutine with NULL stack");
++
++  Coroutine* coro = Coroutine::create_coroutine(THREAD, (CoroutineStack*)stack, JNIHandles::resolve(coroutine));
++  if (coro == NULL) {
++    ThreadInVMfromNative tivm(THREAD);
++    HandleMark mark(THREAD);
++    THROW_0(vmSymbols::java_lang_OutOfMemoryError());
++  }
++  {
++    ThreadCoroutineListGuard guard(THREAD);
++    coro->insert_into_list(guard.get());
++  }
++  return (jlong)coro;
++}
++
++void CoroutineSupport_freeCoroutine(JNIEnv* env, jclass klass, jlong coroutineLong) {
++  DEBUG_CORO_PRINT("CoroutineSupport_terminateCoroutine\n");
++
++  JavaThread* THREAD = JavaThread::thread_from_jni_environment(env);
++  Coroutine* coro = (Coroutine*)coroutineLong;
++  assert(coro != NULL, "cannot free NULL coroutine");
++  assert(!coro->is_thread_coroutine(), "cannot free thread coroutine");
++  assert(coro->thread() == THREAD, "cannot free coroutine belonging to another thread");
++
++  if (coro->stack()->current_coroutine() == coro) {
++    coro->stack()->set_current_coroutine(NULL);
++  }
++  {
++    ThreadCoroutineListGuard guard(THREAD);
++    coro->remove_from_list(guard.get());
++  }
++  Coroutine::free_coroutine(coro);
++}
++
++jboolean CoroutineSupport_isDisposable(JNIEnv* env, jclass klass, jlong coroutineLong) {
++  DEBUG_CORO_PRINT("CoroutineSupport_isDisposable\n");
++
++  JavaThread* THREAD = JavaThread::thread_from_jni_environment(env);
++  Coroutine* coro = (Coroutine*)coroutineLong;
++  assert(coro != NULL, "cannot free NULL coroutine");
++  assert(!coro->is_thread_coroutine(), "cannot free thread coroutine");
++
++  return coro->is_disposable();
++}
++
++jobject CoroutineSupport_cleanupCoroutine(JNIEnv* env, jclass klass) {
++  DEBUG_CORO_PRINT("CoroutineSupport_cleanupCoroutine\n");
++
++  JavaThread* THREAD = JavaThread::thread_from_jni_environment(env);
++  // TODO: implementation needed...
++
++  return NULL;
++}
++
++
++jboolean CoroutineSupport_stealCoroutineData(JNIEnv* env, jclass klass, jlong coroutine, jlong newStackId, jobject threadObj, jobject coroutineSupport) {
++  DEBUG_CORO_PRINT("CoroutineSupport_stealCoroutineData\n");
++  JavaThread* THREAD = JavaThread::thread_from_jni_environment(env);
++  Coroutine* coro = (Coroutine*)coroutine;
++  CoroutineStack* newStack = (CoroutineStack*)newStackId;
++
++  CoroutineStack* stack = coro->stack();
++  if (coro->state() == Coroutine::_onstack) {
++    assert(coro->stack()->current_coroutine() == coro, "unexpected coroutine state");
++    while( Atomic::cmpxchg(1, stack->locked_ptr(), 0) != 0) {
++      if (stack->current_coroutine() != coro) {
++        assert(coro->state() == Coroutine::_stored, "unexpected coroutine state");
++        break;
++      }
++    }
++    assert(stack->current_coroutine() == coro, "unexpected coroutine state");
++
++    intptr_t size = (address)stack->stack_base() - (address)stack->last_sp();
++    assert((size % HeapWordSize) == 0, "misaligned stack data size");
++    size = size / HeapWordSize;
++
++    if (coro->data()->capacity() < size) {
++      CoroutineData* new_data = CoroutineData::create_data((size + COROUTINE_DATA_OVERSIZE) * 2);
++      if (new_data == NULL) {
++        ThreadInVMfromNative tivm(THREAD);
++        THROW_MSG_0(vmSymbols::java_lang_OutOfMemoryError(), "cannot create CoroutineData object");
++      }
++      CoroutineData::free_data(coro->data());
++      coro->set_data(new_data);
++    }
++    memcpy(coro->data()->data() + coro->data()->capacity() - size, stack->last_sp(), size * HeapWordSize);
++    coro->data()->set_size(size);
++    coro->set_state(Coroutine::_stored);
++    stack->set_current_coroutine(NULL);
++
++    stack->unlock();
++  }
++  assert(coro->state() == Coroutine::_stored, "unexpected coroutine state");
++  coro->migrate_to_stack(newStack, coroutineSupport);
++
++  {
++    JavaThread* other_thread = java_lang_Thread::thread(JNIHandles::resolve(threadObj));
++    ThreadCoroutineListGuard guard(other_thread);
++    coro->remove_from_list(guard.get());
++  }
++  {
++    ThreadCoroutineListGuard guard(THREAD);
++    coro->insert_into_list(guard.get());
++    coro->set_thread(THREAD);
++  }
++  return true;
++}
++
++jobject serialize_frames(JNIEnv* env, Coroutine* coro, frame fr, RegisterMap& map, TRAPS) {
++  if (fr.sp() == NULL) {
++    DEBUG_CORO_PRINT("empty coroutine");
++    return NULL;
++  }
++
++  ThreadInVMfromNative tivm((JavaThread*)THREAD);
++  ResourceMark mark;
++  HandleMark hmark;
++
++  GrowableArray<Handle> frames;
++
++  int callee_params = 0;
++
++  vframe* frame = vframe::new_vframe(&fr, &map, coro->thread());
++  for (; frame != NULL && !frame->is_entry_frame(); frame = frame->sender()) {
++    if (frame->is_java_frame()) {
++      DEBUG_CORO_PRINT("java frame");
++      javaVFrame* jframe = (javaVFrame*)frame;/*
++      if (jframe->method()->method_holder() == SystemDictionary::coroutine_base_klass()) {
++        tty->print_cr("skipped coroutine_base method");
++      } else*/ if (jframe->method()->method_holder() == SystemDictionary::coroutine_support_klass()) {
++        DEBUG_CORO_PRINT("skipped coroutine_support method");
++        callee_params = jframe->method()->size_of_parameters();
++      } else {
++
++        jint bci = jframe->bci();
++        StackValueCollection* locals = jframe->locals();
++        StackValueCollection* expressions = jframe->expressions();
++        GrowableArray<MonitorInfo*>* monitors = jframe->monitors();
++
++        jint localCount = locals->size();
++        assert(expressions->size() >= callee_params, "unexpected expression count");
++        jint expressionCount = expressions->size() - callee_params;
++        jint monitorCount = monitors->length();
++
++        if (monitorCount > 0) {
++          THROW_MSG_NULL(vmSymbols::java_lang_IllegalArgumentException(), "cannot serialize coroutine with synchronized blocks or methods");
++        }
++
++        DEBUG_CORO_ONLY(tty->print_cr("%s(%i) %i %i %i", jframe->method()->name_and_sig_as_C_string(), bci, localCount, expressionCount, monitorCount));
++
++        Handle reflection_method;
++        if (jframe->method()->is_initializer()) {
++          reflection_method = Reflection::new_constructor(jframe->method(), CHECK_NULL);
++        } else {
++          reflection_method = Reflection::new_method(jframe->method(), UseNewReflection, false, CHECK_NULL);
++        }
++        typeArrayHandle scalarValues = oopFactory::new_longArray(localCount + expressionCount, CHECK_NULL);
++        objArrayHandle objectValues = oopFactory::new_objectArray(localCount + expressionCount + monitorCount, CHECK_NULL);
++
++        instanceKlass::cast(SystemDictionary::coroutine_frame_klass())->initialize(CHECK_NULL);
++        instanceHandle frameObj = instanceKlass::cast(SystemDictionary::coroutine_frame_klass())->allocate_instance(CHECK_NULL);
++
++        java_dyn_CoroutineFrame::set_method(frameObj(), reflection_method());
++        java_dyn_CoroutineFrame::set_bci(frameObj(), bci);
++        java_dyn_CoroutineFrame::set_localCount(frameObj(), localCount);
++        java_dyn_CoroutineFrame::set_expressionCount(frameObj(), expressionCount);
++        java_dyn_CoroutineFrame::set_scalarValues(frameObj(), scalarValues());
++        java_dyn_CoroutineFrame::set_objectValues(frameObj(), objectValues());
++
++        frames.append(frameObj);
++
++
++        for (int i=0; i<localCount + expressionCount; i++) {
++          StackValue* value;
++          if (i < localCount)
++            value = locals->at(i);
++          else
++            value = expressions->at(i - localCount);
++
++          switch (value->type()) {
++          case T_INT:
++            scalarValues->long_at_put(i, value->get_int());
++            objectValues->obj_at_put(i, NULL);
++            break;
++          case T_OBJECT:
++            scalarValues->long_at_put(i, 0);
++            objectValues->obj_at_put(i, value->get_obj()());
++            break;
++          case T_CONFLICT:
++            scalarValues->long_at_put(i, 0);
++            objectValues->obj_at_put(i, NULL);
++            break;
++          default:
++            ShouldNotReachHere();
++            break;
++          }
++        }
++        callee_params = jframe->method()->size_of_parameters();
++      }
++    } else {
++      THROW_MSG_NULL(vmSymbols::java_lang_IllegalArgumentException(), "cannot serialize coroutine with non-java frames");
++    }
++  }
++
++  objArrayOop array = instanceKlass::cast(SystemDictionary::coroutine_frame_klass())->allocate_objArray(1, frames.length(), CHECK_NULL);
++  for (int i=0; i<frames.length(); i++) {
++    array->obj_at_put(frames.length() - 1 - i, frames.at(i)());
++  }
++
++  return JNIHandles::make_local(array);
++}
++
++jobject CoroutineSupport_serializeCoroutineData(JNIEnv* env, jclass klass, jlong coroutine) {
++  DEBUG_CORO_PRINT("CoroutineSupport_serializeCoroutineData\n");
++  JavaThread* THREAD = JavaThread::thread_from_jni_environment(env);
++  Coroutine* coro = (Coroutine*)coroutine;
++
++  RegisterMap map(coro->thread());
++
++  CoroutineStack* stack = coro->stack();
++  if (coro->state() == Coroutine::_onstack) {
++    assert(coro->stack()->current_coroutine() == coro, "unexpected coroutine state");
++    while( Atomic::cmpxchg(1, stack->locked_ptr(), 0) != 0) {
++      if (stack->current_coroutine() != coro) {
++        assert(coro->state() == Coroutine::_stored, "unexpected coroutine state");
++        return serialize_frames(env, coro, coro->data()->last_frame(coro, map), map, THREAD);
++      }
++    }
++    jobject frames = serialize_frames(env, coro, stack->last_frame(coro, map), map, THREAD);
++    stack->unlock();
++    return frames;
++  }
++  return serialize_frames(env, coro, coro->data()->last_frame(coro, map), map, THREAD);
++}
++
++void CoroutineSupport_replaceCoroutineData(JNIEnv* env, jclass klass, jlong coroutine, jobject frames) {
++  DEBUG_CORO_PRINT("CoroutineSupport_serializeCoroutineData\n");
++  JavaThread* THREAD = JavaThread::thread_from_jni_environment(env);
++
++  if (frames == NULL) {
++    THROW(vmSymbols::java_lang_NullPointerException());
++  }
++  methodOop m;
++
++  Coroutine* coro = (Coroutine*)coroutine;
++
++  CoroutineData* new_data = CoroutineData::create_data(objArrayHandle((objArrayOop)JNIHandles::resolve(frames)), coro->stack()->stack_base(), coro->thread(), CHECK);
++
++  CoroutineStack* stack = coro->stack();
++  if (coro->state() == Coroutine::_onstack) {
++    stack->set_current_coroutine(NULL);
++    coro->set_state(Coroutine::_stored);
++  }
++  assert(coro->state() == Coroutine::_stored, "unexpected coroutine state");
++
++  CoroutineData::free_data(coro->data());
++  coro->set_handle_area(new HandleArea(NULL, 64));
++  coro->set_resource_area(new ResourceArea(64));
++  coro->set_last_handle_mark(new HandleMark(coro->thread(), coro->handle_area(), NULL));
++  coro->set_data(new_data);
++
++}
++
++
+ 
+ /// JVM_RegisterUnsafeMethods
+ 
+@@ -1475,6 +1875,33 @@
+     {CC"defineAnonymousClass", CC"("DAC_Args")"CLS,      FN_PTR(Unsafe_DefineAnonymousClass)},
+ };
+ 
++#define COBA "Ljava/dyn/CoroutineBase;"
++#define COSU "Ljava/dyn/CoroutineSupport;"
++#define COFR "Ljava/dyn/CoroutineFrame;"
++#define THRE "Ljava/lang/Thread;"
++
++JNINativeMethod coroutine_support_methods[] = {
++    {CC"getThreadCoroutine",      CC"()J",            FN_PTR(CoroutineSupport_getThreadCoroutine)},
++    {CC"createCoroutineStack",    CC"(J)J",           FN_PTR(CoroutineSupport_createCoroutineStack)},
++    {CC"freeCoroutineStack",      CC"(J)V",           FN_PTR(CoroutineSupport_freeCoroutineStack)},
++    {CC"createCoroutine",         CC"("COBA"J)J",     FN_PTR(CoroutineSupport_createCoroutine)},
++    {CC"replaceCoroutineData",    CC"(J["COFR")V",    FN_PTR(CoroutineSupport_replaceCoroutineData)},
++    {CC"freeCoroutine",           CC"(J)V",           FN_PTR(CoroutineSupport_freeCoroutine)},
++    {CC"isDisposable",            CC"(J)Z",           FN_PTR(CoroutineSupport_isDisposable)},
++    {CC"prepareSwitch",           CC"("COBA")V",      FN_PTR(CoroutineSupport_prepareSwitch)},
++    {CC"switchTo",                CC"("COBA COBA")V", FN_PTR(CoroutineSupport_switchTo)},
++    {CC"switchToAndTerminate",    CC"("COBA COBA")V", FN_PTR(CoroutineSupport_switchToAndTerminate)},
++    {CC"switchToAndExit",         CC"("COBA COBA")V", FN_PTR(CoroutineSupport_switchToAndExit)},
++    {CC"cleanupCoroutine",        CC"()"COBA,         FN_PTR(CoroutineSupport_cleanupCoroutine)},
++    {CC"stealCoroutineData",      CC"(JJ"THRE COSU")Z", FN_PTR(CoroutineSupport_stealCoroutineData)},
++    {CC"serializeCoroutineData",  CC"(J)["COFR,       FN_PTR(CoroutineSupport_serializeCoroutineData)}
++};
++
++#define COMPILE_CORO_METHODS_FROM (6)
++
++#undef THRE
++#undef COBA
++
+ #undef CC
+ #undef FN_PTR
+ 
+@@ -1573,3 +2000,28 @@
+     guarantee(status == 0, "register unsafe natives");
+   }
+ JVM_END
++
++JVM_ENTRY(void, JVM_RegisterCoroutineSupportMethods(JNIEnv *env, jclass corocls))
++  UnsafeWrapper("JVM_RegisterCoroutineSupportMethods");
++  {
++    ThreadToNativeFromVM ttnfv(thread);
++    {
++      int coro_method_count = (int)(sizeof(coroutine_support_methods)/sizeof(JNINativeMethod));
++
++      for (int i=0; i<coro_method_count; i++) {
++        env->RegisterNatives(corocls, coroutine_support_methods + i, 1);
++        if (env->ExceptionOccurred()) {
++          tty->print_cr("Warning:  Coroutine classes not found (%i)", i);
++          vm_exit(1);
++        }
++      }
++      for (int i=COMPILE_CORO_METHODS_FROM; i<coro_method_count; i++) {
++        jmethodID id = env->GetStaticMethodID(corocls, coroutine_support_methods[i].name, coroutine_support_methods[i].signature);
++        {
++          ThreadInVMfromNative tivfn(thread);
++          nmethod* nm = AdapterHandlerLibrary::create_native_wrapper(methodHandle(JNIHandles::resolve_jmethod_id(id)));
++        }
++      }
++    }
++  }
++JVM_END
+diff --git a/src/share/vm/runtime/coroutine.cpp b/src/share/vm/runtime/coroutine.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/share/vm/runtime/coroutine.cpp
+@@ -0,0 +1,772 @@
++/*
++ * Copyright 2001-2010 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ *
++ */
++
++#include "precompiled.hpp"
++#include "runtime/coroutine.hpp"
++#ifdef TARGET_ARCH_x86
++# include "vmreg_x86.inline.hpp"
++#endif
++#ifdef TARGET_ARCH_sparc
++# include "vmreg_sparc.inline.hpp"
++#endif
++#ifdef TARGET_ARCH_zero
++# include "vmreg_zero.inline.hpp"
++#endif
++
++
++#ifdef _WINDOWS
++
++LONG WINAPI topLevelExceptionFilter(struct _EXCEPTION_POINTERS* exceptionInfo);
++
++
++void coroutine_start(Coroutine* coroutine, jobject coroutineObj) {
++  coroutine->thread()->set_thread_state(_thread_in_vm);
++
++  if (UseVectoredExceptions) {
++    // If we are using vectored exception we don't need to set a SEH
++    coroutine->run(coroutineObj);
++  }
++  else {
++    // Install a win32 structured exception handler around every thread created
++    // by VM, so VM can genrate error dump when an exception occurred in non-
++    // Java thread (e.g. VM thread).
++    __try {
++       coroutine->run(coroutineObj);
++    } __except(topLevelExceptionFilter((_EXCEPTION_POINTERS*)_exception_info())) {
++    }
++  }
++
++  ShouldNotReachHere();
++}
++#endif
++
++#if defined(LINUX) || defined(_ALLBSD_SOURCE)
++
++void coroutine_start(Coroutine* coroutine, jobject coroutineObj) {
++  coroutine->thread()->set_thread_state(_thread_in_vm);
++
++  coroutine->run(coroutineObj);
++  ShouldNotReachHere();
++}
++#endif
++
++void Coroutine::run(jobject coroutine) {
++
++  // do not call JavaThread::current() here!
++
++  _thread->set_resource_area(new ResourceArea(32));
++  _thread->set_handle_area(new HandleArea(NULL, 32));
++
++  // used to test validitity of stack trace backs
++//  this->record_base_of_stack_pointer();
++
++  // Record real stack base and size.
++//  this->record_stack_base_and_size();
++
++  // Initialize thread local storage; set before calling MutexLocker
++//  this->initialize_thread_local_storage();
++
++//  this->create_stack_guard_pages();
++
++  // Thread is now sufficient initialized to be handled by the safepoint code as being
++  // in the VM. Change thread state from _thread_new to _thread_in_vm
++//  ThreadStateTransition::transition_and_fence(this, _thread_new, _thread_in_vm);
++
++  // This operation might block. We call that after all safepoint checks for a new thread has
++  // been completed.
++//  this->set_active_handles(JNIHandleBlock::allocate_block());
++
++  // We call another function to do the rest so we are sure that the stack addresses used
++  // from there will be lower than the stack base just computed
++  {
++    HandleMark hm(_thread);
++    HandleMark hm2(_thread);
++    Handle obj(_thread, JNIHandles::resolve(coroutine));
++    JNIHandles::destroy_global(coroutine);
++    JavaValue result(T_VOID);
++    JavaCalls::call_virtual(&result,
++                            obj,
++                            KlassHandle(_thread, SystemDictionary::coroutine_base_klass()),
++                            vmSymbolHandles::startInternal_method_name(),
++                            vmSymbolHandles::void_method_signature(),
++                            _thread);
++  }
++}
++
++
++void Coroutine::migrate_to_stack(CoroutineStack* new_stack, jobject coroutineSupport) {
++  assert(_state == _stored, "unexpected coroutine state during migration");
++  size_t delta = new_stack->stack_base() - _stack->stack_base();
++  assert((delta % HeapWordSize) == 0, "unexpected alignment");
++  intptr_t new_displacement = (_data->data() + _data->capacity()) - ((intptr_t*)new_stack->stack_base());
++
++  ResourceMark mark(Thread::current());
++  GrowableArray<frame>* frames = new GrowableArray<frame>();
++  RegisterMap map(_thread);
++  {
++    frame fr = _data->last_frame(this, map);
++    if (fr.sp() == NULL) {
++      return;
++    }
++    do {
++      frames->append(fr);
++      fr = fr.sender(&map);
++    } while(!fr.is_first_frame());
++    frames->append(fr);
++  }
++
++  for (int i=0; i<frames->length(); i++) {
++    frame current = frames->at(i);
++    frame last = i == 0 ? frame() : frames->at(i - 1);
++
++    if (current.is_interpreted_frame()) {
++      current.fp()[frame::interpreter_frame_sender_sp_offset] += delta;
++      current.fp()[frame::interpreter_frame_last_sp_offset] += delta;
++      current.fp()[frame::interpreter_frame_monitor_block_top_offset] += delta;
++      current.fp()[frame::interpreter_frame_locals_offset] += delta;
++    } else if (current.is_compiled_frame()) {
++      OopMap* oop_map = ((nmethod*)current.cb())->oop_map_for_return_address(current.pc());
++      OopMapStream stream(oop_map, OopMapValue::thread_ptr_value);
++      while (!stream.is_done()) {
++        OopMapValue value = stream.current();
++
++        assert(!value.is_register_loc(), "broken assumption");
++        address value_addr = value.is_register_loc()
++          // Value was in a callee-save register
++          ? map.location(value.reg())
++          // Else value was directly saved on the stack. The frame's original stack pointer,
++          // before any extension by its callee (due to Compiler1 linkage on SPARC), must be used.
++          : ((address)current.unextended_sp()) + value.stack_offset();
++
++        tty->print_cr("$$$ found thread ptr: %s at %08x", value.is_register_loc() ? "reg" : "stack", value_addr);
++
++        stream.next();
++      }
++    } else if (current.is_first_frame()) {
++      JavaCallWrapper* wrapper = current.entry_frame_call_wrapper();
++      wrapper->_thread = new_stack->thread();
++      wrapper->_callee_method = NULL;
++      wrapper->_receiver = NULL;
++
++      current.fp()[frame::entry_frame_call_wrapper_offset] += delta;
++      wrapper = current.entry_frame_call_wrapper();
++    } else {
++      ShouldNotReachHere();
++    }
++
++    // modify link only if the frame is interpreted or compiled by c1
++#ifdef COMPILER2
++    if (current.is_compiled_frame()) {
++      DEBUG_CORO_ONLY(tty->print_cr("skipping compiled frame %08x", current.fp()));
++    } else
++#endif
++    {
++      if (last.is_interpreted_frame()) {
++        intptr_t* fp = last.fp();
++        assert(fp >= _data->data() && fp < (_data->data() + _data->capacity()), "invalid fp");
++        assert((address)*fp < _stack->stack_base() && (address)*fp >= (_stack->stack_base() - _stack->stack_size()), "invalid fp contents");
++        *fp += delta;
++      } else if (last.is_compiled_frame()) {
++        intptr_t* sender_sp = last.unextended_sp() + last.cb()->frame_size();
++        intptr_t* fp = (intptr_t*) (sender_sp - frame::sender_sp_offset);
++
++        //intptr_t* fp = (intptr_t*) *(last.sender_sp() - frame::sender_sp_offset);
++        assert(fp >= _data->data() && fp < (_data->data() + _data->capacity()), "invalid fp");
++        assert((address)*fp < _stack->stack_base() && (address)*fp >= (_stack->stack_base() - _stack->stack_size()), "invalid fp contents");
++        *fp += delta;
++      } else if (last.sp() == NULL) {
++        assert(last.fp() == NULL, "top frame expected");
++        intptr_t* fp = (_data->data() + _data->capacity() - _data->size());
++        assert(fp >= _data->data() && fp < (_data->data() + _data->capacity()), "invalid fp");
++        assert((address)*fp < _stack->stack_base() && (address)*fp >= (_stack->stack_base() - _stack->stack_size()), "invalid fp contents");
++        *fp += delta;
++      } else {
++        ShouldNotReachHere();
++      }
++    }
++  }
++
++  /*
++  do {
++    if (fr.is_interpreted_frame()) {
++      fr.fp()[frame::interpreter_frame_sender_sp_offset] += delta;
++      fr.fp()[frame::interpreter_frame_last_sp_offset] += delta;
++      fr.fp()[frame::interpreter_frame_monitor_block_top_offset] += delta;
++      fr.fp()[frame::interpreter_frame_locals_offset] += delta;
++    } else if (fr.is_compiled_frame()) {
++      OopMap* oop_map = ((nmethod*)fr.cb())->oop_map_for_return_address(fr.pc());
++      OopMapStream stream(oop_map, OopMapValue::thread_ptr_value);
++      while (!stream.is_done()) {
++        OopMapValue value = stream.current();
++
++        address value_addr = value.is_register_loc()
++          // Value was in a callee-save register
++          ? map.location(value.reg())
++          // Else value was directly saved on the stack. The frame's original stack pointer,
++          // before any extension by its callee (due to Compiler1 linkage on SPARC), must be used.
++          : ((address)fr.unextended_sp()) + value.stack_offset();
++
++        tty->print_cr("$$$ found thread ptr: %s at %08x", value.is_register_loc() ? "reg" : "stack", value_addr);
++
++        stream.next();
++      }
++    } else {
++      ShouldNotReachHere();
++    }
++
++    // modify link only if the frame is interpreted or compiled by c1
++#ifdef COMPILER2
++    if (fr.is_compiled_frame()) {
++      tty->print_cr("skipping compiled frame %08x", fr.fp());
++    } else
++#endif
++    {
++      if (last_fr.is_interpreted_frame()) {
++        intptr_t* fp = last_fr.fp();
++        assert(fp >= _data->data() && fp < (_data->data() + _data->capacity()), "invalid fp");
++        assert((address)*fp < _stack->stack_base() && (address)*fp >= (_stack->stack_base() - _stack->stack_size()), "invalid fp contents");
++        *fp += delta;
++      } else if (last_fr.is_compiled_frame()) {
++        intptr_t* fp = (intptr_t*) *(last_fr.sender_sp() - frame::sender_sp_offset + last_fr._displacement);
++        assert(fp >= _data->data() && fp < (_data->data() + _data->capacity()), "invalid fp");
++        assert((address)*fp < _stack->stack_base() && (address)*fp >= (_stack->stack_base() - _stack->stack_size()), "invalid fp contents");
++        *fp += delta;
++      } else {
++        assert(last_fr.pc() == NULL, "top frame expected");
++        intptr_t* fp = (_data->data() + _data->capacity() - _data->size());
++        assert(fp >= _data->data() && fp < (_data->data() + _data->capacity()), "invalid fp");
++        assert((address)*fp < _stack->stack_base() && (address)*fp >= (_stack->stack_base() - _stack->stack_size()), "invalid fp contents");
++        *fp += delta;
++      }
++    }
++    last_fr = fr;
++    fr = fr.sender(&map);
++  } while(!fr.is_first_frame());
++
++  // fix the entry frame - it contains a pointer to the JavaCallWrapper object, which is also on the stack
++  assert(fr.is_first_frame(), "first frame not found");
++
++  if (last_fr.is_interpreted_frame()) {
++    intptr_t* fp = last_fr.fp();
++    *fp += delta;
++  } else if (last_fr.is_compiled_frame()) {
++    intptr_t* fp = (intptr_t*) *(last_fr.sender_sp() - frame::sender_sp_offset + last_fr._displacement);
++    *fp += delta;
++  } else {
++    assert(last_fr.pc() == NULL, "top frame expected");
++    intptr_t* fp = (_data->data() + _data->capacity() - _data->size());
++    *fp += delta;
++  }
++*/
++
++#if defined(_WINDOWS)
++  _last_SEH += delta;
++#endif
++  _stack = new_stack;
++
++  DEBUG_CORO_ONLY(tty->print_cr(" - handle mark nesting: %i", _handle_area->_handle_mark_nesting));
++  assert(_handle_area->_handle_mark_nesting > 1, "invalid handle mark nesting");
++
++}
++
++CoroutineData::CoroutineData(intptr_t capacity) {
++  _capacity = capacity;
++  _size = 0;
++}
++
++CoroutineData* CoroutineData::create_data(intptr_t capacity/* = 256*/) {
++  assert(capacity > 0, "invalid initial CoroutineData capacity");
++  assert((sizeof(CoroutineData) % HeapWordSize) == 0, "misaligned CoroutineData size");
++  intptr_t alloc_size = (capacity * HeapWordSize) + sizeof(CoroutineData);
++
++  void* buf = os::malloc(alloc_size);
++  CoroutineData* data = new (buf) CoroutineData(capacity);
++  if (data == NULL)
++    return NULL;
++
++  return data;
++}
++
++methodOop from_reflected_method(oop reflected, bool initialize, TRAPS) {
++  oop mirror     = NULL;
++  int slot       = 0;
++
++  if (reflected == NULL) {
++    THROW_MSG_NULL(vmSymbols::java_lang_IllegalArgumentException(), "null method not allowed in CoroutineFrame");
++  }
++
++  if (reflected->klass() == SystemDictionary::reflect_Constructor_klass()) {
++    mirror = java_lang_reflect_Constructor::clazz(reflected);
++    slot   = java_lang_reflect_Constructor::slot(reflected);
++  } else {
++    assert(reflected->klass() == SystemDictionary::reflect_Method_klass(), "wrong type");
++    mirror = java_lang_reflect_Method::clazz(reflected);
++    slot   = java_lang_reflect_Method::slot(reflected);
++  }
++  klassOop k     = java_lang_Class::as_klassOop(mirror);
++
++  if (initialize) {
++    KlassHandle k1(THREAD, k);
++    // Make sure class is initialized before handing id's out to methods
++    Klass::cast(k1())->initialize(CHECK_NULL);
++    return instanceKlass::cast(k1())->method_with_idnum(slot);
++  } else {
++    assert(instanceKlass::cast(k)->is_initialized(), "class should already be initialized");
++    return instanceKlass::cast(k)->method_with_idnum(slot);
++  }
++}
++
++CoroutineData* CoroutineData::create_data(objArrayHandle frames, address stack_base, JavaThread* thread, TRAPS) {
++  int frame_count = frames->length();
++  int overall_size = 0;
++
++  for (int i=0; i<frame_count; i++) {
++    objArrayHandle objectValues = java_dyn_CoroutineFrame::objectValues(frames->obj_at(i));
++    overall_size += 10 + objectValues->length();
++
++    // make sure the class of the method is initialized
++    from_reflected_method(java_dyn_CoroutineFrame::method(frames->obj_at(i)), true, CHECK_NULL);
++  }
++  // additional ret_pc and fp
++  overall_size += 2;
++  // JavaCallWrapper object on-stack
++  overall_size += sizeof(JavaCallWrapper) / HeapWordSize;
++  // entry frame
++  overall_size += 8;
++
++  DEBUG_CORO_ONLY(tty->print_cr("new coroutine data size: %i", overall_size));
++
++  No_Safepoint_Verifier no_safepoint();
++
++  assert((sizeof(CoroutineData) % HeapWordSize) == 0, "misaligned CoroutineData size");
++  intptr_t alloc_size = (overall_size * HeapWordSize) + sizeof(CoroutineData);
++
++  void* buf = os::malloc(alloc_size);
++  CoroutineData* data = new (buf) CoroutineData(overall_size);
++  if (data == NULL)
++    return NULL;
++
++  int capacity = data->capacity();
++  int size = 0;
++  intptr_t** d = (intptr_t**)data->data();
++
++  size += sizeof(JavaCallWrapper) / HeapWordSize;
++  JavaCallWrapper* wrapper = (JavaCallWrapper*)(d + (capacity - size));
++  wrapper->initialize(thread, NULL, NULL, NULL, NULL);
++  intptr_t* wrapper_stack_pos = (intptr_t*)stack_base - size;
++
++  // entry frame caller pc
++  d[capacity - ++size] = NULL;
++  // entry frame link
++  d[capacity - ++size] = NULL;
++  intptr_t* fp = (intptr_t*)stack_base - size;
++  // 5 empty slots
++  for (int i=0; i<5; i++)
++    d[capacity - ++size] = NULL;
++  // address of JavaCallWrapper
++  d[capacity - ++size] = wrapper_stack_pos;
++
++  intptr_t* ret_pc = (intptr_t*)StubRoutines::_call_stub_return_address;
++
++  for (int i=0; i<frame_count; i++) {
++    oop frame = frames->obj_at(i);
++    oop next_frame = ((i + 1) >= frame_count) ? NULL : frames->obj_at(i + 1);
++    objArrayOop objectValues = java_dyn_CoroutineFrame::objectValues(frame);
++    typeArrayOop scalarValues = java_dyn_CoroutineFrame::scalarValues(frame);
++    jint local_count = java_dyn_CoroutineFrame::localCount(frame);
++    jint expression_count = java_dyn_CoroutineFrame::expressionCount(frame);
++    jint monitor_count = objectValues->length() - local_count - expression_count;
++    assert(monitor_count == 0, "monitors not supported");
++    jint bci = java_dyn_CoroutineFrame::bci(frame);
++    methodOop method = from_reflected_method(java_dyn_CoroutineFrame::method(frame), false, THREAD);
++
++    methodOop callee_method = next_frame == NULL ? NULL : from_reflected_method(java_dyn_CoroutineFrame::method(next_frame), false, THREAD);
++
++    for (int j=0; j<local_count; j++) {
++      if (objectValues->obj_at(j) != NULL) {
++        assert(j < objectValues->length(), "wrong array length");
++        d[capacity - ++size] = (intptr_t*)objectValues->obj_at(j);
++      } else {
++        assert(j < scalarValues->length(), "wrong array length");
++        d[capacity - ++size] = (intptr_t*)scalarValues->long_at(j);
++      }
++    }
++    d[capacity - ++size] = ret_pc;
++    address bcp = method->bcp_from(bci);
++    int parameter_count = callee_method == NULL ? 0 : callee_method->size_of_parameters();
++    ret_pc  = (intptr_t*)Interpreter::deopt_continue_after_entry(method, bcp, parameter_count, i == (frame_count - 1));
++
++    d[capacity - ++size] = fp;
++    fp = (intptr_t*)stack_base - size;
++
++    // sender_sp
++    d[capacity - ++size] = fp + (2 + method->max_locals() - method->size_of_parameters());
++    // last_sp
++    d[capacity - ++size] = fp - (8 + monitor_count + expression_count + (callee_method == NULL ? 0 : callee_method->size_of_parameters()));
++
++    d[capacity - ++size] = (intptr_t*)method;
++    d[capacity - ++size] = (intptr_t*)method->method_data();
++    d[capacity - ++size] = (intptr_t*)method->constants()->cache();
++
++    // locals
++    d[capacity - ++size] = fp + (1 + method->max_locals());
++    // bcp
++    d[capacity - ++size] = (intptr_t*)bcp;
++    // end of monitors
++    d[capacity - ++size] = fp - (8 + monitor_count);
++    for (int j=0; j<monitor_count; j++) {
++      ShouldNotReachHere();
++      d[capacity - ++size] = NULL;
++    }
++    for (int j=local_count; j<local_count + expression_count; j++) {
++      if (objectValues->obj_at(j) != NULL) {
++        assert(j < objectValues->length(), "wrong array length");
++        d[capacity - ++size] = (intptr_t*)objectValues->obj_at(j);
++      } else {
++        assert(j < scalarValues->length(), "wrong array length");
++        d[capacity - ++size] = (intptr_t*)scalarValues->long_at(j);
++      }
++    }
++
++  }
++  d[capacity - ++size] = ret_pc;
++  d[capacity - ++size] = fp;
++
++  data->set_size(size);
++  assert(size == overall_size, "mismatched coroutine data size");
++
++  return data;
++}
++
++void CoroutineData::free_data(CoroutineData *data) {
++  os::free(data);
++}
++
++void CoroutineData::frames_do(Coroutine* coro, FrameClosure* fc) {
++  DEBUG_CORO_ONLY(tty->print_cr("frames_do CoroutineData"));
++
++  RegisterMap map(coro->thread());
++
++  map.set_include_argument_oops(false);
++  intptr_t* data = (intptr_t*)(this + 1);
++  intptr_t* fp = (data + _capacity - _size);
++  intptr_t displacement = (data + _capacity) - ((intptr_t*)coro->stack()->stack_base());
++
++  intptr_t* sp = (intptr_t*)(fp + 2);
++  address pc = (address)fp[1];
++  if (fp[0] == (intptr_t)NULL_WORD)
++    return;
++  fp = (intptr_t*)fp[0] + displacement;
++
++  frame fr(sp, fp, pc, displacement);
++  StackFrameStream fst(coro->thread(), fr);
++  fst.register_map()->set_location(rbp->as_VMReg(), (address)(data + _capacity - _size));
++  fst.register_map()->set_include_argument_oops(false);
++  for(; !fst.is_done(); fst.next()) {
++    fc->frames_do(fst.current(), fst.register_map());
++  }
++}
++
++frame CoroutineData::last_frame(Coroutine* coro, RegisterMap& map) const {
++  DEBUG_CORO_ONLY(tty->print_cr("last_frame CoroutineData"));
++
++  map.set_include_argument_oops(false);
++  intptr_t* data = (intptr_t*)(this + 1);
++  intptr_t* fp = (data + _capacity - _size);
++  intptr_t displacement = (data + _capacity) - ((intptr_t*)coro->stack()->stack_base());
++
++  intptr_t* sp = (intptr_t*)(fp + 2);
++  address pc = (address)fp[1];
++  if (fp[0] == (intptr_t)NULL_WORD)
++    return frame(NULL, NULL, pc, displacement);
++  fp = (intptr_t*)fp[0] + displacement;
++
++  return frame(sp, fp, pc, displacement);
++}
++
++
++Coroutine* Coroutine::create_thread_coroutine(JavaThread* thread, CoroutineStack* stack) {
++  Coroutine* coro = new Coroutine();
++  if (coro == NULL)
++    return NULL;
++
++  coro->_state = _current;
++  coro->_is_thread_coroutine = true;
++  coro->_thread = thread;
++  coro->_stack = stack;
++  coro->_data = NULL;
++  coro->_resource_area = NULL;
++  coro->_handle_area = NULL;
++  coro->_last_handle_mark = NULL;
++#ifdef ASSERT
++  coro->_java_call_counter = 0;
++#endif
++  stack->set_current_coroutine(coro);
++#if defined(_WINDOWS)
++  coro->_last_SEH = NULL;
++#endif
++  return coro;
++}
++
++Coroutine* Coroutine::create_coroutine(JavaThread* thread, CoroutineStack* stack, oop coroutineObj) {
++  CoroutineData* data = CoroutineData::create_data();
++  if (data == NULL)
++    return NULL;
++
++  Coroutine* coro = new Coroutine();
++  if (coro == NULL) {
++    CoroutineData::free_data(data);
++    return NULL;
++  }
++
++  int capacity = data->capacity();
++  int size = 0;
++  intptr_t** d = (intptr_t**)data->data();
++  d[capacity - ++size] = NULL;
++  jobject obj = JNIHandles::make_global(coroutineObj);
++  d[capacity - ++size] = (intptr_t*)obj;
++  d[capacity - ++size] = (intptr_t*)coro;
++  d[capacity - ++size] = NULL;
++  d[capacity - ++size] = (intptr_t*)coroutine_start;
++  d[capacity - ++size] = NULL;
++  data->set_size(size);
++
++  coro->_state = _stored;
++  coro->_is_thread_coroutine = false;
++  coro->_thread = thread;
++  coro->_stack = stack;
++  coro->_data = data;
++  coro->_resource_area = NULL;
++  coro->_handle_area = NULL;
++  coro->_last_handle_mark = NULL;
++#ifdef ASSERT
++  coro->_java_call_counter = 0;
++#endif
++#if defined(_WINDOWS)
++  coro->_last_SEH = NULL;
++#endif
++  return coro;
++}
++
++void Coroutine::free_coroutine(Coroutine* coroutine) {
++  if (coroutine->data() != NULL)
++    CoroutineData::free_data(coroutine->data());
++  if (coroutine->stack() != NULL && coroutine->stack()->current_coroutine() == coroutine)
++    coroutine->stack()->set_current_coroutine(NULL);
++  delete coroutine;
++}
++
++void Coroutine::frames_do(FrameClosure* fc) {
++  switch (_state) {
++    case Coroutine::_current:
++      // the contents of this coroutine have already been visited
++      break;
++    case Coroutine::_stored:
++      _data->frames_do(this, fc);
++      break;
++    case Coroutine::_onstack:
++      _stack->frames_do(fc);
++      break;
++    case Coroutine::_dead:
++      // coroutine is dead, ignore
++      break;
++  }
++}
++
++class oops_do_Closure: public FrameClosure {
++private:
++  OopClosure* _f;
++  CodeBlobClosure* _cf;
++public:
++  oops_do_Closure(OopClosure* f, CodeBlobClosure* cf): _f(f), _cf(cf) { }
++  void frames_do(frame* fr, RegisterMap* map) { fr->oops_do(_f, _cf, map); }
++};
++
++void Coroutine::oops_do(OopClosure* f, CodeBlobClosure* cf) {
++  oops_do_Closure fc(f, cf);
++  frames_do(&fc);
++  if ((_state == _stored || _state == _onstack) &&_handle_area != NULL) {
++    DEBUG_CORO_ONLY(tty->print_cr("collecting handle area %08x", _handle_area));
++    _handle_area->oops_do(f);
++  }
++}
++
++class nmethods_do_Closure: public FrameClosure {
++private:
++  CodeBlobClosure* _cf;
++public:
++  nmethods_do_Closure(CodeBlobClosure* cf): _cf(cf) { }
++  void frames_do(frame* fr, RegisterMap* map) { fr->nmethods_do(_cf); }
++};
++
++void Coroutine::nmethods_do(CodeBlobClosure* cf) {
++  nmethods_do_Closure fc(cf);
++  frames_do(&fc);
++}
++
++class frames_do_Closure: public FrameClosure {
++private:
++  void (*_f)(frame*, const RegisterMap*);
++public:
++  frames_do_Closure(void f(frame*, const RegisterMap*)): _f(f) { }
++  void frames_do(frame* fr, RegisterMap* map) { _f(fr, map); }
++};
++
++void Coroutine::frames_do(void f(frame*, const RegisterMap* map)) {
++  frames_do_Closure fc(f);
++  frames_do(&fc);
++}
++
++bool Coroutine::is_disposable() {
++  if (state() != _stored)
++    return false;
++
++  return data()->data()[data()->capacity() - data()->size() + 1] == (intptr_t)coroutine_start;
++}
++
++
++CoroutineStack* CoroutineStack::create_thread_stack(JavaThread* thread) {
++  CoroutineStack* stack = new CoroutineStack(0);
++  if (stack == NULL)
++    return NULL;
++
++  stack->_thread = thread;
++  stack->_current_coroutine = NULL;
++  stack->_is_thread_stack = true;
++  stack->_reserved_space;
++  stack->_virtual_space;
++  stack->_stack_base = thread->stack_base();
++  stack->_stack_size = thread->stack_size();
++  stack->_last_sp = NULL;
++  stack->_locked = 0;
++  return stack;
++}
++
++CoroutineStack* CoroutineStack::create_stack(JavaThread* thread, intptr_t size/* = -1*/) {  
++  if (size <= 0)
++    size = DefaultCoroutineStackSize;
++
++  uint reserved_pages = StackShadowPages + StackRedPages + StackYellowPages;
++  uintx real_stack_size = size + (reserved_pages * os::vm_page_size());
++  uintx reserved_size = align_size_up(real_stack_size, os::vm_allocation_granularity());
++
++  CoroutineStack* stack = new CoroutineStack(reserved_size);
++  if (stack == NULL)
++    return NULL;
++  if (!stack->_virtual_space.initialize(stack->_reserved_space, real_stack_size)) {
++    stack->_reserved_space.release();
++    delete stack;
++    return NULL;
++  }
++
++  stack->_thread = thread;
++  stack->_current_coroutine = NULL;
++  stack->_is_thread_stack = false;
++  stack->_stack_base = (address)stack->_virtual_space.high();
++  stack->_stack_size = stack->_virtual_space.committed_size();
++  stack->_last_sp = NULL;
++  stack->_locked = 0;
++
++  if (os::uses_stack_guard_pages()) {
++    address low_addr = stack->stack_base() - stack->stack_size();
++    size_t len = (StackYellowPages + StackRedPages) * os::vm_page_size();
++
++    bool allocate = os::allocate_stack_guard_pages();
++
++    if (allocate && !os::create_stack_guard_pages((char *) low_addr, len)) {
++      warning("Attempt to allocate stack guard pages failed.");
++      stack->_virtual_space.release();
++      stack->_reserved_space.release();
++      return NULL;
++    }
++
++    if (!os::guard_memory((char *) low_addr, len)) {
++      warning("Attempt to protect stack guard pages failed.");
++      if (os::uncommit_memory((char *) low_addr, len)) {
++        warning("Attempt to deallocate stack guard pages failed.");
++      }
++    }
++  }
++
++  DEBUG_CORO_ONLY(tty->print("created coroutine stack at %08x with stack size %i (real size: %i)\n", stack->_stack_base, size, stack->_stack_size));
++  return stack;
++}
++
++void CoroutineStack::free_stack(CoroutineStack* stack) {
++  if (stack->_reserved_space.size() > 0) {
++    stack->_virtual_space.release();
++    stack->_reserved_space.release();
++  }
++  delete stack;
++}
++
++void CoroutineStack::frames_do(FrameClosure* fc) {
++  assert(_last_sp != NULL, "CoroutineStack with NULL last_sp");
++
++  DEBUG_CORO_ONLY(tty->print_cr("frames_do stack %08x", _stack_base));
++
++  intptr_t* fp = ((intptr_t**)_last_sp)[0];
++  assert(fp != NULL, "coroutine with NULL fp");
++
++  address pc = ((address*)_last_sp)[1];
++  intptr_t* sp = ((intptr_t*)_last_sp) + 2;
++
++  frame fr(sp, fp, pc);
++  StackFrameStream fst(_thread, fr);
++  fst.register_map()->set_location(rbp->as_VMReg(), (address)_last_sp);
++  fst.register_map()->set_include_argument_oops(false);
++  for(; !fst.is_done(); fst.next()) {
++    fc->frames_do(fst.current(), fst.register_map());
++  }
++}
++
++frame CoroutineStack::last_frame(Coroutine* coro, RegisterMap& map) const {
++  DEBUG_CORO_ONLY(tty->print_cr("last_frame CoroutineStack"));
++
++  intptr_t* fp = ((intptr_t**)_last_sp)[0];
++  assert(fp != NULL, "coroutine with NULL fp");
++
++  address pc = ((address*)_last_sp)[1];
++  intptr_t* sp = ((intptr_t*)_last_sp) + 2;
++
++  return frame(sp, fp, pc);
++}
++
++ThreadCoroutineListGuard::ThreadCoroutineListGuard(JavaThread* thread) {
++  _thread = thread;
++  Coroutine* result;
++  do {
++    _value = thread->coroutine_list();
++    if (_value == NULL) {
++      result = (Coroutine*)-1;
++    } else {
++      result = (Coroutine*)Atomic::cmpxchg_ptr(NULL, &thread->coroutine_list(), _value);
++    }
++  } while (_value != result);
++}
++
++ThreadCoroutineListGuard::~ThreadCoroutineListGuard() {
++  _thread->coroutine_list() = _value;
++}
++
+diff --git a/src/share/vm/runtime/coroutine.hpp b/src/share/vm/runtime/coroutine.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/share/vm/runtime/coroutine.hpp
+@@ -0,0 +1,309 @@
++/*
++ * Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ *
++ */
++
++#ifndef SHARE_VM_RUNTIME_COROUTINE_HPP
++#define SHARE_VM_RUNTIME_COROUTINE_HPP
++
++#include "runtime/jniHandles.hpp"
++#include "runtime/handles.hpp"
++#include "memory/resourceArea.hpp"
++#include "runtime/javaFrameAnchor.hpp"
++#include "runtime/monitorChunk.hpp"
++
++// number of heap words that prepareSwitch will add as a safety measure to the CoroutineData size
++#define COROUTINE_DATA_OVERSIZE (64)
++
++//#define DEBUG_COROUTINES
++
++#ifdef DEBUG_COROUTINES
++#define DEBUG_CORO_ONLY(x) x
++#define DEBUG_CORO_PRINT(x) tty->print(x)
++#else
++#define DEBUG_CORO_ONLY(x) 
++#define DEBUG_CORO_PRINT(x)
++#endif
++
++class Coroutine;
++class CoroutineData;
++class CoroutineStack;
++
++
++template<class T>
++class DoublyLinkedList {
++private:
++  T*  _last;
++  T*  _next;
++
++public:
++  DoublyLinkedList() {
++    _last = NULL;
++    _next = NULL;
++  }
++
++  typedef T* pointer;
++
++  void remove_from_list(pointer& list);
++  void insert_into_list(pointer& list);
++
++  T* last() const   { return _last; }
++  T* next() const   { return _next; }
++};
++
++class FrameClosure: public StackObj {
++public:
++  virtual void frames_do(frame* fr, RegisterMap* map) = 0;
++};
++
++
++class Coroutine: public CHeapObj, public DoublyLinkedList<Coroutine> {
++public:
++  enum CoroutineState {
++    _stored     = 0x00000000,
++    _onstack    = 0x00000001,
++    _current    = 0x00000002,
++    _dead       = 0x00000003,      // TODO is this really needed?
++    _dummy      = 0xffffffff
++  };
++
++private:
++  CoroutineState  _state;
++
++  bool            _is_thread_coroutine;
++
++  JavaThread*     _thread;
++  CoroutineStack* _stack;
++  CoroutineData*  _data;
++
++  ResourceArea*   _resource_area;
++  HandleArea*     _handle_area;
++  HandleMark*     _last_handle_mark;
++#ifdef ASSERT
++  int             _java_call_counter;
++#endif
++
++#ifdef _LP64
++  intptr_t        _storage[2];
++#endif
++
++  // objects of this type can only be created via static functions
++  Coroutine() { }
++
++  void frames_do(FrameClosure* fc);
++
++public:
++  void run(jobject coroutine);
++
++  static Coroutine* create_thread_coroutine(JavaThread* thread, CoroutineStack* stack);
++  static Coroutine* create_coroutine(JavaThread* thread, CoroutineStack* stack, oop coroutineObj);
++  static void free_coroutine(Coroutine* coroutine);
++
++  CoroutineState state() const      { return _state; }
++  void set_state(CoroutineState x)  { _state = x; }
++
++  bool is_thread_coroutine() const  { return _is_thread_coroutine; }
++
++  JavaThread* thread() const        { return _thread; }
++  void set_thread(JavaThread* x)    { _thread = x; }
++
++  CoroutineStack* stack() const     { return _stack; }
++
++  CoroutineData* data() const       { return _data; }
++  void set_data(CoroutineData* x)   { _data = x; }
++
++  ResourceArea* resource_area() const     { return _resource_area; }
++  void set_resource_area(ResourceArea* x) { _resource_area = x; }
++
++  HandleArea* handle_area() const         { return _handle_area; }
++  void set_handle_area(HandleArea* x)     { _handle_area = x; }
++
++  HandleMark* last_handle_mark() const    { return _last_handle_mark; }
++  void set_last_handle_mark(HandleMark* x){ _last_handle_mark = x; }
++
++#ifdef ASSERT
++  int java_call_counter() const           { return _java_call_counter; }
++  void set_java_call_counter(int x)       { _java_call_counter = x; }
++#endif
++
++  bool is_disposable();
++
++  void migrate_to_stack(CoroutineStack* x, jobject coroutineSupport);
++
++  // GC support
++  void oops_do(OopClosure* f, CodeBlobClosure* cf);
++  void nmethods_do(CodeBlobClosure* cf);
++  void frames_do(void f(frame*, const RegisterMap* map));
++
++  static ByteSize state_offset()              { return byte_offset_of(Coroutine, _state); }
++  static ByteSize stack_offset()              { return byte_offset_of(Coroutine, _stack); }
++  static ByteSize data_offset()               { return byte_offset_of(Coroutine, _data); }
++
++  static ByteSize resource_area_offset()      { return byte_offset_of(Coroutine, _resource_area); }
++  static ByteSize handle_area_offset()        { return byte_offset_of(Coroutine, _handle_area); }
++  static ByteSize last_handle_mark_offset()   { return byte_offset_of(Coroutine, _last_handle_mark); }
++#ifdef ASSERT
++  static ByteSize java_call_counter_offset()  { return byte_offset_of(Coroutine, _java_call_counter); }
++#endif
++
++#ifdef _LP64
++  static ByteSize storage_offset()            { return byte_offset_of(Coroutine, _storage); }
++#endif
++
++#if defined(_WINDOWS)
++private:
++  address _last_SEH;
++public:
++  static ByteSize last_SEH_offset()           { return byte_offset_of(Coroutine, _last_SEH); }
++#endif
++};
++
++class CoroutineData {
++private:
++  intptr_t  _size;
++  intptr_t  _capacity;
++
++  // objects of this type can only be created via static functions
++  CoroutineData(intptr_t capacity);
++
++public:
++  static CoroutineData* create_data(intptr_t capacity = 256);
++  static CoroutineData* create_data(objArrayHandle frames, address stack_base, JavaThread* thread, TRAPS);
++  static void free_data(CoroutineData* data);
++
++  intptr_t size() const     { return _size; }
++  void set_size(intptr_t x) { _size = x; }
++
++  intptr_t capacity() const { return _capacity; }
++  
++  intptr_t* data() const    { return (intptr_t*)(this + 1); }
++
++  frame last_frame(Coroutine* coro, RegisterMap& map) const;
++
++  // GC support
++  void frames_do(Coroutine* coro, FrameClosure* fc);
++
++  static ByteSize size_offset()     { return byte_offset_of(CoroutineData, _size); }
++  static ByteSize capacity_offset() { return byte_offset_of(CoroutineData, _capacity); }
++  static ByteSize content_offset()  { return in_ByteSize(sizeof(CoroutineData)); }
++};
++
++class CoroutineStack: public CHeapObj, public DoublyLinkedList<CoroutineStack> {
++private:
++  JavaThread*     _thread;
++  Coroutine*      _current_coroutine;
++
++  bool            _is_thread_stack;
++  ReservedSpace   _reserved_space;
++  VirtualSpace    _virtual_space;
++
++  address         _stack_base;
++  intptr_t        _stack_size;
++
++  address         _last_sp;
++
++  jbyte           _locked;
++
++  // objects of this type can only be created via static functions
++  CoroutineStack(intptr_t size) : _reserved_space(size) { }
++
++public:
++  static CoroutineStack* create_thread_stack(JavaThread* thread);
++  static CoroutineStack* create_stack(JavaThread* thread, intptr_t size = -1);
++  static void free_stack(CoroutineStack* stack);
++
++  static intptr_t get_start_method();
++
++  JavaThread* thread() const                { return _thread; }
++  bool is_thread_stack() const              { return _is_thread_stack; }
++
++  Coroutine* current_coroutine() const      { return _current_coroutine; }
++  void set_current_coroutine(Coroutine* x)  { _current_coroutine = x; }
++
++  address last_sp() const                   { return _last_sp; }
++  void set_last_sp(address x)               { _last_sp = x; }
++
++  address stack_base() const                { return _stack_base; }
++  intptr_t stack_size() const               { return _stack_size; }
++
++  jbyte* locked_ptr()                       { return &_locked; }
++  void unlock()                             { _locked = 0; }
++
++  frame last_frame(Coroutine* coro, RegisterMap& map) const;
++
++  // GC support
++  void frames_do(FrameClosure* fc);
++
++  static ByteSize stack_base_offset()         { return byte_offset_of(CoroutineStack, _stack_base); }
++  static ByteSize stack_size_offset()         { return byte_offset_of(CoroutineStack, _stack_size); }
++  static ByteSize last_sp_offset()            { return byte_offset_of(CoroutineStack, _last_sp); }
++  static ByteSize current_coroutine_offset()  { return byte_offset_of(CoroutineStack, _current_coroutine); }
++  static ByteSize locked_offset()             { return byte_offset_of(CoroutineStack, _locked); }
++
++};
++
++/*
++ * This class is used to guard any modifications of a threads coroutine_list.
++ * It uses cmpxchg to set the coroutine_list to NULL upon construction and restores the value upon destruction.
++ */
++class ThreadCoroutineListGuard : StackObj {
++private:
++  Coroutine*    _value;
++  JavaThread*   _thread;
++public:
++  ThreadCoroutineListGuard(JavaThread* thread);
++  ~ThreadCoroutineListGuard();
++
++  Coroutine*& get() {
++    return _value;
++  }
++};
++
++
++
++template<class T> void DoublyLinkedList<T>::remove_from_list(pointer& list) {
++  if (list == this) {
++    if (list->_next == list)
++      list = NULL;
++    else
++      list = list->_next;
++  }
++  _last->_next = _next;
++  _next->_last = _last;
++  _last = NULL;
++  _next = NULL;
++}
++
++template<class T> void DoublyLinkedList<T>::insert_into_list(pointer& list) {
++  if (list == NULL) {
++    _next = (T*)this;
++    _last = (T*)this;
++    list = (T*)this;
++  } else {
++    _next = list->_next;
++    list->_next = (T*)this;
++    _last = list;
++    _next->_last = (T*)this;
++  }
++}
++
++#endif // SHARE_VM_RUNTIME_COROUTINE_HPP
+diff --git a/src/share/vm/runtime/frame.cpp b/src/share/vm/runtime/frame.cpp
+--- a/src/share/vm/runtime/frame.cpp
++++ b/src/share/vm/runtime/frame.cpp
+@@ -495,7 +495,7 @@
+ 
+ intptr_t* frame::interpreter_frame_local_at(int index) const {
+   const int n = Interpreter::local_offset_in_bytes(index)/wordSize;
+-  return &((*interpreter_frame_locals_addr())[n]);
++  return &((*interpreter_frame_locals_addr() + _displacement)[n]);
+ }
+ 
+ intptr_t* frame::interpreter_frame_expression_stack_at(jint offset) const {
+@@ -1314,3 +1314,8 @@
+   _fr = thread->last_frame();
+   _is_done = false;
+ }
++
++StackFrameStream::StackFrameStream(JavaThread *thread, frame last_frame, bool update) : _reg_map(thread, update) {
++  _fr = last_frame;
++  _is_done = false;
++}
+diff --git a/src/share/vm/runtime/frame.hpp b/src/share/vm/runtime/frame.hpp
+--- a/src/share/vm/runtime/frame.hpp
++++ b/src/share/vm/runtime/frame.hpp
+@@ -79,9 +79,13 @@
+   deopt_state _deopt_state;
+ 
+  public:
++  intptr_t  _displacement;
++
+   // Constructors
+   frame();
+ 
++  void set_displacement(intptr_t x)   { _displacement = x; }
++
+   // Accessors
+ 
+   // pc: Returns the pc at which this frame will continue normally.
+@@ -177,7 +181,7 @@
+ 
+  public:
+ 
+-  intptr_t* addr_at(int index) const             { return &fp()[index];    }
++  intptr_t* addr_at(int index) const             { return &fp()[/*_displacement + */index];    }
+   intptr_t  at(int index) const                  { return *addr_at(index); }
+ 
+   // accessors for locals
+@@ -480,6 +484,7 @@
+   bool        _is_done;
+  public:
+    StackFrameStream(JavaThread *thread, bool update = true);
++   StackFrameStream(JavaThread *thread, frame last_frame, bool update = true);
+ 
+   // Iteration
+   bool is_done()                  { return (_is_done) ? true : (_is_done = _fr.is_first_frame(), false); }
+diff --git a/src/share/vm/runtime/globals.hpp b/src/share/vm/runtime/globals.hpp
+--- a/src/share/vm/runtime/globals.hpp
++++ b/src/share/vm/runtime/globals.hpp
+@@ -3718,7 +3718,13 @@
+   product(bool, UseVMInterruptibleIO, false,                                \
+           "(Unstable, Solaris-specific) Thread interrupt before or with "   \
+           "EINTR for I/O operations results in OS_INTRPT. The default value"\
+-          " of this flag is true for JDK 6 and earliers")
++          " of this flag is true for JDK 6 and earliers")                   \
++                                                                            \
++  product(uintx, DefaultCoroutineStackSize, 8*8*K,                          \
++        "Default size of the stack that is associated with new coroutines") \
++                                                                            \
++  product(uintx, MaxFreeCoroutinesCacheSize, 20,                            \
++          "The number of free coroutine stacks a thread can keep")          
+ 
+ /*
+  *  Macros for factoring of globals
+diff --git a/src/share/vm/runtime/handles.cpp b/src/share/vm/runtime/handles.cpp
+--- a/src/share/vm/runtime/handles.cpp
++++ b/src/share/vm/runtime/handles.cpp
+@@ -121,6 +121,23 @@
+   thread->set_last_handle_mark(this);
+ }
+ 
++HandleMark::HandleMark(Thread* thread, HandleArea* area, HandleMark* last_handle_mark) {
++  _thread = thread;
++  // Save area
++  _area  = area;
++  // Save current top
++  _chunk = _area->_chunk;
++  _hwm   = _area->_hwm;
++  _max   = _area->_max;
++  NOT_PRODUCT(_size_in_bytes = _area->_size_in_bytes;)
++  debug_only(_area->_handle_mark_nesting++);
++  assert(_area->_handle_mark_nesting > 0, "must stack allocate HandleMarks");
++  debug_only(Atomic::inc(&_nof_handlemarks);)
++
++  // Link this in the thread
++  set_previous_handle_mark(last_handle_mark);
++}
++
+ 
+ HandleMark::~HandleMark() {
+   HandleArea* area = _area;   // help compilers with poor alias analysis
+diff --git a/src/share/vm/runtime/handles.hpp b/src/share/vm/runtime/handles.hpp
+--- a/src/share/vm/runtime/handles.hpp
++++ b/src/share/vm/runtime/handles.hpp
+@@ -246,6 +246,7 @@
+   friend class NoHandleMark;
+   friend class ResetNoHandleMark;
+ #ifdef ASSERT
++public:
+   int _handle_mark_nesting;
+   int _no_handle_mark_nesting;
+ #endif
+@@ -257,6 +258,11 @@
+     debug_only(_no_handle_mark_nesting = 0);
+     _prev = prev;
+   }
++  HandleArea(HandleArea* prev, size_t init_size) : Arena(init_size) {
++    debug_only(_handle_mark_nesting    = 0);
++    debug_only(_no_handle_mark_nesting = 0);
++    _prev = prev;
++  }
+ 
+   // Handle allocation
+  private:
+@@ -325,6 +331,7 @@
+  public:
+   HandleMark();                            // see handles_inline.hpp
+   HandleMark(Thread* thread)                      { initialize(thread); }
++  HandleMark(Thread* thread, HandleArea* area, HandleMark* last_handle_mark);
+   ~HandleMark();
+ 
+   // Functions used by HandleMarkCleaner
+diff --git a/src/share/vm/runtime/javaCalls.cpp b/src/share/vm/runtime/javaCalls.cpp
+--- a/src/share/vm/runtime/javaCalls.cpp
++++ b/src/share/vm/runtime/javaCalls.cpp
+@@ -119,6 +119,15 @@
+   }
+ }
+ 
++void JavaCallWrapper::initialize(JavaThread* thread, JNIHandleBlock* handles, methodOop callee_method, oop receiver, JavaValue* result) {
++  _thread = thread;
++  _handles = handles;
++  _callee_method = callee_method;
++  _receiver = receiver;
++  _result = result;
++  _anchor.clear();
++}
++
+ 
+ JavaCallWrapper::~JavaCallWrapper() {
+   assert(_thread == JavaThread::current(), "must still be the same thread");
+diff --git a/src/share/vm/runtime/javaCalls.hpp b/src/share/vm/runtime/javaCalls.hpp
+--- a/src/share/vm/runtime/javaCalls.hpp
++++ b/src/share/vm/runtime/javaCalls.hpp
+@@ -59,6 +59,7 @@
+ class JavaCallWrapper: StackObj {
+   friend class VMStructs;
+  private:
++ public:
+   JavaThread*      _thread;                 // the thread to which this call belongs
+   JNIHandleBlock*  _handles;                // the saved handle block
+   methodOop        _callee_method;          // to be able to collect arguments if entry frame is top frame
+@@ -68,13 +69,15 @@
+ 
+   JavaValue*       _result;                 // result value
+ 
+- public:
+   // Construction/destruction
+    JavaCallWrapper(methodHandle callee_method, Handle receiver, JavaValue* result, TRAPS);
+   ~JavaCallWrapper();
+ 
++  void initialize(JavaThread* thread, JNIHandleBlock* handles, methodOop callee_method, oop receiver, JavaValue* result);
++
+   // Accessors
+   JavaThread*      thread() const           { return _thread; }
++
+   JNIHandleBlock*  handles() const          { return _handles; }
+ 
+   JavaFrameAnchor* anchor(void)             { return &_anchor; }
+diff --git a/src/share/vm/runtime/thread.cpp b/src/share/vm/runtime/thread.cpp
+--- a/src/share/vm/runtime/thread.cpp
++++ b/src/share/vm/runtime/thread.cpp
+@@ -44,6 +44,7 @@
+ #include "runtime/aprofiler.hpp"
+ #include "runtime/arguments.hpp"
+ #include "runtime/biasedLocking.hpp"
++#include "runtime/coroutine.hpp"
+ #include "runtime/deoptimization.hpp"
+ #include "runtime/fprofiler.hpp"
+ #include "runtime/frame.inline.hpp"
+@@ -1285,6 +1286,10 @@
+   _interp_only_mode    = 0;
+   _special_runtime_exit_condition = _no_async_condition;
+   _pending_async_exception = NULL;
++
++  _coroutine_stack_list = NULL;
++  _coroutine_list = NULL;
++
+   _is_compiling = false;
+   _thread_stat = NULL;
+   _thread_stat = new ThreadStatistics();
+@@ -1464,6 +1469,8 @@
+   // Record real stack base and size.
+   this->record_stack_base_and_size();
+ 
++  this->initialize_coroutine_support();
++
+   // Initialize thread local storage; set before calling MutexLocker
+   this->initialize_thread_local_storage();
+ 
+@@ -2373,6 +2380,12 @@
+     frame* fr = fst.current();
+     f(fr, fst.register_map());
+   }
++  // traverse the coroutine stack frames
++  Coroutine* current = _coroutine_list;
++  do {
++    current->frames_do(f);
++    current = current->next();
++  } while (current != _coroutine_list);
+ }
+ 
+ 
+@@ -2529,6 +2542,13 @@
+       fst.current()->oops_do(f, cf, fst.register_map());
+     }
+   }
++  
++
++  Coroutine* current = _coroutine_list;
++  do {
++    current->oops_do(f, cf);
++    current = current->next();
++  } while (current != _coroutine_list);
+ 
+   // callee_target is never live across a gc point so NULL it here should
+   // it still contain a methdOop.
+@@ -2570,6 +2590,13 @@
+       fst.current()->nmethods_do(cf);
+     }
+   }
++
++  Coroutine* current = _coroutine_list;
++  do {
++    current->nmethods_do(cf);
++    current = current->next();
++  } while (current != _coroutine_list);
++
+ }
+ 
+ // Printing
+@@ -3059,6 +3086,7 @@
+   // stacksize. This adjusted size is what is used to figure the placement
+   // of the guard pages.
+   main_thread->record_stack_base_and_size();
++  main_thread->initialize_coroutine_support();
+   main_thread->initialize_thread_local_storage();
+ 
+   main_thread->set_active_handles(JNIHandleBlock::allocate_block());
+@@ -4311,3 +4339,9 @@
+   VMThread* thread = VMThread::vm_thread();
+   if (thread != NULL) thread->verify();
+ }
++
++
++void JavaThread::initialize_coroutine_support() {
++  CoroutineStack::create_thread_stack(this)->insert_into_list(_coroutine_stack_list);
++  Coroutine::create_thread_coroutine(this, _coroutine_stack_list)->insert_into_list(_coroutine_list);
++}
+diff --git a/src/share/vm/runtime/thread.hpp b/src/share/vm/runtime/thread.hpp
+--- a/src/share/vm/runtime/thread.hpp
++++ b/src/share/vm/runtime/thread.hpp
+@@ -80,6 +80,9 @@
+ 
+ class WorkerThread;
+ 
++class Coroutine;
++class CoroutineStack;
++
+ // Class hierarchy
+ // - Thread
+ //   - NamedThread
+@@ -549,6 +552,10 @@
+   void leaving_jvmti_env_iteration()             { --_jvmti_env_iteration_count; }
+   bool is_inside_jvmti_env_iteration()           { return _jvmti_env_iteration_count > 0; }
+ 
++  static ByteSize resource_area_offset()         { return byte_offset_of(Thread, _resource_area); }
++  static ByteSize handle_area_offset()           { return byte_offset_of(Thread, _handle_area); }
++  static ByteSize last_handle_mark_offset()      { return byte_offset_of(Thread, _last_handle_mark); }
++
+   // Code generation
+   static ByteSize exception_file_offset()        { return byte_offset_of(Thread, _exception_file   ); }
+   static ByteSize exception_line_offset()        { return byte_offset_of(Thread, _exception_line   ); }
+@@ -857,6 +864,22 @@
+   // This is set to popframe_pending to signal that top Java frame should be popped immediately
+   int _popframe_condition;
+ 
++  // coroutine support
++  CoroutineStack*   _coroutine_stack_list;
++  Coroutine*        _coroutine_list;
++
++  intptr_t          _coroutine_temp;
++
++ public:
++  CoroutineStack*& coroutine_stack_list()        { return _coroutine_stack_list; }
++  Coroutine*& coroutine_list()                   { return _coroutine_list; }
++
++  static ByteSize coroutine_temp_offset()        { return byte_offset_of(JavaThread, _coroutine_temp); }
++  
++  void initialize_coroutine_support();
++
++ private:
++
+ #ifndef PRODUCT
+   int _jmp_ring_index;
+   struct {
+@@ -1268,6 +1291,9 @@
+   static ByteSize is_method_handle_return_offset() { return byte_offset_of(JavaThread, _is_method_handle_return); }
+   static ByteSize stack_guard_state_offset()     { return byte_offset_of(JavaThread, _stack_guard_state   ); }
+   static ByteSize suspend_flags_offset()         { return byte_offset_of(JavaThread, _suspend_flags       ); }
++#ifdef ASSERT
++  static ByteSize java_call_counter_offset()     { return byte_offset_of(JavaThread, _java_call_counter); }
++#endif
+ 
+   static ByteSize do_not_unlock_if_synchronized_offset() { return byte_offset_of(JavaThread, _do_not_unlock_if_synchronized); }
+   static ByteSize should_post_on_exceptions_flag_offset() {
+diff --git a/src/share/vm/runtime/threadLocalStorage.cpp b/src/share/vm/runtime/threadLocalStorage.cpp
+--- a/src/share/vm/runtime/threadLocalStorage.cpp
++++ b/src/share/vm/runtime/threadLocalStorage.cpp
+@@ -57,6 +57,14 @@
+   guarantee(get_thread_slow() == thread, "must be the same thread, slowly");
+ }
+ 
++void ThreadLocalStorage::add_coroutine_stack(Thread* thread, address stack_base, size_t stack_size) {
++  pd_add_coroutine_stack(thread, stack_base, stack_size);
++}
++
++void ThreadLocalStorage::remove_coroutine_stack(Thread* thread, address stack_base, size_t stack_size) {
++  pd_remove_coroutine_stack(thread, stack_base, stack_size);
++}
++
+ void ThreadLocalStorage::init() {
+   assert(!is_initialized(),
+          "More than one attempt to initialize threadLocalStorage");
+diff --git a/src/share/vm/runtime/threadLocalStorage.hpp b/src/share/vm/runtime/threadLocalStorage.hpp
+--- a/src/share/vm/runtime/threadLocalStorage.hpp
++++ b/src/share/vm/runtime/threadLocalStorage.hpp
+@@ -43,6 +43,9 @@
+   static Thread* get_thread_slow();
+   static void    invalidate_all() { pd_invalidate_all(); }
+ 
++  static void    add_coroutine_stack(Thread* thread, address stack_base, size_t stack_size);
++  static void    remove_coroutine_stack(Thread* thread, address stack_base, size_t stack_size);
++
+   // Machine dependent stuff
+ #ifdef TARGET_OS_ARCH_linux_x86
+ # include "threadLS_linux_x86.hpp"
+@@ -88,6 +91,10 @@
+   // Processor dependent parts of set_thread and initialization
+   static void pd_set_thread(Thread* thread);
+   static void pd_init();
++
++  static void pd_add_coroutine_stack(Thread* thread, address stack_base, size_t stack_size);
++  static void pd_remove_coroutine_stack(Thread* thread, address stack_base, size_t stack_size);
++
+   // Invalidate any thread cacheing or optimization schemes.
+   static void pd_invalidate_all();
+ 
+diff --git a/src/share/vm/utilities/debug.cpp b/src/share/vm/utilities/debug.cpp
+--- a/src/share/vm/utilities/debug.cpp
++++ b/src/share/vm/utilities/debug.cpp
+@@ -106,6 +106,16 @@
+   if (BreakAtWarning) BREAKPOINT;
+ }
+ 
++void warning_fixed_args(const char* message) {
++  // In case error happens before init or during shutdown
++  if (tty == NULL) ostream_init();
++
++  tty->print("%s warning: ", VM_Version::vm_name());
++  tty->print_cr(message);
++  if (BreakAtWarning) BREAKPOINT;
++}
++
++
+ #ifndef PRODUCT
+ 
+ #define is_token_break(ch) (isspace(ch) || (ch) == ',')
+diff --git a/src/share/vm/utilities/debug.hpp b/src/share/vm/utilities/debug.hpp
+--- a/src/share/vm/utilities/debug.hpp
++++ b/src/share/vm/utilities/debug.hpp
+@@ -161,6 +161,7 @@
+ void report_untested(const char* file, int line, const char* message);
+ 
+ void warning(const char* format, ...);
++void warning_fixed_args(const char* message);
+ 
+ // out of memory reporting
+ void report_java_out_of_memory(const char* message);

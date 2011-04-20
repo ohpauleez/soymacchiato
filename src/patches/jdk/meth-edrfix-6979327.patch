@@ -1,0 +1,1535 @@
+6979327: method handle invocation should use casts instead of type parameters to specify return type
+Summary: Change result type parameters to result type casts.  (Also, replace private placeholder class InvokeDynamic.)
+Reviewed-by: twisti
+
+diff --git a/make/java/dyn/Makefile b/make/java/dyn/Makefile
+--- a/make/java/dyn/Makefile
++++ b/make/java/dyn/Makefile
+@@ -36,9 +36,7 @@
+ LANGUAGE_VERSION = -source 7
+ CLASS_VERSION = -target 7
+ 
+-# Actually, it will be less disruptive to compile with the same
+-# -target option as the rest of the system, and just turn on
+-# the specific compiler option we need here:
+-OTHER_JAVACFLAGS = -XDinvokedynamic
++# Tell the compiler not to accept transitional forms.
++OTHER_JAVACFLAGS = -XDallowTransitionalJSR292=no
+ 
+ include $(BUILDDIR)/common/Classes.gmk
+diff --git a/src/share/classes/java/dyn/InvokeDynamic.java b/src/share/classes/java/dyn/InvokeDynamic.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/java/dyn/InvokeDynamic.java
+@@ -0,0 +1,33 @@
++/*
++ * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Oracle designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Oracle in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++package java.dyn;
++
++/**
++ * This is a place-holder class.  Some HotSpot implementations need to see it.
++ */
++final class InvokeDynamic {
++    private InvokeDynamic() { throw new InternalError(); }  // do not instantiate
++}
+diff --git a/src/share/classes/java/dyn/MethodHandle.java b/src/share/classes/java/dyn/MethodHandle.java
+--- a/src/share/classes/java/dyn/MethodHandle.java
++++ b/src/share/classes/java/dyn/MethodHandle.java
+@@ -164,7 +164,7 @@
+ mt = MethodType.methodType(String.class, char.class, char.class);
+ mh = lookup.findVirtual(String.class, "replace", mt);
+ // (Ljava/lang/String;CC)Ljava/lang/String;
+-s = mh.&lt;String&gt;invokeExact("daddy",'d','n');
++s = (String) mh.invokeExact("daddy",'d','n');
+ assert(s.equals("nanny"));
+ // weakly typed invocation (using MHs.invoke)
+ s = (String) mh.invokeWithArguments("sappy", 'p', 'v');
+@@ -183,7 +183,7 @@
+ mt = MethodType.methodType(int.class);
+ mh = lookup.findVirtual(java.util.List.class, "size", mt);
+ // (Ljava/util/List;)I
+-i = mh.&lt;int&gt;invokeExact(java.util.Arrays.asList(1,2,3));
++i = (int) mh.invokeExact(java.util.Arrays.asList(1,2,3));
+ assert(i == 3);
+  * </pre></blockquote>
+  * Each of the above calls generates a single invokevirtual instruction
+@@ -298,7 +298,7 @@
+      * @throws WrongMethodTypeException if the target's type is not identical with the caller's type signature
+      * @throws Throwable anything thrown by the underlying method propagates unchanged through the method handle call
+      */
+-    public final native @PolymorphicSignature <R,A> R invokeExact(A... args) throws Throwable;
++    public final native @PolymorphicSignature Object invokeExact(Object... args) throws Throwable;
+ 
+     /**
+      * Invoke the method handle, allowing any caller signature,
+@@ -327,7 +327,7 @@
+      * @throws WrongMethodTypeException if the target's type cannot be adjusted to the caller's type signature
+      * @throws Throwable anything thrown by the underlying method propagates unchanged through the method handle call
+      */
+-    public final native @PolymorphicSignature <R,A> R invokeGeneric(A... args) throws Throwable;
++    public final native @PolymorphicSignature Object invokeGeneric(Object... args) throws Throwable;
+ 
+     /**
+      * Perform a varargs invocation, passing the arguments in the given array
+diff --git a/src/share/classes/sun/dyn/AdapterMethodHandle.java b/src/share/classes/sun/dyn/AdapterMethodHandle.java
+--- a/src/share/classes/sun/dyn/AdapterMethodHandle.java
++++ b/src/share/classes/sun/dyn/AdapterMethodHandle.java
+@@ -496,7 +496,7 @@
+             if (this.type() == newType)
+                 return this;
+             try {
+-                MethodHandle retyped = (MethodHandle) typeHandler.<MethodHandle>invokeExact(target, newType);
++                MethodHandle retyped = (MethodHandle) typeHandler.invokeExact(target, newType);
+                 // Contract:  Must return the desired type, or throw WMT
+                 if (retyped.type() != newType)
+                     throw new WrongMethodTypeException(retyped.toString());
+diff --git a/src/share/classes/sun/dyn/CallSiteImpl.java b/src/share/classes/sun/dyn/CallSiteImpl.java
+--- a/src/share/classes/sun/dyn/CallSiteImpl.java
++++ b/src/share/classes/sun/dyn/CallSiteImpl.java
+@@ -78,8 +78,8 @@
+             } else {
+                 throw new ClassCastException("bootstrap method failed to produce a MethodHandle or CallSite");
+             }
+-            PRIVATE_INITIALIZE_CALL_SITE.<void>invokeExact(site, name, type,
+-                                                           callerMethod, callerBCI);
++            PRIVATE_INITIALIZE_CALL_SITE.invokeExact(site, name, type,
++                                                     callerMethod, callerBCI);
+             assert(site.getTarget() != null);
+             assert(site.getTarget().type().equals(type));
+         } catch (Throwable ex) {
+diff --git a/src/share/classes/sun/dyn/FilterGeneric.java b/src/share/classes/sun/dyn/FilterGeneric.java
+--- a/src/share/classes/sun/dyn/FilterGeneric.java
++++ b/src/share/classes/sun/dyn/FilterGeneric.java
+@@ -303,7 +303,7 @@
+         protected Object invoke_C0(Object a0) { return target.invokeExact(filter.invokeExact(a0)); }
+         protected Object invoke_C1(Object a0) { return target.invokeExact(a0, filter.invokeExact()); }
+         protected Object invoke_Y0(Object a0) { Object[] av = { a0 };
+-                       filter.<void>invokeExact(av); return target.invokeExact(av[0]); }
++                       filter.invokeExact(av); return target.invokeExact(av[0]); }
+     }
+     static class F2X extends Adapter {
+         protected F2X(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+@@ -320,7 +320,7 @@
+         protected Object invoke_C1(Object a0, Object a1) { return target.invokeExact(a0, filter.invokeExact(a1)); }
+         protected Object invoke_C2(Object a0, Object a1) { return target.invokeExact(a0, a1, filter.invokeExact()); }
+         protected Object invoke_Y0(Object a0, Object a1) { Object[] av = { a0, a1 };
+-                       filter.<void>invokeExact(av); return target.invokeExact(av[0], av[1]); }
++                       filter.invokeExact(av); return target.invokeExact(av[0], av[1]); }
+     }
+     // */
+ 
+@@ -337,7 +337,7 @@
+             return target.invokeExact(filter.invokeExact()); }
+         static final Object[] NO_ARGS = { };
+         protected Object invoke_Y0() throws Throwable {
+-            filter.<void>invokeExact(NO_ARGS); // make the flyby
++            filter.invokeExact(NO_ARGS); // make the flyby
+             return target.invokeExact(); }
+     }
+ 
+@@ -375,7 +375,7 @@
+         "            return target.invokeExact(@av@, filter.invokeExact()); }",
+         "        protected Object invoke_Y0(@Tvav@) throws Throwable {",
+         "            Object[] av = { @av@ };",
+-        "            filter.<void>invokeExact(av); // make the flyby",
++        "            filter.invokeExact(av); // make the flyby",
+         "            return target.invokeExact(@av[i]@); }",
+         "    }",
+     } };
+@@ -518,7 +518,7 @@
+             return target.invokeExact(a0, filter.invokeExact()); }
+         protected Object invoke_Y0(Object a0) throws Throwable {
+             Object[] av = { a0 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0]); }
+     }
+     static class F2 extends Adapter {
+@@ -548,7 +548,7 @@
+             return target.invokeExact(a0, a1, filter.invokeExact()); }
+         protected Object invoke_Y0(Object a0, Object a1) throws Throwable {
+             Object[] av = { a0, a1 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1]); }
+     }
+     static class F3 extends Adapter {
+@@ -585,7 +585,7 @@
+             return target.invokeExact(a0, a1, a2, filter.invokeExact()); }
+         protected Object invoke_Y0(Object a0, Object a1, Object a2) throws Throwable {
+             Object[] av = { a0, a1, a2 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1], av[2]); }
+     }
+     static class F4 extends Adapter {
+@@ -629,7 +629,7 @@
+             return target.invokeExact(a0, a1, a2, a3, filter.invokeExact()); }
+         protected Object invoke_Y0(Object a0, Object a1, Object a2, Object a3) throws Throwable {
+             Object[] av = { a0, a1, a2, a3 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1], av[2], av[3]); }
+     }
+     static class F5 extends Adapter {
+@@ -698,7 +698,7 @@
+         protected Object invoke_Y0(Object a0, Object a1, Object a2, Object a3,
+                                    Object a4) throws Throwable {
+             Object[] av = { a0, a1, a2, a3, a4 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1], av[2], av[3], av[4]); }
+     }
+     static class F6 extends Adapter {
+@@ -777,7 +777,7 @@
+         protected Object invoke_Y0(Object a0, Object a1, Object a2, Object a3,
+                                    Object a4, Object a5) throws Throwable {
+             Object[] av = { a0, a1, a2, a3, a4, a5 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1], av[2], av[3], av[4], av[5]); }
+     }
+     static class F7 extends Adapter {
+@@ -866,7 +866,7 @@
+         protected Object invoke_Y0(Object a0, Object a1, Object a2, Object a3,
+                                    Object a4, Object a5, Object a6) throws Throwable {
+             Object[] av = { a0, a1, a2, a3, a4, a5, a6 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1], av[2], av[3], av[4], av[5], av[6]); }
+     }
+     static class F8 extends Adapter {
+@@ -965,7 +965,7 @@
+         protected Object invoke_Y0(Object a0, Object a1, Object a2, Object a3,
+                                    Object a4, Object a5, Object a6, Object a7) throws Throwable {
+             Object[] av = { a0, a1, a2, a3, a4, a5, a6, a7 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1], av[2], av[3], av[4], av[5], av[6], av[7]); }
+     }
+     static class F9 extends Adapter {
+@@ -1104,7 +1104,7 @@
+                                    Object a4, Object a5, Object a6, Object a7,
+                                    Object a8) throws Throwable {
+             Object[] av = { a0, a1, a2, a3, a4, a5, a6, a7, a8 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1], av[2], av[3], av[4], av[5], av[6], av[7], av[8]); }
+     }
+     static class F10 extends Adapter {
+@@ -1256,7 +1256,7 @@
+                                    Object a4, Object a5, Object a6, Object a7,
+                                    Object a8, Object a9) throws Throwable {
+             Object[] av = { a0, a1, a2, a3, a4, a5, a6, a7, a8, a9 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1], av[2], av[3], av[4], av[5], av[6], av[7], av[8], av[9]); }
+     }
+     static class F11 extends Adapter {
+@@ -1442,7 +1442,7 @@
+                                    Object a4, Object a5, Object a6, Object a7,
+                                    Object a8, Object a9, Object a10) throws Throwable {
+             Object[] av = { a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1], av[2], av[3], av[4], av[5], av[6], av[7], av[8], av[9], av[10]); }
+     }
+     static class F12 extends Adapter {
+@@ -1644,7 +1644,7 @@
+                                    Object a4, Object a5, Object a6, Object a7,
+                                    Object a8, Object a9, Object a10, Object a11) throws Throwable {
+             Object[] av = { a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1], av[2], av[3], av[4], av[5], av[6], av[7], av[8], av[9], av[10], av[11]); }
+     }
+     static class F13 extends Adapter {
+@@ -1904,7 +1904,7 @@
+                                    Object a8, Object a9, Object a10, Object a11,
+                                    Object a12) throws Throwable {
+             Object[] av = { a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1], av[2], av[3], av[4], av[5], av[6], av[7], av[8], av[9], av[10], av[11], av[12]); }
+     }
+     static class F14 extends Adapter {
+@@ -2183,7 +2183,7 @@
+                                    Object a8, Object a9, Object a10, Object a11,
+                                    Object a12, Object a13) throws Throwable {
+             Object[] av = { a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1], av[2], av[3], av[4], av[5], av[6], av[7], av[8], av[9], av[10], av[11], av[12], av[13]); }
+     }
+     static class F15 extends Adapter {
+@@ -2481,7 +2481,7 @@
+                                    Object a8, Object a9, Object a10, Object a11,
+                                    Object a12, Object a13, Object a14) throws Throwable {
+             Object[] av = { a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1], av[2], av[3], av[4], av[5], av[6], av[7], av[8], av[9], av[10], av[11], av[12], av[13], av[14]); }
+     }
+     static class F16 extends Adapter {
+@@ -2798,7 +2798,7 @@
+                                    Object a8, Object a9, Object a10, Object a11,
+                                    Object a12, Object a13, Object a14, Object a15) throws Throwable {
+             Object[] av = { a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1], av[2], av[3], av[4], av[5], av[6], av[7], av[8], av[9], av[10], av[11], av[12], av[13], av[14], av[15]); }
+     }
+     static class F17 extends Adapter {
+@@ -3188,7 +3188,7 @@
+                                    Object a12, Object a13, Object a14, Object a15,
+                                    Object a16) throws Throwable {
+             Object[] av = { a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1], av[2], av[3], av[4], av[5], av[6], av[7], av[8], av[9], av[10], av[11], av[12], av[13], av[14], av[15], av[16]); }
+     }
+     static class F18 extends Adapter {
+@@ -3600,7 +3600,7 @@
+                                    Object a12, Object a13, Object a14, Object a15,
+                                    Object a16, Object a17) throws Throwable {
+             Object[] av = { a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1], av[2], av[3], av[4], av[5], av[6], av[7], av[8], av[9], av[10], av[11], av[12], av[13], av[14], av[15], av[16], av[17]); }
+     }
+     static class F19 extends Adapter {
+@@ -4034,7 +4034,7 @@
+                                    Object a12, Object a13, Object a14, Object a15,
+                                    Object a16, Object a17, Object a18) throws Throwable {
+             Object[] av = { a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1], av[2], av[3], av[4], av[5], av[6], av[7], av[8], av[9], av[10], av[11], av[12], av[13], av[14], av[15], av[16], av[17], av[18]); }
+     }
+     static class F20 extends Adapter {
+@@ -4490,7 +4490,7 @@
+                                    Object a12, Object a13, Object a14, Object a15,
+                                    Object a16, Object a17, Object a18, Object a19) throws Throwable {
+             Object[] av = { a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19 };
+-            filter.<void>invokeExact(av); // make the flyby
++            filter.invokeExact(av); // make the flyby
+             return target.invokeExact(av[0], av[1], av[2], av[3], av[4], av[5], av[6], av[7], av[8], av[9], av[10], av[11], av[12], av[13], av[14], av[15], av[16], av[17], av[18], av[19]); }
+     }
+ }
+diff --git a/src/share/classes/sun/dyn/FromGeneric.java b/src/share/classes/sun/dyn/FromGeneric.java
+--- a/src/share/classes/sun/dyn/FromGeneric.java
++++ b/src/share/classes/sun/dyn/FromGeneric.java
+@@ -283,11 +283,11 @@
+         // { return new ThisType(entryPoint, convert, target); }
+ 
+         /// Conversions on the value returned from the target.
+-        protected Object convert_L(Object result) throws Throwable { return convert.<Object>invokeExact(result); }
+-        protected Object convert_I(int    result) throws Throwable { return convert.<Object>invokeExact(result); }
+-        protected Object convert_J(long   result) throws Throwable { return convert.<Object>invokeExact(result); }
+-        protected Object convert_F(float  result) throws Throwable { return convert.<Object>invokeExact(result); }
+-        protected Object convert_D(double result) throws Throwable { return convert.<Object>invokeExact(result); }
++        protected Object convert_L(Object result) throws Throwable { return convert.invokeExact(result); }
++        protected Object convert_I(int    result) throws Throwable { return convert.invokeExact(result); }
++        protected Object convert_J(long   result) throws Throwable { return convert.invokeExact(result); }
++        protected Object convert_F(float  result) throws Throwable { return convert.invokeExact(result); }
++        protected Object convert_D(double result) throws Throwable { return convert.invokeExact(result); }
+ 
+         static private final String CLASS_PREFIX; // "sun.dyn.FromGeneric$"
+         static {
+@@ -316,11 +316,11 @@
+                         { super(e, i, c, t); }
+         protected xA2 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+                         { return new xA2(e, i, c, t); }
+-        protected Object invoke_L2(Object a0, Object a1) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1)); }
+-        protected Object invoke_I2(Object a0, Object a1) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1)); }
+-        protected Object invoke_J2(Object a0, Object a1) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1)); }
+-        protected Object invoke_F2(Object a0, Object a1) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1)); }
+-        protected Object invoke_D2(Object a0, Object a1) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1)); }
++        protected Object invoke_L2(Object a0, Object a1) throws Throwable { return convert_L((Object)invoker.invokeExact(target, a0, a1)); }
++        protected Object invoke_I2(Object a0, Object a1) throws Throwable { return convert_I((int)   invoker.invokeExact(target, a0, a1)); }
++        protected Object invoke_J2(Object a0, Object a1) throws Throwable { return convert_J((long)  invoker.invokeExact(target, a0, a1)); }
++        protected Object invoke_F2(Object a0, Object a1) throws Throwable { return convert_F((float) invoker.invokeExact(target, a0, a1)); }
++        protected Object invoke_D2(Object a0, Object a1) throws Throwable { return convert_D((double)invoker.invokeExact(target, a0, a1)); }
+     }
+     // */
+ 
+@@ -329,7 +329,8 @@
+ //{{{
+ import java.util.*;
+ class genclasses {
+-    static String[] TYPES = { "Object", "int   ", "long  ", "float ", "double" };
++    static String[] TYPES = { "Object",    "int   ",    "long  ",    "float ",    "double" };
++    static String[] WRAPS = { "         ", "(Integer)", "(Long)   ", "(Float)  ", "(Double) " };
+     static String[] TCHARS = { "L",     "I",      "J",      "F",      "D",     "A" };
+     static String[][] TEMPLATES = { {
+         "@for@ arity=0..10  rcat<=4 nrefs<=99 nints=0   nlongs=0",
+@@ -341,13 +342,13 @@
+         "        protected @cat@ makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)",
+         "                        { return new @cat@(e, i, c, t); }",
+         "        //@each-R@",
+-        "        protected Object invoke_@catN@(@Tvav@) throws Throwable { return convert_@Rc@(invoker.<@R@>invokeExact(target@av@)); }",
++        "        protected Object invoke_@catN@(@Tvav@) throws Throwable { return convert_@Rc@((@R@)@W@invoker.invokeExact(target@av@)); }",
+         "        //@end-R@",
+         "    }",
+     } };
+     static final String NEWLINE_INDENT = "\n                ";
+     enum VAR {
+-        cat, catN, R, Rc, av, Tvav, Ovav;
++        cat, catN, R, Rc, W, av, Tvav, Ovav;
+         public final String pattern = "@"+toString().replace('_','.')+"@";
+         public String binding;
+         static void makeBindings(boolean topLevel, int rcat, int nrefs, int nints, int nlongs) {
+@@ -357,6 +358,7 @@
+             VAR.catN.binding = catstr(rcat, nrefs, nints, nlongs);
+             VAR.R.binding = TYPES[rcat];
+             VAR.Rc.binding = TCHARS[rcat];
++            VAR.W.binding = WRAPS[rcat];
+             String[] Tv = new String[nargs];
+             String[] av = new String[nargs];
+             String[] Tvav = new String[nargs];
+@@ -497,11 +499,11 @@
+                         { super(e, i, c, t); }
+         protected A0 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+                         { return new A0(e, i, c, t); }
+-        protected Object invoke_L0() throws Throwable { return convert_L(invoker.<Object>invokeExact(target)); }
+-        protected Object invoke_I0() throws Throwable { return convert_I(invoker.<int   >invokeExact(target)); }
+-        protected Object invoke_J0() throws Throwable { return convert_J(invoker.<long  >invokeExact(target)); }
+-        protected Object invoke_F0() throws Throwable { return convert_F(invoker.<float >invokeExact(target)); }
+-        protected Object invoke_D0() throws Throwable { return convert_D(invoker.<double>invokeExact(target)); }
++        protected Object invoke_L0() throws Throwable { return convert_L((Object)invoker.invokeExact(target)); }
++        protected Object invoke_I0() throws Throwable { return convert_I((int)   invoker.invokeExact(target)); }
++        protected Object invoke_J0() throws Throwable { return convert_J((long)  invoker.invokeExact(target)); }
++        protected Object invoke_F0() throws Throwable { return convert_F((float) invoker.invokeExact(target)); }
++        protected Object invoke_D0() throws Throwable { return convert_D((double)invoker.invokeExact(target)); }
+     }
+     static class A1 extends Adapter {
+         protected A1(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+@@ -509,11 +511,11 @@
+                         { super(e, i, c, t); }
+         protected A1 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+                         { return new A1(e, i, c, t); }
+-        protected Object invoke_L1(Object a0) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0)); }
+-        protected Object invoke_I1(Object a0) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0)); }
+-        protected Object invoke_J1(Object a0) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0)); }
+-        protected Object invoke_F1(Object a0) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0)); }
+-        protected Object invoke_D1(Object a0) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0)); }
++        protected Object invoke_L1(Object a0) throws Throwable { return convert_L((Object)invoker.invokeExact(target, a0)); }
++        protected Object invoke_I1(Object a0) throws Throwable { return convert_I((int)   invoker.invokeExact(target, a0)); }
++        protected Object invoke_J1(Object a0) throws Throwable { return convert_J((long)  invoker.invokeExact(target, a0)); }
++        protected Object invoke_F1(Object a0) throws Throwable { return convert_F((float) invoker.invokeExact(target, a0)); }
++        protected Object invoke_D1(Object a0) throws Throwable { return convert_D((double)invoker.invokeExact(target, a0)); }
+     }
+     static class A2 extends Adapter {
+         protected A2(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+@@ -521,11 +523,11 @@
+                         { super(e, i, c, t); }
+         protected A2 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+                         { return new A2(e, i, c, t); }
+-        protected Object invoke_L2(Object a0, Object a1) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1)); }
+-        protected Object invoke_I2(Object a0, Object a1) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1)); }
+-        protected Object invoke_J2(Object a0, Object a1) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1)); }
+-        protected Object invoke_F2(Object a0, Object a1) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1)); }
+-        protected Object invoke_D2(Object a0, Object a1) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1)); }
++        protected Object invoke_L2(Object a0, Object a1) throws Throwable { return convert_L((Object)invoker.invokeExact(target, a0, a1)); }
++        protected Object invoke_I2(Object a0, Object a1) throws Throwable { return convert_I((int)   invoker.invokeExact(target, a0, a1)); }
++        protected Object invoke_J2(Object a0, Object a1) throws Throwable { return convert_J((long)  invoker.invokeExact(target, a0, a1)); }
++        protected Object invoke_F2(Object a0, Object a1) throws Throwable { return convert_F((float) invoker.invokeExact(target, a0, a1)); }
++        protected Object invoke_D2(Object a0, Object a1) throws Throwable { return convert_D((double)invoker.invokeExact(target, a0, a1)); }
+     }
+     static class A3 extends Adapter {
+         protected A3(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+@@ -533,11 +535,11 @@
+                         { super(e, i, c, t); }
+         protected A3 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+                         { return new A3(e, i, c, t); }
+-        protected Object invoke_L3(Object a0, Object a1, Object a2) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1, a2)); }
+-        protected Object invoke_I3(Object a0, Object a1, Object a2) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1, a2)); }
+-        protected Object invoke_J3(Object a0, Object a1, Object a2) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1, a2)); }
+-        protected Object invoke_F3(Object a0, Object a1, Object a2) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1, a2)); }
+-        protected Object invoke_D3(Object a0, Object a1, Object a2) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1, a2)); }
++        protected Object invoke_L3(Object a0, Object a1, Object a2) throws Throwable { return convert_L((Object)invoker.invokeExact(target, a0, a1, a2)); }
++        protected Object invoke_I3(Object a0, Object a1, Object a2) throws Throwable { return convert_I((int)   invoker.invokeExact(target, a0, a1, a2)); }
++        protected Object invoke_J3(Object a0, Object a1, Object a2) throws Throwable { return convert_J((long)  invoker.invokeExact(target, a0, a1, a2)); }
++        protected Object invoke_F3(Object a0, Object a1, Object a2) throws Throwable { return convert_F((float) invoker.invokeExact(target, a0, a1, a2)); }
++        protected Object invoke_D3(Object a0, Object a1, Object a2) throws Throwable { return convert_D((double)invoker.invokeExact(target, a0, a1, a2)); }
+     }
+     static class A4 extends Adapter {
+         protected A4(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+@@ -545,11 +547,11 @@
+                         { super(e, i, c, t); }
+         protected A4 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+                         { return new A4(e, i, c, t); }
+-        protected Object invoke_L4(Object a0, Object a1, Object a2, Object a3) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1, a2, a3)); }
+-        protected Object invoke_I4(Object a0, Object a1, Object a2, Object a3) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1, a2, a3)); }
+-        protected Object invoke_J4(Object a0, Object a1, Object a2, Object a3) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1, a2, a3)); }
+-        protected Object invoke_F4(Object a0, Object a1, Object a2, Object a3) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1, a2, a3)); }
+-        protected Object invoke_D4(Object a0, Object a1, Object a2, Object a3) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1, a2, a3)); }
++        protected Object invoke_L4(Object a0, Object a1, Object a2, Object a3) throws Throwable { return convert_L((Object)invoker.invokeExact(target, a0, a1, a2, a3)); }
++        protected Object invoke_I4(Object a0, Object a1, Object a2, Object a3) throws Throwable { return convert_I((int)   invoker.invokeExact(target, a0, a1, a2, a3)); }
++        protected Object invoke_J4(Object a0, Object a1, Object a2, Object a3) throws Throwable { return convert_J((long)  invoker.invokeExact(target, a0, a1, a2, a3)); }
++        protected Object invoke_F4(Object a0, Object a1, Object a2, Object a3) throws Throwable { return convert_F((float) invoker.invokeExact(target, a0, a1, a2, a3)); }
++        protected Object invoke_D4(Object a0, Object a1, Object a2, Object a3) throws Throwable { return convert_D((double)invoker.invokeExact(target, a0, a1, a2, a3)); }
+     }
+     static class A5 extends Adapter {
+         protected A5(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+@@ -557,11 +559,11 @@
+                         { super(e, i, c, t); }
+         protected A5 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+                         { return new A5(e, i, c, t); }
+-        protected Object invoke_L5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1, a2, a3, a4)); }
+-        protected Object invoke_I5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1, a2, a3, a4)); }
+-        protected Object invoke_J5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1, a2, a3, a4)); }
+-        protected Object invoke_F5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1, a2, a3, a4)); }
+-        protected Object invoke_D5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1, a2, a3, a4)); }
++        protected Object invoke_L5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable { return convert_L((Object)invoker.invokeExact(target, a0, a1, a2, a3, a4)); }
++        protected Object invoke_I5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable { return convert_I((int)   invoker.invokeExact(target, a0, a1, a2, a3, a4)); }
++        protected Object invoke_J5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable { return convert_J((long)  invoker.invokeExact(target, a0, a1, a2, a3, a4)); }
++        protected Object invoke_F5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable { return convert_F((float) invoker.invokeExact(target, a0, a1, a2, a3, a4)); }
++        protected Object invoke_D5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable { return convert_D((double)invoker.invokeExact(target, a0, a1, a2, a3, a4)); }
+     }
+     static class A6 extends Adapter {
+         protected A6(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+@@ -569,11 +571,11 @@
+                         { super(e, i, c, t); }
+         protected A6 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+                         { return new A6(e, i, c, t); }
+-        protected Object invoke_L6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1, a2, a3, a4, a5)); }
+-        protected Object invoke_I6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1, a2, a3, a4, a5)); }
+-        protected Object invoke_J6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1, a2, a3, a4, a5)); }
+-        protected Object invoke_F6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1, a2, a3, a4, a5)); }
+-        protected Object invoke_D6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1, a2, a3, a4, a5)); }
++        protected Object invoke_L6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable { return convert_L((Object)invoker.invokeExact(target, a0, a1, a2, a3, a4, a5)); }
++        protected Object invoke_I6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable { return convert_I((int)   invoker.invokeExact(target, a0, a1, a2, a3, a4, a5)); }
++        protected Object invoke_J6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable { return convert_J((long)  invoker.invokeExact(target, a0, a1, a2, a3, a4, a5)); }
++        protected Object invoke_F6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable { return convert_F((float) invoker.invokeExact(target, a0, a1, a2, a3, a4, a5)); }
++        protected Object invoke_D6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable { return convert_D((double)invoker.invokeExact(target, a0, a1, a2, a3, a4, a5)); }
+     }
+     static class A7 extends Adapter {
+         protected A7(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+@@ -581,11 +583,11 @@
+                         { super(e, i, c, t); }
+         protected A7 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+                         { return new A7(e, i, c, t); }
+-        protected Object invoke_L7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1, a2, a3, a4, a5, a6)); }
+-        protected Object invoke_I7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1, a2, a3, a4, a5, a6)); }
+-        protected Object invoke_J7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1, a2, a3, a4, a5, a6)); }
+-        protected Object invoke_F7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1, a2, a3, a4, a5, a6)); }
+-        protected Object invoke_D7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1, a2, a3, a4, a5, a6)); }
++        protected Object invoke_L7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable { return convert_L((Object)invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6)); }
++        protected Object invoke_I7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable { return convert_I((int)   invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6)); }
++        protected Object invoke_J7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable { return convert_J((long)  invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6)); }
++        protected Object invoke_F7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable { return convert_F((float) invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6)); }
++        protected Object invoke_D7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable { return convert_D((double)invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6)); }
+     }
+     static class A8 extends Adapter {
+         protected A8(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+@@ -593,11 +595,11 @@
+                         { super(e, i, c, t); }
+         protected A8 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+                         { return new A8(e, i, c, t); }
+-        protected Object invoke_L8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7)); }
+-        protected Object invoke_I8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7)); }
+-        protected Object invoke_J8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7)); }
+-        protected Object invoke_F8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7)); }
+-        protected Object invoke_D8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7)); }
++        protected Object invoke_L8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable { return convert_L((Object)invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7)); }
++        protected Object invoke_I8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable { return convert_I((int)   invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7)); }
++        protected Object invoke_J8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable { return convert_J((long)  invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7)); }
++        protected Object invoke_F8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable { return convert_F((float) invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7)); }
++        protected Object invoke_D8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable { return convert_D((double)invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7)); }
+     }
+     static class A9 extends Adapter {
+         protected A9(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+@@ -605,11 +607,11 @@
+                         { super(e, i, c, t); }
+         protected A9 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+                         { return new A9(e, i, c, t); }
+-        protected Object invoke_L9(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8)); }
+-        protected Object invoke_I9(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8)); }
+-        protected Object invoke_J9(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8)); }
+-        protected Object invoke_F9(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8)); }
+-        protected Object invoke_D9(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8)); }
++        protected Object invoke_L9(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8) throws Throwable { return convert_L((Object)invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8)); }
++        protected Object invoke_I9(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8) throws Throwable { return convert_I((int)   invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8)); }
++        protected Object invoke_J9(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8) throws Throwable { return convert_J((long)  invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8)); }
++        protected Object invoke_F9(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8) throws Throwable { return convert_F((float) invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8)); }
++        protected Object invoke_D9(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8) throws Throwable { return convert_D((double)invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8)); }
+     }
+     static class A10 extends Adapter {
+         protected A10(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+@@ -617,10 +619,10 @@
+                         { super(e, i, c, t); }
+         protected A10 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+                         { return new A10(e, i, c, t); }
+-        protected Object invoke_L10(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)); }
+-        protected Object invoke_I10(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)); }
+-        protected Object invoke_J10(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)); }
+-        protected Object invoke_F10(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)); }
+-        protected Object invoke_D10(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)); }
++        protected Object invoke_L10(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9) throws Throwable { return convert_L((Object)invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)); }
++        protected Object invoke_I10(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9) throws Throwable { return convert_I((int)   invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)); }
++        protected Object invoke_J10(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9) throws Throwable { return convert_J((long)  invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)); }
++        protected Object invoke_F10(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9) throws Throwable { return convert_F((float) invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)); }
++        protected Object invoke_D10(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9) throws Throwable { return convert_D((double)invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)); }
+     }
+ }
+diff --git a/src/share/classes/sun/dyn/MethodHandleImpl.java b/src/share/classes/sun/dyn/MethodHandleImpl.java
+--- a/src/share/classes/sun/dyn/MethodHandleImpl.java
++++ b/src/share/classes/sun/dyn/MethodHandleImpl.java
+@@ -245,52 +245,52 @@
+         }
+         private C invoke_V(Object... av) throws Throwable {
+             C obj = allocate();
+-            rawConstructor.<void>invokeExact((Object)obj, av);
++            rawConstructor.invokeExact((Object)obj, av);
+             return obj;
+         }
+         private C invoke_L0() throws Throwable {
+             C obj = allocate();
+-            rawConstructor.<void>invokeExact((Object)obj);
++            rawConstructor.invokeExact((Object)obj);
+             return obj;
+         }
+         private C invoke_L1(Object a0) throws Throwable {
+             C obj = allocate();
+-            rawConstructor.<void>invokeExact((Object)obj, a0);
++            rawConstructor.invokeExact((Object)obj, a0);
+             return obj;
+         }
+         private C invoke_L2(Object a0, Object a1) throws Throwable {
+             C obj = allocate();
+-            rawConstructor.<void>invokeExact((Object)obj, a0, a1);
++            rawConstructor.invokeExact((Object)obj, a0, a1);
+             return obj;
+         }
+         private C invoke_L3(Object a0, Object a1, Object a2) throws Throwable {
+             C obj = allocate();
+-            rawConstructor.<void>invokeExact((Object)obj, a0, a1, a2);
++            rawConstructor.invokeExact((Object)obj, a0, a1, a2);
+             return obj;
+         }
+         private C invoke_L4(Object a0, Object a1, Object a2, Object a3) throws Throwable {
+             C obj = allocate();
+-            rawConstructor.<void>invokeExact((Object)obj, a0, a1, a2, a3);
++            rawConstructor.invokeExact((Object)obj, a0, a1, a2, a3);
+             return obj;
+         }
+         private C invoke_L5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable {
+             C obj = allocate();
+-            rawConstructor.<void>invokeExact((Object)obj, a0, a1, a2, a3, a4);
++            rawConstructor.invokeExact((Object)obj, a0, a1, a2, a3, a4);
+             return obj;
+         }
+         private C invoke_L6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable {
+             C obj = allocate();
+-            rawConstructor.<void>invokeExact((Object)obj, a0, a1, a2, a3, a4, a5);
++            rawConstructor.invokeExact((Object)obj, a0, a1, a2, a3, a4, a5);
+             return obj;
+         }
+         private C invoke_L7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable {
+             C obj = allocate();
+-            rawConstructor.<void>invokeExact((Object)obj, a0, a1, a2, a3, a4, a5, a6);
++            rawConstructor.invokeExact((Object)obj, a0, a1, a2, a3, a4, a5, a6);
+             return obj;
+         }
+         private C invoke_L8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable {
+             C obj = allocate();
+-            rawConstructor.<void>invokeExact((Object)obj, a0, a1, a2, a3, a4, a5, a6, a7);
++            rawConstructor.invokeExact((Object)obj, a0, a1, a2, a3, a4, a5, a6, a7);
+             return obj;
+         }
+         static MethodHandle[] makeInvokes() {
+@@ -951,54 +951,54 @@
+             return addTypeString(target, this);
+         }
+         private Object invoke_V(Object... av) throws Throwable {
+-            if (test.<boolean>invokeExact(av))
+-                return target.<Object>invokeExact(av);
+-            return fallback.<Object>invokeExact(av);
++            if ((boolean) test.invokeExact(av))
++                return target.invokeExact(av);
++            return fallback.invokeExact(av);
+         }
+         private Object invoke_L0() throws Throwable {
+-            if (test.<boolean>invokeExact())
+-                return target.<Object>invokeExact();
+-            return fallback.<Object>invokeExact();
++            if ((boolean) test.invokeExact())
++                return target.invokeExact();
++            return fallback.invokeExact();
+         }
+         private Object invoke_L1(Object a0) throws Throwable {
+-            if (test.<boolean>invokeExact(a0))
+-                return target.<Object>invokeExact(a0);
+-            return fallback.<Object>invokeExact(a0);
++            if ((boolean) test.invokeExact(a0))
++                return target.invokeExact(a0);
++            return fallback.invokeExact(a0);
+         }
+         private Object invoke_L2(Object a0, Object a1) throws Throwable {
+-            if (test.<boolean>invokeExact(a0, a1))
+-                return target.<Object>invokeExact(a0, a1);
+-            return fallback.<Object>invokeExact(a0, a1);
++            if ((boolean) test.invokeExact(a0, a1))
++                return target.invokeExact(a0, a1);
++            return fallback.invokeExact(a0, a1);
+         }
+         private Object invoke_L3(Object a0, Object a1, Object a2) throws Throwable {
+-            if (test.<boolean>invokeExact(a0, a1, a2))
+-                return target.<Object>invokeExact(a0, a1, a2);
+-            return fallback.<Object>invokeExact(a0, a1, a2);
++            if ((boolean) test.invokeExact(a0, a1, a2))
++                return target.invokeExact(a0, a1, a2);
++            return fallback.invokeExact(a0, a1, a2);
+         }
+         private Object invoke_L4(Object a0, Object a1, Object a2, Object a3) throws Throwable {
+-            if (test.<boolean>invokeExact(a0, a1, a2, a3))
+-                return target.<Object>invokeExact(a0, a1, a2, a3);
+-            return fallback.<Object>invokeExact(a0, a1, a2, a3);
++            if ((boolean) test.invokeExact(a0, a1, a2, a3))
++                return target.invokeExact(a0, a1, a2, a3);
++            return fallback.invokeExact(a0, a1, a2, a3);
+         }
+         private Object invoke_L5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable {
+-            if (test.<boolean>invokeExact(a0, a1, a2, a3, a4))
+-                return target.<Object>invokeExact(a0, a1, a2, a3, a4);
+-            return fallback.<Object>invokeExact(a0, a1, a2, a3, a4);
++            if ((boolean) test.invokeExact(a0, a1, a2, a3, a4))
++                return target.invokeExact(a0, a1, a2, a3, a4);
++            return fallback.invokeExact(a0, a1, a2, a3, a4);
+         }
+         private Object invoke_L6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable {
+-            if (test.<boolean>invokeExact(a0, a1, a2, a3, a4, a5))
+-                return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5);
+-            return fallback.<Object>invokeExact(a0, a1, a2, a3, a4, a5);
++            if ((boolean) test.invokeExact(a0, a1, a2, a3, a4, a5))
++                return target.invokeExact(a0, a1, a2, a3, a4, a5);
++            return fallback.invokeExact(a0, a1, a2, a3, a4, a5);
+         }
+         private Object invoke_L7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable {
+-            if (test.<boolean>invokeExact(a0, a1, a2, a3, a4, a5, a6))
+-                return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5, a6);
+-            return fallback.<Object>invokeExact(a0, a1, a2, a3, a4, a5, a6);
++            if ((boolean) test.invokeExact(a0, a1, a2, a3, a4, a5, a6))
++                return target.invokeExact(a0, a1, a2, a3, a4, a5, a6);
++            return fallback.invokeExact(a0, a1, a2, a3, a4, a5, a6);
+         }
+         private Object invoke_L8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable {
+-            if (test.<boolean>invokeExact(a0, a1, a2, a3, a4, a5, a6, a7))
+-                return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5, a6, a7);
+-            return fallback.<Object>invokeExact(a0, a1, a2, a3, a4, a5, a6, a7);
++            if ((boolean) test.invokeExact(a0, a1, a2, a3, a4, a5, a6, a7))
++                return target.invokeExact(a0, a1, a2, a3, a4, a5, a6, a7);
++            return fallback.invokeExact(a0, a1, a2, a3, a4, a5, a6, a7);
+         }
+         static MethodHandle[] makeInvokes() {
+             ArrayList<MethodHandle> invokes = new ArrayList<MethodHandle>();
+@@ -1058,82 +1058,82 @@
+         }
+         private Object invoke_V(Object... av) throws Throwable {
+             try {
+-                return target.<Object>invokeExact(av);
++                return target.invokeExact(av);
+             } catch (Throwable t) {
+                 if (!exType.isInstance(t))  throw t;
+-                return catcher.<Object>invokeExact(t, av);
++                return catcher.invokeExact(t, av);
+             }
+         }
+         private Object invoke_L0() throws Throwable {
+             try {
+-                return target.<Object>invokeExact();
++                return target.invokeExact();
+             } catch (Throwable t) {
+                 if (!exType.isInstance(t))  throw t;
+-                return catcher.<Object>invokeExact(t);
++                return catcher.invokeExact(t);
+             }
+         }
+         private Object invoke_L1(Object a0) throws Throwable {
+             try {
+-                return target.<Object>invokeExact(a0);
++                return target.invokeExact(a0);
+             } catch (Throwable t) {
+                 if (!exType.isInstance(t))  throw t;
+-                return catcher.<Object>invokeExact(t, a0);
++                return catcher.invokeExact(t, a0);
+             }
+         }
+         private Object invoke_L2(Object a0, Object a1) throws Throwable {
+             try {
+-                return target.<Object>invokeExact(a0, a1);
++                return target.invokeExact(a0, a1);
+             } catch (Throwable t) {
+                 if (!exType.isInstance(t))  throw t;
+-                return catcher.<Object>invokeExact(t, a0, a1);
++                return catcher.invokeExact(t, a0, a1);
+             }
+         }
+         private Object invoke_L3(Object a0, Object a1, Object a2) throws Throwable {
+             try {
+-                return target.<Object>invokeExact(a0, a1, a2);
++                return target.invokeExact(a0, a1, a2);
+             } catch (Throwable t) {
+                 if (!exType.isInstance(t))  throw t;
+-                return catcher.<Object>invokeExact(t, a0, a1, a2);
++                return catcher.invokeExact(t, a0, a1, a2);
+             }
+         }
+         private Object invoke_L4(Object a0, Object a1, Object a2, Object a3) throws Throwable {
+             try {
+-                return target.<Object>invokeExact(a0, a1, a2, a3);
++                return target.invokeExact(a0, a1, a2, a3);
+             } catch (Throwable t) {
+                 if (!exType.isInstance(t))  throw t;
+-                return catcher.<Object>invokeExact(t, a0, a1, a2, a3);
++                return catcher.invokeExact(t, a0, a1, a2, a3);
+             }
+         }
+         private Object invoke_L5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable {
+             try {
+-                return target.<Object>invokeExact(a0, a1, a2, a3, a4);
++                return target.invokeExact(a0, a1, a2, a3, a4);
+             } catch (Throwable t) {
+                 if (!exType.isInstance(t))  throw t;
+-                return catcher.<Object>invokeExact(t, a0, a1, a2, a3, a4);
++                return catcher.invokeExact(t, a0, a1, a2, a3, a4);
+             }
+         }
+         private Object invoke_L6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable {
+             try {
+-                return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5);
++                return target.invokeExact(a0, a1, a2, a3, a4, a5);
+             } catch (Throwable t) {
+                 if (!exType.isInstance(t))  throw t;
+-                return catcher.<Object>invokeExact(t, a0, a1, a2, a3, a4, a5);
++                return catcher.invokeExact(t, a0, a1, a2, a3, a4, a5);
+             }
+         }
+         private Object invoke_L7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable {
+             try {
+-                return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5, a6);
++                return target.invokeExact(a0, a1, a2, a3, a4, a5, a6);
+             } catch (Throwable t) {
+                 if (!exType.isInstance(t))  throw t;
+-                return catcher.<Object>invokeExact(t, a0, a1, a2, a3, a4, a5, a6);
++                return catcher.invokeExact(t, a0, a1, a2, a3, a4, a5, a6);
+             }
+         }
+         private Object invoke_L8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable {
+             try {
+-                return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5, a6, a7);
++                return target.invokeExact(a0, a1, a2, a3, a4, a5, a6, a7);
+             } catch (Throwable t) {
+                 if (!exType.isInstance(t))  throw t;
+-                return catcher.<Object>invokeExact(t, a0, a1, a2, a3, a4, a5, a6, a7);
++                return catcher.invokeExact(t, a0, a1, a2, a3, a4, a5, a6, a7);
+             }
+         }
+         static MethodHandle[] makeInvokes() {
+diff --git a/src/share/classes/sun/dyn/SpreadGeneric.java b/src/share/classes/sun/dyn/SpreadGeneric.java
+--- a/src/share/classes/sun/dyn/SpreadGeneric.java
++++ b/src/share/classes/sun/dyn/SpreadGeneric.java
+@@ -277,12 +277,12 @@
+         protected xS2(SpreadGeneric outer, MethodHandle t) { super(outer, t); }
+         protected xS2 makeInstance(SpreadGeneric outer, MethodHandle t) { return new xS2(outer, t); }
+         protected Object invoke_S0(Object a0, Object a1, Object av) throws Throwable { av = super.check(av,0);
+-             return target.<Object>invokeExact(a0, a1)); }
++             return target.invokeExact(a0, a1)); }
+         protected Object invoke_S1(Object a0, Object av) throws Throwable { av = super.check(av,1);
+-             return target.<Object>invokeExact(a0,
++             return target.invokeExact(a0,
+                 super.select(av,0)); }
+         protected Object invoke_S2(Object a0, Object av) throws Throwable { av = super.check(av,1);
+-             return target.<Object>invokeExact(
++             return target.invokeExact(
+                 super.select(av,0), super.select(av,1)); }
+     }
+     // */
+@@ -300,10 +300,10 @@
+         "        protected @cat@(SpreadGeneric outer, MethodHandle t) { super(outer, t); }",
+         "        protected @cat@ makeInstance(SpreadGeneric outer, MethodHandle t) { return new @cat@(outer, t); }",
+         "        protected Object invoke_S0(@Tvav,@Object av) throws Throwable { av = super.check(av, 0);",
+-        "            return target.<Object>invokeExact(@av@); }",
++        "            return target.invokeExact(@av@); }",
+         "        //@each-S@",
+         "        protected Object invoke_S@S@(@Tvav,@Object av) throws Throwable { av = super.check(av, @S@);",
+-        "            return target.<Object>invokeExact(@av,@@sv@); }",
++        "            return target.invokeExact(@av,@@sv@); }",
+         "        //@end-S@",
+         "    }",
+     } };
+@@ -414,16 +414,16 @@
+         protected S0(SpreadGeneric outer, MethodHandle t) { super(outer, t); }
+         protected S0 makeInstance(SpreadGeneric outer, MethodHandle t) { return new S0(outer, t); }
+         protected Object invoke_S0(Object av) throws Throwable { av = super.check(av, 0);
+-            return target.<Object>invokeExact(); }
++            return target.invokeExact(); }
+     }
+     static class S1 extends Adapter {
+         protected S1(SpreadGeneric outer) { super(outer); }  // to build prototype
+         protected S1(SpreadGeneric outer, MethodHandle t) { super(outer, t); }
+         protected S1 makeInstance(SpreadGeneric outer, MethodHandle t) { return new S1(outer, t); }
+         protected Object invoke_S0(Object a0, Object av) throws Throwable { av = super.check(av, 0);
+-            return target.<Object>invokeExact(a0); }
++            return target.invokeExact(a0); }
+         protected Object invoke_S1(Object av) throws Throwable { av = super.check(av, 1);
+-            return target.<Object>invokeExact(
++            return target.invokeExact(
+                 super.select(av,0)); }
+     }
+     static class S2 extends Adapter {
+@@ -431,12 +431,12 @@
+         protected S2(SpreadGeneric outer, MethodHandle t) { super(outer, t); }
+         protected S2 makeInstance(SpreadGeneric outer, MethodHandle t) { return new S2(outer, t); }
+         protected Object invoke_S0(Object a0, Object a1, Object av) throws Throwable { av = super.check(av, 0);
+-            return target.<Object>invokeExact(a0, a1); }
++            return target.invokeExact(a0, a1); }
+         protected Object invoke_S1(Object a0, Object av) throws Throwable { av = super.check(av, 1);
+-            return target.<Object>invokeExact(a0,
++            return target.invokeExact(a0,
+                 super.select(av,0)); }
+         protected Object invoke_S2(Object av) throws Throwable { av = super.check(av, 2);
+-            return target.<Object>invokeExact(
++            return target.invokeExact(
+                 super.select(av,0), super.select(av,1)); }
+     }
+     static class S3 extends Adapter {
+@@ -444,15 +444,15 @@
+         protected S3(SpreadGeneric outer, MethodHandle t) { super(outer, t); }
+         protected S3 makeInstance(SpreadGeneric outer, MethodHandle t) { return new S3(outer, t); }
+         protected Object invoke_S0(Object a0, Object a1, Object a2, Object av) throws Throwable { av = super.check(av, 0);
+-            return target.<Object>invokeExact(a0, a1, a2); }
++            return target.invokeExact(a0, a1, a2); }
+         protected Object invoke_S1(Object a0, Object a1, Object av) throws Throwable { av = super.check(av, 1);
+-            return target.<Object>invokeExact(a0, a1,
++            return target.invokeExact(a0, a1,
+                 super.select(av,0)); }
+         protected Object invoke_S2(Object a0, Object av) throws Throwable { av = super.check(av, 2);
+-            return target.<Object>invokeExact(a0,
++            return target.invokeExact(a0,
+                 super.select(av,0), super.select(av,1)); }
+         protected Object invoke_S3(Object av) throws Throwable { av = super.check(av, 3);
+-            return target.<Object>invokeExact(
++            return target.invokeExact(
+                 super.select(av,0), super.select(av,1), super.select(av,2)); }
+     }
+     static class S4 extends Adapter {
+@@ -460,18 +460,18 @@
+         protected S4(SpreadGeneric outer, MethodHandle t) { super(outer, t); }
+         protected S4 makeInstance(SpreadGeneric outer, MethodHandle t) { return new S4(outer, t); }
+         protected Object invoke_S0(Object a0, Object a1, Object a2, Object a3, Object av) throws Throwable { av = super.check(av, 0);
+-            return target.<Object>invokeExact(a0, a1, a2, a3); }
++            return target.invokeExact(a0, a1, a2, a3); }
+         protected Object invoke_S1(Object a0, Object a1, Object a2, Object av) throws Throwable { av = super.check(av, 1);
+-            return target.<Object>invokeExact(a0, a1, a2,
++            return target.invokeExact(a0, a1, a2,
+                 super.select(av,0)); }
+         protected Object invoke_S2(Object a0, Object a1, Object av) throws Throwable { av = super.check(av, 2);
+-            return target.<Object>invokeExact(a0, a1,
++            return target.invokeExact(a0, a1,
+                 super.select(av,0), super.select(av,1)); }
+         protected Object invoke_S3(Object a0, Object av) throws Throwable { av = super.check(av, 3);
+-            return target.<Object>invokeExact(a0,
++            return target.invokeExact(a0,
+                 super.select(av,0), super.select(av,1), super.select(av,2)); }
+         protected Object invoke_S4(Object av) throws Throwable { av = super.check(av, 4);
+-            return target.<Object>invokeExact(
++            return target.invokeExact(
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3)); }
+     }
+     static class S5 extends Adapter {
+@@ -479,21 +479,21 @@
+         protected S5(SpreadGeneric outer, MethodHandle t) { super(outer, t); }
+         protected S5 makeInstance(SpreadGeneric outer, MethodHandle t) { return new S5(outer, t); }
+         protected Object invoke_S0(Object a0, Object a1, Object a2, Object a3, Object a4, Object av) throws Throwable { av = super.check(av, 0);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4); }
++            return target.invokeExact(a0, a1, a2, a3, a4); }
+         protected Object invoke_S1(Object a0, Object a1, Object a2, Object a3, Object av) throws Throwable { av = super.check(av, 1);
+-            return target.<Object>invokeExact(a0, a1, a2, a3,
++            return target.invokeExact(a0, a1, a2, a3,
+                 super.select(av,0)); }
+         protected Object invoke_S2(Object a0, Object a1, Object a2, Object av) throws Throwable { av = super.check(av, 2);
+-            return target.<Object>invokeExact(a0, a1, a2,
++            return target.invokeExact(a0, a1, a2,
+                 super.select(av,0), super.select(av,1)); }
+         protected Object invoke_S3(Object a0, Object a1, Object av) throws Throwable { av = super.check(av, 3);
+-            return target.<Object>invokeExact(a0, a1,
++            return target.invokeExact(a0, a1,
+                 super.select(av,0), super.select(av,1), super.select(av,2)); }
+         protected Object invoke_S4(Object a0, Object av) throws Throwable { av = super.check(av, 4);
+-            return target.<Object>invokeExact(a0,
++            return target.invokeExact(a0,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3)); }
+         protected Object invoke_S5(Object av) throws Throwable { av = super.check(av, 5);
+-            return target.<Object>invokeExact(
++            return target.invokeExact(
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4)); }
+     }
+@@ -502,25 +502,25 @@
+         protected S6(SpreadGeneric outer, MethodHandle t) { super(outer, t); }
+         protected S6 makeInstance(SpreadGeneric outer, MethodHandle t) { return new S6(outer, t); }
+         protected Object invoke_S0(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object av) throws Throwable { av = super.check(av, 0);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5); }
++            return target.invokeExact(a0, a1, a2, a3, a4, a5); }
+         protected Object invoke_S1(Object a0, Object a1, Object a2, Object a3, Object a4, Object av) throws Throwable { av = super.check(av, 1);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4,
++            return target.invokeExact(a0, a1, a2, a3, a4,
+                 super.select(av,0)); }
+         protected Object invoke_S2(Object a0, Object a1, Object a2, Object a3, Object av) throws Throwable { av = super.check(av, 2);
+-            return target.<Object>invokeExact(a0, a1, a2, a3,
++            return target.invokeExact(a0, a1, a2, a3,
+                 super.select(av,0), super.select(av,1)); }
+         protected Object invoke_S3(Object a0, Object a1, Object a2, Object av) throws Throwable { av = super.check(av, 3);
+-            return target.<Object>invokeExact(a0, a1, a2,
++            return target.invokeExact(a0, a1, a2,
+                 super.select(av,0), super.select(av,1), super.select(av,2)); }
+         protected Object invoke_S4(Object a0, Object a1, Object av) throws Throwable { av = super.check(av, 4);
+-            return target.<Object>invokeExact(a0, a1,
++            return target.invokeExact(a0, a1,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3)); }
+         protected Object invoke_S5(Object a0, Object av) throws Throwable { av = super.check(av, 5);
+-            return target.<Object>invokeExact(a0,
++            return target.invokeExact(a0,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4)); }
+         protected Object invoke_S6(Object av) throws Throwable { av = super.check(av, 6);
+-            return target.<Object>invokeExact(
++            return target.invokeExact(
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4), super.select(av,5)); }
+     }
+@@ -529,29 +529,29 @@
+         protected S7(SpreadGeneric outer, MethodHandle t) { super(outer, t); }
+         protected S7 makeInstance(SpreadGeneric outer, MethodHandle t) { return new S7(outer, t); }
+         protected Object invoke_S0(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object av) throws Throwable { av = super.check(av, 0);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5, a6); }
++            return target.invokeExact(a0, a1, a2, a3, a4, a5, a6); }
+         protected Object invoke_S1(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object av) throws Throwable { av = super.check(av, 1);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5,
++            return target.invokeExact(a0, a1, a2, a3, a4, a5,
+                 super.select(av,0)); }
+         protected Object invoke_S2(Object a0, Object a1, Object a2, Object a3, Object a4, Object av) throws Throwable { av = super.check(av, 2);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4,
++            return target.invokeExact(a0, a1, a2, a3, a4,
+                 super.select(av,0), super.select(av,1)); }
+         protected Object invoke_S3(Object a0, Object a1, Object a2, Object a3, Object av) throws Throwable { av = super.check(av, 3);
+-            return target.<Object>invokeExact(a0, a1, a2, a3,
++            return target.invokeExact(a0, a1, a2, a3,
+                 super.select(av,0), super.select(av,1), super.select(av,2)); }
+         protected Object invoke_S4(Object a0, Object a1, Object a2, Object av) throws Throwable { av = super.check(av, 4);
+-            return target.<Object>invokeExact(a0, a1, a2,
++            return target.invokeExact(a0, a1, a2,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3)); }
+         protected Object invoke_S5(Object a0, Object a1, Object av) throws Throwable { av = super.check(av, 5);
+-            return target.<Object>invokeExact(a0, a1,
++            return target.invokeExact(a0, a1,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4)); }
+         protected Object invoke_S6(Object a0, Object av) throws Throwable { av = super.check(av, 6);
+-            return target.<Object>invokeExact(a0,
++            return target.invokeExact(a0,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4), super.select(av,5)); }
+         protected Object invoke_S7(Object av) throws Throwable { av = super.check(av, 7);
+-            return target.<Object>invokeExact(
++            return target.invokeExact(
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4), super.select(av,5), super.select(av,6)); }
+     }
+@@ -560,33 +560,33 @@
+         protected S8(SpreadGeneric outer, MethodHandle t) { super(outer, t); }
+         protected S8 makeInstance(SpreadGeneric outer, MethodHandle t) { return new S8(outer, t); }
+         protected Object invoke_S0(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object av) throws Throwable { av = super.check(av, 0);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5, a6, a7); }
++            return target.invokeExact(a0, a1, a2, a3, a4, a5, a6, a7); }
+         protected Object invoke_S1(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object av) throws Throwable { av = super.check(av, 1);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5, a6,
++            return target.invokeExact(a0, a1, a2, a3, a4, a5, a6,
+                 super.select(av,0)); }
+         protected Object invoke_S2(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object av) throws Throwable { av = super.check(av, 2);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5,
++            return target.invokeExact(a0, a1, a2, a3, a4, a5,
+                 super.select(av,0), super.select(av,1)); }
+         protected Object invoke_S3(Object a0, Object a1, Object a2, Object a3, Object a4, Object av) throws Throwable { av = super.check(av, 3);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4,
++            return target.invokeExact(a0, a1, a2, a3, a4,
+                 super.select(av,0), super.select(av,1), super.select(av,2)); }
+         protected Object invoke_S4(Object a0, Object a1, Object a2, Object a3, Object av) throws Throwable { av = super.check(av, 4);
+-            return target.<Object>invokeExact(a0, a1, a2, a3,
++            return target.invokeExact(a0, a1, a2, a3,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3)); }
+         protected Object invoke_S5(Object a0, Object a1, Object a2, Object av) throws Throwable { av = super.check(av, 5);
+-            return target.<Object>invokeExact(a0, a1, a2,
++            return target.invokeExact(a0, a1, a2,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4)); }
+         protected Object invoke_S6(Object a0, Object a1, Object av) throws Throwable { av = super.check(av, 6);
+-            return target.<Object>invokeExact(a0, a1,
++            return target.invokeExact(a0, a1,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4), super.select(av,5)); }
+         protected Object invoke_S7(Object a0, Object av) throws Throwable { av = super.check(av, 7);
+-            return target.<Object>invokeExact(a0,
++            return target.invokeExact(a0,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4), super.select(av,5), super.select(av,6)); }
+         protected Object invoke_S8(Object av) throws Throwable { av = super.check(av, 8);
+-            return target.<Object>invokeExact(
++            return target.invokeExact(
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4), super.select(av,5), super.select(av,6), super.select(av,7)); }
+     }
+@@ -595,37 +595,37 @@
+         protected S9(SpreadGeneric outer, MethodHandle t) { super(outer, t); }
+         protected S9 makeInstance(SpreadGeneric outer, MethodHandle t) { return new S9(outer, t); }
+         protected Object invoke_S0(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object av) throws Throwable { av = super.check(av, 0);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5, a6, a7, a8); }
++            return target.invokeExact(a0, a1, a2, a3, a4, a5, a6, a7, a8); }
+         protected Object invoke_S1(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object av) throws Throwable { av = super.check(av, 1);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5, a6, a7,
++            return target.invokeExact(a0, a1, a2, a3, a4, a5, a6, a7,
+                 super.select(av,0)); }
+         protected Object invoke_S2(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object av) throws Throwable { av = super.check(av, 2);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5, a6,
++            return target.invokeExact(a0, a1, a2, a3, a4, a5, a6,
+                 super.select(av,0), super.select(av,1)); }
+         protected Object invoke_S3(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object av) throws Throwable { av = super.check(av, 3);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5,
++            return target.invokeExact(a0, a1, a2, a3, a4, a5,
+                 super.select(av,0), super.select(av,1), super.select(av,2)); }
+         protected Object invoke_S4(Object a0, Object a1, Object a2, Object a3, Object a4, Object av) throws Throwable { av = super.check(av, 4);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4,
++            return target.invokeExact(a0, a1, a2, a3, a4,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3)); }
+         protected Object invoke_S5(Object a0, Object a1, Object a2, Object a3, Object av) throws Throwable { av = super.check(av, 5);
+-            return target.<Object>invokeExact(a0, a1, a2, a3,
++            return target.invokeExact(a0, a1, a2, a3,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4)); }
+         protected Object invoke_S6(Object a0, Object a1, Object a2, Object av) throws Throwable { av = super.check(av, 6);
+-            return target.<Object>invokeExact(a0, a1, a2,
++            return target.invokeExact(a0, a1, a2,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4), super.select(av,5)); }
+         protected Object invoke_S7(Object a0, Object a1, Object av) throws Throwable { av = super.check(av, 7);
+-            return target.<Object>invokeExact(a0, a1,
++            return target.invokeExact(a0, a1,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4), super.select(av,5), super.select(av,6)); }
+         protected Object invoke_S8(Object a0, Object av) throws Throwable { av = super.check(av, 8);
+-            return target.<Object>invokeExact(a0,
++            return target.invokeExact(a0,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4), super.select(av,5), super.select(av,6), super.select(av,7)); }
+         protected Object invoke_S9(Object av) throws Throwable { av = super.check(av, 9);
+-            return target.<Object>invokeExact(
++            return target.invokeExact(
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4), super.select(av,5), super.select(av,6), super.select(av,7),
+                 super.select(av,8)); }
+@@ -635,42 +635,42 @@
+         protected S10(SpreadGeneric outer, MethodHandle t) { super(outer, t); }
+         protected S10 makeInstance(SpreadGeneric outer, MethodHandle t) { return new S10(outer, t); }
+         protected Object invoke_S0(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9, Object av) throws Throwable { av = super.check(av, 0);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9); }
++            return target.invokeExact(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9); }
+         protected Object invoke_S1(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object av) throws Throwable { av = super.check(av, 1);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5, a6, a7, a8,
++            return target.invokeExact(a0, a1, a2, a3, a4, a5, a6, a7, a8,
+                 super.select(av,0)); }
+         protected Object invoke_S2(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object av) throws Throwable { av = super.check(av, 2);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5, a6, a7,
++            return target.invokeExact(a0, a1, a2, a3, a4, a5, a6, a7,
+                 super.select(av,0), super.select(av,1)); }
+         protected Object invoke_S3(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object av) throws Throwable { av = super.check(av, 3);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5, a6,
++            return target.invokeExact(a0, a1, a2, a3, a4, a5, a6,
+                 super.select(av,0), super.select(av,1), super.select(av,2)); }
+         protected Object invoke_S4(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object av) throws Throwable { av = super.check(av, 4);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4, a5,
++            return target.invokeExact(a0, a1, a2, a3, a4, a5,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3)); }
+         protected Object invoke_S5(Object a0, Object a1, Object a2, Object a3, Object a4, Object av) throws Throwable { av = super.check(av, 5);
+-            return target.<Object>invokeExact(a0, a1, a2, a3, a4,
++            return target.invokeExact(a0, a1, a2, a3, a4,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4)); }
+         protected Object invoke_S6(Object a0, Object a1, Object a2, Object a3, Object av) throws Throwable { av = super.check(av, 6);
+-            return target.<Object>invokeExact(a0, a1, a2, a3,
++            return target.invokeExact(a0, a1, a2, a3,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4), super.select(av,5)); }
+         protected Object invoke_S7(Object a0, Object a1, Object a2, Object av) throws Throwable { av = super.check(av, 7);
+-            return target.<Object>invokeExact(a0, a1, a2,
++            return target.invokeExact(a0, a1, a2,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4), super.select(av,5), super.select(av,6)); }
+         protected Object invoke_S8(Object a0, Object a1, Object av) throws Throwable { av = super.check(av, 8);
+-            return target.<Object>invokeExact(a0, a1,
++            return target.invokeExact(a0, a1,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4), super.select(av,5), super.select(av,6), super.select(av,7)); }
+         protected Object invoke_S9(Object a0, Object av) throws Throwable { av = super.check(av, 9);
+-            return target.<Object>invokeExact(a0,
++            return target.invokeExact(a0,
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4), super.select(av,5), super.select(av,6), super.select(av,7),
+                 super.select(av,8)); }
+         protected Object invoke_S10(Object av) throws Throwable { av = super.check(av, 10);
+-            return target.<Object>invokeExact(
++            return target.invokeExact(
+                 super.select(av,0), super.select(av,1), super.select(av,2), super.select(av,3),
+                 super.select(av,4), super.select(av,5), super.select(av,6), super.select(av,7),
+                 super.select(av,8), super.select(av,9)); }
+diff --git a/src/share/classes/sun/dyn/ToGeneric.java b/src/share/classes/sun/dyn/ToGeneric.java
+--- a/src/share/classes/sun/dyn/ToGeneric.java
++++ b/src/share/classes/sun/dyn/ToGeneric.java
+@@ -367,33 +367,33 @@
+         // { return new ThisType(entryPoint, convert, target); }
+ 
+         // Code to run when the arguments (<= 4) have all been boxed.
+-        protected Object target()               throws Throwable { return invoker.<Object>invokeExact(target); }
+-        protected Object target(Object a0)      throws Throwable { return invoker.<Object>invokeExact(target, a0); }
++        protected Object target()               throws Throwable { return invoker.invokeExact(target); }
++        protected Object target(Object a0)      throws Throwable { return invoker.invokeExact(target, a0); }
+         protected Object target(Object a0, Object a1)
+-                                                throws Throwable { return invoker.<Object>invokeExact(target, a0, a1); }
++                                                throws Throwable { return invoker.invokeExact(target, a0, a1); }
+         protected Object target(Object a0, Object a1, Object a2)
+-                                                throws Throwable { return invoker.<Object>invokeExact(target, a0, a1, a2); }
++                                                throws Throwable { return invoker.invokeExact(target, a0, a1, a2); }
+         protected Object target(Object a0, Object a1, Object a2, Object a3)
+-                                                throws Throwable { return invoker.<Object>invokeExact(target, a0, a1, a2, a3); }
++                                                throws Throwable { return invoker.invokeExact(target, a0, a1, a2, a3); }
+         /*
+-        protected Object target_0(Object... av) throws Throwable { return invoker.<Object>invokeExact(target, av); }
++        protected Object target_0(Object... av) throws Throwable { return invoker.invokeExact(target, av); }
+         protected Object target_1(Object a0, Object... av)
+-                                                throws Throwable { return invoker.<Object>invokeExact(target, a0, (Object)av); }
++                                                throws Throwable { return invoker.invokeExact(target, a0, (Object)av); }
+         protected Object target_2(Object a0, Object a1, Object... av)
+-                                                throws Throwable { return invoker.<Object>invokeExact(target, a0, a1, (Object)av); }
++                                                throws Throwable { return invoker.invokeExact(target, a0, a1, (Object)av); }
+         protected Object target_3(Object a0, Object a1, Object a2, Object... av)
+-                                                throws Throwable { return invoker.<Object>invokeExact(target, a0, a1, a2, (Object)av); }
++                                                throws Throwable { return invoker.invokeExact(target, a0, a1, a2, (Object)av); }
+         protected Object target_4(Object a0, Object a1, Object a2, Object a3, Object... av)
+-                                                throws Throwable { return invoker.<Object>invokeExact(target, a0, a1, a2, a3, (Object)av); }
++                                                throws Throwable { return invoker.invokeExact(target, a0, a1, a2, a3, (Object)av); }
+         // */
+         // (For more than 4 arguments, generate the code in the adapter itself.)
+ 
+         // Code to run when the generic target has finished and produced a value.
+-        protected Object return_L(Object res) throws Throwable { return convert.<Object>invokeExact(res); }
+-        protected int    return_I(Object res) throws Throwable { return convert.<int   >invokeExact(res); }
+-        protected long   return_J(Object res) throws Throwable { return convert.<long  >invokeExact(res); }
+-        protected float  return_F(Object res) throws Throwable { return convert.<float >invokeExact(res); }
+-        protected double return_D(Object res) throws Throwable { return convert.<double>invokeExact(res); }
++        protected Object return_L(Object res) throws Throwable { return (Object)convert.invokeExact(res); }
++        protected int    return_I(Object res) throws Throwable { return (int)   convert.invokeExact(res); }
++        protected long   return_J(Object res) throws Throwable { return (long)  convert.invokeExact(res); }
++        protected float  return_F(Object res) throws Throwable { return (float) convert.invokeExact(res); }
++        protected double return_D(Object res) throws Throwable { return (double)convert.invokeExact(res); }
+ 
+         static private final String CLASS_PREFIX; // "sun.dyn.ToGeneric$"
+         static {
+@@ -420,7 +420,7 @@
+         protected A1(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+         protected A1(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { super(e, i, c, t); }
+         protected A1 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { return new A1(e, i, c, t); }
+-        protected Object target(Object a0)   throws Throwable { return invoker.<Object>invokeExact(target, a0); }
++        protected Object target(Object a0)   throws Throwable { return invoker.invokeExact(target, a0); }
+         protected Object targetA1(Object a0) throws Throwable { return target(a0); }
+         protected Object targetA1(int    a0) throws Throwable { return target(a0); }
+         protected Object targetA1(long   a0) throws Throwable { return target(a0); }
+@@ -458,7 +458,7 @@
+         "        protected @cat@(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype",
+         "        protected @cat@(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { super(e, i, c, t); }",
+         "        protected @cat@ makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { return new @cat@(e, i, c, t); }",
+-        "        protected Object target(@Ovav@)   throws Throwable { return invoker.<Object>invokeExact(target, @av@); }",
++        "        protected Object target(@Ovav@)   throws Throwable { return invoker.invokeExact(target, @av@); }",
+         "        //@each-Tv@",
+         "        protected Object target@cat@(@Tvav@) throws Throwable { return target(@av@); }",
+         "        //@end-Tv@",
+@@ -618,7 +618,7 @@
+         protected A0(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+         protected A0(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { super(e, i, c, t); }
+         protected A0 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { return new A0(e, i, c, t); }
+-        protected Object target()   throws Throwable { return invoker.<Object>invokeExact(target); }
++        protected Object target()   throws Throwable { return invoker.invokeExact(target); }
+         protected Object targetA0() throws Throwable { return target(); }
+         protected Object invoke_L() throws Throwable { return return_L(targetA0()); }
+         protected int    invoke_I() throws Throwable { return return_I(targetA0()); }
+@@ -630,7 +630,7 @@
+         protected A1(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+         protected A1(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { super(e, i, c, t); }
+         protected A1 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { return new A1(e, i, c, t); }
+-        protected Object target(Object a0)   throws Throwable { return invoker.<Object>invokeExact(target, a0); }
++        protected Object target(Object a0)   throws Throwable { return invoker.invokeExact(target, a0); }
+         protected Object targetA1(Object a0) throws Throwable { return target(a0); }
+         protected Object targetA1(int    a0) throws Throwable { return target(a0); }
+         protected Object targetA1(long   a0) throws Throwable { return target(a0); }
+@@ -654,7 +654,7 @@
+         protected A2(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+         protected A2(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { super(e, i, c, t); }
+         protected A2 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { return new A2(e, i, c, t); }
+-        protected Object target(Object a0, Object a1)   throws Throwable { return invoker.<Object>invokeExact(target, a0, a1); }
++        protected Object target(Object a0, Object a1)   throws Throwable { return invoker.invokeExact(target, a0, a1); }
+         protected Object targetA2(Object a0, Object a1) throws Throwable { return target(a0, a1); }
+         protected Object targetA2(Object a0, int    a1) throws Throwable { return target(a0, a1); }
+         protected Object targetA2(int    a0, int    a1) throws Throwable { return target(a0, a1); }
+@@ -690,7 +690,7 @@
+         protected A3(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+         protected A3(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { super(e, i, c, t); }
+         protected A3 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { return new A3(e, i, c, t); }
+-        protected Object target(Object a0, Object a1, Object a2)   throws Throwable { return invoker.<Object>invokeExact(target, a0, a1, a2); }
++        protected Object target(Object a0, Object a1, Object a2)   throws Throwable { return invoker.invokeExact(target, a0, a1, a2); }
+         protected Object targetA3(Object a0, Object a1, Object a2) throws Throwable { return target(a0, a1, a2); }
+         protected Object targetA3(Object a0, Object a1, int    a2) throws Throwable { return target(a0, a1, a2); }
+         protected Object targetA3(Object a0, int    a1, int    a2) throws Throwable { return target(a0, a1, a2); }
+@@ -739,7 +739,7 @@
+         protected A4(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+         protected A4(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { super(e, i, c, t); }
+         protected A4 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { return new A4(e, i, c, t); }
+-        protected Object target(Object a0, Object a1, Object a2, Object a3)   throws Throwable { return invoker.<Object>invokeExact(target, a0, a1, a2, a3); }
++        protected Object target(Object a0, Object a1, Object a2, Object a3)   throws Throwable { return invoker.invokeExact(target, a0, a1, a2, a3); }
+         protected Object targetA4(Object a0, Object a1, Object a2, Object a3) throws Throwable { return target(a0, a1, a2, a3); }
+         protected Object targetA4(Object a0, Object a1, Object a2, int    a3) throws Throwable { return target(a0, a1, a2, a3); }
+         protected Object targetA4(Object a0, Object a1, int    a2, int    a3) throws Throwable { return target(a0, a1, a2, a3); }
+@@ -781,7 +781,7 @@
+         protected A5(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+         protected A5(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { super(e, i, c, t); }
+         protected A5 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { return new A5(e, i, c, t); }
+-        protected Object target(Object a0, Object a1, Object a2, Object a3, Object a4)   throws Throwable { return invoker.<Object>invokeExact(target, a0, a1, a2, a3, a4); }
++        protected Object target(Object a0, Object a1, Object a2, Object a3, Object a4)   throws Throwable { return invoker.invokeExact(target, a0, a1, a2, a3, a4); }
+         protected Object targetA5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable { return target(a0, a1, a2, a3, a4); }
+         protected Object targetA5(Object a0, Object a1, Object a2, Object a3, int    a4) throws Throwable { return target(a0, a1, a2, a3, a4); }
+         protected Object targetA5(Object a0, Object a1, Object a2, int    a3, int    a4) throws Throwable { return target(a0, a1, a2, a3, a4); }
+@@ -832,7 +832,7 @@
+         protected A6(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+         protected A6(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { super(e, i, c, t); }
+         protected A6 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { return new A6(e, i, c, t); }
+-        protected Object target(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5)   throws Throwable { return invoker.<Object>invokeExact(target, a0, a1, a2, a3, a4, a5); }
++        protected Object target(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5)   throws Throwable { return invoker.invokeExact(target, a0, a1, a2, a3, a4, a5); }
+         protected Object targetA6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable { return target(a0, a1, a2, a3, a4, a5); }
+         protected Object targetA6(Object a0, Object a1, Object a2, Object a3, Object a4, long   a5) throws Throwable { return target(a0, a1, a2, a3, a4, a5); }
+         protected Object targetA6(Object a0, Object a1, Object a2, Object a3, long   a4, long   a5) throws Throwable { return target(a0, a1, a2, a3, a4, a5); }
+@@ -866,7 +866,7 @@
+         protected A7(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+         protected A7(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { super(e, i, c, t); }
+         protected A7 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { return new A7(e, i, c, t); }
+-        protected Object target(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6)   throws Throwable { return invoker.<Object>invokeExact(target, a0, a1, a2, a3, a4, a5, a6); }
++        protected Object target(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6)   throws Throwable { return invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6); }
+         protected Object targetA7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable { return target(a0, a1, a2, a3, a4, a5, a6); }
+         protected Object targetA7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, long   a6) throws Throwable { return target(a0, a1, a2, a3, a4, a5, a6); }
+         protected Object targetA7(Object a0, Object a1, Object a2, Object a3, Object a4, long   a5, long   a6) throws Throwable { return target(a0, a1, a2, a3, a4, a5, a6); }
+@@ -904,7 +904,7 @@
+         protected A8(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+         protected A8(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { super(e, i, c, t); }
+         protected A8 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { return new A8(e, i, c, t); }
+-        protected Object target(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7)   throws Throwable { return invoker.<Object>invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7); }
++        protected Object target(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7)   throws Throwable { return invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7); }
+         protected Object targetA8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable { return target(a0, a1, a2, a3, a4, a5, a6, a7); }
+         protected Object targetA8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, long   a7) throws Throwable { return target(a0, a1, a2, a3, a4, a5, a6, a7); }
+         protected Object targetA8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, long   a6, long   a7) throws Throwable { return target(a0, a1, a2, a3, a4, a5, a6, a7); }
+@@ -946,7 +946,7 @@
+         protected A9(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+         protected A9(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { super(e, i, c, t); }
+         protected A9 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { return new A9(e, i, c, t); }
+-        protected Object target(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8)   throws Throwable { return invoker.<Object>invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8); }
++        protected Object target(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8)   throws Throwable { return invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8); }
+         protected Object targetA9(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8) throws Throwable { return target(a0, a1, a2, a3, a4, a5, a6, a7, a8); }
+         protected Object targetA9(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, long   a8) throws Throwable { return target(a0, a1, a2, a3, a4, a5, a6, a7, a8); }
+         protected Object targetA9(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, long   a7, long   a8) throws Throwable { return target(a0, a1, a2, a3, a4, a5, a6, a7, a8); }
+@@ -992,7 +992,7 @@
+         protected A10(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+         protected A10(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { super(e, i, c, t); }
+         protected A10 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { return new A10(e, i, c, t); }
+-        protected Object target(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9)   throws Throwable { return invoker.<Object>invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9); }
++        protected Object target(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9)   throws Throwable { return invoker.invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9); }
+         protected Object targetA10(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9) throws Throwable { return target(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9); }
+         protected Object targetA10(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, long   a9) throws Throwable { return target(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9); }
+         protected Object targetA10(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, long   a8, long   a9) throws Throwable { return target(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9); }
+diff --git a/test/java/dyn/InvokeGenericTest.java b/test/java/dyn/InvokeGenericTest.java
+--- a/test/java/dyn/InvokeGenericTest.java
++++ b/test/java/dyn/InvokeGenericTest.java
+@@ -25,7 +25,7 @@
+ 
+ /* @test
+  * @summary unit tests for java.dyn.MethodHandle.invokeGeneric
+- * @compile -target 7 InvokeGenericTest.java
++ * @compile -XDallowTransitionalJSR292=no -target 7 InvokeGenericTest.java
+  * @run junit/othervm -XX:+UnlockExperimentalVMOptions -XX:+EnableMethodHandles test.java.dyn.InvokeGenericTest
+  */
+ 
+@@ -350,7 +350,7 @@
+         String[] args = { "one", "two" };
+         MethodHandle mh = callable(Object.class, String.class);
+         Object res; List resl;
+-        res = resl = (List) mh.<List>invokeGeneric((String)args[0], (Object)args[1]);
++        res = resl = (List) mh.invokeGeneric((String)args[0], (Object)args[1]);
+         //System.out.println(res);
+         assertEquals(Arrays.asList(args), res);
+     }
+@@ -476,7 +476,7 @@
+         Integer[] args = { 1, 2 };
+         MethodHandle mh = callable(Object.class, int.class);
+         Object res; List resl;
+-        res = resl = (List) mh.<List>invokeGeneric((int)args[0], (Object)args[1]);
++        res = resl = (List) mh.invokeGeneric((int)args[0], (Object)args[1]);
+         //System.out.println(res);
+         assertEquals(Arrays.asList(args), res);
+     }
+diff --git a/test/java/dyn/JavaDocExamplesTest.java b/test/java/dyn/JavaDocExamplesTest.java
+--- a/test/java/dyn/JavaDocExamplesTest.java
++++ b/test/java/dyn/JavaDocExamplesTest.java
+@@ -95,11 +95,11 @@
+ MethodHandle HASHCODE_3 = LOOKUP.findVirtual(Object.class,
+   "hashCode", methodType(int.class));
+ //assertEquals("xy", (String) CONCAT_1.invokeExact("x", "y"));
+-assertEquals("xy", (String) CONCAT_2.<String>invokeExact("x", "y"));
+-assertEquals("xy", (String) CONCAT_3.<String>invokeExact("x", "y"));
+-//assertEquals("xy".hashCode(), (int) HASHCODE_1.<int>invokeExact((Object)"xy"));
+-assertEquals("xy".hashCode(), (int) HASHCODE_2.<int>invokeExact((Object)"xy"));
+-assertEquals("xy".hashCode(), (int) HASHCODE_3.<int>invokeExact((Object)"xy"));
++assertEquals("xy", (String) CONCAT_2.invokeExact("x", "y"));
++assertEquals("xy", (String) CONCAT_3.invokeExact("x", "y"));
++//assertEquals("xy".hashCode(), (int) HASHCODE_1.invokeExact((Object)"xy"));
++assertEquals("xy".hashCode(), (int) HASHCODE_2.invokeExact((Object)"xy"));
++assertEquals("xy".hashCode(), (int) HASHCODE_3.invokeExact((Object)"xy"));
+ {}
+     }
+     @Test public void testDropArguments() throws Throwable {
+diff --git a/test/java/dyn/MethodHandlesTest.java b/test/java/dyn/MethodHandlesTest.java
+--- a/test/java/dyn/MethodHandlesTest.java
++++ b/test/java/dyn/MethodHandlesTest.java
+@@ -25,8 +25,8 @@
+ 
+ /* @test
+  * @summary unit tests for java.dyn.MethodHandles
+- * @compile -XDinvokedynamic MethodHandlesTest.java
+- * @run junit/othervm -XX:+UnlockExperimentalVMOptions -XX:+EnableInvokeDynamic test.java.dyn.MethodHandlesTest
++ * @compile -source 7 -target 7 -XDallowTransitionalJSR292=no MethodHandlesTest.java
++ * @run junit/othervm -XX:+UnlockExperimentalVMOptions -XX:+EnableMethodHandles test.java.dyn.MethodHandlesTest
+  */
+ 
+ package test.java.dyn;
+@@ -891,12 +891,12 @@
+         for (int i = 0; i <= 1; i++) {
+             if (isStatic) {
+                 if (type == int.class)
+-                    sawValue = mh.<int>invokeExact();  // do these exactly
++                    sawValue = (int) mh.invokeExact();  // do these exactly
+                 else
+                     sawValue = mh.invokeExact();
+             } else {
+                 if (type == int.class)
+-                    sawValue = mh.<int>invokeExact((Object) fields);
++                    sawValue = (int) mh.invokeExact((Object) fields);
+                 else
+                     sawValue = mh.invokeExact((Object) fields);
+             }
+@@ -965,14 +965,14 @@
+             Object putValue = randomArg(type);
+             if (isStatic) {
+                 if (type == int.class)
+-                    mh.<void>invokeExact((int)(Integer)putValue);  // do these exactly
++                    mh.invokeExact((int)putValue);  // do these exactly
+                 else
+-                    mh.<void>invokeExact(putValue);
++                    mh.invokeExact(putValue);
+             } else {
+                 if (type == int.class)
+-                    mh.<void>invokeExact((Object) fields, (int)(Integer)putValue);
++                    mh.invokeExact((Object) fields, (int)putValue);
+                 else
+-                    mh.<void>invokeExact((Object) fields, putValue);
++                    mh.invokeExact((Object) fields, putValue);
+             }
+             assertEquals(f.get(fields), putValue);
+         }
+@@ -1038,11 +1038,11 @@
+             model.set(i, random);
+             if (testSetter) {
+                 if (elemType == int.class)
+-                    mh.<void>invokeExact((int[]) array, i, (int)(Integer)random);
++                    mh.invokeExact((int[]) array, i, (int)random);
+                 else if (elemType == boolean.class)
+-                    mh.<void>invokeExact((boolean[]) array, i, (boolean)(Boolean)random);
++                    mh.invokeExact((boolean[]) array, i, (boolean)random);
+                 else
+-                    mh.<void>invokeExact(array, i, random);
++                    mh.invokeExact(array, i, random);
+                 assertEquals(model, array2list(array));
+             } else {
+                 Array.set(array, i, random);
+@@ -1058,9 +1058,9 @@
+             if (!testSetter) {
+                 expValue = sawValue;
+                 if (elemType == int.class)
+-                    sawValue = mh.<int>invokeExact((int[]) array, i);
++                    sawValue = (int) mh.invokeExact((int[]) array, i);
+                 else if (elemType == boolean.class)
+-                    sawValue = mh.<boolean>invokeExact((boolean[]) array, i);
++                    sawValue = (boolean) mh.invokeExact((boolean[]) array, i);
+                 else
+                     sawValue = mh.invokeExact(array, i);
+                 assertEquals(sawValue, expValue);
+@@ -1355,15 +1355,15 @@
+             assertArrayEquals(args, check);
+             switch (nargs) {
+                 case 0:
+-                    check = target.<Object[]>invokeExact();
++                    check = (Object[]) target.invokeExact();
+                     assertArrayEquals(args, check);
+                     break;
+                 case 1:
+-                    check = target.<Object[]>invokeExact(args[0]);
++                    check = (Object[]) target.invokeExact(args[0]);
+                     assertArrayEquals(args, check);
+                     break;
+                 case 2:
+-                    check = target.<Object[]>invokeExact(args[0], args[1]);
++                    check = (Object[]) target.invokeExact(args[0], args[1]);
+                     assertArrayEquals(args, check);
+                     break;
+             }
+@@ -1377,8 +1377,11 @@
+         MethodHandle result = MethodHandles.spreadArguments(target2, newType);
+         Object[] returnValue;
+         if (pos == 0) {
+-            Object rawRetVal = result.invokeExact(args);
+-            returnValue = (Object[]) rawRetVal;
++            // In the following line, the first cast implies
++            // normal Object return value for the MH call (Object[])->Object,
++            // while the second cast dynamically converts to an Object array.
++            // Such a double cast is typical of MH.invokeExact.
++            returnValue = (Object[]) (Object) result.invokeExact(args);
+         } else {
+             Object[] args1 = Arrays.copyOfRange(args, 0, pos+1);
+             args1[pos] = Arrays.copyOfRange(args, pos, args.length);

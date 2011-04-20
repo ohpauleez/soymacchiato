@@ -1,0 +1,167 @@
+0000000: writing libraries in Java for non-Java languages requires permissive Dynamic type
+MQ base = 80586310cc78 in http://hg.openjdk.java.net/bsd-port/bsd-port/langtools [2009-03-12] + meth.patch
+
+diff --git a/src/share/classes/com/sun/tools/javac/code/Symtab.java b/src/share/classes/com/sun/tools/javac/code/Symtab.java
+--- a/src/share/classes/com/sun/tools/javac/code/Symtab.java
++++ b/src/share/classes/com/sun/tools/javac/code/Symtab.java
+@@ -119,6 +119,7 @@
+     public final Type stringBuilderType;
+     public final Type cloneableType;
+     public final Type serializableType;
++    public final Type dynamicType;
+     public final Type methodHandleType;
+     public final Type invokeDynamicType;
+     public final Type throwableType;
+@@ -425,6 +426,9 @@
+         cloneableType = enterClass("java.lang.Cloneable");
+         throwableType = enterClass("java.lang.Throwable");
+         serializableType = enterClass("java.io.Serializable");
++        dynamicType = enterClass("java.dyn.Dynamic");
++        // interface Dynamic does *not* inherit members from Object:
++        ((ClassType)dynamicType).supertype_field = Type.noType;
+         methodHandleType = enterClass("java.dyn.MethodHandle");
+         invokeDynamicType = enterClass("java.dyn.InvokeDynamic");
+         errorType = enterClass("java.lang.Error");
+diff --git a/src/share/classes/com/sun/tools/javac/code/Types.java b/src/share/classes/com/sun/tools/javac/code/Types.java
+--- a/src/share/classes/com/sun/tools/javac/code/Types.java
++++ b/src/share/classes/com/sun/tools/javac/code/Types.java
+@@ -266,6 +266,8 @@
+      * convertions to s?
+      */
+     public boolean isConvertible(Type t, Type s, Warner warn) {
++        if (s.tsym == syms.dynamicType.tsym) return true;
++        if (t.tsym == syms.dynamicType.tsym && s.tsym == syms.objectType.tsym) return true;
+         boolean tPrimitive = t.isPrimitive();
+         boolean sPrimitive = s.isPrimitive();
+         if (tPrimitive == sPrimitive)
+@@ -893,6 +895,8 @@
+         if (t == s)
+             return true;
+ 
++        if (t.tsym == syms.dynamicType.tsym || s.tsym == syms.dynamicType.tsym) return true;
++
+         if (t.isPrimitive() != s.isPrimitive())
+             return allowBoxing && isConvertible(t, s, warn);
+ 
+@@ -1495,6 +1499,7 @@
+      * (not defined for Method and ForAll types)
+      */
+     public boolean isAssignable(Type t, Type s, Warner warn) {
++        if (s.tsym == syms.dynamicType.tsym) return true;
+         if (t.tag == ERROR)
+             return true;
+         if (t.tag <= INT && t.constValue() != null) {
+@@ -2245,6 +2250,8 @@
+                 Name fullname = cls.tsym.getQualifiedName();
+                 if (fullname == names.java_lang_Object)
+                     cls.rank_field = 0;
++                else if (fullname == names.java_dyn_Dynamic)
++                    cls.rank_field = 1;
+                 else {
+                     int r = rank(supertype(cls));
+                     for (List<Type> l = interfaces(cls);
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Lower.java b/src/share/classes/com/sun/tools/javac/comp/Lower.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Lower.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Lower.java
+@@ -2672,6 +2672,12 @@
+         Type unboxedType = types.unboxedType(tree.type);
+         // note: the "primitive" parameter is not used.  There muse be
+         // a conversion from unboxedType to primitive.
++        if (tree.type.tsym == syms.dynamicType.tsym) {
++            // use primitive target typing if the source is java.dyn.Dynamic
++            unboxedType = primitive;
++            ClassSymbol boxedClass = types.boxedClass(unboxedType);
++            tree = make.TypeCast(boxedClass.type, tree);
++        }
+         make_at(tree.pos());
+         Symbol valueSym = lookupMethod(tree.pos(),
+                                        unboxedType.tsym.name.append(names.Value), // x.intValue()
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Resolve.java b/src/share/classes/com/sun/tools/javac/comp/Resolve.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Resolve.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Resolve.java
+@@ -884,7 +884,12 @@
+         }
+         Type restype;
+         if (typeargtypes.isEmpty()) {
+-            restype = syms.objectType;
++            if (site == syms.dynamicType)
++                // foo.bar() defaults to (Dynamic) -> Dynamic
++                restype = syms.dynamicType;
++            else
++                // InvokeDynamic.bar(foo) defaults to (typeof foo) -> Object
++                restype = syms.objectType;
+         } else {
+             restype = typeargtypes.head;
+             if (!typeargtypes.tail.isEmpty())
+@@ -876,7 +876,8 @@
+                               List<Type> argtypes,
+                               List<Type> typeargtypes) {
+         assert allowInvokedynamic;
+-        assert site == syms.invokeDynamicType || (site == syms.methodHandleType && name == names.invoke);
++        assert site == syms.invokeDynamicType || site == syms.dynamicType
++	   || (site == syms.methodHandleType && name == names.invoke);
+         ClassSymbol c = (ClassSymbol) site.tsym;
+         Scope implicit = c.members().next;
+         if (implicit == null) {
+@@ -1317,7 +1317,7 @@
+         }
+         if (sym.kind >= AMBIGUOUS &&
+             allowInvokedynamic &&
+-            (site == syms.invokeDynamicType ||
++            (site == syms.invokeDynamicType || site == syms.dynamicType ||
+              site == syms.methodHandleType && name == names.invoke)) {
+             // lookup failed; supply an exactly-typed implicit method
+             sym = findImplicitMethod(env, site, name, argtypes, typeargtypes);
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/Gen.java b/src/share/classes/com/sun/tools/javac/jvm/Gen.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Gen.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/Gen.java
+@@ -2059,6 +2059,7 @@
+         // For basic types, the coerce(...) in genExpr(...) will do
+         // the conversion.
+         if (tree.clazz.type.tag > lastBaseTag &&
++            !types.isSameType(tree.clazz.type, syms.dynamicType) &&
+             types.asSuper(tree.expr.type, tree.clazz.type.tsym) == null) {
+             code.emitop2(checkcast, makeRef(tree.pos(), tree.clazz.type));
+         }
+@@ -2142,9 +2143,22 @@
+             }
+             result = items.
+                 makeImmediateItem(sym.type, ((VarSymbol) sym).getConstValue());
+-        } else if (allowInvokedynamic && sym.kind == MTH && ssym == syms.invokeDynamicType.tsym) {
+-            base.drop();
+-            result = items.makeDynamicItem(sym);
++        } else if (allowInvokedynamic && sym.kind == MTH &&
++                   (sym.owner == syms.invokeDynamicType.tsym || sym.owner == syms.dynamicType.tsym)) {
++            if (ssym == syms.dynamicType.tsym || ssym == syms.invokeDynamicType.tsym) {
++                base.drop();
++                result = items.makeDynamicItem(sym);
++            } else {
++                // There is a receiver value here; let's mix it into the argument list.
++                Symbol sym1 = sym.clone(sym.owner);
++                MethodType type1 = (MethodType) sym1.type.clone();
++                type1.argtypes = type1.argtypes.prepend(tree.selected.type);
++                sym1.type = type1;
++                // TODO: find a way to memoize sym1 as derived from sym
++                base.load();
++                result = items.makeDynamicItem(sym1);
++                // Since invokedynamic allows null first argument, do not call genNullCheck.
++            }
+         } else {
+             if (!accessSuper)
+                 sym = binaryQualifier(sym, tree.selected.type);
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Attr.java b/src/share/classes/com/sun/tools/javac/comp/Attr.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Attr.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Attr.java
+@@ -1318,9 +1332,10 @@
+             }
+ 
+             // as a special case, MethodHandle.<T>invoke(abc) and InvokeDynamic.<T>foo(abc)
+-            // has type <T>, and T can be a primitive type.
++            // and ((Dynamic)a).<T>foo(bc) has type <T>, and T can be a primitive type.
+             if (tree.meth.getTag() == JCTree.SELECT && !typeargtypes.isEmpty()) {
+               Type selt = ((JCFieldAccess) tree.meth).selected.type;
+-              if ((selt == syms.methodHandleType && methName == names.invoke) || selt == syms.invokeDynamicType) {
++              if ((selt == syms.methodHandleType && methName == names.invoke) ||
++                  selt == syms.invokeDynamicType || selt == syms.dynamicType) {
+                   assert types.isSameType(restype, typeargtypes.head) : mtype;
+                   typeargtypesNonRefOK = true;

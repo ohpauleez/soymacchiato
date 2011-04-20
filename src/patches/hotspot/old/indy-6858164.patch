@@ -1,0 +1,1265 @@
+pushed to jdk7
+6858164: invokedynamic code needs some cleanup (post-6655638)
+Summary: Fix several crashers, remove needless paths for boxed-style bootstrap method call, refactor & simplify APIs for rewriter constantPoolOop, remove sun.dyn.CallSiteImpl
+Reviewed-by: kvn
+
+diff --git a/src/cpu/sparc/vm/templateInterpreter_sparc.cpp b/src/cpu/sparc/vm/templateInterpreter_sparc.cpp
+--- a/src/cpu/sparc/vm/templateInterpreter_sparc.cpp
++++ b/src/cpu/sparc/vm/templateInterpreter_sparc.cpp
+@@ -150,8 +150,7 @@
+ }
+ 
+ 
+-address TemplateInterpreterGenerator::generate_return_entry_for(TosState state, int step, bool unbox) {
+-  assert(!unbox, "NYI");//6815692//
++address TemplateInterpreterGenerator::generate_return_entry_for(TosState state, int step) {
+   address compiled_entry = __ pc();
+   Label cont;
+ 
+diff --git a/src/cpu/x86/vm/templateInterpreter_x86_32.cpp b/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
+--- a/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
++++ b/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
+@@ -155,15 +155,8 @@
+ }
+ 
+ 
+-address TemplateInterpreterGenerator::generate_return_entry_for(TosState state, int step, bool unbox) {
++address TemplateInterpreterGenerator::generate_return_entry_for(TosState state, int step) {
+   TosState incoming_state = state;
+-  if (EnableInvokeDynamic) {
+-    if (unbox) {
+-      incoming_state = atos;
+-    }
+-  } else {
+-    assert(!unbox, "old behavior");
+-  }
+ 
+   Label interpreter_entry;
+   address compiled_entry = __ pc();
+@@ -216,46 +209,6 @@
+   __ restore_bcp();
+   __ restore_locals();
+ 
+-  Label L_fail;
+-
+-  if (unbox && state != atos) {
+-    // cast and unbox
+-    BasicType type = as_BasicType(state);
+-    if (type == T_BYTE)  type = T_BOOLEAN; // FIXME
+-    KlassHandle boxk = SystemDictionaryHandles::box_klass(type);
+-    __ mov32(rbx, ExternalAddress((address) boxk.raw_value()));
+-    __ testl(rax, rax);
+-    Label L_got_value, L_get_value;
+-    // convert nulls to zeroes (avoid NPEs here)
+-    if (!(type == T_FLOAT || type == T_DOUBLE)) {
+-      // if rax already contains zero bits, forge ahead
+-      __ jcc(Assembler::zero, L_got_value);
+-    } else {
+-      __ jcc(Assembler::notZero, L_get_value);
+-      __ fldz();
+-      __ jmp(L_got_value);
+-    }
+-    __ bind(L_get_value);
+-    __ cmp32(rbx, Address(rax, oopDesc::klass_offset_in_bytes()));
+-    __ jcc(Assembler::notEqual, L_fail);
+-    int offset = java_lang_boxing_object::value_offset_in_bytes(type);
+-    // Cf. TemplateTable::getfield_or_static
+-    switch (type) {
+-      case T_BYTE:     // fall through:
+-      case T_BOOLEAN:  __ load_signed_byte(rax, Address(rax, offset));    break;
+-      case T_CHAR:     __ load_unsigned_short(rax, Address(rax, offset)); break;
+-      case T_SHORT:    __ load_signed_short(rax, Address(rax, offset));   break;
+-      case T_INT:      __ movl(rax, Address(rax, offset));                break;
+-      case T_FLOAT:    __ fld_s(Address(rax, offset));                    break;
+-      case T_DOUBLE:   __ fld_d(Address(rax, offset));                    break;
+-      // Access to java.lang.Double.value does not need to be atomic:
+-      case T_LONG:   { __ movl(rdx, Address(rax, offset + 4));
+-                       __ movl(rax, Address(rax, offset + 0));  }         break;
+-      default: ShouldNotReachHere();
+-    }
+-    __ bind(L_got_value);
+-  }
+-
+   Label L_got_cache, L_giant_index;
+   if (EnableInvokeDynamic) {
+     __ cmpb(Address(rsi, 0), Bytecodes::_invokedynamic);
+@@ -263,32 +216,6 @@
+   }
+   __ get_cache_and_index_at_bcp(rbx, rcx, 1, false);
+   __ bind(L_got_cache);
+-  if (unbox && state == atos) {
+-    // insert a casting conversion, to keep verifier sane
+-    Label L_ok, L_ok_pops;
+-    __ testl(rax, rax);
+-    __ jcc(Assembler::zero, L_ok);
+-    __ push(rax);               // save the object to check
+-    __ push(rbx);               // save CP cache reference
+-    __ movl(rdx, Address(rax, oopDesc::klass_offset_in_bytes()));
+-    __ movl(rbx, Address(rbx, rcx,
+-                      Address::times_4, constantPoolCacheOopDesc::base_offset() +
+-                      ConstantPoolCacheEntry::f1_offset()));
+-    __ movl(rbx, Address(rbx, __ delayed_value(sun_dyn_CallSiteImpl::type_offset_in_bytes, rcx)));
+-    __ movl(rbx, Address(rbx, __ delayed_value(java_dyn_MethodType::rtype_offset_in_bytes, rcx)));
+-    __ movl(rax, Address(rbx, __ delayed_value(java_lang_Class::klass_offset_in_bytes, rcx)));
+-    __ check_klass_subtype(rdx, rax, rbx, L_ok_pops);
+-    __ pop(rcx);                // pop and discard CP cache
+-    __ mov(rbx, rax);           // target supertype into rbx for L_fail
+-    __ pop(rax);                // failed object into rax for L_fail
+-    __ jmp(L_fail);
+-
+-    __ bind(L_ok_pops);
+-    // restore pushed temp regs:
+-    __ pop(rbx);
+-    __ pop(rax);
+-    __ bind(L_ok);
+-  }
+   __ movl(rbx, Address(rbx, rcx,
+                     Address::times_ptr, constantPoolCacheOopDesc::base_offset() +
+                     ConstantPoolCacheEntry::flags_offset()));
+@@ -301,14 +228,6 @@
+     __ bind(L_giant_index);
+     __ get_cache_and_index_at_bcp(rbx, rcx, 1, true);
+     __ jmp(L_got_cache);
+-
+-    if (unbox) {
+-      __ bind(L_fail);
+-      __ push(rbx);             // missed klass (required)
+-      __ push(rax);             // bad object (actual)
+-      __ movptr(rdx, ExternalAddress((address) &Interpreter::_throw_WrongMethodType_entry));
+-      __ call(rdx);
+-    }
+   }
+ 
+   return entry;
+diff --git a/src/cpu/x86/vm/templateInterpreter_x86_64.cpp b/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
+--- a/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
++++ b/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
+@@ -166,8 +166,7 @@
+ 
+ 
+ address TemplateInterpreterGenerator::generate_return_entry_for(TosState state,
+-                                                                int step, bool unbox) {
+-  assert(!unbox, "NYI");//6815692//
++                                                                int step) {
+ 
+   // amd64 doesn't need to do anything special about compiled returns
+   // to the interpreter so the code that exists on x86 to place a sentinel
+diff --git a/src/cpu/x86/vm/templateTable_x86_32.cpp b/src/cpu/x86/vm/templateTable_x86_32.cpp
+--- a/src/cpu/x86/vm/templateTable_x86_32.cpp
++++ b/src/cpu/x86/vm/templateTable_x86_32.cpp
+@@ -2890,9 +2890,6 @@
+ 
+ 
+ void TemplateTable::prepare_invoke(Register method, Register index, int byte_no) {
+-  bool is_invdyn_bootstrap = (byte_no < 0);
+-  if (is_invdyn_bootstrap)  byte_no = -byte_no;
+-
+   // determine flags
+   Bytecodes::Code code = bytecode();
+   const bool is_invokeinterface  = code == Bytecodes::_invokeinterface;
+@@ -2907,8 +2904,6 @@
+   const Register flags  = rdx;
+   assert_different_registers(method, index, recv, flags);
+ 
+-  assert(!is_invdyn_bootstrap || is_invokedynamic, "byte_no<0 hack only for invdyn");
+-
+   // save 'interpreter return address'
+   __ save_bcp();
+ 
+@@ -2944,9 +2939,7 @@
+   // load return address
+   {
+     address table_addr;
+-    if (is_invdyn_bootstrap)
+-      table_addr = (address)Interpreter::return_5_unbox_addrs_by_index_table();
+-    else if (is_invokeinterface || is_invokedynamic)
++    if (is_invokeinterface || is_invokedynamic)
+       table_addr = (address)Interpreter::return_5_addrs_by_index_table();
+     else
+       table_addr = (address)Interpreter::return_3_addrs_by_index_table();
+@@ -3154,53 +3147,10 @@
+   }
+ 
+   Label handle_unlinked_site;
+-  __ movptr(rcx, Address(rax, __ delayed_value(sun_dyn_CallSiteImpl::target_offset_in_bytes, rcx)));
+-  __ testptr(rcx, rcx);
+-  __ jcc(Assembler::zero, handle_unlinked_site);
+-
++  __ movptr(rcx, Address(rax, __ delayed_value(java_dyn_CallSite::target_offset_in_bytes, rcx)));
++  __ null_check(rcx);
+   __ prepare_to_jump_from_interpreted();
+   __ jump_to_method_handle_entry(rcx, rdx);
+-
+-  // Initial calls come here...
+-  __ bind(handle_unlinked_site);
+-  __ pop(rcx);                 // remove return address pushed by prepare_invoke
+-
+-  // box stacked arguments into an array for the bootstrap method
+-  address entry = CAST_FROM_FN_PTR(address, InterpreterRuntime::bootstrap_invokedynamic);
+-  __ restore_bcp();      // rsi must be correct for call_VM
+-  __ call_VM(rax, entry, rax);
+-  __ movl(rdi, rax);            // protect bootstrap MH from prepare_invoke
+-
+-  // recompute return address
+-  __ restore_bcp();      // rsi must be correct for prepare_invoke
+-  prepare_invoke(rax, rbx, -byte_no);  // smashes rcx, rdx
+-  // rax: CallSite object (f1)
+-  // rbx: unused (f2)
+-  // rdi: bootstrap MH
+-  // rdx: flags
+-
+-  // now load up the arglist, which has been neatly boxed
+-  __ get_thread(rcx);
+-  __ movptr(rdx, Address(rcx, JavaThread::vm_result_2_offset()));
+-  __ movptr(Address(rcx, JavaThread::vm_result_2_offset()), NULL_WORD);
+-  __ verify_oop(rdx);
+-  // rdx = arglist
+-
+-  // save SP now, before we add the bootstrap call to the stack
+-  // We must preserve a fiction that the original arguments are outgoing,
+-  // because the return sequence will reset the stack to this point
+-  // and then pop all those arguments.  It seems error-prone to use
+-  // a different argument list size just for bootstrapping.
+-  __ prepare_to_jump_from_interpreted();
+-
+-  // Now let's play adapter, pushing the real arguments on the stack.
+-  __ pop(rbx);                  // return PC
+-  __ push(rdi);                 // boot MH
+-  __ push(rax);                 // call site
+-  __ push(rdx);                 // arglist
+-  __ push(rbx);                 // return PC, again
+-  __ mov(rcx, rdi);
+-  __ jump_to_method_handle_entry(rcx, rdx);
+ }
+ 
+ //----------------------------------------------------------------------------------------------------
+diff --git a/src/share/vm/ci/ciEnv.cpp b/src/share/vm/ci/ciEnv.cpp
+--- a/src/share/vm/ci/ciEnv.cpp
++++ b/src/share/vm/ci/ciEnv.cpp
+@@ -690,10 +690,8 @@
+   ciInstanceKlass* declared_holder = get_instance_klass_for_declared_method_holder(holder);
+ 
+   // Get the method's name and signature.
+-  int nt_index = cpool->name_and_type_ref_index_at(index);
+-  int sig_index = cpool->signature_ref_index_at(nt_index);
+   symbolOop name_sym = cpool->name_ref_at(index);
+-  symbolOop sig_sym = cpool->symbol_at(sig_index);
++  symbolOop sig_sym  = cpool->signature_ref_at(index);
+ 
+   if (holder_is_accessible) { // Our declared holder is loaded.
+     instanceKlass* lookup = declared_holder->get_instanceKlass();
+diff --git a/src/share/vm/classfile/javaClasses.cpp b/src/share/vm/classfile/javaClasses.cpp
+--- a/src/share/vm/classfile/javaClasses.cpp
++++ b/src/share/vm/classfile/javaClasses.cpp
+@@ -2430,15 +2430,15 @@
+ }
+ 
+ 
+-// Support for sun_dyn_CallSiteImpl
++// Support for java_dyn_CallSite
+ 
+-int sun_dyn_CallSiteImpl::_type_offset;
+-int sun_dyn_CallSiteImpl::_target_offset;
+-int sun_dyn_CallSiteImpl::_vmmethod_offset;
++int java_dyn_CallSite::_type_offset;
++int java_dyn_CallSite::_target_offset;
++int java_dyn_CallSite::_vmmethod_offset;
+ 
+-void sun_dyn_CallSiteImpl::compute_offsets() {
++void java_dyn_CallSite::compute_offsets() {
+   if (!EnableInvokeDynamic)  return;
+-  klassOop k = SystemDictionary::CallSiteImpl_klass();
++  klassOop k = SystemDictionary::CallSite_klass();
+   if (k != NULL) {
+     compute_offset(_type_offset,   k, vmSymbols::type_name(),   vmSymbols::java_dyn_MethodType_signature(), true);
+     compute_offset(_target_offset, k, vmSymbols::target_name(), vmSymbols::java_dyn_MethodHandle_signature(), true);
+@@ -2446,23 +2446,23 @@
+   }
+ }
+ 
+-oop sun_dyn_CallSiteImpl::type(oop site) {
++oop java_dyn_CallSite::type(oop site) {
+   return site->obj_field(_type_offset);
+ }
+ 
+-oop sun_dyn_CallSiteImpl::target(oop site) {
++oop java_dyn_CallSite::target(oop site) {
+   return site->obj_field(_target_offset);
+ }
+ 
+-void sun_dyn_CallSiteImpl::set_target(oop site, oop target) {
++void java_dyn_CallSite::set_target(oop site, oop target) {
+   site->obj_field_put(_target_offset, target);
+ }
+ 
+-oop sun_dyn_CallSiteImpl::vmmethod(oop site) {
++oop java_dyn_CallSite::vmmethod(oop site) {
+   return site->obj_field(_vmmethod_offset);
+ }
+ 
+-void sun_dyn_CallSiteImpl::set_vmmethod(oop site, oop ref) {
++void java_dyn_CallSite::set_vmmethod(oop site, oop ref) {
+   site->obj_field_put(_vmmethod_offset, ref);
+ }
+ 
+@@ -2811,7 +2811,7 @@
+     java_dyn_MethodTypeForm::compute_offsets();
+   }
+   if (EnableInvokeDynamic) {
+-    sun_dyn_CallSiteImpl::compute_offsets();
++    java_dyn_CallSite::compute_offsets();
+   }
+   java_security_AccessControlContext::compute_offsets();
+   // Initialize reflection classes. The layouts of these classes
+diff --git a/src/share/vm/classfile/javaClasses.hpp b/src/share/vm/classfile/javaClasses.hpp
+--- a/src/share/vm/classfile/javaClasses.hpp
++++ b/src/share/vm/classfile/javaClasses.hpp
+@@ -1061,9 +1061,9 @@
+ };
+ 
+ 
+-// Interface to sun.dyn.CallSiteImpl objects
++// Interface to java.dyn.CallSite objects
+ 
+-class sun_dyn_CallSiteImpl: AllStatic {
++class java_dyn_CallSite: AllStatic {
+   friend class JavaClasses;
+ 
+ private:
+diff --git a/src/share/vm/classfile/systemDictionary.cpp b/src/share/vm/classfile/systemDictionary.cpp
+--- a/src/share/vm/classfile/systemDictionary.cpp
++++ b/src/share/vm/classfile/systemDictionary.cpp
+@@ -1973,7 +1973,7 @@
+   WKID indy_group_end   = WK_KLASS_ENUM_NAME(Dynamic_klass);
+   initialize_wk_klasses_until(indy_group_start, scan, CHECK);
+   if (EnableInvokeDynamic) {
+-    initialize_wk_klasses_through(indy_group_start, scan, CHECK);
++    initialize_wk_klasses_through(indy_group_end, scan, CHECK);
+   }
+   if (_well_known_klasses[indy_group_start] == NULL) {
+     // Skip the rest of the dynamic typing classes, if Linkage is not loaded.
+@@ -2404,7 +2404,7 @@
+                                                 methodHandle mh_invdyn,
+                                                 TRAPS) {
+   Handle empty;
+-  // call sun.dyn.CallSiteImpl::makeSite(caller, name, mtype, cmid, cbci)
++  // call java.dyn.CallSite::makeSite(caller, name, mtype, cmid, cbci)
+   oop name_str_oop = StringTable::intern(name(), CHECK_(empty)); // not a handle!
+   JavaCallArguments args(Handle(THREAD, caller->java_mirror()));
+   args.push_oop(name_str_oop);
+@@ -2413,17 +2413,19 @@
+   args.push_int(caller_bci);
+   JavaValue result(T_OBJECT);
+   JavaCalls::call_static(&result,
+-                         SystemDictionary::CallSiteImpl_klass(),
++                         SystemDictionary::CallSite_klass(),
+                          vmSymbols::makeSite_name(), vmSymbols::makeSite_signature(),
+                          &args, CHECK_(empty));
+   oop call_site_oop = (oop) result.get_jobject();
+   assert(call_site_oop->is_oop()
+-         /*&& sun_dyn_CallSiteImpl::is_instance(call_site_oop)*/, "must be sane");
+-  sun_dyn_CallSiteImpl::set_vmmethod(call_site_oop, mh_invdyn());
++         /*&& java_dyn_CallSite::is_instance(call_site_oop)*/, "must be sane");
++  java_dyn_CallSite::set_vmmethod(call_site_oop, mh_invdyn());
+   if (TraceMethodHandles) {
++#ifndef PRODUCT
+     tty->print_cr("Linked invokedynamic bci=%d site="INTPTR_FORMAT":", caller_bci, call_site_oop);
+     call_site_oop->print();
+     tty->cr();
++#endif //PRODUCT
+   }
+   return call_site_oop;
+ }
+@@ -2436,9 +2438,17 @@
+ 
+   instanceKlassHandle ik(THREAD, caller());
+ 
+-  if (ik->bootstrap_method() != NULL) {
+-    return Handle(THREAD, ik->bootstrap_method());
++  oop boot_method_oop = ik->bootstrap_method();
++  if (boot_method_oop != NULL) {
++    if (TraceMethodHandles) {
++      tty->print_cr("bootstrap method for "PTR_FORMAT" cached as "PTR_FORMAT":", ik(), boot_method_oop);
++    }
++    NOT_PRODUCT(if (!boot_method_oop->is_oop()) { tty->print_cr("*** boot MH of "PTR_FORMAT" = "PTR_FORMAT, ik(), boot_method_oop); ik()->print(); });
++    assert(boot_method_oop->is_oop()
++           && java_dyn_MethodHandle::is_instance(boot_method_oop), "must be sane");
++    return Handle(THREAD, boot_method_oop);
+   }
++  boot_method_oop = NULL;  // GC safety
+ 
+   // call java.dyn.Linkage::findBootstrapMethod(caller, sbk)
+   JavaCallArguments args(Handle(THREAD, ik->java_mirror()));
+@@ -2452,9 +2462,18 @@
+                          vmSymbols::findBootstrapMethod_name(),
+                          vmSymbols::findBootstrapMethod_signature(),
+                          &args, CHECK_(empty));
+-  oop boot_method_oop = (oop) result.get_jobject();
++  boot_method_oop = (oop) result.get_jobject();
+ 
+   if (boot_method_oop != NULL) {
++    if (TraceMethodHandles) {
++#ifndef PRODUCT
++      tty->print_cr("--------");
++      tty->print_cr("bootstrap method for "PTR_FORMAT" computed as "PTR_FORMAT":", ik(), boot_method_oop);
++      ik()->print();
++      boot_method_oop->print();
++      tty->print_cr("========");
++#endif //PRODUCT
++    }
+     assert(boot_method_oop->is_oop()
+            && java_dyn_MethodHandle::is_instance(boot_method_oop), "must be sane");
+     // probably no race conditions, but let's be careful:
+@@ -2463,6 +2482,14 @@
+     else
+       boot_method_oop = ik->bootstrap_method();
+   } else {
++    if (TraceMethodHandles) {
++#ifndef PRODUCT
++      tty->print_cr("--------");
++      tty->print_cr("bootstrap method for "PTR_FORMAT" computed as NULL:", ik());
++      ik()->print();
++      tty->print_cr("========");
++#endif //PRODUCT
++    }
+     boot_method_oop = ik->bootstrap_method();
+   }
+ 
+diff --git a/src/share/vm/classfile/systemDictionary.hpp b/src/share/vm/classfile/systemDictionary.hpp
+--- a/src/share/vm/classfile/systemDictionary.hpp
++++ b/src/share/vm/classfile/systemDictionary.hpp
+@@ -144,7 +144,6 @@
+   template(WrongMethodTypeException_klass, java_dyn_WrongMethodTypeException, Opt) \
+   template(Linkage_klass,                java_dyn_Linkage,               Opt) \
+   template(CallSite_klass,               java_dyn_CallSite,              Opt) \
+-  template(CallSiteImpl_klass,           sun_dyn_CallSiteImpl,     Opt) \
+   template(Dynamic_klass,                java_dyn_Dynamic,               Opt) \
+   /* Note: MethodHandle must be first, and Dynamic last in group */           \
+                                                                               \
+diff --git a/src/share/vm/classfile/verifier.cpp b/src/share/vm/classfile/verifier.cpp
+--- a/src/share/vm/classfile/verifier.cpp
++++ b/src/share/vm/classfile/verifier.cpp
+@@ -1903,17 +1903,8 @@
+   verify_cp_type(index, cp, types, CHECK_VERIFY(this));
+ 
+   // Get method name and signature
+-  symbolHandle method_name;
+-  symbolHandle method_sig;
+-  if (opcode == Bytecodes::_invokedynamic) {
+-    int name_index = cp->name_ref_index_at(index);
+-    int sig_index  = cp->signature_ref_index_at(index);
+-    method_name = symbolHandle(THREAD, cp->symbol_at(name_index));
+-    method_sig  = symbolHandle(THREAD, cp->symbol_at(sig_index));
+-  } else {
+-    method_name = symbolHandle(THREAD, cp->name_ref_at(index));
+-    method_sig  = symbolHandle(THREAD, cp->signature_ref_at(index));
+-  }
++  symbolHandle method_name(THREAD, cp->name_ref_at(index));
++  symbolHandle method_sig(THREAD, cp->signature_ref_at(index));
+ 
+   if (!SignatureVerifier::is_valid_method_signature(method_sig)) {
+     class_format_error(
+diff --git a/src/share/vm/classfile/vmSymbols.hpp b/src/share/vm/classfile/vmSymbols.hpp
+--- a/src/share/vm/classfile/vmSymbols.hpp
++++ b/src/share/vm/classfile/vmSymbols.hpp
+@@ -233,10 +233,9 @@
+   template(sun_dyn_AdapterMethodHandle,               "sun/dyn/AdapterMethodHandle")              \
+   template(sun_dyn_BoundMethodHandle,                 "sun/dyn/BoundMethodHandle")                \
+   template(sun_dyn_DirectMethodHandle,                "sun/dyn/DirectMethodHandle")               \
+-  template(sun_dyn_CallSiteImpl,                      "sun/dyn/CallSiteImpl")                     \
+   template(makeImpl_name,                             "makeImpl") /*MethodType::makeImpl*/        \
+   template(makeImpl_signature,    "(Ljava/lang/Class;[Ljava/lang/Class;ZZ)Ljava/dyn/MethodType;") \
+-  template(makeSite_name,                             "makeSite") /*CallSiteImpl::makeImpl*/       \
++  template(makeSite_name,                             "makeSite") /*CallSite::makeSite*/          \
+   template(makeSite_signature,    "(Ljava/lang/Class;Ljava/lang/String;Ljava/dyn/MethodType;II)Ljava/dyn/CallSite;") \
+   template(findBootstrapMethod_name,                  "findBootstrapMethod")                      \
+   template(findBootstrapMethod_signature, "(Ljava/lang/Class;Ljava/lang/Class;)Ljava/dyn/MethodHandle;") \
+diff --git a/src/share/vm/includeDB_core b/src/share/vm/includeDB_core
+--- a/src/share/vm/includeDB_core
++++ b/src/share/vm/includeDB_core
+@@ -1291,6 +1291,7 @@
+ cpCacheOop.cpp                          markSweep.inline.hpp
+ cpCacheOop.cpp                          objArrayOop.hpp
+ cpCacheOop.cpp                          oop.inline.hpp
++cpCacheOop.cpp                          rewriter.hpp
+ cpCacheOop.cpp                          universe.inline.hpp
+ 
+ cpCacheOop.hpp                          allocation.hpp
+diff --git a/src/share/vm/interpreter/bytecodeTracer.cpp b/src/share/vm/interpreter/bytecodeTracer.cpp
+--- a/src/share/vm/interpreter/bytecodeTracer.cpp
++++ b/src/share/vm/interpreter/bytecodeTracer.cpp
+@@ -282,18 +282,21 @@
+   constantPoolOop constants = method()->constants();
+   constantTag tag = constants->tag_at(i);
+ 
++  int nt_index = -1;
++
+   switch (tag.value()) {
+   case JVM_CONSTANT_InterfaceMethodref:
+   case JVM_CONSTANT_Methodref:
+   case JVM_CONSTANT_Fieldref:
++  case JVM_CONSTANT_NameAndType:
+     break;
+   default:
+     st->print_cr(" bad tag=%d at %d", tag.value(), i);
+     return;
+   }
+ 
+-  symbolOop name = constants->name_ref_at(orig_i);
+-  symbolOop signature = constants->signature_ref_at(orig_i);
++  symbolOop name = constants->uncached_name_ref_at(i);
++  symbolOop signature = constants->uncached_signature_ref_at(i);
+   st->print_cr(" %d <%s> <%s> ", i, name->as_C_string(), signature->as_C_string());
+ }
+ 
+diff --git a/src/share/vm/interpreter/interpreter.cpp b/src/share/vm/interpreter/interpreter.cpp
+--- a/src/share/vm/interpreter/interpreter.cpp
++++ b/src/share/vm/interpreter/interpreter.cpp
+@@ -314,6 +314,20 @@
+       break;
+     }
+ 
++   case Bytecodes::_invokedynamic: {
++      Thread *thread = Thread::current();
++      ResourceMark rm(thread);
++      methodHandle mh(thread, method);
++      type = Bytecode_invoke_at(mh, bci)->result_type(thread);
++      // since the cache entry might not be initialized:
++      // (NOT needed for the old calling convension)
++      if (!is_top_frame) {
++        int index = Bytes::get_native_u4(bcp+1);
++        method->constants()->cache()->entry_at(index)->set_parameter_size(callee_parameters);
++      }
++      break;
++    }
++
+     case Bytecodes::_ldc   :
+       type = constant_pool_type( method, *(bcp+1) );
+       break;
+diff --git a/src/share/vm/interpreter/interpreterRuntime.cpp b/src/share/vm/interpreter/interpreterRuntime.cpp
+--- a/src/share/vm/interpreter/interpreterRuntime.cpp
++++ b/src/share/vm/interpreter/interpreterRuntime.cpp
+@@ -681,7 +681,7 @@
+ IRT_END
+ 
+ 
+-// First time execution:  Resolve symbols, create a permanent CallSiteImpl object.
++// First time execution:  Resolve symbols, create a permanent CallSite object.
+ IRT_ENTRY(void, InterpreterRuntime::resolve_invokedynamic(JavaThread* thread)) {
+   ResourceMark rm(thread);
+ 
+@@ -708,21 +708,16 @@
+   constantPoolHandle pool(thread, caller_method->constants());
+   pool->set_invokedynamic();    // mark header to flag active call sites
+ 
+-  int raw_index = four_byte_index(thread);
+-  assert(constantPoolCacheOopDesc::is_secondary_index(raw_index), "invokedynamic indexes marked specially");
+-
+-  // there are two CPC entries that are of interest:
+-  int site_index = constantPoolCacheOopDesc::decode_secondary_index(raw_index);
+-  int main_index = pool->cache()->entry_at(site_index)->main_entry_index();
+-  // and there is one CP entry, a NameAndType:
+-  int nt_index = pool->map_instruction_operand_to_index(raw_index);
++  int site_index = four_byte_index(thread);
++  // there is a second CPC entries that is of interest; it caches signature info:
++  int main_index = pool->cache()->secondary_entry_at(site_index)->main_entry_index();
+ 
+   // first resolve the signature to a MH.invoke methodOop
+   if (!pool->cache()->entry_at(main_index)->is_resolved(bytecode)) {
+     JvmtiHideSingleStepping jhss(thread);
+     CallInfo info;
+     LinkResolver::resolve_invoke(info, Handle(), pool,
+-                                 raw_index, bytecode, CHECK);
++                                 site_index, bytecode, CHECK);
+     // The main entry corresponds to a JVM_CONSTANT_NameAndType, and serves
+     // as a common reference point for all invokedynamic call sites with
+     // that exact call descriptor.  We will link it in the CP cache exactly
+@@ -741,7 +736,7 @@
+   assert(mh_invdyn.not_null() && mh_invdyn->is_method() && mh_invdyn->is_method_handle_invoke(),
+          "correct result from LinkResolver::resolve_invokedynamic");
+ 
+-  symbolHandle call_site_name(THREAD, pool->nt_name_ref_at(nt_index));
++  symbolHandle call_site_name(THREAD, pool->name_ref_at(site_index));
+   Handle call_site
+     = SystemDictionary::make_dynamic_call_site(caller_method->method_holder(),
+                                                caller_method->method_idnum(),
+@@ -753,61 +748,11 @@
+   // In the secondary entry, the f1 field is the call site, and the f2 (index)
+   // field is some data about the invoke site.
+   int extra_data = 0;
+-  pool->cache()->entry_at(site_index)->set_dynamic_call(call_site(), extra_data);
++  pool->cache()->secondary_entry_at(site_index)->set_dynamic_call(call_site(), extra_data);
+ }
+ IRT_END
+ 
+ 
+-// Called on first time execution, and also whenever the CallSite.target is null.
+-// FIXME:  Do more of this in Java code.
+-IRT_ENTRY(void, InterpreterRuntime::bootstrap_invokedynamic(JavaThread* thread, oopDesc* call_site)) {
+-  methodHandle   mh_invdyn(thread, (methodOop) sun_dyn_CallSiteImpl::vmmethod(call_site));
+-  Handle         mh_type(thread,   mh_invdyn->method_handle_type());
+-  objArrayHandle mh_ptypes(thread, java_dyn_MethodType::ptypes(mh_type()));
+-
+-  // squish the arguments down to a single array
+-  int nargs = mh_ptypes->length();
+-  objArrayHandle arg_array;
+-  {
+-    objArrayOop aaoop = oopFactory::new_objArray(SystemDictionary::object_klass(), nargs, CHECK);
+-    arg_array = objArrayHandle(thread, aaoop);
+-  }
+-  frame fr = thread->last_frame();
+-  assert(fr.interpreter_frame_bcp() != NULL, "sanity");
+-  int tos_offset = 0;
+-  for (int i = nargs; --i >= 0; ) {
+-    intptr_t* slot_addr = fr.interpreter_frame_tos_at(tos_offset++);
+-    oop ptype = mh_ptypes->obj_at(i);
+-    oop arg = NULL;
+-    if (!java_lang_Class::is_primitive(ptype)) {
+-      arg = *(oop*) slot_addr;
+-    } else {
+-      BasicType bt = java_lang_Class::primitive_type(ptype);
+-      assert(frame::interpreter_frame_expression_stack_direction() < 0, "else reconsider this code");
+-      jvalue value;
+-      Interpreter::get_jvalue_in_slot(slot_addr, bt, &value);
+-      tos_offset += type2size[bt]-1;
+-      arg = java_lang_boxing_object::create(bt, &value, CHECK);
+-      // FIXME:  These boxing objects are not canonicalized under
+-      // the Java autoboxing rules.  They should be...
+-      // The best approach would be to push the arglist creation into Java.
+-      // The JVM should use a lower-level interface to communicate argument lists.
+-    }
+-    arg_array->obj_at_put(i, arg);
+-  }
+-
+-  // now find the bootstrap method
+-  oop bootstrap_mh_oop = instanceKlass::cast(fr.interpreter_frame_method()->method_holder())->bootstrap_method();
+-  assert(bootstrap_mh_oop != NULL, "resolve_invokedynamic ensures a BSM");
+-
+-  // return the bootstrap method and argument array via vm_result/_2
+-  thread->set_vm_result(bootstrap_mh_oop);
+-  thread->set_vm_result_2(arg_array());
+-}
+-IRT_END
+-
+-
+-
+ //------------------------------------------------------------------------------------------------------------------------
+ // Miscellaneous
+ 
+diff --git a/src/share/vm/interpreter/interpreterRuntime.hpp b/src/share/vm/interpreter/interpreterRuntime.hpp
+--- a/src/share/vm/interpreter/interpreterRuntime.hpp
++++ b/src/share/vm/interpreter/interpreterRuntime.hpp
+@@ -91,7 +91,6 @@
+   // Calls
+   static void    resolve_invoke       (JavaThread* thread, Bytecodes::Code bytecode);
+   static void    resolve_invokedynamic(JavaThread* thread);
+-  static void  bootstrap_invokedynamic(JavaThread* thread, oopDesc* call_site);
+ 
+   // Breakpoints
+   static void _breakpoint(JavaThread* thread, methodOopDesc* method, address bcp);
+diff --git a/src/share/vm/interpreter/linkResolver.cpp b/src/share/vm/interpreter/linkResolver.cpp
+--- a/src/share/vm/interpreter/linkResolver.cpp
++++ b/src/share/vm/interpreter/linkResolver.cpp
+@@ -1015,11 +1015,8 @@
+ 
+   // This guy is reached from InterpreterRuntime::resolve_invokedynamic.
+ 
+-  assert(constantPoolCacheOopDesc::is_secondary_index(raw_index), "must be secondary index");
+-  int nt_index = pool->map_instruction_operand_to_index(raw_index);
+-
+   // At this point, we only need the signature, and can ignore the name.
+-  symbolHandle method_signature(THREAD, pool->nt_signature_ref_at(nt_index));
++  symbolHandle method_signature(THREAD, pool->signature_ref_at(raw_index));  // raw_index works directly
+   symbolHandle method_name = vmSymbolHandles::invoke_name();
+   KlassHandle resolved_klass = SystemDictionaryHandles::MethodHandle_klass();
+ 
+diff --git a/src/share/vm/interpreter/rewriter.cpp b/src/share/vm/interpreter/rewriter.cpp
+--- a/src/share/vm/interpreter/rewriter.cpp
++++ b/src/share/vm/interpreter/rewriter.cpp
+@@ -48,16 +48,6 @@
+ }
+ 
+ 
+-int Rewriter::add_extra_cp_cache_entry(int main_entry) {
+-  // Hack: We put it on the map as an encoded value.
+-  // The only place that consumes this is ConstantPoolCacheEntry::set_initial_state
+-  int encoded = constantPoolCacheOopDesc::encode_secondary_index(main_entry);
+-  int plain_secondary_index = _cp_cache_map.append(encoded);
+-  return constantPoolCacheOopDesc::encode_secondary_index(plain_secondary_index);
+-}
+-
+-
+-
+ // Creates a constant pool cache given a CPC map
+ // This creates the constant pool cache initially in a state
+ // that is unsafe for concurrent GC processing but sets it to
+@@ -127,7 +117,7 @@
+   assert(p[-1] == Bytecodes::_invokedynamic, "");
+   int cp_index = Bytes::get_Java_u2(p);
+   int cpc  = maybe_add_cp_cache_entry(cp_index);  // add lazily
+-  int cpc2 = add_extra_cp_cache_entry(cpc);
++  int cpc2 = add_secondary_cp_cache_entry(cpc);
+ 
+   // Replace the trailing four bytes with a CPC index for the dynamic
+   // call site.  Unlike other CPC entries, there is one per bytecode,
+@@ -137,7 +127,7 @@
+   // all these entries.  That is the main reason invokedynamic
+   // must have a five-byte instruction format.  (Of course, other JVM
+   // implementations can use the bytes for other purposes.)
+-  Bytes::put_native_u4(p, cpc2);
++  Bytes::put_native_u4(p, constantPoolCacheOopDesc::encode_secondary_index(cpc2));
+   // Note: We use native_u4 format exclusively for 4-byte indexes.
+ }
+ 
+diff --git a/src/share/vm/interpreter/rewriter.hpp b/src/share/vm/interpreter/rewriter.hpp
+--- a/src/share/vm/interpreter/rewriter.hpp
++++ b/src/share/vm/interpreter/rewriter.hpp
+@@ -43,13 +43,18 @@
+   bool has_cp_cache(int i) { return (uint)i < (uint)_cp_map.length() && _cp_map[i] >= 0; }
+   int maybe_add_cp_cache_entry(int i) { return has_cp_cache(i) ? _cp_map[i] : add_cp_cache_entry(i); }
+   int add_cp_cache_entry(int cp_index) {
++    assert((cp_index & _secondary_entry_tag) == 0, "bad tag");
+     assert(_cp_map[cp_index] == -1, "not twice on same cp_index");
+     int cache_index = _cp_cache_map.append(cp_index);
+     _cp_map.at_put(cp_index, cache_index);
+     assert(cp_entry_to_cp_cache(cp_index) == cache_index, "");
+     return cache_index;
+   }
+-  int add_extra_cp_cache_entry(int main_entry);
++  int add_secondary_cp_cache_entry(int main_cpc_entry) {
++    assert(main_cpc_entry < _cp_cache_map.length(), "must be earlier CP cache entry");
++    int cache_index = _cp_cache_map.append(main_cpc_entry | _secondary_entry_tag);
++    return cache_index;
++  }
+ 
+   // All the work goes in here:
+   Rewriter(instanceKlassHandle klass, TRAPS);
+@@ -65,4 +70,8 @@
+  public:
+   // Driver routine:
+   static void rewrite(instanceKlassHandle klass, TRAPS);
++
++  enum {
++    _secondary_entry_tag = nth_bit(30)
++  };
+ };
+diff --git a/src/share/vm/interpreter/templateInterpreter.cpp b/src/share/vm/interpreter/templateInterpreter.cpp
+--- a/src/share/vm/interpreter/templateInterpreter.cpp
++++ b/src/share/vm/interpreter/templateInterpreter.cpp
+@@ -178,14 +178,12 @@
+ #endif // !PRODUCT
+ EntryPoint TemplateInterpreter::_return_entry[TemplateInterpreter::number_of_return_entries];
+ EntryPoint TemplateInterpreter::_earlyret_entry;
+-EntryPoint TemplateInterpreter::_return_unbox_entry;
+ EntryPoint TemplateInterpreter::_deopt_entry [TemplateInterpreter::number_of_deopt_entries ];
+ EntryPoint TemplateInterpreter::_continuation_entry;
+ EntryPoint TemplateInterpreter::_safept_entry;
+ 
+ address    TemplateInterpreter::_return_3_addrs_by_index[TemplateInterpreter::number_of_return_addrs];
+ address    TemplateInterpreter::_return_5_addrs_by_index[TemplateInterpreter::number_of_return_addrs];
+-address    TemplateInterpreter::_return_5_unbox_addrs_by_index[TemplateInterpreter::number_of_return_addrs];
+ 
+ DispatchTable TemplateInterpreter::_active_table;
+ DispatchTable TemplateInterpreter::_normal_table;
+@@ -253,22 +251,6 @@
+     }
+   }
+ 
+-  if (EnableInvokeDynamic) {
+-    CodeletMark cm(_masm, "unboxing return entry points");
+-    Interpreter::_return_unbox_entry =
+-      EntryPoint(
+-        generate_return_unbox_entry_for(btos, 5),
+-        generate_return_unbox_entry_for(ctos, 5),
+-        generate_return_unbox_entry_for(stos, 5),
+-        generate_return_unbox_entry_for(atos, 5), // cast conversion
+-        generate_return_unbox_entry_for(itos, 5),
+-        generate_return_unbox_entry_for(ltos, 5),
+-        generate_return_unbox_entry_for(ftos, 5),
+-        generate_return_unbox_entry_for(dtos, 5),
+-        Interpreter::_return_entry[5].entry(vtos) // no unboxing for void
+-      );
+-  }
+-
+   { CodeletMark cm(_masm, "earlyret entry points");
+     Interpreter::_earlyret_entry =
+       EntryPoint(
+@@ -319,8 +301,6 @@
+     int index = Interpreter::TosState_as_index(states[j]);
+     Interpreter::_return_3_addrs_by_index[index] = Interpreter::return_entry(states[j], 3);
+     Interpreter::_return_5_addrs_by_index[index] = Interpreter::return_entry(states[j], 5);
+-    if (EnableInvokeDynamic)
+-      Interpreter::_return_5_unbox_addrs_by_index[index] = Interpreter::return_unbox_entry(states[j], 5);
+   }
+ 
+   { CodeletMark cm(_masm, "continuation entry points");
+@@ -547,18 +527,6 @@
+ }
+ 
+ 
+-address TemplateInterpreter::return_unbox_entry(TosState state, int length) {
+-  assert(EnableInvokeDynamic, "");
+-  if (state == vtos) {
+-    // no unboxing to do, actually
+-    return return_entry(state, length);
+-  } else {
+-    assert(length == 5, "unboxing entries generated for invokedynamic only");
+-    return _return_unbox_entry.entry(state);
+-  }
+-}
+-
+-
+ address TemplateInterpreter::deopt_entry(TosState state, int length) {
+   guarantee(0 <= length && length < Interpreter::number_of_deopt_entries, "illegal length");
+   return _deopt_entry[length].entry(state);
+diff --git a/src/share/vm/interpreter/templateInterpreter.hpp b/src/share/vm/interpreter/templateInterpreter.hpp
+--- a/src/share/vm/interpreter/templateInterpreter.hpp
++++ b/src/share/vm/interpreter/templateInterpreter.hpp
+@@ -110,14 +110,12 @@
+ #endif // !PRODUCT
+   static EntryPoint _return_entry[number_of_return_entries];    // entry points to return to from a call
+   static EntryPoint _earlyret_entry;                            // entry point to return early from a call
+-  static EntryPoint _return_unbox_entry;                        // entry point to unbox a return value from a call
+   static EntryPoint _deopt_entry[number_of_deopt_entries];      // entry points to return to from a deoptimization
+   static EntryPoint _continuation_entry;
+   static EntryPoint _safept_entry;
+ 
+   static address    _return_3_addrs_by_index[number_of_return_addrs];     // for invokevirtual   return entries
+   static address    _return_5_addrs_by_index[number_of_return_addrs];     // for invokeinterface return entries
+-  static address    _return_5_unbox_addrs_by_index[number_of_return_addrs]; // for invokedynamic bootstrap methods
+ 
+   static DispatchTable _active_table;                           // the active    dispatch table (used by the interpreter for dispatch)
+   static DispatchTable _normal_table;                           // the normal    dispatch table (used to set the active table in normal mode)
+@@ -159,12 +157,10 @@
+   // Support for invokes
+   static address*   return_3_addrs_by_index_table()             { return _return_3_addrs_by_index; }
+   static address*   return_5_addrs_by_index_table()             { return _return_5_addrs_by_index; }
+-  static address*   return_5_unbox_addrs_by_index_table()       { return _return_5_unbox_addrs_by_index; }
+   static int        TosState_as_index(TosState state);          // computes index into return_3_entry_by_index table
+ 
+   static address    return_entry  (TosState state, int length);
+   static address    deopt_entry   (TosState state, int length);
+-  static address    return_unbox_entry(TosState state, int length);
+ 
+   // Safepoint support
+   static void       notice_safepoints();                        // stops the thread when reaching a safepoint
+diff --git a/src/share/vm/interpreter/templateInterpreterGenerator.hpp b/src/share/vm/interpreter/templateInterpreterGenerator.hpp
+--- a/src/share/vm/interpreter/templateInterpreterGenerator.hpp
++++ b/src/share/vm/interpreter/templateInterpreterGenerator.hpp
+@@ -51,10 +51,7 @@
+   address generate_WrongMethodType_handler();
+   address generate_ArrayIndexOutOfBounds_handler(const char* name);
+   address generate_continuation_for(TosState state);
+-  address generate_return_entry_for(TosState state, int step, bool unbox = false);
+-  address generate_return_unbox_entry_for(TosState state, int step) {
+-    return generate_return_entry_for(state, step, true);
+-  }
++  address generate_return_entry_for(TosState state, int step);
+   address generate_earlyret_entry_for(TosState state);
+   address generate_deopt_entry_for(TosState state, int step);
+   address generate_safept_entry_for(TosState state, address runtime_entry);
+diff --git a/src/share/vm/oops/constantPoolOop.cpp b/src/share/vm/oops/constantPoolOop.cpp
+--- a/src/share/vm/oops/constantPoolOop.cpp
++++ b/src/share/vm/oops/constantPoolOop.cpp
+@@ -262,25 +262,48 @@
+ 
+ 
+ int constantPoolOopDesc::impl_name_and_type_ref_index_at(int which, bool uncached) {
+-  jint ref_index = field_or_method_at(which, uncached);
++  int i = which;
++  if (!uncached && cache() != NULL) {
++    if (constantPoolCacheOopDesc::is_secondary_index(which))
++      // Invokedynamic indexes are always processed in native order
++      // so there is no question of reading a native u2 in Java order here.
++      return cache()->main_entry_at(which)->constant_pool_index();
++    // change byte-ordering and go via cache
++    i = remap_instruction_operand_from_cache(which);
++  } else {
++    if (tag_at(which).is_name_and_type())
++      // invokedynamic index is a simple name-and-type
++      return which;
++  }
++  assert(tag_at(i).is_field_or_method(), "Corrupted constant pool");
++  jint ref_index = *int_at_addr(i);
+   return extract_high_short_from_int(ref_index);
+ }
+ 
+ 
+ int constantPoolOopDesc::impl_klass_ref_index_at(int which, bool uncached) {
+-  jint ref_index = field_or_method_at(which, uncached);
++  guarantee(!constantPoolCacheOopDesc::is_secondary_index(which),
++            "an invokedynamic instruction does not have a klass");
++  int i = which;
++  if (!uncached && cache() != NULL) {
++    // change byte-ordering and go via cache
++    i = remap_instruction_operand_from_cache(which);
++  }
++  assert(tag_at(i).is_field_or_method(), "Corrupted constant pool");
++  jint ref_index = *int_at_addr(i);
+   return extract_low_short_from_int(ref_index);
+ }
+ 
+ 
+ 
+-int constantPoolOopDesc::map_instruction_operand_to_index(int operand) {
+-  if (constantPoolCacheOopDesc::is_secondary_index(operand)) {
+-    return cache()->main_entry_at(operand)->constant_pool_index();
+-  }
++int constantPoolOopDesc::remap_instruction_operand_from_cache(int operand) {
++  // Operand was fetched by a stream using get_Java_u2, yet was stored
++  // by Rewriter::rewrite_member_reference in native order.
++  // So now we have to fix the damage by swapping back to native order.
+   assert((int)(u2)operand == operand, "clean u2");
+-  int index = Bytes::swap_u2(operand);
+-  return cache()->entry_at(index)->constant_pool_index();
++  int cpc_index = Bytes::swap_u2(operand);
++  int member_index = cache()->entry_at(cpc_index)->constant_pool_index();
++  return member_index;
+ }
+ 
+ 
+diff --git a/src/share/vm/oops/constantPoolOop.hpp b/src/share/vm/oops/constantPoolOop.hpp
+--- a/src/share/vm/oops/constantPoolOop.hpp
++++ b/src/share/vm/oops/constantPoolOop.hpp
+@@ -342,12 +342,14 @@
+   }
+ 
+   // The following methods (name/signature/klass_ref_at, klass_ref_at_noresolve,
+-  // name_and_type_ref_index_at) all expect constant pool indices
+-  // from the bytecodes to be passed in, which are actually potentially byte-swapped
+-  // or rewritten constant pool cache indices.  They all call map_instruction_operand_to_index.
+-  int map_instruction_operand_to_index(int operand);
++  // name_and_type_ref_index_at) all expect to be passed indices obtained
++  // directly from the bytecode, and extracted according to java byte order.
++  // If the indices are meant to refer to fields or methods, they are
++  // actually potentially byte-swapped, rewritten constant pool cache indices.
++  // The routine remap_instruction_operand_from_cache manages the adjustment
++  // of these values back to constant pool indices.
+ 
+-  // There are also "uncached" versions which do not map the operand index; see below.
++  // There are also "uncached" versions which do not adjust the operand index; see below.
+ 
+   // Lookup for entries consisting of (klass_index, name_and_type index)
+   klassOop klass_ref_at(int which, TRAPS);
+@@ -361,8 +363,6 @@
+   // Lookup for entries consisting of (name_index, signature_index)
+   int name_ref_index_at(int which_nt);            // ==  low-order jshort of name_and_type_at(which_nt)
+   int signature_ref_index_at(int which_nt);       // == high-order jshort of name_and_type_at(which_nt)
+-  symbolOop nt_name_ref_at(int which_nt)          { return symbol_at(name_ref_index_at(which_nt)); }
+-  symbolOop nt_signature_ref_at(int which_nt)     { return symbol_at(signature_ref_index_at(which_nt)); }
+ 
+   BasicType basic_type_for_signature_at(int which);
+ 
+@@ -425,18 +425,7 @@
+   int       impl_klass_ref_index_at(int which, bool uncached);
+   int       impl_name_and_type_ref_index_at(int which, bool uncached);
+ 
+-  // Takes either a constant pool cache index in possibly byte-swapped
+-  // byte order (which comes from the bytecodes after rewriting) or,
+-  // if "uncached" is true, a vanilla constant pool index
+-  jint field_or_method_at(int which, bool uncached) {
+-    int i = which;
+-    if (!uncached && cache() != NULL) {
+-      // change byte-ordering and go via cache
+-      i = map_instruction_operand_to_index(which);
+-    }
+-    assert(tag_at(i).is_field_or_method(), "Corrupted constant pool");
+-    return *int_at_addr(i);
+-  }
++  int remap_instruction_operand_from_cache(int operand);
+ 
+   // Used while constructing constant pool (only by ClassFileParser)
+   jint klass_index_at(int which) {
+diff --git a/src/share/vm/oops/cpCacheOop.cpp b/src/share/vm/oops/cpCacheOop.cpp
+--- a/src/share/vm/oops/cpCacheOop.cpp
++++ b/src/share/vm/oops/cpCacheOop.cpp
+@@ -28,21 +28,17 @@
+ 
+ // Implememtation of ConstantPoolCacheEntry
+ 
+-void ConstantPoolCacheEntry::set_initial_state(int index) {
+-  if (constantPoolCacheOopDesc::is_secondary_index(index)) {
+-    // Hack:  The rewriter is trying to say that this entry itself
+-    // will be a secondary entry.
+-    int main_index = constantPoolCacheOopDesc::decode_secondary_index(index);
+-    assert(0 <= main_index && main_index < 0x10000, "sanity check");
+-    _indices = (main_index << 16);
+-    assert(main_entry_index() == main_index, "");
+-    return;
+-  }
++void ConstantPoolCacheEntry::initialize_entry(int index) {
+   assert(0 < index && index < 0x10000, "sanity check");
+   _indices = index;
+   assert(constant_pool_index() == index, "");
+ }
+ 
++void ConstantPoolCacheEntry::initialize_secondary_entry(int main_index) {
++  assert(0 <= main_index && main_index < 0x10000, "sanity check");
++  _indices = (main_index << 16);
++  assert(main_entry_index() == main_index, "");
++}
+ 
+ int ConstantPoolCacheEntry::as_flags(TosState state, bool is_final,
+                     bool is_vfinal, bool is_volatile,
+@@ -223,10 +219,10 @@
+ 
+ 
+ void ConstantPoolCacheEntry::set_dynamic_call(Handle call_site, int extra_data) {
+-  methodOop method = (methodOop) sun_dyn_CallSiteImpl::vmmethod(call_site());
++  methodOop method = (methodOop) java_dyn_CallSite::vmmethod(call_site());
+   assert(method->is_method(), "must be initialized properly");
+   int param_size = method->size_of_parameters();
+-  assert(param_size > 1, "method argument size must include MH.this & initial dynamic receiver");
++  assert(param_size >= 1, "method argument size must include MH.this");
+   param_size -= 1;              // do not count MH.this; it is not stacked for invokedynamic
+   if (Atomic::cmpxchg_ptr(call_site(), &_f1, NULL) == NULL) {
+     // racing threads might be trying to install their own favorites
+@@ -439,7 +435,18 @@
+ 
+ void constantPoolCacheOopDesc::initialize(intArray& inverse_index_map) {
+   assert(inverse_index_map.length() == length(), "inverse index map must have same length as cache");
+-  for (int i = 0; i < length(); i++) entry_at(i)->set_initial_state(inverse_index_map[i]);
++  for (int i = 0; i < length(); i++) {
++    ConstantPoolCacheEntry* e = entry_at(i);
++    int original_index = inverse_index_map[i];
++    if ((original_index & Rewriter::_secondary_entry_tag) != 0) {
++      int main_index = (original_index - Rewriter::_secondary_entry_tag);
++      assert(!entry_at(main_index)->is_secondary_entry(), "valid main index");
++      e->initialize_secondary_entry(main_index);
++    } else {
++      e->initialize_entry(original_index);
++    }
++    assert(entry_at(i) == e, "sanity");
++  }
+ }
+ 
+ // RedefineClasses() API support:
+diff --git a/src/share/vm/oops/cpCacheOop.hpp b/src/share/vm/oops/cpCacheOop.hpp
+--- a/src/share/vm/oops/cpCacheOop.hpp
++++ b/src/share/vm/oops/cpCacheOop.hpp
+@@ -154,7 +154,8 @@
+   };
+ 
+   // Initialization
+-  void set_initial_state(int index);             // sets entry to initial state
++  void initialize_entry(int original_index);     // initialize primary entry
++  void initialize_secondary_entry(int main_index); // initialize secondary entry
+ 
+   void set_field(                                // sets entry to resolved field state
+     Bytecodes::Code get_code,                    // the bytecode used for reading the field
+@@ -251,6 +252,7 @@
+ 
+   // Code generation support
+   static WordSize size()                         { return in_WordSize(sizeof(ConstantPoolCacheEntry) / HeapWordSize); }
++  static ByteSize size_in_bytes()                { return in_ByteSize(sizeof(ConstantPoolCacheEntry)); }
+   static ByteSize indices_offset()               { return byte_offset_of(ConstantPoolCacheEntry, _indices); }
+   static ByteSize f1_offset()                    { return byte_offset_of(ConstantPoolCacheEntry, _f1); }
+   static ByteSize f2_offset()                    { return byte_offset_of(ConstantPoolCacheEntry, _f2); }
+@@ -321,6 +323,7 @@
+   ConstantPoolCacheEntry* base() const           { return (ConstantPoolCacheEntry*)((address)this + in_bytes(base_offset())); }
+ 
+   friend class constantPoolCacheKlass;
++  friend class ConstantPoolCacheEntry;
+ 
+  public:
+   // Initialization
+@@ -329,7 +332,8 @@
+   // Secondary indexes.
+   // They must look completely different from normal indexes.
+   // The main reason is that byte swapping is sometimes done on normal indexes.
+-  // Also, it is helpful for debugging to tell the two apart.
++  // Also, some of the CP accessors do different things for secondary indexes.
++  // Finally, it is helpful for debugging to tell the two apart.
+   static bool is_secondary_index(int i) { return (i < 0); }
+   static int  decode_secondary_index(int i) { assert(is_secondary_index(i),  ""); return ~i; }
+   static int  encode_secondary_index(int i) { assert(!is_secondary_index(i), ""); return ~i; }
+@@ -337,18 +341,35 @@
+   // Accessors
+   void set_constant_pool(constantPoolOop pool)   { oop_store_without_check((oop*)&_constant_pool, (oop)pool); }
+   constantPoolOop constant_pool() const          { return _constant_pool; }
+-  ConstantPoolCacheEntry* entry_at(int i) const  { assert(0 <= i && i < length(), "index out of bounds"); return base() + i; }
++  // Fetches the entry at the given index.
++  // The entry may be either primary or secondary.
++  // In either case the index must not be encoded or byte-swapped in any way.
++  ConstantPoolCacheEntry* entry_at(int i) const {
++    assert(0 <= i && i < length(), "index out of bounds");
++    return base() + i;
++  }
++  // Fetches the secondary entry referred to by index.
++  // The index may be a secondary index, and must not be byte-swapped.
++  ConstantPoolCacheEntry* secondary_entry_at(int i) const {
++    int raw_index = i;
++    if (is_secondary_index(i)) {  // correct these on the fly
++      raw_index = decode_secondary_index(i);
++    }
++    assert(entry_at(raw_index)->is_secondary_entry(), "not a secondary entry");
++    return entry_at(raw_index);
++  }
++  // Given a primary or secondary index, fetch the corresponding primary entry.
++  // Indirect through the secondary entry, if the index is encoded as a secondary index.
++  // The index must not be byte-swapped.
+   ConstantPoolCacheEntry* main_entry_at(int i) const {
+-    ConstantPoolCacheEntry* e;
++    int primary_index = i;
+     if (is_secondary_index(i)) {
+       // run through an extra level of indirection:
+-      i = decode_secondary_index(i);
+-      e = entry_at(i);
+-      i = e->main_entry_index();
++      int raw_index = decode_secondary_index(i);
++      primary_index = entry_at(raw_index)->main_entry_index();
+     }
+-    e = entry_at(i);
+-    assert(!e->is_secondary_entry(), "only one level of indirection");
+-    return e;
++    assert(!entry_at(primary_index)->is_secondary_entry(), "only one level of indirection");
++    return entry_at(primary_index);
+   }
+ 
+   // GC support
+@@ -359,6 +380,12 @@
+ 
+   // Code generation
+   static ByteSize base_offset()                  { return in_ByteSize(sizeof(constantPoolCacheOopDesc)); }
++  static ByteSize entry_offset(int raw_index) {
++    int index = raw_index;
++    if (is_secondary_index(raw_index))
++      index = decode_secondary_index(raw_index);
++    return (base_offset() + ConstantPoolCacheEntry::size_in_bytes() * index);
++  }
+ 
+   // RedefineClasses() API support:
+   // If any entry of this constantPoolCache points to any of
+diff --git a/src/share/vm/oops/generateOopMap.cpp b/src/share/vm/oops/generateOopMap.cpp
+--- a/src/share/vm/oops/generateOopMap.cpp
++++ b/src/share/vm/oops/generateOopMap.cpp
+@@ -1556,13 +1556,13 @@
+     case Bytecodes::_getfield:          do_field(true,  false, itr->get_index_big(), itr->bci()); break;
+     case Bytecodes::_putfield:          do_field(false, false, itr->get_index_big(), itr->bci()); break;
+ 
+-    case Bytecodes::_invokevirtual:
+-    case Bytecodes::_invokespecial:     do_method(false, false, itr->get_index_big(), itr->bci()); break;
+-    case Bytecodes::_invokestatic:      do_method(true,  false, itr->get_index_big(), itr->bci()); break;
+-    case Bytecodes::_invokedynamic:     do_method(false, true,  itr->get_index_int(), itr->bci()); break;
+-    case Bytecodes::_invokeinterface:   do_method(false, true,  itr->get_index_big(), itr->bci()); break;
+-    case Bytecodes::_newarray:
+-    case Bytecodes::_anewarray:         pp_new_ref(vCTS, itr->bci()); break;
++   case Bytecodes::_invokevirtual:
++   case Bytecodes::_invokespecial:     do_method(false, false, itr->get_index_big(), itr->bci()); break;
++   case Bytecodes::_invokestatic:      do_method(true,  false, itr->get_index_big(), itr->bci()); break;
++    case Bytecodes::_invokedynamic:     do_method(true,  false, itr->get_index_int(), itr->bci()); break;
++   case Bytecodes::_invokeinterface:   do_method(false, true,  itr->get_index_big(), itr->bci()); break;
++   case Bytecodes::_newarray:
++   case Bytecodes::_anewarray:         pp_new_ref(vCTS, itr->bci()); break;
+     case Bytecodes::_checkcast:         do_checkcast(); break;
+     case Bytecodes::_arraylength:
+     case Bytecodes::_instanceof:        pp(rCTS, vCTS); break;
+@@ -1900,11 +1900,9 @@
+ }
+ 
+ void GenerateOopMap::do_method(int is_static, int is_interface, int idx, int bci) {
+-  // Dig up signature for field in constant pool
+-  constantPoolOop cp    = _method->constants();
+-  int nameAndTypeIdx    = cp->name_and_type_ref_index_at(idx);
+-  int signatureIdx      = cp->signature_ref_index_at(nameAndTypeIdx);  // @@@@@
+-  symbolOop signature   = cp->symbol_at(signatureIdx);
++ // Dig up signature for field in constant pool
++  constantPoolOop cp  = _method->constants();
++  symbolOop signature = cp->signature_ref_at(idx);
+ 
+   // Parse method signature
+   CellTypeState out[4];
+diff --git a/src/share/vm/oops/instanceKlassKlass.cpp b/src/share/vm/oops/instanceKlassKlass.cpp
+--- a/src/share/vm/oops/instanceKlassKlass.cpp
++++ b/src/share/vm/oops/instanceKlassKlass.cpp
+@@ -317,6 +317,11 @@
+     pm->claim_or_forward_breadth(sg_addr);
+   }
+ 
++  oop* bsm_addr = ik->adr_bootstrap_method();
++  if (PSScavenge::should_scavenge(bsm_addr)) {
++    pm->claim_or_forward_breadth(bsm_addr);
++  }
++
+   klassKlass::oop_copy_contents(pm, obj);
+ }
+ 
+@@ -345,6 +350,11 @@
+     pm->claim_or_forward_depth(sg_addr);
+   }
+ 
++  oop* bsm_addr = ik->adr_bootstrap_method();
++  if (PSScavenge::should_scavenge(bsm_addr)) {
++    pm->claim_or_forward_depth(bsm_addr);
++  }
++
+   klassKlass::oop_copy_contents(pm, obj);
+ }
+ 
+diff --git a/src/share/vm/prims/jvm.cpp b/src/share/vm/prims/jvm.cpp
+--- a/src/share/vm/prims/jvm.cpp
++++ b/src/share/vm/prims/jvm.cpp
+@@ -2257,10 +2257,8 @@
+   switch (cp->tag_at(cp_index).value()) {
+     case JVM_CONSTANT_InterfaceMethodref:
+     case JVM_CONSTANT_Methodref:
++    case JVM_CONSTANT_NameAndType:  // for invokedynamic
+       return cp->uncached_name_ref_at(cp_index)->as_utf8();
+-    case JVM_CONSTANT_NameAndType:
+-      // for invokedynamic
+-      return cp->nt_name_ref_at(cp_index)->as_utf8();
+     default:
+       fatal("JVM_GetCPMethodNameUTF: illegal constant");
+   }
+@@ -2277,10 +2275,8 @@
+   switch (cp->tag_at(cp_index).value()) {
+     case JVM_CONSTANT_InterfaceMethodref:
+     case JVM_CONSTANT_Methodref:
++    case JVM_CONSTANT_NameAndType:  // for invokedynamic
+       return cp->uncached_signature_ref_at(cp_index)->as_utf8();
+-    case JVM_CONSTANT_NameAndType:
+-      // for invokedynamic
+-      return cp->nt_signature_ref_at(cp_index)->as_utf8();
+     default:
+       fatal("JVM_GetCPMethodSignatureUTF: illegal constant");
+   }
+diff --git a/src/share/vm/prims/methodHandles.cpp b/src/share/vm/prims/methodHandles.cpp
+--- a/src/share/vm/prims/methodHandles.cpp
++++ b/src/share/vm/prims/methodHandles.cpp
+@@ -2347,9 +2347,9 @@
+ JVM_ENTRY(void, MH_linkCallSite(JNIEnv *env, jobject igcls, jobject site_jh, jobject target_jh)) {
+   // No special action required, yet.
+   oop site_oop = JNIHandles::resolve(site_jh);
+-  if (site_oop == NULL || site_oop->klass() != SystemDictionary::CallSiteImpl_klass())
++  if (site_oop == NULL || site_oop->klass() != SystemDictionary::CallSite_klass())
+     THROW_MSG(vmSymbols::java_lang_IllegalArgumentException(), "call site");
+-  sun_dyn_CallSiteImpl::set_target(site_oop, JNIHandles::resolve(target_jh));
++  java_dyn_CallSite::set_target(site_oop, JNIHandles::resolve(target_jh));
+ }
+ JVM_END
+ 
+@@ -2365,6 +2365,7 @@
+ #define OBJ   LANG"Object;"
+ #define CLS   LANG"Class;"
+ #define STRG  LANG"String;"
++#define CST   JDYN"CallSite;"
+ #define MT    JDYN"MethodType;"
+ #define MH    JDYN"MethodHandle;"
+ #define MHI   IDYN"MethodHandleImpl;"
+@@ -2372,7 +2373,6 @@
+ #define AMH   IDYN"AdapterMethodHandle;"
+ #define BMH   IDYN"BoundMethodHandle;"
+ #define DMH   IDYN"DirectMethodHandle;"
+-#define CSTI  IDYN"CallSiteImpl;"
+ 
+ #define CC (char*)  /*cast a literal from (const char*)*/
+ #define FN_PTR(f) CAST_FROM_FN_PTR(void*, &f)
+@@ -2398,7 +2398,7 @@
+ 
+ // More entry points specifically for EnableInvokeDynamic.
+ static JNINativeMethod methods2[] = {
+-  {CC"linkCallSite",            CC"("CSTI MH")V",               FN_PTR(MH_linkCallSite)}
++  {CC"linkCallSite",            CC"("CST MH")V",                FN_PTR(MH_linkCallSite)}
+ };
+ 
+ 

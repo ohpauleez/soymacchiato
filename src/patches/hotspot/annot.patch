@@ -1,0 +1,401 @@
+Parse annotations in the class file parser.  This is in parallel with the Java-based annotation parsing normally done.
+
+diff --git a/src/share/vm/classfile/classFileParser.cpp b/src/share/vm/classfile/classFileParser.cpp
+--- a/src/share/vm/classfile/classFileParser.cpp
++++ b/src/share/vm/classfile/classFileParser.cpp
+@@ -220,6 +220,13 @@ void ClassFileParser::parse_constant_poo
+ }
+ 
+ bool inline valid_cp_range(int index, int length) { return (index > 0 && index < length); }
++
++inline symbolOop check_symbol_at(constantPoolHandle cp, int index) {
++  if (valid_cp_range(index, cp->length()) && cp->tag_at(index).is_utf8())
++    return cp->symbol_at(index);
++  else
++    return NULL;
++}
+ 
+ constantPoolHandle ClassFileParser::parse_constant_pool(TRAPS) {
+   ClassFileStream* cfs = stream();
+@@ -1314,13 +1321,127 @@ u2* ClassFileParser::parse_checked_excep
+   return checked_exceptions_start;
+ }
+ 
++// Skip an annotation.  Return >=limit if there is any problem.
++int ClassFileParser::skip_annotation(u1* buffer, int limit, int index) {
++  // annotation := atype:u2 do(nmem:u2) {member:u2 value}
++  // value := switch (tag:u1) { ... } 
++  index += 2;  // skip atype
++  if ((index += 2) >= limit)  return limit;  // read nmem
++  int nmem = Bytes::get_Java_u2(buffer+index-2);
++  while (--nmem >= 0 && index < limit) {
++    index += 2; // skip member
++    index = skip_annotation_value(buffer, limit, index);
++  }
++  return index;
++}
++
++// Skip an annotation value.  Return >=limit if there is any problem.
++int ClassFileParser::skip_annotation_value(u1* buffer, int limit, int index) {
++  // value := switch (tag:u1) {
++  //   case B, C, I, S, Z, D, F, J, c: con:u2;
++  //   case e: e_class:u2 e_name:u2;
++  //   case s: s_con:u2;
++  //   case [: do(nval:u2) {value};
++  //   case @: annotation;
++  //   case s: s_con:u2;
++  // }
++  if ((index += 1) >= limit)  return limit;  // read tag
++  u1 tag = buffer[index-1];
++  switch (tag) {
++  case 'B': case 'C': case 'I': case 'S': case 'Z':
++  case 'D': case 'F': case 'J': case 'c': case 's':
++    index += 2;  // skip con or s_con
++    break;
++  case 'e':
++    index += 4;  // skip e_class, e_name
++    break;
++  case '[':
++    {
++      if ((index += 2) >= limit)  return limit;  // read nval
++      int nval = Bytes::get_Java_u2(buffer+index-2);
++      while (--nval >= 0 && index < limit) {
++        index = skip_annotation_value(buffer, limit, index);
++      }
++    }
++    break;
++  case '@':
++    index = skip_annotation(buffer, limit, index);
++    break;
++  default:
++    assert(false, "annotation tag");
++    return limit;  //  bad tag byte
++  }
++  return index;
++}
++
++// Sift through annotations, looking for those significant to the VM:
++void ClassFileParser::parse_class_annotations(u1* buffer, int limit,
++                                              constantPoolHandle cp,
++                                              symbolHandle* retention_policy,
++                                              TRAPS) {
++  // annotations := do(nann:u2) {annotation}
++  int index = 0;
++  if ((index += 2) >= limit)  return;  // read nann
++  int nann = Bytes::get_Java_u2(buffer+index-2);
++  enum {  // initial annotation layout
++    atype_off = 0,      // utf8 such as 'Ljava/lang/annotation/Retention;'
++    count_off = 2,      // u2   such as 1 (one value)
++    member_off = 4,     // utf8 such as 'value'
++    tag_off = 6,        // u1   such as 'c' (type) or 'e' (enum)
++    e_tag_val = 'e',
++      e_type_off = 7,   // utf8 such as 'Ljava/lang/annotation/RetentionPolicy;'
++      e_con_off = 9,    // utf8 payload, such as 'SOURCE', 'CLASS', 'RUNTIME'
++      e_size = 11,     // end of 'e' annotation
++    c_tag_val = 'c',
++      c_con_off = 7,    // utf8 payload, such as 'I' or 'Ljava/lang/String;'
++      c_size = 9,       // end of 'c' annotation
++    min_size = 6        // smallest possible size (zero members)
++  };
++  while (--nann >= 0 && index + min_size <= limit) {
++    int index0 = index;
++    index = skip_annotation(buffer, limit, index);
++    u1* abase = buffer + index0;
++    int atype = Bytes::get_Java_u2(abase + atype_off);
++    int count = Bytes::get_Java_u2(abase + count_off);
++    symbolOop aname = check_symbol_at(cp, atype);
++    if (aname == NULL)  break;  // invalid annotation name
++    symbolOop member = NULL;
++    if (count >= 1) {
++      int member_index = Bytes::get_Java_u2(abase + member_off);
++      member = check_symbol_at(cp, member_index);
++      if (member == NULL)  break;  // invalid member name
++    }
++
++    // The parsing of @Retention is for example only.
++#define Retention_signature       classloader_signature  // just for illustration
++#define RetentionPolicy_signature thread_signature
++    if (aname == vmSymbols::Retention_signature()) {
++      symbolOop payload = NULL;
++      if (count == 1
++          && e_size == (index0 - index)  // match size
++          && e_tag_val == *(abase + tag_off)
++          && (check_symbol_at(cp, Bytes::get_Java_u2(abase + e_type_off))
++              == vmSymbols::RetentionPolicy_signature())
++          && member == vmSymbols::value_name()) {
++        payload = check_symbol_at(cp, Bytes::get_Java_u2(abase + e_con_off));
++      }
++      check_property(payload != NULL,
++                     "Invalid @Retention annotation at offset %u in class file %s",
++                     index0, CHECK);
++      (*retention_policy) = payload;  // return the payload
++    }
++  }
++#undef Retention_signature
++#undef RetentionPolicy_signature
++}
++
+ 
+ #define MAX_ARGS_SIZE 255
+ #define MAX_CODE_SIZE 65535
+ #define INITIAL_MAX_LVT_NUMBER 256
+ 
+ // Note: the parse_method below is big and clunky because all parsing of the code and exceptions
+-// attribute is inlined. This is curbersome to avoid since we inline most of the parts in the
++// attribute is inlined. This is cumbersome to avoid since we inline most of the parts in the
+ // methodOop to save footprint, so we only know the size of the resulting methodOop when the
+ // entire method attribute is parsed.
+ //
+@@ -1971,7 +2092,7 @@ typeArrayHandle ClassFileParser::sort_me
+ }
+ 
+ 
+-void ClassFileParser::parse_classfile_sourcefile_attribute(constantPoolHandle cp, instanceKlassHandle k, TRAPS) {
++void ClassFileParser::parse_classfile_sourcefile_attribute(constantPoolHandle cp, symbolHandle* sourcefile_ret, TRAPS) {
+   ClassFileStream* cfs = stream();
+   cfs->guarantee_more(2, CHECK);  // sourcefile_index
+   u2 sourcefile_index = cfs->get_u2_fast();
+@@ -1980,14 +2101,15 @@ void ClassFileParser::parse_classfile_so
+       cp->tag_at(sourcefile_index).is_utf8(),
+     "Invalid SourceFile attribute at constant pool index %u in class file %s",
+     sourcefile_index, CHECK);
+-  k->set_source_file_name(cp->symbol_at(sourcefile_index));
++  (*sourcefile_ret) = cp->symbol_at(sourcefile_index);
+ }
+ 
+ 
+ 
+ void ClassFileParser::parse_classfile_source_debug_extension_attribute(constantPoolHandle cp,
+-                                                                       instanceKlassHandle k,
+-                                                                       int length, TRAPS) {
++                                                                       int length,
++                                                                       symbolHandle* sde_symbol_ret,
++                                                                       TRAPS) {
+   ClassFileStream* cfs = stream();
+   u1* sde_buffer = cfs->get_u1_buffer();
+   assert(sde_buffer != NULL, "null sde buffer");
+@@ -1998,7 +2120,7 @@ void ClassFileParser::parse_classfile_so
+     // (common case)
+     symbolOop sde_symbol = oopFactory::new_symbol((char*)sde_buffer,
+                                                   length, CHECK);
+-    k->set_source_debug_extension(sde_symbol);
++    (*sde_symbol_ret) = symbolHandle(THREAD, sde_symbol);
+   }
+   // Got utf8 string, set stream position forward
+   cfs->skip_u1(length, CHECK);
+@@ -2009,7 +2131,7 @@ void ClassFileParser::parse_classfile_so
+ #define RECOGNIZED_INNER_CLASS_MODIFIERS (JVM_RECOGNIZED_CLASS_MODIFIERS | JVM_ACC_PRIVATE | JVM_ACC_PROTECTED | JVM_ACC_STATIC)
+ 
+ // Return number of classes in the inner classes attribute table
+-u2 ClassFileParser::parse_classfile_inner_classes_attribute(constantPoolHandle cp, instanceKlassHandle k, TRAPS) {
++u2 ClassFileParser::parse_classfile_inner_classes_attribute(constantPoolHandle cp, typeArrayHandle* inner_classes_ret, TRAPS) {
+   ClassFileStream* cfs = stream();
+   cfs->guarantee_more(2, CHECK_0);  // length
+   u2 length = cfs->get_u2_fast();
+@@ -2079,15 +2201,15 @@ u2 ClassFileParser::parse_classfile_inne
+   }
+ 
+   // Update instanceKlass with inner class info.
+-  k->set_inner_classes(inner_classes());
++  (*inner_classes_ret) = inner_classes;
+   return length;
+ }
+ 
+-void ClassFileParser::parse_classfile_synthetic_attribute(constantPoolHandle cp, instanceKlassHandle k, TRAPS) {
+-  k->set_is_synthetic();
+-}
+-
+-void ClassFileParser::parse_classfile_signature_attribute(constantPoolHandle cp, instanceKlassHandle k, TRAPS) {
++void ClassFileParser::parse_classfile_synthetic_attribute(constantPoolHandle cp, bool* synthetic_flag_ret, TRAPS) {
++  (*synthetic_flag_ret) = true;
++}
++
++void ClassFileParser::parse_classfile_signature_attribute(constantPoolHandle cp, symbolHandle* signature_ret, TRAPS) {
+   ClassFileStream* cfs = stream();
+   u2 signature_index = cfs->get_u2(CHECK);
+   check_property(
+@@ -2095,13 +2217,13 @@ void ClassFileParser::parse_classfile_si
+       cp->tag_at(signature_index).is_utf8(),
+     "Invalid constant pool index %u in Signature attribute in class file %s",
+     signature_index, CHECK);
+-  k->set_generic_signature(cp->symbol_at(signature_index));
+-}
+-
+-void ClassFileParser::parse_classfile_attributes(constantPoolHandle cp, instanceKlassHandle k, TRAPS) {
++  (*signature_ret) = cp->symbol_at(signature_index);
++}
++
++void ClassFileParser::parse_classfile_attributes(constantPoolHandle cp, TRAPS) {
+   ClassFileStream* cfs = stream();
+   // Set inner classes attribute to default sentinel
+-  k->set_inner_classes(Universe::the_empty_short_array());
++  _inner_classes = typeArrayHandle(THREAD, Universe::the_empty_short_array());
+   cfs->guarantee_more(2, CHECK);  // attributes_count
+   u2 attributes_count = cfs->get_u2_fast();
+   bool parsed_sourcefile_attribute = false;
+@@ -2132,10 +2254,10 @@ void ClassFileParser::parse_classfile_at
+       } else {
+         parsed_sourcefile_attribute = true;
+       }
+-      parse_classfile_sourcefile_attribute(cp, k, CHECK);
++      parse_classfile_sourcefile_attribute(cp, &_sourcefile, CHECK);
+     } else if (tag == vmSymbols::tag_source_debug_extension()) {
+       // Check for SourceDebugExtension tag
+-      parse_classfile_source_debug_extension_attribute(cp, k, (int)attribute_length, CHECK);
++      parse_classfile_source_debug_extension_attribute(cp, (int)attribute_length, &_sde_symbol, CHECK);
+     } else if (tag == vmSymbols::tag_inner_classes()) {
+       // Check for InnerClasses tag
+       if (parsed_innerclasses_attribute) {
+@@ -2143,7 +2265,7 @@ void ClassFileParser::parse_classfile_at
+       } else {
+         parsed_innerclasses_attribute = true;
+       }
+-      u2 num_of_classes = parse_classfile_inner_classes_attribute(cp, k, CHECK);
++      u2 num_of_classes = parse_classfile_inner_classes_attribute(cp, &_inner_classes, CHECK);
+       if (_need_verify && _major_version >= JAVA_1_5_VERSION) {
+         guarantee_property(attribute_length == sizeof(num_of_classes) + 4 * sizeof(u2) * num_of_classes,
+                           "Wrong InnerClasses attribute length in class file %s", CHECK);
+@@ -2156,7 +2278,7 @@ void ClassFileParser::parse_classfile_at
+           "Invalid Synthetic classfile attribute length %u in class file %s",
+           attribute_length, CHECK);
+       }
+-      parse_classfile_synthetic_attribute(cp, k, CHECK);
++      parse_classfile_synthetic_attribute(cp, &_synthetic_flag, CHECK);
+     } else if (tag == vmSymbols::tag_deprecated()) {
+       // Check for Deprecatd tag - 4276120
+       if (attribute_length != 0) {
+@@ -2171,11 +2293,16 @@ void ClassFileParser::parse_classfile_at
+             "Wrong Signature attribute length %u in class file %s",
+             attribute_length, CHECK);
+         }
+-        parse_classfile_signature_attribute(cp, k, CHECK);
++        parse_classfile_signature_attribute(cp, &_generic_signature, CHECK);
+       } else if (tag == vmSymbols::tag_runtime_visible_annotations()) {
+         runtime_visible_annotations_length = attribute_length;
+         runtime_visible_annotations = cfs->get_u1_buffer();
+         assert(runtime_visible_annotations != NULL, "null visible annotations");
++        parse_class_annotations(runtime_visible_annotations,
++                                runtime_visible_annotations_length,
++                                cp,
++                                &_retention_policy,
++                                CHECK);
+         cfs->skip_u1(runtime_visible_annotations_length, CHECK);
+       } else if (PreserveAllAnnotations && tag == vmSymbols::tag_runtime_invisible_annotations()) {
+         runtime_invisible_annotations_length = attribute_length;
+@@ -2204,7 +2331,8 @@ void ClassFileParser::parse_classfile_at
+              !cp->tag_at(method_index).is_name_and_type())) {
+           classfile_parse_error("Invalid or out-of-bounds method index in EnclosingMethod attribute in class file %s", CHECK);
+         }
+-        k->set_enclosing_method_indices(class_index, method_index);
++        _em_class_index  = class_index;
++        _em_method_index = method_index;
+       } else {
+         // Unknown attribute
+         cfs->skip_u1(attribute_length, CHECK);
+@@ -2219,7 +2347,7 @@ void ClassFileParser::parse_classfile_at
+                                                      runtime_invisible_annotations,
+                                                      runtime_invisible_annotations_length,
+                                                      CHECK);
+-  k->set_class_annotations(annotations());
++  _annotations = annotations;
+ }
+ 
+ 
+@@ -2471,6 +2599,9 @@ instanceKlassHandle ClassFileParser::par
+ 
+   _has_finalizer = _has_empty_finalizer = _has_vanilla_constructor = false;
+ 
++  _em_class_index = _em_method_index = 0;
++  _synthetic_flag = false;
++
+   if (JvmtiExport::should_post_class_file_load_hook()) {
+     unsigned char* ptr = cfs->buffer();
+     unsigned char* end_ptr = cfs->buffer() + cfs->length();
+@@ -2673,6 +2804,12 @@ instanceKlassHandle ClassFileParser::par
+     objArrayHandle methods_annotations(THREAD, methods_annotations_oop);
+     objArrayHandle methods_parameter_annotations(THREAD, methods_parameter_annotations_oop);
+     objArrayHandle methods_default_annotations(THREAD, methods_default_annotations_oop);
++
++    // Additional attributes
++    parse_classfile_attributes(cp, CHECK_(nullHandle));
++
++    // Make sure this is the end of class file stream
++    guarantee_property(cfs->at_eos(), "Extra bytes at the end of class file %s", CHECK_(nullHandle));
+ 
+     // We check super class after class file is parsed and format is checked
+     if (super_class_index > 0 && super_klass.is_null()) {
+@@ -3129,11 +3266,14 @@ instanceKlassHandle ClassFileParser::par
+       this_klass->set_has_miranda_methods(); // then set a flag
+     }
+ 
+-    // Additional attributes
+-    parse_classfile_attributes(cp, this_klass, CHECK_(nullHandle));
+-
+-    // Make sure this is the end of class file stream
+-    guarantee_property(cfs->at_eos(), "Extra bytes at the end of class file %s", CHECK_(nullHandle));
++    // Fill in field values from parse_classfile_attributes:
++    this_klass->set_inner_classes(_inner_classes());
++    this_klass->set_enclosing_method_indices(_em_class_index, _em_method_index);
++    this_klass->set_source_file_name(_sourcefile());
++    this_klass->set_source_debug_extension(_sde_symbol());
++    this_klass->set_generic_signature(_generic_signature());
++    if (_synthetic_flag)  this_klass->set_is_synthetic();
++    this_klass->set_class_annotations(_annotations());
+ 
+     // Initialize static fields
+     this_klass->do_local_static_fields(&initialize_static_field, CHECK_(nullHandle));
+diff --git a/src/share/vm/classfile/classFileParser.hpp b/src/share/vm/classfile/classFileParser.hpp
+--- a/src/share/vm/classfile/classFileParser.hpp
++++ b/src/share/vm/classfile/classFileParser.hpp
+@@ -38,6 +38,16 @@ class ClassFileParser VALUE_OBJ_CLASS_SP
+   bool _has_finalizer;
+   bool _has_empty_finalizer;
+   bool _has_vanilla_constructor;
++
++  // class attributes parsed before the instance klass is created:
++  u2              _em_class_index, _em_method_index; //for enclosing method
++  bool            _synthetic_flag;
++  symbolHandle    _retention_policy;
++  symbolHandle    _sourcefile;
++  symbolHandle    _generic_signature;
++  symbolHandle    _sde_symbol;
++  typeArrayHandle _inner_classes;
++  typeArrayHandle _annotations;
+ 
+   enum { fixed_buffer_size = 128 };
+   u_char linenumbertable_buffer[fixed_buffer_size];
+@@ -109,20 +119,26 @@ class ClassFileParser VALUE_OBJ_CLASS_SP
+   typeArrayOop parse_stackmap_table(u4 code_attribute_length, TRAPS);
+ 
+   // Classfile attribute parsing
+-  void parse_classfile_sourcefile_attribute(constantPoolHandle cp, instanceKlassHandle k, TRAPS);
+-  void parse_classfile_source_debug_extension_attribute(constantPoolHandle cp,
+-                                                instanceKlassHandle k, int length, TRAPS);
+-  u2   parse_classfile_inner_classes_attribute(constantPoolHandle cp,
+-                                               instanceKlassHandle k, TRAPS);
+-  void parse_classfile_attributes(constantPoolHandle cp, instanceKlassHandle k, TRAPS);
+-  void parse_classfile_synthetic_attribute(constantPoolHandle cp, instanceKlassHandle k, TRAPS);
+-  void parse_classfile_signature_attribute(constantPoolHandle cp, instanceKlassHandle k, TRAPS);
++  void parse_classfile_sourcefile_attribute(constantPoolHandle cp, symbolHandle* sourcefile, TRAPS);
++  void parse_classfile_source_debug_extension_attribute(constantPoolHandle cp, int length,
++                                                        symbolHandle* sde_symbol_ret,
++                                                        TRAPS);
++  u2   parse_classfile_inner_classes_attribute(constantPoolHandle cp, typeArrayHandle* inner_classes, TRAPS);
++  void parse_classfile_attributes(constantPoolHandle cp, TRAPS);
++  void parse_classfile_synthetic_attribute(constantPoolHandle cp, bool* synthetic_flag, TRAPS);
++  void parse_classfile_signature_attribute(constantPoolHandle cp, symbolHandle* signature, TRAPS);
+ 
+   // Annotations handling
+   typeArrayHandle assemble_annotations(u1* runtime_visible_annotations,
+                                        int runtime_visible_annotations_length,
+                                        u1* runtime_invisible_annotations,
+                                        int runtime_invisible_annotations_length, TRAPS);
++  int skip_annotation(u1* buffer, int limit, int index);
++  int skip_annotation_value(u1* buffer, int limit, int index);
++  void parse_class_annotations(u1* buffer, int limit, constantPoolHandle cp,
++                               /* Results: */
++                               symbolHandle* retention_policy,
++                               TRAPS);
+ 
+   // Final setup
+   int  compute_oop_map_size(instanceKlassHandle super, int nonstatic_oop_count,

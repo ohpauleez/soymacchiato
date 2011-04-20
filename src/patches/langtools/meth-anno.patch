@@ -1,0 +1,111 @@
+diff --git a/src/share/classes/com/sun/tools/javac/code/Attribute.java b/src/share/classes/com/sun/tools/javac/code/Attribute.java
+--- a/src/share/classes/com/sun/tools/javac/code/Attribute.java
++++ b/src/share/classes/com/sun/tools/javac/code/Attribute.java
+@@ -132,7 +132,27 @@
+      *  or its type, represented as a Symbol or signature string.
+      */
+     public static abstract class Member extends Attribute {
+-        Member() { super(null); throw new UnsupportedOperationException("NYI"); }
++        public ReferenceMode mode;
++        public Symbol value;
++        public Member(Type type, ReferenceMode mode, Symbol value) {
++            super(type);
++            assert value != null;
++            this.mode = mode;
++            this.value = value;
++        }
++        public void accept(Visitor v) { v.visitMember(this); }
++        public String toString() {
++            return mode + ":" + value;
++        }
++        public ReferenceMode getMode() {
++            return mode;
++        }
++        public Symbol getValue() {
++            return value;
++        }
++        public <R, P> R accept(AnnotationValueVisitor<R, P> v, P p) {
++            return v.visitMemberConstant(mode, value, p);
++        }
+     }
+ 
+     /** A compound annotation element value, the type of which is an
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Annotate.java b/src/share/classes/com/sun/tools/javac/comp/Annotate.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Annotate.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Annotate.java
+@@ -251,32 +251,36 @@
+             VarSymbol enumerator = (VarSymbol) sym;
+             return new Attribute.Enum(expected, enumerator);
+         }
+-        if (expected.tsym == syms.methodHandleType.tsym ||
+-            expected.tsym == syms.methodTypeType.tsym) {
++        if (expected.tsym == syms.methodHandleType.tsym) {
+             attr.attribExpr(tree, env, expected);
+-            JCExpression mhref;
+-            if (expected.tsym == syms.methodTypeType.tsym) {
+-                mhref = null;
+-                if (tree.getTag() == JCTree.APPLY) {
+-                    JCMethodInvocation call = (JCMethodInvocation) tree;
+-                    Symbol sym = TreeInfo.symbol(call.meth);
+-                    if (sym.owner == syms.methodHandleType.tsym &&
+-                        sym.name == names.type &&
+-                        call.args.isEmpty() &&
+-                        call.meth.getTag() == JCTree.SELECT) {
+-                        mhref = ((JCFieldAccess)call.meth).selected;
+-                    }
+-                }
+-            } else {
+-                mhref = tree;
+-            }
+-            if (mhref == null || mhref.getTag() != JCTree.REFERENCE ||
+-                TreeInfo.nonstaticSelect(mhref)) {
++            if (tree == null || tree.getTag() != JCTree.REFERENCE ||
++                TreeInfo.nonstaticSelect(tree)) {
+                 log.error(tree.pos(), "member.reference.annotation.must.be.constant");
+                 return new Attribute.Error(expected);
+             }
+-            // FIXME: recode the member reference as an annotation
+-            throw new UnsupportedOperationException("NYI");
++            JCMemberReference ref = (JCMemberReference) tree;
++            return new Attribute.Member(syms.methodHandleType, ref.mode, ref.sym);
++        }
++        if (expected.tsym == syms.methodTypeType.tsym) {
++            attr.attribExpr(tree, env, expected);
++            JCTree ref = null;
++            if (tree.getTag() == JCTree.APPLY) {
++                JCMethodInvocation call = (JCMethodInvocation) tree;
++                Symbol sym = TreeInfo.symbol(call.meth);
++                if (sym.owner == syms.methodHandleType.tsym &&
++                    sym.name == names.type &&
++                    call.args.isEmpty() &&
++                    call.meth.getTag() == JCTree.SELECT) {
++                    ref = ((JCFieldAccess)call.meth).selected;
++                }
++            }
++            if (ref == null || ref.getTag() != JCTree.REFERENCE ||
++                TreeInfo.nonstaticSelect(ref)) {
++                log.error(tree.pos(), "member.reference.annotation.must.be.constant");
++                return new Attribute.Error(expected);
++            }
++            ((JCMemberReference) ref);
++            return new Attribute.MethodType(syms.methodTypeType, tree.mode, tree.sym);
+         }
+         if (!expected.isErroneous())
+             log.error(tree.pos(), "annotation.value.not.allowable.type");
+diff --git a/test/tools/javac/meth/MHLiterals.java b/test/tools/javac/meth/MHLiterals.java
+--- a/test/tools/javac/meth/MHLiterals.java
++++ b/test/tools/javac/meth/MHLiterals.java
+@@ -398,4 +398,13 @@
+ 
+         testConstructors();
+     }
++
++    @interface MHAnnotation {
++        java.dyn.MethodHandle value();
++        java.dyn.MethodType   type() default MHLiterals#m4().type();
++    }
++    @MHAnnotation(MHLiterals#m4())
++        int anno_m4;
++    @MHAnnotation(value = Int#c1, type = Int#c1.type())
++        int anno_c1;
+ }

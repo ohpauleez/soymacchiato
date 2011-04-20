@@ -1,0 +1,989 @@
+6964498: JSR 292 invokedynamic sites need local bootstrap methods
+Summary: Add JVM_CONSTANT_InvokeDynamic records to constant pool to determine per-instruction BSMs; add MethodHandleProvider.
+Reviewed-by: twisti
+
+diff --git a/src/share/classes/java/dyn/BootstrapMethod.java b/src/share/classes/java/dyn/BootstrapMethod.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/java/dyn/BootstrapMethod.java
+@@ -0,0 +1,82 @@
++/*
++ * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Oracle designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Oracle in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++package java.dyn;
++
++import java.lang.annotation.*;
++
++/**
++ * Annotation on InvokeDynamic method calls which requests the JVM to use a specific
++ * <a href="package-summary.html#bsm">bootstrap method</a>
++ * to link the call.  This annotation is not retained as such in the class file,
++ * but is transformed into a constant-pool entry for the invokedynamic instruction which
++ * specifies the desired bootstrap method.
++ * <p>
++ * If only the <code>value</code> is given, it must name a subclass of {@link CallSite}
++ * with a constructor which accepts a class, string, and method type.
++ * If the <code>value</code> and <code>name</code> are both given, there must be
++ * a static method in the given class of the given name which accepts a class, string,
++ * and method type, and returns a reference coercible to {@link CallSite}.
++ * <p>
++ * This annotation can be placed either on the return type of a single {@link InvokeDynamic}
++ * call (see examples) or else it can be placed on an enclosing class or method, where it
++ * determines a default bootstrap method for any {@link InvokeDynamic} calls which are not
++ * specifically annotated with a bootstrap method.
++ * Every {@link InvokeDynamic} call must be given a bootstrap method.
++ * <p>
++ * Examples:
++<blockquote><pre>
++&#064;BootstrapMethod(value=MyLanguageRuntime.class, name="bootstrapDynamic")
++String x = (String) InvokeDynamic.greet();
++//BSM => MyLanguageRuntime.bootstrapDynamic(Here.class, "greet", methodType(String.class))
++&#064;BootstrapMethod(MyCallSite.class)
++void example() throws Throwable {
++    InvokeDynamic.greet();
++    //BSM => new MyCallSite(Here.class, "greet", methodType(void.class))
++}
++</pre></blockquote>
++ * <p>
++ */
++@Target({ElementType.TYPE_USE,
++            // For defaulting every indy site within a class or method; cf. @SuppressWarnings:
++            ElementType.TYPE, ElementType.METHOD, ElementType.CONSTRUCTOR
++            })
++@Retention(RetentionPolicy.SOURCE)
++public @interface BootstrapMethod {
++    /** The class containing the bootstrap method. */
++    Class<?> value();
++
++    /** The name of the bootstrap method.
++     *  If this is the empty string, an instance of the bootstrap class is created,
++     *  and a constructor is invoked.
++     *  Otherwise, there must be a static method of the required name.
++     */
++    String name() default "";  // empty string denotes a constructor with 'new'
++
++    /** The argument types of the bootstrap method, as passed out by the JVM.
++     *  There is usually no reason to override the default.
++     */
++    Class<?>[] arguments() default {Class.class, String.class, MethodType.class};
++}
+diff --git a/src/share/classes/java/dyn/CallSite.java b/src/share/classes/java/dyn/CallSite.java
+--- a/src/share/classes/java/dyn/CallSite.java
++++ b/src/share/classes/java/dyn/CallSite.java
+@@ -25,56 +25,26 @@
+ 
+ package java.dyn;
+ 
+-import sun.dyn.Access;
+-import sun.dyn.MemberName;
+-import sun.dyn.CallSiteImpl;
++import sun.dyn.*;
++import java.util.Collection;
+ 
+ /**
+- * A {@code CallSite} reifies an {@code invokedynamic} instruction from bytecode,
+- * and controls its linkage.
+- * Every linked {@code CallSite} object corresponds to a distinct instance
+- * of the {@code invokedynamic} instruction, and vice versa.
++ * A {@code CallSite} is a holder for a variable {@link MethodHandle},
++ * which is called its {@code target}.
++ * Every call to a {@code CallSite} is delegated to the site's current target.
+  * <p>
+- * Every linked {@code CallSite} object has one state variable,
+- * a {@link MethodHandle} reference called the {@code target}.
+- * This reference is never null.  Though it can change its value
+- * successive values must always have exactly the {@link MethodType method type}
+- * called for by the bytecodes of the associated {@code invokedynamic} instruction
++ * A call site is initially created in an <em>unlinked</em> state,
++ * which is distinguished by a null target variable.
++ * Before the call site may be invoked (and before certain other
++ * operations are attempted), the call site must be linked to
++ * a non-null target.
+  * <p>
+- * It is the responsibility of each class's
+- * {@link Linkage#registerBootstrapMethod(Class, MethodHandle) bootstrap method}
+- * to produce call sites which have been pre-linked to an initial target method.
+- * The required {@link MethodType type} for the target method is a parameter
+- * to each bootstrap method call.
+- * <p>
+- * The bootstrap method may elect to produce call sites of a
+- * language-specific subclass of {@code CallSite}.  In such a case,
+- * the subclass may claim responsibility for initializing its target to
+- * a non-null value, by overriding {@link #initialTarget}.
+- * <p>
+- * An {@code invokedynamic} instruction which has not yet been executed
+- * is said to be <em>unlinked</em>.  When an unlinked call site is executed,
+- * the containing class's bootstrap method is called to manufacture a call site,
+- * for the instruction.  If the bootstrap method does not assign a non-null
+- * value to the new call site's target variable, the method {@link #initialTarget}
+- * is called to produce the new call site's first target method.
+- * <p>
+- * A freshly-created {@code CallSite} object is not yet in a linked state.
+- * An unlinked {@code CallSite} object reports null for its {@code callerClass}.
+- * When the JVM receives a {@code CallSite} object from a bootstrap method,
+- * it first ensures that its target is non-null and of the correct type.
+- * The JVM then links the {@code CallSite} object to the call site instruction,
+- * enabling the {@code callerClass} to return the class in which the instruction occurs.
+- * <p>
+- * Next, the JVM links the instruction to the {@code CallSite}, at which point
+- * any further execution of the {@code invokedynamic} instruction implicitly
+- * invokes the current target of the {@code CallSite} object.
+- * After this two-way linkage, both the instruction and the {@code CallSite}
+- * object are said to be linked.
+- * <p>
+- * This state of linkage continues until the method containing the
+- * dynamic call site is garbage collected, or the dynamic call site
+- * is invalidated by an explicit request.
++ * A call site may be <em>relinked</em> by changing its target.
++ * The new target must be non-null and must have the same
++ * {@linkplain MethodHandle#type() type}
++ * as the previous target.
++ * Thus, though a call site can be relinked to a series of
++ * successive targets, it cannot change its type.
+  * <p>
+  * Linkage happens once in the lifetime of any given {@code CallSite} object.
+  * Because of call site invalidation, this linkage can be repeated for
+@@ -87,6 +57,10 @@
+  * Here is a sample use of call sites and bootstrap methods which links every
+  * dynamic call site to print its arguments:
+ <blockquote><pre><!-- see indy-demo/src/PrintArgsDemo.java -->
++&#064;BootstrapMethod(value=PrintArgsDemo.class, name="bootstrapDynamic")
++static void test() throws Throwable {
++    InvokeDynamic.baz("baz arg", 2, 3.14);
++}
+ private static void printArgs(Object... args) {
+   System.out.println(java.util.Arrays.deepToString(args));
+ }
+@@ -96,17 +70,16 @@
+   Class thisClass = lookup.lookupClass();  // (who am I?)
+   printArgs = lookup.findStatic(thisClass,
+       "printArgs", MethodType.methodType(void.class, Object[].class));
+-  Linkage.registerBootstrapMethod("bootstrapDynamic");
+ }
+ private static CallSite bootstrapDynamic(Class caller, String name, MethodType type) {
+   // ignore caller and name, but match the type:
+   return new CallSite(MethodHandles.collectArguments(printArgs, type));
+ }
+ </pre></blockquote>
+- * @see Linkage#registerBootstrapMethod(java.lang.Class, java.dyn.MethodHandle)
+  * @author John Rose, JSR 292 EG
+  */
+ public class CallSite
++    implements MethodHandleProvider
+ {
+     private static final Access IMPL_TOKEN = Access.getToken();
+ 
+@@ -209,6 +182,7 @@
+      * {@code InvokeDynamicBootstrapError}, which in turn causes the
+      * linkage of the {@code invokedynamic} instruction to terminate
+      * abnormally.
++     * @deprecated transitional form defined in EDR but removed in PFD
+      */
+     protected MethodHandle initialTarget(Class<?> callerClass, String name, MethodType type) {
+         throw new InvokeDynamicBootstrapError("target must be initialized before call site is linked: "+name+type);
+@@ -278,16 +252,40 @@
+      */
+     @Override
+     public String toString() {
+-        StringBuilder buf = new StringBuilder("CallSite#");
+-        buf.append(hashCode());
+-        if (!isLinked())
+-            buf.append("[unlinked]");
+-        else
+-            buf.append("[")
+-                .append("from ").append(vmmethod.getDeclaringClass().getName())
+-                .append(" : ").append(getTarget().type())
+-                .append(" => ").append(getTarget())
+-                .append("]");
+-        return buf.toString();
++        return "CallSite"+(target == null ? "" : target.type());
+     }
++
++    /**
++     * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
++     * Produce a method handle equivalent to an invokedynamic instruction
++     * which has been linked to this call site.
++     * <p>If this call site is a {@link ConstantCallSite}, this method
++     * simply returns the call site's target, since that will not change.
++     * <p>Otherwise, this method is equivalent to the following code:
++     * <p><blockquote><pre>
++     * MethodHandle getTarget, invoker, result;
++     * getTarget = MethodHandles.lookup().bind(this, "getTarget", MethodType.methodType(MethodHandle.class));
++     * invoker = MethodHandles.exactInvoker(this.type());
++     * result = MethodHandles.foldArguments(invoker, getTarget)
++     * </pre></blockquote>
++     * @return a method handle which always invokes this call site's current target
++     */
++    public final MethodHandle dynamicInvoker() {
++        if (this instanceof ConstantCallSite)
++            return getTarget();  // will not change dynamically
++        MethodHandle getCSTarget = GET_TARGET;
++        if (getCSTarget == null)
++            GET_TARGET = getCSTarget = MethodHandles.Lookup.IMPL_LOOKUP.
++                findVirtual(CallSite.class, "getTarget", MethodType.methodType(MethodHandle.class));
++        MethodHandle getTarget = MethodHandleImpl.bindReceiver(IMPL_TOKEN, getCSTarget, this);
++        MethodHandle invoker = MethodHandles.exactInvoker(this.type());
++        return MethodHandles.foldArguments(invoker, getTarget);
++    }
++    private static MethodHandle GET_TARGET = null;  // link this lazily, not eagerly
++
++    /** Implementation of {@link MethodHandleProvider} which returns {@code this.dynamicInvoker()}. */
++    public final MethodHandle asMethodHandle() { return dynamicInvoker(); }
++
++    /** Implementation of {@link MethodHandleProvider}, which returns {@code this.dynamicInvoker().asType(type)}. */
++    public final MethodHandle asMethodHandle(MethodType type) { return dynamicInvoker().asType(type); }
+ }
+diff --git a/src/share/classes/java/dyn/ConstantCallSite.java b/src/share/classes/java/dyn/ConstantCallSite.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/java/dyn/ConstantCallSite.java
+@@ -0,0 +1,43 @@
++/*
++ * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Oracle designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Oracle in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++package java.dyn;
++
++/**
++ * A {@code ConstantCallSite} is a {@link CallSite} whose target is permanent, and can never be changed.
++ * The only way to relink an {@code invokedynamic} instruction bound to a {@code ConstantCallSite} is
++ * to invalidate the instruction as a whole.
++ * @author John Rose, JSR 292 EG
++ */
++public class ConstantCallSite extends CallSite {
++    /** Create a call site with a permanent target. */
++    public ConstantCallSite(MethodHandle target) {
++        super(target);
++    }
++    /** Throw an {@link IllegalArgumentException}, because this kind of call site cannot change its target. */
++    @Override public final void setTarget(MethodHandle ignore) {
++        throw new IllegalArgumentException("ConstantCallSite");
++    }
++}
+diff --git a/src/share/classes/java/dyn/InvokeDynamic.java b/src/share/classes/java/dyn/InvokeDynamic.java
+--- a/src/share/classes/java/dyn/InvokeDynamic.java
++++ b/src/share/classes/java/dyn/InvokeDynamic.java
+@@ -35,7 +35,7 @@
+  * The target method is a property of the reified {@linkplain CallSite call site object}
+  * which is linked to each active {@code invokedynamic} instruction.
+  * The call site object is initially produced by a
+- * {@linkplain java.dyn.Linkage#registerBootstrapMethod(Class, MethodHandle) bootstrap method}
++ * {@linkplain BootstrapMethod bootstrap method}
+  * associated with the class whose bytecodes include the dynamic call site.
+  * <p>
+  * The type {@code InvokeDynamic} has no particular meaning as a
+@@ -45,22 +45,31 @@
+  * It may be imported for ease of use.
+  * <p>
+  * Here are some examples:
+- * <p><blockquote><pre>
+- * Object x; String s; int i;
+- * x = InvokeDynamic.greet("world"); // greet(Ljava/lang/String;)Ljava/lang/Object;
+- * s = InvokeDynamic.&lt;String&gt;hail(x); // hail(Ljava/lang/Object;)Ljava/lang/String;
+- * InvokeDynamic.&lt;void&gt;cogito(); // cogito()V
+- * i = InvokeDynamic.&lt;int&gt;#"op:+"(2, 3); // "op:+"(II)I
+- * </pre></blockquote>
++<blockquote><pre><!-- see indy-demo/src/JavaDocExamples.java -->
++&#064;BootstrapMethod(value=Here.class, name="bootstrapDynamic")
++static void example() throws Throwable {
++    Object x; String s; int i;
++    x = InvokeDynamic.greet("world"); // greet(Ljava/lang/String;)Ljava/lang/Object;
++    s = (String) InvokeDynamic.hail(x); // hail(Ljava/lang/Object;)Ljava/lang/String;
++    InvokeDynamic.cogito(); // cogito()V
++    i = (int) InvokeDynamic.#"op:+"(2, 3); // "op:+"(II)I
++}
++static MethodHandle bootstrapDynamic(Class caller, String name, MethodType type) { ... }
++</pre></blockquote>
+  * Each of the above calls generates a single invokedynamic instruction
+  * with the name-and-type descriptors indicated in the comments.
++ * <p>
+  * The argument types are taken directly from the actual arguments,
+- * while the return type is taken from the type parameter.
+- * (This type parameter may be a primtive, and it defaults to {@code Object}.)
++ * while the return type corresponds to the target of the assignment.
++ * (Currently, the return type must be given as a false type parameter.
++ * This type parameter is an irregular use of the generic type syntax,
++ * and is likely to change in favor of a convention based on target typing.)
++ * <p>
+  * The final example uses a special syntax for uttering non-Java names.
+  * Any name legal to the JVM may be given between the double quotes.
++ * <p>
+  * None of these calls is complete without a bootstrap method,
+- * which must be registered by the static initializer of the enclosing class.
++ * which must be declared for the enclosing class or method.
+  * @author John Rose, JSR 292 EG
+  */
+ @MethodHandle.PolymorphicSignature
+diff --git a/src/share/classes/java/dyn/InvokeDynamicBootstrapError.java b/src/share/classes/java/dyn/InvokeDynamicBootstrapError.java
+--- a/src/share/classes/java/dyn/InvokeDynamicBootstrapError.java
++++ b/src/share/classes/java/dyn/InvokeDynamicBootstrapError.java
+@@ -28,15 +28,11 @@
+ /**
+  * Thrown to indicate that an {@code invokedynamic} instruction has
+  * failed to find its
+- * {@linkplain Linkage#registerBootstrapMethod(Class, MethodHandle) bootstrap method},
++ * {@linkplain BootstrapMethod bootstrap method},
+  * or the bootstrap method has
+  * failed to provide a
+  * {@linkplain CallSite} call site with a non-null {@linkplain MethodHandle target}
+  * of the correct {@linkplain MethodType method type}.
+- * <p>
+- * The bootstrap method must have been declared during a class's initialization
+- * by a call to one of the overloadings of
+- * {@link Linkage#registerBootstrapMethod registerBootstrapMethod}.
+  *
+  * @author John Rose, JSR 292 EG
+  */
+diff --git a/src/share/classes/java/dyn/Linkage.java b/src/share/classes/java/dyn/Linkage.java
+--- a/src/share/classes/java/dyn/Linkage.java
++++ b/src/share/classes/java/dyn/Linkage.java
+@@ -25,7 +25,6 @@
+ 
+ package java.dyn;
+ 
+-import java.lang.annotation.Annotation;
+ import java.dyn.MethodHandles.Lookup;
+ import java.util.WeakHashMap;
+ import sun.dyn.Access;
+@@ -56,11 +55,7 @@
+      * <li>the class containing the {@code invokedynamic} instruction, for which the bootstrap method was registered
+      * <li>the name of the method being invoked (a {@link String})
+      * <li>the type of the method being invoked (a {@link MethodType})
+-     * <li><em>TBD</em> optionally, an unordered array of {@link Annotation}s attached to the call site
+-     *     <em>(Until this feature is implemented, this will always receive an empty array.)</em>
+      * </ul>
+-     * <em>(TBD: The final argument type may be missing from the method handle's type.
+-     * Additional arguments may be added in the future.)</em>
+      * The bootstrap method acts as a factory method which accepts the given arguments
+      * and returns a {@code CallSite} object (possibly of a subclass of {@code CallSite}).
+      * <p>
+@@ -86,6 +81,7 @@
+      *            or is already running in another thread
+      * @exception SecurityException if there is a security manager installed,
+      *            and a {@link LinkagePermission} check fails for "registerBootstrapMethod"
++     * @deprecated Use @{@link BootstrapMethod} annotations instead
+      */
+     public static
+     void registerBootstrapMethod(Class callerClass, MethodHandle bootstrapMethod) {
+@@ -97,14 +93,9 @@
+ 
+     static private void checkBSM(MethodHandle mh) {
+         if (mh == null)  throw newIllegalArgumentException("null bootstrap method");
+-        if (mh.type() == BOOTSTRAP_METHOD_TYPE_2)
+-            // For now, always pass an empty array for the Annotations argument
+-            mh = MethodHandles.insertArguments(mh, BOOTSTRAP_METHOD_TYPE_2.parameterCount()-1,
+-                                               (Object)NO_ANNOTATIONS);
+         if (mh.type() == BOOTSTRAP_METHOD_TYPE)  return;
+         throw new WrongMethodTypeException(mh.toString());
+     }
+-    static private final Annotation[] NO_ANNOTATIONS = { };
+ 
+     /**
+      * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+@@ -115,6 +106,7 @@
+      * @throws NoSuchMethodException if there is no such method
+      * @throws IllegalStateException if the caller class's static initializer
+      *         has already run, or is already running in another thread
++     * @deprecated Use @{@link BootstrapMethod} annotations instead
+      */
+     public static
+     void registerBootstrapMethod(Class<?> runtime, String name) {
+@@ -131,6 +123,7 @@
+      * @throws IllegalArgumentException if there is no such method
+      * @throws IllegalStateException if the caller class's static initializer
+      *         has already run, or is already running in another thread
++     * @deprecated Use @{@link BootstrapMethod} annotations instead
+      */
+     public static
+     void registerBootstrapMethod(String name) {
+@@ -142,18 +135,10 @@
+     void registerBootstrapMethodLookup(Class<?> callerClass, Class<?> runtime, String name) {
+         Lookup lookup = new Lookup(IMPL_TOKEN, callerClass);
+         MethodHandle bootstrapMethod;
+-        // Try both types.  TBD
+         try {
+-            bootstrapMethod = lookup.findStatic(runtime, name, BOOTSTRAP_METHOD_TYPE_2);
++            bootstrapMethod = lookup.findStatic(runtime, name, BOOTSTRAP_METHOD_TYPE);
+         } catch (NoAccessException ex) {
+-            bootstrapMethod = null;
+-        }
+-        if (bootstrapMethod == null) {
+-            try {
+-                bootstrapMethod = lookup.findStatic(runtime, name, BOOTSTRAP_METHOD_TYPE);
+-            } catch (NoAccessException ex) {
+-                throw new IllegalArgumentException("no such bootstrap method in "+runtime+": "+name, ex);
+-            }
++            throw new IllegalArgumentException("no such bootstrap method in "+runtime+": "+name, ex);
+         }
+         checkBSM(bootstrapMethod);
+         MethodHandleImpl.registerBootstrap(IMPL_TOKEN, callerClass, bootstrapMethod);
+@@ -172,6 +157,7 @@
+      *            and the immediate caller of this method is not in the same
+      *            package as the caller class
+      *            and a {@link LinkagePermission} check fails for "getBootstrapMethod"
++     * @deprecated
+      */
+     public static
+     MethodHandle getBootstrapMethod(Class callerClass) {
+@@ -188,10 +174,6 @@
+     public static final MethodType BOOTSTRAP_METHOD_TYPE
+             = MethodType.methodType(CallSite.class,
+                                     Class.class, String.class, MethodType.class);
+-    static final MethodType BOOTSTRAP_METHOD_TYPE_2
+-            = MethodType.methodType(CallSite.class,
+-                                    Class.class, String.class, MethodType.class,
+-                                    Annotation[].class);
+ 
+     /**
+      * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+diff --git a/src/share/classes/java/dyn/LinkagePermission.java b/src/share/classes/java/dyn/LinkagePermission.java
+--- a/src/share/classes/java/dyn/LinkagePermission.java
++++ b/src/share/classes/java/dyn/LinkagePermission.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2009, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -31,6 +31,7 @@
+ import java.util.StringTokenizer;
+ 
+ /**
++ * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+  * This class is for managing runtime permission checking for
+  * operations performed by methods in the {@link Linkage} class.
+  * Like a {@link RuntimePermission}, on which it is modeled,
+@@ -52,13 +53,6 @@
+  * </tr>
+  *
+  * <tr>
+- *   <td>registerBootstrapMethod.{class name}</td>
+- *   <td>Specifying a bootstrap method for {@code invokedynamic} instructions within a class of the given name</td>
+- *   <td>An attacker could attempt to attach a bootstrap method to a class which
+- *       has just been loaded, thus gaining control of its {@code invokedynamic} calls.</td>
+- * </tr>
+- *
+- * <tr>
+  *   <td>invalidateAll</td>
+  *   <td>Force the relinking of invokedynamic call sites everywhere.</td>
+  *   <td>This could allow an attacker to slow down the system,
+@@ -73,8 +67,9 @@
+  *   <td>See {@code invalidateAll}.</td>
+  * </tr>
+  * </table>
++ * <p>ISSUE: Is this still needed?
+  *
+- * @see java.security.RuntimePermission
++ * @see java.lang.RuntimePermission
+  * @see java.lang.SecurityManager
+  *
+  * @author John Rose, JSR 292 EG
+@@ -84,7 +79,7 @@
+     /**
+      * Create a new LinkagePermission with the given name.
+      * The name is the symbolic name of the LinkagePermission, such as
+-     * "registerBootstrapMethod", "invalidateCallerClass.*", etc. An asterisk
++     * "invalidateCallerClass.*", etc. An asterisk
+      * may appear at the end of the name, following a ".", or by itself, to
+      * signify a wildcard match.
+      *
+diff --git a/src/share/classes/java/dyn/MethodHandle.java b/src/share/classes/java/dyn/MethodHandle.java
+--- a/src/share/classes/java/dyn/MethodHandle.java
++++ b/src/share/classes/java/dyn/MethodHandle.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2009, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -36,11 +36,13 @@
+ /**
+  * A method handle is a typed, directly executable reference to a method,
+  * constructor, field, or similar low-level operation, with optional
+- * conversion or substitution of arguments or return values.
++ * transformations of arguments or return values.
++ * (These transformations include conversion, insertion, deletion,
++ * substitution.  See the methods of this class and of {@link MethodHandles}.)
+  * <p>
+  * Method handles are strongly typed according to signature.
+  * They are not distinguished by method name or enclosing class.
+- * A method handle must be invoked under a signature which exactly matches
++ * A method handle must be invoked under a signature which matches
+  * the method handle's own {@link MethodType method type}.
+  * <p>
+  * Every method handle confesses its type via the {@code type} accessor.
+@@ -174,9 +176,10 @@
+  * merely a documentation convention.  These type parameters do
+  * not play a role in type-checking method handle invocations.
+  * <p>
+- * Note: Like classes and strings, method handles that correspond directly
+- * to fields and methods can be represented directly as constants to be
+- * loaded by {@code ldc} bytecodes.
++ * Like classes and strings, method handles that correspond to accessible
++ * fields, methods, and constructors can be represented directly
++ * in a class file's constant pool as constants to be loaded by {@code ldc} bytecodes.
++ * Loading such a constant causes the component classes of its type to be loaded as necessary.
+  *
+  * @see MethodType
+  * @see MethodHandles
+@@ -186,6 +189,7 @@
+         // Note: This is an implementation inheritance hack, and will be removed
+         // with a JVM change which moves the required hidden state onto this class.
+         extends MethodHandleImpl
++        implements MethodHandleProvider
+ {
+     private static Access IMPL_TOKEN = Access.getToken();
+ 
+@@ -197,7 +201,7 @@
+      * those methods which are signature polymorphic.
+      */
+     @java.lang.annotation.Target({java.lang.annotation.ElementType.METHOD,java.lang.annotation.ElementType.TYPE})
+-    @java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.CLASS)
++    @java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME)
+     @interface PolymorphicSignature { }
+ 
+     private MethodType type;
+@@ -274,10 +278,14 @@
+      * and performing simple conversions for arguments and return types.
+      * The signature at the call site of {@code invokeGeneric} must
+      * have the same arity as this method handle's {@code type}.
+-     * The same conversions are allowed on arguments or return values as are supported by
+-     * by {@link MethodHandles#convertArguments}.
++     * <p>
+      * If the call site signature exactly matches this method handle's {@code type},
+      * the call proceeds as if by {@link #invokeExact}.
++     * <p>
++     * Otherwise, the call proceeds as if this method handle were first
++     * adjusted by calling {@link #asType} to adjust this method handle
++     * to the required type, and then the call proceeds as if by
++     * {@link #invokeExact} on the adjusted method handle.
+      */
+     public final native @PolymorphicSignature <R,A> R invokeGeneric(A... args) throws Throwable;
+ 
+@@ -538,4 +546,10 @@
+     public final MethodHandle bindTo(Object x) {
+         return MethodHandles.insertArguments(this, 0, x);
+     }
++
++    /** Implementation of {@link MethodHandleProvider}, which returns {@code this}. */
++    public final MethodHandle asMethodHandle() { return this; }
++
++    /** Implementation of {@link MethodHandleProvider}, which returns {@code this.asType(type)}. */
++    public final MethodHandle asMethodHandle(MethodType type) { return this.asType(type); }
+ }
+diff --git a/src/share/classes/java/dyn/MethodHandleProvider.java b/src/share/classes/java/dyn/MethodHandleProvider.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/java/dyn/MethodHandleProvider.java
+@@ -0,0 +1,80 @@
++/*
++ * Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Oracle designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Oracle in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++package java.dyn;
++
++/**
++ * An interface for an object to provide a target {@linkplain MethodHandle method handle} to a {@code invokedynamic} instruction.
++ * There are many function-like objects in various Java APIs.
++ * This interface provides a standard way for such function-like objects to be bound
++ * to a dynamic call site, by providing a view of their behavior in the form of a low-level method handle.
++ * <p>
++ * The type {@link MethodHandle} is a concrete class whose implementation
++ * hierarchy (if any) may be tightly coupled to the underlying JVM implementation.
++ * It cannot also serve as a base type for user-defined functional APIs.
++ * For this reason, {@code MethodHandle} cannot be subclassed to add new
++ * behavior to method handles.  But this interface can be used to provide
++ * a link between a user-defined function and the {@code invokedynamic}
++ * instruction and the method handle API.
++ */
++public interface MethodHandleProvider {
++    /** Produce a method handle which will serve as a behavioral proxy for the current object.
++     *  The type and invocation behavior of the proxy method handle are user-defined,
++     *  and should have some relation to the intended meaning of the original object itself.
++     *  <p>
++     *  The current object may have a changeable behavior.
++     *  For example, {@link CallSite} has a {@code setTarget} method which changes its invocation.
++     *  In such a case, it is <em>incorrect</em> for {@code asMethodHandle} to return
++     *  a method handle whose behavior may diverge from that of the current object.
++     *  Rather, the returned method handle must stably and permanently access
++     *  the behavior of the current object, even if that behavior is changeable.
++     *  <p>
++     *  The reference identity of the proxy method handle is not guaranteed to
++     *  have any particular relation to the reference identity of the object.
++     *  In particular, several objects with the same intended meaning could
++     *  share a common method handle, or the same object could return different
++     *  method handles at different times.  In the latter case, the different
++     *  method handles should have the same type and invocation behavior,
++     *  and be usable from any thread at any time.
++     *  In particular, if a MethodHandleProvider is bound to an <code>invokedynamic</code>
++     *  call site, the proxy method handle extracted at the time of binding
++     *  will be used for an unlimited time, until the call site is rebound.
++     *  <p>
++     *  The type {@link MethodHandle} itself implements {@code MethodHandleProvider}, and
++     *  for this method simply returns {@code this}.
++     */
++    public MethodHandle asMethodHandle();
++
++    /** Produce a method handle of a given type which will serve as a behavioral proxy for the current object.
++     *  As for the no-argument version {@link #asMethodHandle()}, the invocation behavior of the
++     *  proxy method handle is user-defined.  But the type must be the given type,
++     *  or else a {@link WrongMethodTypeException} must be thrown.
++     *  <p>
++     *  If the current object somehow represents a variadic or overloaded behavior,
++     *  the method handle returned for a given type might represent only a subset of
++     *  the current object's repertoire of behaviors, which correspond to that type.
++     */
++    public MethodHandle asMethodHandle(MethodType type) throws WrongMethodTypeException;
++}
+diff --git a/src/share/classes/java/dyn/package-info.java b/src/share/classes/java/dyn/package-info.java
+--- a/src/share/classes/java/dyn/package-info.java
++++ b/src/share/classes/java/dyn/package-info.java
+@@ -40,20 +40,18 @@
+  * The JVM links any such call (regardless of signature) to a dynamically
+  * typed method handle invocation.  In the case of {@code invokeGeneric},
+  * argument and return value conversions are applied.
++ * </li>
+  *
+- * <li>In source code, the class {@link java.dyn.InvokeDynamic} appears to accept
++ * <li>In source code, the class {@link java.dyn.InvokeDynamic InvokeDynamic} appears to accept
+  * any static method invocation, of any name and any signature.
+  * But instead of emitting
+  * an {@code invokestatic} instruction for such a call, the Java compiler emits
+  * an {@code invokedynamic} instruction with the given name and signature.
+- *
+- * <li>When the JVM links an {@code invokedynamic} instruction, it calls the
+- * {@linkplain java.dyn.Linkage#registerBootstrapMethod(Class, MethodHandle) bootstrap method}
+- * of the containing class to obtain a {@linkplain java.dyn.CallSite call site} object through which
+- * the call site will link its target {@linkplain java.dyn.MethodHandle method handle}.
++ * </li>
+  *
+  * <li>The JVM bytecode format supports immediate constants of
+- * the classes {@link java.dyn.MethodHandle} and {@link java.dyn.MethodType}.
++ * the classes {@link java.dyn.MethodHandle MethodHandle} and {@link java.dyn.MethodType MethodType}.
++ * </li>
+  * </ul>
+  *
+  * <h2><a name="jvm_mods"></a>Corresponding JVM bytecode format changes</h2>
+@@ -65,18 +63,50 @@
+  * The first byte is the opcode 186 (hexadecimal {@code BA}).
+  * The next two bytes are a constant pool index (in the same format as for the other {@code invoke} instructions).
+  * The final two bytes are reserved for future use and required to be zero.
+- * The constant pool reference is to a entry with tag {@code CONSTANT_NameAndType}
+- * (decimal 12).  It is thus not a method reference of any sort, but merely
+- * the method name, argument types, and return type of the dynamic call site.
+- * <em>(TBD: The EG is discussing the possibility of a special constant pool entry type,
+- * so that other information may be added, such as a per-instruction bootstrap
+- * method and/or annotations.)</em>
++ * The constant pool reference of an {@code invokedynamic} instruction is to a entry
++ * with tag {@code CONSTANT_InvokeDynamic} (decimal 17).  See below for its format.
++ * The entry specifies the bootstrap method (a {@link java.dyn.MethodHandle MethodHandle} constant),
++ * the dynamic invocation name, and the argument types and return type of the call.
++ * <p>
++ * Each instance of an {@code invokedynamic} instruction is called a <em>dynamic call site</em>.
++ * Multiple instances of an {@code invokedynamic} instruction can share a single
++ * {@code CONSTANT_InvokeDynamic} entry.
++ * In any case, distinct call sites always have distinct linkage state.
++ * <p>
++ * Moreover, for the purpose of distinguishing dynamic call sites,
++ * the JVM is allowed (but not required) to make internal copies
++ * of {@code invokedynamic} instructions, each one
++ * constituting a separate dynamic call site with its own linkage state.
++ * Such copying, if it occurs, cannot be observed except indirectly via
++ * execution of bootstrap methods and target methods.
++ * <p>
++ * A dynamic call site is originally in an unlinked state.  In this state, there is
++ * no target method for the call site to invoke.
++ * A dynamic call site is linked by means of a bootstrap method,
++ * as <a href="#bsm">described below</a>.
++ * <p>
++ * <em>(Historic Note: Some older JVMs may allow the index of a {@code CONSTANT_NameAndType}
++ * instead of a {@code CONSTANT_InvokeDynamic}.  In earlier, obsolete versions of this API, the
++ * bootstrap method was specified dynamically, in a per-class basis, during class initialization.)</em>
++ *
++ * <h3>constant pool entries for {@code invokedynamic} instructions</h3>
++ * If a constant pool entry has the tag {@code CONSTANT_InvokeDynamic} (decimal 17),
++ * it must contain exactly four more bytes.
++ * The first two bytes after the tag must be an index to a {@code CONSTANT_MethodHandle}
++ * entry, and the second two bytes must be an index to a {@code CONSTANT_NameAndType}.
++ * The first index specifies a bootstrap method used by the associated dynamic call sites.
++ * The second index specifies the method name, argument types, and return type of the dynamic call site.
++ * The structure of such an entry is therefore analogous to a {@code CONSTANT_Methodref},
++ * except that the {@code CONSTANT_Class} reference in a {@code CONSTANT_Methodref} entry
++ * is replaced by a bootstrap method reference.
+  *
+  * <h3>constant pool entries for {@code MethodType}s</h3>
+  * If a constant pool entry has the tag {@code CONSTANT_MethodType} (decimal 16),
+- * it must contain exactly two more bytes, which are an index to a {@code CONSTANT_Utf8}
+- * entry which represents a method type signature.  The JVM will ensure that on first
+- * execution of an {@code ldc} instruction for this entry, a {@link java.dyn.MethodType}
++ * it must contain exactly two more bytes, which must be an index to a {@code CONSTANT_Utf8}
++ * entry which represents a method type signature.
++ * <p>
++ * The JVM will ensure that on first
++ * execution of an {@code ldc} instruction for this entry, a {@link java.dyn.MethodType MethodType}
+  * will be created which represents the signature.
+  * Any classes mentioned in the {@code MethodType} will be loaded if necessary,
+  * but not initialized.
+@@ -86,12 +116,15 @@
+  * <h3>constant pool entries for {@code MethodHandle}s</h3>
+  * If a constant pool entry has the tag {@code CONSTANT_MethodHandle} (decimal 15),
+  * it must contain exactly three more bytes.  The first byte after the tag is a subtag
+- * value in the range 1 through 9, and the last two are an index to a
++ * value which must be in the range 1 through 9, and the last two must be an index to a
+  * {@code CONSTANT_Fieldref}, {@code CONSTANT_Methodref}, or
+  * {@code CONSTANT_InterfaceMethodref} entry which represents a field or method
+  * for which a method handle is to be created.
++ * Furthermore, the subtag value and the type of the constant index value
++ * must agree according to the table below.
++ * <p>
+  * The JVM will ensure that on first execution of an {@code ldc} instruction
+- * for this entry, a {@link java.dyn.MethodHandle} will be created which represents
++ * for this entry, a {@link java.dyn.MethodHandle MethodHandle} will be created which represents
+  * the field or method reference, according to the specific mode implied by the subtag.
+  * <p>
+  * As with {@code CONSTANT_Class} and {@code CONSTANT_MethodType} constants,
+@@ -126,6 +159,129 @@
+  * Method handles for subtags {@code REF_getStatic}, {@code REF_putStatic}, and {@code REF_invokeStatic}
+  * may force class initialization on their first invocation, just like the corresponding bytecodes.
+  *
++ * <h2><a name="bsm"></a>Bootstrap Methods</h2>
++ * Before the JVM can execute a dynamic call site (an {@code invokedynamic} instruction),
++ * the call site must first be <em>linked</em>.
++ * Linking is accomplished by calling a <em>bootstrap method</em>
++ * which is given the static information content of the call site,
++ * and which must produce a {@link java.dyn.MethodHandle method handle}
++ * that gives the behavior of the call site.
++ * <p>
++ * Each {@code invokedynamic} instruction statically specifies its own
++ * bootstrap method as a constant pool reference.
++ * The constant pool reference also specifies the call site's name and type signature,
++ * just like {@code invokevirtual} and the other invoke instructions.
++ * <p>
++ * Linking starts with resolving the constant pool entry for the
++ * bootstrap method, and resolving a {@link java.dyn.MethodType MethodType} object for
++ * the type signature of the dynamic call site.
++ * This resolution process may trigger class loading.
++ * It may therefore throw an error if a class fails to load.
++ * This error becomes the abnormal termination of the dynamic
++ * call site execution.
++ * Linkage does not trigger class initialization.
++ * <p>
++ * Next, the bootstrap method call is started, with four values being stacked:
++ * <ul>
++ * <li>a {@code MethodHandle}, the resolved bootstrap method itself </li>
++ * <li>a {@code Class}, the <em>caller class</em> in which dynamic call site occurs </li>
++ * <li>a {@code String}, the method name mentioned in the call site </li>
++ * <li>a {@code MethodType}, the resolved type signature of the call </li>
++ * </ul>
++ * The method handle is then applied to the other values as if by
++ * {@linkplain java.dyn.MethodHandle#invokeGeneric the <code>invokeGeneric</code> method}.
++ * The returned result must be a {@link java.dyn.CallSite CallSite}, a {@link java.dyn.MethodHandle MethodHandle},
++ * or another {@link java.dyn.MethodHandleProvider MethodHandleProvider} value.
++ * The method {@linkplain java.dyn.MethodHandleProvider#asMethodHandle asMethodHandle}
++ * is then called on the returned value.  The result of that second
++ * call is the {@code MethodHandle} which becomes the
++ * permanent binding for the dynamic call site.
++ * That method handle's type must be exactly equal to the type
++ * derived from the dynamic call site signature and passed to
++ * the bootstrap method.
++ * <p>
++ * After resolution, the linkage process may fail in a variety of ways.
++ * All failures are reported by an {@link java.dyn.InvokeDynamicBootstrapError InvokeDynamicBootstrapError},
++ * which is thrown as the abnormal termination of the dynamic call
++ * site execution.
++ * The following circumstances will cause this:
++ * <ul>
++ * <li>the bootstrap method invocation completes abnormally </li>
++ * <li>the result from the bootstrap invocation is not a reference to
++ *     an object of type {@link java.dyn.MethodHandleProvider MethodHandleProvider} </li>
++ * <li>the call to {@code asMethodHandle} completes abnormally </li>
++ * <li>the call to {@code asMethodHandle} fails to return a reference to
++ *     an object of type {@link java.dyn.MethodHandle MethodHandle} </li>
++ * <li>the method handle produced by {@code asMethodHandle} does not have
++ *     the expected {@code MethodType} </li>
++ * </ul>
++ * <h3>timing of linkage</h3>
++ * A dynamic call site is linked just before its first execution.
++ * The bootstrap method call implementing the linkage occurs within
++ * a thread that is attempting a first execution.
++ * <p>
++ * If there are several such threads, the JVM picks one thread
++ * and runs the bootstrap method while the others wait for the
++ * invocation to terminate normally or abnormally.
++ * <p>
++ * After a bootstrap method is called and a method handle target
++ * successfully extracted, the JVM attempts to link the instruction
++ * being executed to the target method handle.
++ * This may fail if there has been intervening linkage
++ * or invalidation event for the same instruction.
++ * If such a failure occurs, the dynamic call site must be
++ * re-executed from the beginning, either re-linking it
++ * (if it has been invalidated) or invoking the target
++ * (if it the instruction has been linked by some other means).
++ * <p>
++ * If the instruction is linked successfully, the target method
++ * handle is invoked to complete the instruction execution.
++ * The state of linkage continues until the method containing the
++ * dynamic call site is garbage collected, or the dynamic call site
++ * is invalidated by an explicit request,
++ * such as {@link java.dyn.Linkage#invalidateCallerClass Linkage.invalidateCallerClass}.
++ * <p>
++ * In an application which requires dynamic call sites with individually
++ * mutable behaviors, their bootstrap methods should produce distinct
++ * {@link java.dyn.CallSite CallSite} objects, one for each linkage request.
++ * <p>
++ * If a class containing {@code invokedynamic} instructions
++ * is {@linkplain java.dyn.Linkage#invalidateCallerClass(Class) invalidated},
++ * subsequent execution of those {@code invokedynamic} instructions
++ * will require linking.
++ * It is as if they had never been executed in the first place.
++ * (However, invalidation does not cause constant pool entries to be
++ * resolved a second time.)
++ * <p>
++ * Invalidation events and bootstrap method calls for a particular
++ * dynamic call site are globally ordered relative to each other.
++ * When an invokedynamic instruction is invalidated, if there is
++ * simultaneously a bootstrap method invocation in process
++ * (in the same thread or a different thread), the result
++ * eventually returned must not be used to link the call site.
++ * Put another way, when a call site is invalidated, its
++ * subsequent linkage (if any) must be performed by a bootstrap method
++ * call initiated after the invalidation occurred.
++ * <p>
++ * If several threads simultaneously execute a bootstrap method for a single dynamic
++ * call site, the JVM must choose one target object and installs it visibly to
++ * all threads.  Any other bootstrap method calls are allowed to complete, but their
++ * results are ignored, and their dynamic call site invocations proceed with the originally
++ * chosen target object.
++ * <p>
++ * The JVM is free to duplicate dynamic call sites.
++ * This means that, even if a class contains just one {@code invokedynamic}
++ * instruction, its bootstrap method may be executed several times,
++ * once for each duplicate.  Thus, bootstrap method code should not
++ * assume an exclusive one-to-one correspondence between particular occurrences
++ * of {@code invokedynamic} bytecodes in class files and linkage events.
++ * <p>
++ * In principle, each individual execution of an {@code invokedynamic}
++ * instruction could be deemed (by a conforming implementation) to be a separate
++ * duplicate, requiring its own execution of the bootstrap method.
++ * However, implementations are expected to perform code duplication
++ * (if at all) in order to improve performance, not make it worse.
++ *
+  * @author John Rose, JSR 292 EG
+  */
+ 
+diff --git a/src/share/classes/sun/dyn/CallSiteImpl.java b/src/share/classes/sun/dyn/CallSiteImpl.java
+--- a/src/share/classes/sun/dyn/CallSiteImpl.java
++++ b/src/share/classes/sun/dyn/CallSiteImpl.java
+@@ -49,18 +49,21 @@
+         }
+         CallSite site;
+         try {
+-            if (bootstrapMethod.type().parameterCount() == 3)
+-                site = bootstrapMethod.<CallSite>invokeExact(caller, name, type);
+-            else if (bootstrapMethod.type().parameterCount() == 4)
+-                site = bootstrapMethod.<CallSite>invokeExact(caller, name, type,
+-                                                             !(info instanceof java.lang.annotation.Annotation[]) ? null
+-                                                             : (java.lang.annotation.Annotation[]) info);
++            Object binding;
++            if (false)  // switch when invokeGeneric works
++                binding = bootstrapMethod.invokeGeneric(caller, name, type);
+             else
+-                throw new InternalError("bad BSM: "+bootstrapMethod);
+-            if (!(site instanceof CallSite))
+-                throw new InvokeDynamicBootstrapError("class bootstrap method failed to create a call site: "+caller);
+-            PRIVATE_INITIALIZE_CALL_SITE.<void>invokeExact(site,
+-                                                           name, type,
++                binding = bootstrapMethod.invokeVarargs(new Object[]{ caller, name, type });
++            //System.out.println("BSM for "+name+type+" => "+binding);
++            if (binding instanceof CallSite) {
++                site = (CallSite) binding;
++            } else if (binding instanceof MethodHandleProvider) {
++                MethodHandle target = ((MethodHandleProvider) binding).asMethodHandle();
++                site = new ConstantCallSite(target);
++            } else {
++                throw new ClassCastException("bootstrap method failed to produce a MethodHandle or CallSite");
++            }
++            PRIVATE_INITIALIZE_CALL_SITE.<void>invokeExact(site, name, type,
+                                                            callerMethod, callerBCI);
+             assert(site.getTarget() != null);
+             assert(site.getTarget().type().equals(type));
+diff --git a/test/java/dyn/MethodHandlesTest.java b/test/java/dyn/MethodHandlesTest.java
+--- a/test/java/dyn/MethodHandlesTest.java
++++ b/test/java/dyn/MethodHandlesTest.java
+@@ -1327,7 +1327,8 @@
+         MethodHandle result = MethodHandles.spreadArguments(target2, newType);
+         Object[] returnValue;
+         if (pos == 0) {
+-            returnValue = (Object[]) result.invokeExact(args);
++            Object rawRetVal = result.invokeExact(args);
++            returnValue = (Object[]) rawRetVal;
+         } else {
+             Object[] args1 = Arrays.copyOfRange(args, 0, pos+1);
+             args1[pos] = Arrays.copyOfRange(args, pos, args.length);

@@ -1,0 +1,30 @@
+Patches to JTReg test harness to allow OpenJDK unit tests to use JUnit.
+These changes are relative to JTreg 4.0, and will likely be released as JTReg 4.1.
+
+To build JTReg:
+* start with http://openjdk.java.net/jtreg/build.html
+* fetch sources & dependencies as noted
+* fetch junit-4.5.jar from http://sourceforge.net/projects/junit/files/junit/4.5/junit-4.5.jar/download
+* apply these patches
+* build (see example script below)
+
+Or, to use the pre-build image:
+* unzip jtreg-no-junit.zip
+* fetch junit-4.5.jar from http://sourceforge.net/projects/junit/files/junit/4.5/junit-4.5.jar/download
+* copy junit-4.5.jar to jtreg-no-junit/lib/junit.jar
+
+#! /bin/sh
+
+sets="
+CHMOD=chmod CP=cp DIFF=diff ECHO=echo FIND=find GREP=grep
+MKDIR=mkdir PERL=perl SED=sed SH=sh TEST=test UNZIP=unzip ZIP=zip
+JDK15HOME=$JAVA5_HOME
+JDK16HOME=$JAVA6_HOME
+XALANHOME=$XALAN_HOME
+ANTHOME=$ANT_HOME
+JTHARNESS_HOME=$JAVATEST_HOME
+JUNIT_JAR=$JUNIT4_JAR
+"
+
+exec \
+make -C make $sets "$@"

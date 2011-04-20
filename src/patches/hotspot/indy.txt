@@ -1,0 +1,16 @@
+6655646: dynamic languages need dynamically linked call sites
+Summary: invokedynamic instruction (JSR 292 RI)
+
+http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=6655646
+
+Features:
+- enabled via -XX:+EnableInvokeDynamic
+
+Notes:
+
+If you get an error like this:
+  Exception in thread "main" java.lang.VerifyError: (class: Foo, method: ...) Illegal instruction found at offset 39
+then you need a JDK with a patch to the old verifier plugin, see ../jdk/indy.verify.patch
+As a workaround, use this JVM flag to turn off the (unpatched) verifier:
+  -Xverify:none
+or else put your classes on the BCP: -Xbootclasspath/a:my/classes:my.jar

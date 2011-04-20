@@ -1,0 +1,1316 @@
+diff --git a/src/share/classes/sun/misc/Continuation.java b/src/share/classes/sun/misc/Continuation.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/sun/misc/Continuation.java
+@@ -0,0 +1,164 @@
++/*
++ * Copyright 2010 Google, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Sun designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Sun in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++package sun.misc;
++
++/**
++ * The JVM Continuation class. The API design is still in progress.
++ *
++ * @author Hiroshi Yamauchi
++ */
++public class Continuation {
++
++    private static native void registerNatives();
++    static {
++        registerNatives();
++    }
++
++    /**
++     * The stack frames data
++     */
++    protected volatile Object stack;
++
++    /**
++     * The list of compiled code PCs in the stack. Needed to reclaim
++     * the compiled code in the code cache.
++     */
++    protected volatile long[] pcs;
++
++    /**
++     * A data field for convenience. This field is set to the second
++     * <code>data</code> parameter to {@link #enter} upon a {@link
++     * #save} call.
++     *
++     * <p>For example, this field can be used to pass some data from
++     * a scope entry point (a {@link #enter} call site) to the
++     * continuation resume point.
++     */
++    protected volatile Object data1;
++
++    /**
++     * A simple data field for convenience. For example, this field
++     * can be used to pass some data from the continuation save
++     * point to the continuation resume point.
++     */
++    protected volatile Object data2;   // the user-defined data
++
++    public Object data1() { synchronized(this) { return data1; } }
++    public Object data2() { synchronized(this) { return data2; } }
++    public void set_data1(Object o) { synchronized(this) { data1 = o; } }
++    public void set_data2(Object o) { synchronized(this) { data2 = o; } }
++    public boolean isSaved() { return stack != null; }
++
++    /**
++     * The continuation may save the compiled stack frames. The
++     * reference count of the compiled code (nmethod) is incremented
++     * upon a continuation save and decremented by this finalizer.
++     */
++    protected void finalize() throws Throwable {
++        if (pcs == null || pcs.length == 0) {
++            return;
++        }
++        for (long pc : pcs) {
++            dec_code_cache_ref_count(pc);
++        }
++    }
++
++    /**
++     * Copies the stack frames in the current scope, and stores them
++     * in this object.  This method must be called in an enclosing
++     * scope. Calling this method causes the stack frames in the
++     * scope to suspend (including the current frame) and the enter
++     * call at the entry of the current scope to return.
++     *
++     * @return the parameter passed to the resume call when the saved stack
++     *         frames are resumed in the future.
++     */
++    public Object save() {
++        return save_cont(this);
++    }
++
++    /**
++     * Reactivates the stack frames saved in this object on the
++     * current thread.  Overwrites the stack frames in the current
++     * scope with the saved stack frames.  This method must be
++     * called in an enclosing scope. Calling this method causes the
++     * suspended save call to resume from the point where it was
++     * suspended.
++     *
++     * @param rv the value to be returned from the resumed save call site.
++     */
++    public void resume(Object rv) {
++        if (stack == null) {
++            throw new IllegalArgumentException(
++                "Continuation hasn't been saved or tried to resume for a second time.");
++        }
++        Object s = stack;
++        stack = null; // resumable only once
++        resume_cont(s, rv);
++    }
++
++    /**
++     * Marks the beginning of a new 'scope' in preparation for stack
++     * save/resume.  Executes the given Runnable.
++     *
++     * @param data any user defined data to be passed from this call
++     *             site to the point where {@link #resume} is called
++     *             for convenience. The {@link #data1} field will be
++     *             set to this object.
++     * @return the Continuation object after the scope was saved
++     *         into a Continuation object or null if it wasn't and
++     *         simply returned
++     */
++    public static Object enter(Runnable r, Object data) {
++        Object rv = enter0(r, data);
++        return rv;
++    }
++
++    /*
++     * This method currently exists just for convenience for the
++     * continuation implementation in the JVM. This method along with
++     * enter() above will never be jitted. This may go away in the
++     * future.
++     */
++    private static Object enter0(Runnable r, Object data) {
++        Object rv = enter1(r, data);
++        return rv;
++    }
++
++    /*
++     * This method currently exists just for convenience for the
++     * continuation implementation in the JVM. This may go away in the
++     * future.
++     */
++    private static Object enter1(Runnable r, Object data) {
++        r.run();
++        return null; // If saved, this will return the CSE.
++    }
++
++    private static native Object save_cont(Continuation cont);
++    private static native void resume_cont(Object stack, Object rv);
++    private static native void dec_code_cache_ref_count(long pc);
++}
+diff --git a/test/sun/misc/Continuation/ContinuationTest1.java b/test/sun/misc/Continuation/ContinuationTest1.java
+new file mode 100644
+--- /dev/null
++++ b/test/sun/misc/Continuation/ContinuationTest1.java
+@@ -0,0 +1,248 @@
++/*
++ * Copyright 2010 Google, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Sun designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Sun in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++import java.util.*;
++import sun.misc.Continuation;
++
++/*
++ * Basic tests for Continuation.
++ */
++public class ContinuationTest1 {
++
++    public Object subSave(Continuation cont, int a, int b, int c, int d, int e) {
++        int i;
++        cont.save();
++        i = 0;
++        i += a;
++        i += b;
++        i += c;
++        i += d;
++        i += e;
++        assertEquals(15, i);
++        return 10102;
++    }
++
++    private int cnt = 0;
++
++    public void testRec() {
++        final Continuation c = new Continuation();
++        Runnable r1 = new Runnable() {
++            public void run() {
++                assertEquals(10102, subSave(c, 1, 2, 3, 4, 5));
++            }
++          };
++        Continuation.enter(r1, null);
++        Runnable r2 = new Runnable() {
++            public void run() {
++                c.resume(null);
++            }
++          };
++        Continuation.enter(r2, null);
++        System.out.println("testRec   : PASS");
++    }
++
++    public void testSimple() {
++        final List<Integer> actions = new LinkedList<Integer>();
++        final Continuation c = new Continuation();
++        String data1 = "data1";
++        Runnable r1 = new Runnable() {
++            public void run() {
++                actions.add(1);
++                c.save();
++                actions.add(3);
++            }
++          };
++        Continuation.enter(r1, data1);
++        Runnable r2 = new Runnable() {
++            public void run() {
++                actions.add(2);
++                c.resume(null);
++                actions.add(100);
++            }
++          };
++        Continuation.enter(r2, null);
++        assertIdentity(c.data1(), data1);
++        assertEquals(actions.size(), 3);
++        assertEquals(actions.get(0), 1);
++        assertEquals(actions.get(1), 2);
++        assertEquals(actions.get(2), 3);
++        System.out.println("testSimple: PASS");
++    }
++
++    // If a monitor is held when a continuation is attempted to be saved,
++    // an exception should be thrown.
++    public void testMonitors() {
++        final Continuation c = new Continuation();
++        final Object lock = new Object();
++        Runnable r1 = new Runnable() {
++            public void run() {
++                synchronized(lock) {
++                    c.save(); // this should throw an exception
++                    assertTrue(false);
++                }
++                assertTrue(false);
++            }
++          };
++        try {
++            Continuation.enter(r1, null);
++        } catch (Throwable t) {
++            System.out.println("testMonitors: PASS");
++            return;
++        }
++        assertTrue(false);
++    }
++
++    // If the continuation is attempted to be resumed twice, an
++    // exception should be thrown.
++    public void testDoubleResume() {
++        final Continuation c = new Continuation();
++        final Object lock = new Object();
++        Runnable r1 = new Runnable() {
++            public void run() {
++                c.save();
++            }
++          };
++        Continuation.enter(r1, null);
++        Runnable r2 = new Runnable() {
++            public void run() {
++                c.resume(null);
++            }
++          };
++        Continuation.enter(r2, null);
++        try {
++            Continuation.enter(r2, null);
++        } catch (Throwable t) {
++            System.out.println("testDoubleResume: PASS");
++            return;
++        }
++        assertTrue(false);
++    }
++
++    public void testData1() throws Exception {
++        final Continuation c = new Continuation();
++        final Object data1 = new Object();
++        Runnable r1 = new Runnable() {
++            public void run() {
++                c.save();
++                assertIdentity(c.data1(), data1);
++            }
++          };
++        Continuation.enter(r1, data1);
++        assertIdentity(c.data1(), data1);
++        Runnable r2 = new Runnable() {
++            public void run() {
++                Runnable r3 = new Runnable() {
++                    public void run() {
++                        c.resume(null);
++                    }
++                  };
++                Continuation.enter(r3, null);
++            }
++          };
++        Thread t = new Thread(r2);
++        t.start();
++        t.join();
++        System.out.println("testData1: PASS");
++    }
++
++    public void testManyParams() {
++        final Continuation c = new Continuation();
++        Runnable r1 = new Runnable() {
++            public void run() {
++                Object rv = manyParamsSub(c, 5, true, false, 1, (short) 2, (byte) 3, (char) 4, (long) 5, 6, (short) 7, (byte) 8, (char) 9,
++                                          (long) 10, (float) 11, (double) 12, (float) 13, (double) 14, 15, 16, 17, 18, 19, 20);
++                assertEquals(43, rv);
++            }
++          };
++        Continuation.enter(r1, null);
++        Runnable r2 = new Runnable() {
++            public void run() {
++                c.resume(43);
++            }
++          };
++        Continuation.enter(r2, null);
++        System.out.println("testManyParams: PASS");
++    }
++
++    private Object manyParamsSub(Continuation cont, int depth, boolean a, boolean b, int c, short d, byte e, char f,
++                                 long g, Integer h, Short i, Byte j, Character k, Long l, float m, double n, Float o, Double p, Integer q, int r,
++                                 int s, int t, int u, int v) {
++        final Object ret;
++        if (depth > 0)
++            ret = manyParamsSub(cont, depth - 1, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v);
++        else
++            ret = cont.save();
++        assertEquals(a, true);
++        assertEquals(b, false);
++        assertEquals(c, 1);
++        assertEquals(d, (short) 2);
++        assertEquals(e, (byte) 3);
++        assertEquals(f, (char) 4);
++        assertEquals(g, (long) 5);
++        assertEquals(h, 6);
++        assertEquals(i, (short) 7);
++        assertEquals(j, (byte) 8);
++        assertEquals(k, (char) 9);
++        assertEquals(l, (long) 10);
++        assertEquals(m, (float) 11);
++        assertEquals(n, (double) 12);
++        assertEquals(o, (float) 13);
++        assertEquals(p, (double) 14);
++        assertEquals(q, 15);
++        assertEquals(r, 16);
++        assertEquals(s, 17);
++        assertEquals(t, 18);
++        assertEquals(u, 19);
++        assertEquals(v, 20);
++        return ret;
++    }
++
++    public static void main(String[] args) throws Exception {
++        ContinuationTest1 test = new ContinuationTest1();
++        test.testSimple();
++        test.testData1();
++        test.testRec();
++        test.testManyParams();
++        test.testMonitors();
++        test.testDoubleResume();
++    }
++
++    private static void assertTrue(boolean cond) {
++        if (!cond) {
++            throw new RuntimeException("assertion failed");
++        }
++    }
++
++    private static void assertEquals(Object o1, Object o2) {
++        if (!o1.equals(o2)) {
++            throw new RuntimeException("assertion failed: [" + o1 + "] != [" + o2 + "]");
++        }
++    }
++
++    private static void assertIdentity(Object o1, Object o2) {
++        if (o1 != o2) {
++            throw new RuntimeException("assertion failed: [" + o1 + "] != [" + o2 + "]");
++        }
++    }
++}
+diff --git a/test/sun/misc/Continuation/ContinuationTest2.java b/test/sun/misc/Continuation/ContinuationTest2.java
+new file mode 100644
+--- /dev/null
++++ b/test/sun/misc/Continuation/ContinuationTest2.java
+@@ -0,0 +1,49 @@
++/*
++ * Copyright 2010 Google, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Sun designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Sun in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++import sun.misc.Continuation;
++
++/*
++ * Tests a simple continuation save/resume in the same thread.
++ */
++public class ContinuationTest2 {
++
++    public static void main(String[] args) {
++        Object rv = Continuation.enter(
++            new Runnable() {
++              public void run() {
++                  System.out.println(ContinuationTestBase.gammon1());
++              }
++            }, null);
++        System.out.println("main: " + rv);
++        final Continuation cont = (Continuation) rv;
++        Object rv1 = Continuation.enter(
++            new Runnable() {
++              public void run() {
++                cont.resume("resuming");
++              }
++            }, null);
++        System.out.println("main2");
++    }
++}
+diff --git a/test/sun/misc/Continuation/ContinuationTest3.java b/test/sun/misc/Continuation/ContinuationTest3.java
+new file mode 100644
+--- /dev/null
++++ b/test/sun/misc/Continuation/ContinuationTest3.java
+@@ -0,0 +1,63 @@
++/*
++ * Copyright 2010 Google, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Sun designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Sun in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++import sun.misc.Continuation;
++
++/*
++ * Tests a simple continuation save/resume between two threads in a
++ * loop.
++ *
++ * The two threads synchronize via a join.
++ */
++public class ContinuationTest3 {
++
++    public static void main(String[] args) throws Exception {
++      for(int i = 0; i < 10; ++i) {
++        Object rv = Continuation.enter(
++            new Runnable() {
++              public void run() {
++                System.out.println(ContinuationTestBase.gammon2(65000));
++              }
++            }, null);
++        System.out.println("main: " + rv);
++        final Continuation cont = (Continuation) rv;
++        System.out.println("cont: " + cont);
++        Runnable r = new Runnable() {
++            public void run() {
++                Object rv1 = Continuation.enter(
++                    new Runnable() {
++                        public void run() {
++                          cont.resume("resuming");
++                        }
++                    }, null);
++                System.out.println("thread end");
++            }
++          };
++        Thread t = new Thread(r);
++        t.start();
++        t.join();
++        System.out.println("main2");
++      }
++    }
++}
+diff --git a/test/sun/misc/Continuation/ContinuationTest4.java b/test/sun/misc/Continuation/ContinuationTest4.java
+new file mode 100644
+--- /dev/null
++++ b/test/sun/misc/Continuation/ContinuationTest4.java
+@@ -0,0 +1,65 @@
++/*
++ * Copyright 2010 Google, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Sun designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Sun in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++import sun.misc.Continuation;
++
++/*
++ * Tests a simple continuation save/resume between two threads in a loop.
++ *
++ * Deoptimizations happen.
++ *
++ * The two threads synchronize via a join.
++ */
++public class ContinuationTest4 {
++
++    public static void main(String[] args) throws Exception {
++      for(int i = 0; i < 10; ++i) {
++        Object rv = Continuation.enter(
++            new Runnable() {
++              public void run() {
++                System.out.println(ContinuationTestBase.gammon3(true));
++              }
++            }, null);
++        System.out.println("main: " + rv);
++        final Continuation cont = (Continuation) rv;
++        System.out.println("cont: " + cont);
++        ContinuationTestBase.gammon3(false); // induce deopt of gammon3
++        Runnable r = new Runnable() {
++            public void run() {
++                Object rv1 = Continuation.enter(
++                    new Runnable() {
++                        public void run() {
++                            cont.resume("resuming");
++                        }
++                    }, null);
++                System.out.println("thread end");
++            }
++          };
++        Thread t = new Thread(r);
++        t.start();
++        t.join();
++        System.out.println("main2");
++      }
++    }
++}
+diff --git a/test/sun/misc/Continuation/ContinuationTest5.java b/test/sun/misc/Continuation/ContinuationTest5.java
+new file mode 100644
+--- /dev/null
++++ b/test/sun/misc/Continuation/ContinuationTest5.java
+@@ -0,0 +1,61 @@
++/*
++ * Copyright 2010 Google, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Sun designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Sun in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++import sun.misc.Continuation;
++
++/*
++ * Tests a simple continuation save/resume between two threads in a loop.
++ *
++ * The two threads do not synchronize via a join.
++ */
++public class ContinuationTest5 {
++
++    public static void main(String[] args) throws Exception {
++      for(int i = 0; i < 10; ++i) {
++        Object rv = Continuation.enter(
++            new Runnable() {
++                public void run() {
++                    System.out.println(ContinuationTestBase.gammon2(65000));
++                }
++            }, null);
++        System.out.println("main: " + rv);
++        final Continuation cont = (Continuation) rv;
++        System.out.println("cont: " + cont);
++        Runnable r = new Runnable() {
++            public void run() {
++                Object rv1 = Continuation.enter(
++                    new Runnable() {
++                        public void run() {
++                            cont.resume("resuming");
++                        }
++                    }, null);
++                System.out.println("thread end");
++            }
++          };
++        Thread t = new Thread(r);
++        t.start();
++        System.out.println("main2");
++      }
++    }
++}
+diff --git a/test/sun/misc/Continuation/ContinuationTest6.java b/test/sun/misc/Continuation/ContinuationTest6.java
+new file mode 100644
+--- /dev/null
++++ b/test/sun/misc/Continuation/ContinuationTest6.java
+@@ -0,0 +1,64 @@
++/*
++ * Copyright 2010 Google, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Sun designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Sun in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++import sun.misc.Continuation;
++
++/*
++ * Tests a simple continuation save/resume between two threads in a loop.
++ *
++ * Deoptimization happen.
++ *
++ * The two threads do not synchronize via a join.
++ */
++public class ContinuationTest6 {
++
++    public static void main(String[] args) throws Exception {
++      for(int i = 0; i < 10; ++i) {
++        Object rv = Continuation.enter(
++            new Runnable() {
++                public void run() {
++                    System.out.println(ContinuationTestBase.gammon3(true));
++                }
++            }, null);
++        System.out.println("main: " + rv);
++        final Continuation cont = (Continuation) rv;
++        System.out.println("cont: " + cont);
++        ContinuationTestBase.gammon3(false); // induce deopt of gammon
++        Runnable r = new Runnable() {
++            public void run() {
++                Object rv1 = Continuation.enter(
++                    new Runnable() {
++                        public void run() {
++                            cont.resume("resuming");
++                        }
++                    }, null);
++                System.out.println("thread end");
++            }
++          };
++        Thread t = new Thread(r);
++        t.start();
++        System.out.println("main2");
++      }
++    }
++}
+diff --git a/test/sun/misc/Continuation/ContinuationTest7.java b/test/sun/misc/Continuation/ContinuationTest7.java
+new file mode 100644
+--- /dev/null
++++ b/test/sun/misc/Continuation/ContinuationTest7.java
+@@ -0,0 +1,50 @@
++/*
++ * Copyright 2010 Google, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Sun designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Sun in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++import sun.misc.Continuation;
++import java.util.concurrent.CountDownLatch;
++
++/*
++ * Tests a save-resume cycle in parallel.
++ */
++public class ContinuationTest7 {
++
++    public static void main(String[] args) throws Exception {
++        final int parallel = 2;
++        final CountDownLatch latch = new CountDownLatch(parallel);
++        for(int i = 0; i < parallel; ++i) {
++            Runnable r = new Runnable() {
++                public void run() {
++                    // Repeat the save-resume cycle 5 times
++                    for (int i = 0; i < 5; ++i) {
++                        ContinuationTestBase.gammon2(100);
++                    }
++                    latch.countDown();
++                }};
++            ContinuationTestBase.saveResumeCycle(r, null);
++        }
++        latch.await();
++        ContinuationTestBase.executor.shutdown();
++    }
++}
+diff --git a/test/sun/misc/Continuation/ContinuationTest8.java b/test/sun/misc/Continuation/ContinuationTest8.java
+new file mode 100644
+--- /dev/null
++++ b/test/sun/misc/Continuation/ContinuationTest8.java
+@@ -0,0 +1,50 @@
++/*
++ * Copyright 2010 Google, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Sun designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Sun in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++import sun.misc.Continuation;
++import java.util.concurrent.CountDownLatch;
++
++/*
++ * Like ContinuationTest7 but with extra stack frames via recursion.
++ */
++public class ContinuationTest8 {
++
++    public static void main(String[] args) throws Exception {
++        final int parallel = 3000;
++        final CountDownLatch latch = new CountDownLatch(parallel);
++        for(int i = 0; i < parallel; ++i) {
++            Runnable r = new Runnable() {
++                public void run() {
++                    // Repeat the save-resume cycle 5 times
++                    for (int i = 0; i < 5; ++i) {
++                        ContinuationTestBase.gammon4(100);
++                    }
++                    latch.countDown();
++                }};
++            ContinuationTestBase.saveResumeCycle(r, null);
++        }
++        latch.await();
++        ContinuationTestBase.executor.shutdown();
++    }
++}
+diff --git a/test/sun/misc/Continuation/ContinuationTest9.java b/test/sun/misc/Continuation/ContinuationTest9.java
+new file mode 100644
+--- /dev/null
++++ b/test/sun/misc/Continuation/ContinuationTest9.java
+@@ -0,0 +1,180 @@
++/*
++ * Copyright 2010 Google, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Sun designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Sun in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++import java.util.LinkedList;
++import sun.misc.Continuation;
++
++/*
++ * This class demonstrates the continuation feature by implementing a
++ * user-thread-like object.
++ */
++public class ContinuationTest9 {
++    private static int ITER = 10000;
++
++    public static void test() throws Exception {
++        Runnable r1 = new Runnable() {
++            public void run() {
++                while (true) {
++                    System.out.println("t1: " + counter++);
++                    UserThread.yield();
++                    if (counter > ITER) {
++                        return;
++                    }
++                }
++            }};
++        Runnable r2 = new Runnable() {
++        public void run() {
++            while (true) {
++                System.out.println("t2: " + counter++);
++                UserThread.yield();
++                if (counter > ITER) {
++                    return;
++                }
++            }
++        }};
++        UserThread t1 = new UserThread(r1);
++        UserThread t2 = new UserThread(r2);
++        t1.start();
++        t2.start();
++        UserThread.join();
++    }
++
++    private static int counter = 0;
++
++    public static void main(String[] args) throws Exception {
++      test();
++      System.exit(0);
++    }
++}
++
++class UserThread {
++    // The schedule queue
++    private static final LinkedList<UserThread> queue = new LinkedList<UserThread>();
++    // The currently scheduled UserThread
++    private static UserThread currentThread;
++    // Used to synchronize between the internal thread and the outside world
++    // This guards queue, nthreads and currentThread
++    private static final Object lock = new Object();
++    // The number of live UserThreads
++    private static int nthreads = 0;
++    // Lock for join
++    private static final Object awaitLock = new Object();
++
++    // The backing Java thread that executes
++    // all UserThreads
++    private static final Thread jthread =
++        new Thread(new Runnable() {
++            public void run() {
++                while (true) {
++                    try {
++                        UserThread ut_to_run;
++                        synchronized (lock) {
++                            if (queue.size() == 0) {
++                                // Wait if there's no user thread to schedule
++                                lock.wait();
++                            }
++                            // Get the user thread to be scheduled next
++                            ut_to_run = queue.remove();
++                            currentThread = ut_to_run;
++                        }
++                        final UserThread ut = ut_to_run;
++                        final Continuation c = ut.continuation;
++                        // If it's scheduled for the first time,
++                        if (c == null) {
++                            // simply execute the given Runnable in a scope
++                            Continuation.enter(ut.runnable, null);
++                        } else {
++                            // Otherwise, resume the saved continuation
++                            Runnable r = new Runnable() {
++                                public void run() {
++                                    c.resume(null);
++                                }};
++                            Continuation.enter(r, null);
++                        }
++                    } catch (Throwable t) {
++                        throw new RuntimeException(t);
++                    }
++                }
++            }
++          });
++
++    static {
++        jthread.start();
++    }
++
++    private final Runnable runnable;
++    private Continuation continuation;
++
++    public UserThread(final Runnable r) {
++        runnable = new Runnable() {
++            public void run() {
++                r.run();
++                UserThread.exit();
++            }
++          };
++    }
++
++    public void start() {
++        synchronized(lock) {
++            nthreads++;
++            // Add the given user thread to the schedule queue
++            queue.add(this);
++            // Notify the Java thread if it's waiting
++            lock.notify();
++        }
++    }
++
++    public static void yield() {
++        // Create a new continuation for each yield
++        final Continuation c = new Continuation();
++        synchronized (lock) {
++            // Save it in the user thread
++            currentThread.continuation = c;
++            // Put the user thread back to the schedule queue
++            queue.add(currentThread);
++        }
++        // Save the current scope into it. It will cause
++        // the enter at the bottom of the scope to return.
++        c.save();
++    }
++
++    private static void exit() {
++        int new_nthreads;
++        synchronized (lock) {
++            nthreads--;
++            new_nthreads = nthreads;
++            if (new_nthreads == 0) {
++                synchronized (awaitLock) {
++                    awaitLock.notify();
++                }
++            }
++        }
++    }
++
++    public static void join() throws InterruptedException {
++        synchronized (awaitLock) {
++            awaitLock.wait();
++        }
++    }
++}
+diff --git a/test/sun/misc/Continuation/ContinuationTestBase.java b/test/sun/misc/Continuation/ContinuationTestBase.java
+new file mode 100644
+--- /dev/null
++++ b/test/sun/misc/Continuation/ContinuationTestBase.java
+@@ -0,0 +1,225 @@
++/*
++ * Copyright 2010 Google, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Sun designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Sun in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++import sun.misc.Continuation;
++import java.util.*;
++import java.util.concurrent.*;
++
++/*
++ * Shared code among the continuation tests.
++ */
++public class ContinuationTestBase {
++
++    static class A {
++        static int f = 0;
++    }
++
++    static String gammon1() {
++        String normally = "";
++        try {
++            System.out.println("ENTER gammon1");
++            String res = "gammon1+"+spinach(true);
++            normally = " NORMALLY";
++            return res;
++        } finally {
++            System.out.println("EXIT gammon1"+normally);
++        }
++    }
++
++    static String gammon2(final int iter) {
++        String normally = "";
++        try {
++            System.out.println("ENTER gammon2");
++            int s = 0;
++            String str = "";
++            for (int i = 0; i < iter; ++i) {
++                s = s ^ (i << 32) % 344;
++                if (s % 1000 == 0) {
++                    str += s;
++                }
++                if (i % 1000 == 0) {
++                    System.out.print(".");
++                }
++            }
++            String res = "gammon2+" + spinach(true);
++            System.out.println("after spinach.");
++            s = 0;
++            str = "";
++            for (int i = 0; i < iter; ++i) {
++                s = s ^ (i << 32) % 344;
++                if (s % 1000 == 0) {
++                    str += s;
++                }
++                if (i % 1000 == 0) {
++                    System.out.print(".");
++                }
++            }
++             normally = " NORMALLY" + str.hashCode();
++            return res;
++        } finally {
++            System.out.println("EXIT gammon2" + normally);
++        }
++    }
++
++    static String gammon3(boolean doSave) {
++        String normally = "";
++        try {
++            System.out.println("ENTER gammon3");
++            int s = 0;
++            String str = "";
++            for (int i = 0; i < 65000; ++i) {
++                s = s ^ (i << 32) % 344;
++                if (s % 1000 == 0) {
++                    str += s;
++                }
++                if (i % 1000 == 0) {
++                    System.out.print(".");
++                }
++            }
++            String res = "gammon3+" + spinach(doSave);
++            System.out.println("after spinach.");
++            s = doSave ? 0 : A.f; // induce deopt when doSave = false
++            str = "";
++            for (int i = 0; i < 65000; ++i) {
++                s = s ^ (i << 32) % 344;
++                if (s % 1000 == 0) {
++                    str += s;
++                }
++                if (i % 1000 == 0) {
++                    System.out.print(".");
++                }
++            }
++            normally = " NORMALLY" + str.hashCode();
++            return res;
++        } finally {
++            System.out.println("EXIT gammon3"+normally);
++        }
++    }
++
++    static String gammon4(final int iter) {
++        String normally = "";
++        try {
++            System.out.println("ENTER gammon4");
++            int s = 0;
++            String str = "";
++            for (int i = 0; i < iter; ++i) {
++                s = s ^ (i << 32) % 344;
++                if (s % 1000 == 0) {
++                    str += s;
++                }
++                if (i % 1000 == 0) {
++                    System.out.print(".");
++                }
++            }
++            String res = "gammon4+" + spinach2(true);
++            System.out.println("after spinach2.");
++            s = 0;
++            str = "";
++            for (int i = 0; i < iter; ++i) {
++                s = s ^ (i << 32) % 344;
++                if (s % 1000 == 0) {
++                    str += s;
++                }
++                if (i % 1000 == 0) {
++                    System.out.print(".");
++                }
++            }
++            normally = " NORMALLY" + str.hashCode();
++            return res;
++        } finally {
++            System.out.println("EXIT gammon4" + normally);
++        }
++    }
++
++    static String spinach(boolean doSave) {
++        String normally = "";
++        try {
++            System.out.println("ENTER spinach");
++            String res = "spinach+" + magic(doSave);
++            System.out.println("after magic.");
++            normally = " NORMALLY";
++            return res;
++        } finally {
++            System.out.println("EXIT spinach" + normally);
++        }
++    }
++
++    static String spinach2(boolean doSave) {
++        String normally = "";
++        try {
++            System.out.println("ENTER spinach2");
++            String res = "spinach2+" + recurse(doSave, 200);
++            System.out.println("after magic.");
++            normally = " NORMALLY";
++            return res;
++        } finally {
++            System.out.println("EXIT spinach" + normally);
++        }
++    }
++
++    static String recurse(boolean doSave, int n) {
++        if (n != 0) {
++            return recurse(doSave, n - 1);
++        }
++        return magic(doSave);
++    }
++
++    static String magic(boolean doSave) {
++        if (!doSave) {
++            return "deopt";
++        }
++        Continuation cont = new Continuation();
++        Object rv = cont.save();
++        System.out.println("Just resumed.");
++        rv = toString(rv);
++        System.out.println("save rv="+rv);
++        return rv.toString();
++    }
++
++    static String toString(Object x) {
++        if (x == null)  return "null";
++        if (x instanceof Object[])
++            return Arrays.deepToString((Object[])x);
++        return x.toString();
++    }
++
++    static ExecutorService executor = Executors.newFixedThreadPool(2);
++
++    // A helper for repeating the save-resume cycle
++    static void saveResumeCycle(final Runnable task,
++                                final Object return_value) {
++        Runnable r = new Runnable() {
++            public void run() {
++                final Continuation c = (Continuation) Continuation.enter(task, executor);
++                if (c != null) {
++                    Runnable resumer = new Runnable() {
++                        public void run() {
++                            c.resume(return_value);
++                        }};
++                    saveResumeCycle(resumer, return_value);
++                }
++            }};
++        executor.execute(r);
++    }
++}
+diff --git a/test/sun/misc/Continuation/run_all_tests.sh b/test/sun/misc/Continuation/run_all_tests.sh
+new file mode 100644
+--- /dev/null
++++ b/test/sun/misc/Continuation/run_all_tests.sh
+@@ -0,0 +1,37 @@
++#!/bin/sh
++#
++# Run all the continuation tests with different combinations of the compilers and GCs.
++
++if [ -z $JAVABIN ]
++then
++  echo "JAVABIN is unset. Set it to the java launcher. Abort."
++  exit -1
++fi
++
++DATE=`date +'%F_%T' | sed 's/\-/_/g' | sed 's/\:/_/g'`
++
++COMMON_JVM_FLAGS=""
++JVM_FLAGS_LIST="-Xint -client -server -client_-Xcomp -server_-Xcomp -server_-XX:+UseParallelGC -server_-XX:+UseConcMarkSweepGC -client_-XX:+UseParallelGC -client_-XX:+UseConcMarkSweepGC"
++
++mkdir -p logs
++mkdir -p logs/$DATE
++NTESTS=9
++
++for i in `seq 1 $NTESTS`
++do
++  TEST=ContinuationTest$i
++  echo "Running $TEST..."
++  for f in $JVM_FLAGS_LIST
++  do
++    JVM_FLAGS=`echo $f | sed 's/_/ /g'`
++    JVM_FLAGS_LABEL=`echo $f | sed 's/-/_/g'`
++    for k in `seq 1 3`
++    do
++      LABEL=$TEST-$JVM_FLAGS_LABEL-$k
++      LOG=logs/$DATE/log-$LABEL.txt
++      COMMAND="$JAVABIN $COMMON_JVM_FLAGS $JVM_FLAGS $TEST"
++      echo "Executing $COMMAND"
++      $COMMAND > $LOG 2>&1 || echo "Test $LABEL failed. The log is in $LOG"
++    done
++  done
++done

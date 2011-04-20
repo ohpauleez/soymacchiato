@@ -1,0 +1,123 @@
+7032323: implement JSR 292 EG adjustments through Public Review (March 2011)
+Summary: Changes following JSR 292 Public Review comments.
+Reviewed-by: ?
+
+Key Items:
+- CallSite constructor needs a hook for self-binding.  (Under EG discussion.)
+
+diff --git a/src/share/classes/java/lang/ClassValue.java b/src/share/classes/java/lang/ClassValue.java
+--- a/src/share/classes/java/lang/ClassValue.java
++++ b/src/share/classes/java/lang/ClassValue.java
+@@ -193,6 +193,7 @@
+         = new WeakHashMap<Class<?>, ClassValueMap>();
+ 
+     private static ClassValueMap getMap(Class<?> type) {
++        type.getClass();  // test for null
+         return ROOT.get(type);
+     }
+ 
+diff --git a/src/share/classes/java/lang/invoke/CallSite.java b/src/share/classes/java/lang/invoke/CallSite.java
+--- a/src/share/classes/java/lang/invoke/CallSite.java
++++ b/src/share/classes/java/lang/invoke/CallSite.java
+@@ -122,6 +122,18 @@
+     }
+ 
+     /**
++     * Make a call site object equipped with an initial target method handle.
++     * @param target the method handle which will be the initial target of the call site
++     * @param bindSelf if true, bind the call site to the target method handle
++     * @throws NullPointerException if the proposed target is null
++     */
++    /*package-private*/
++    CallSite(MethodHandle target, boolean bindSelf) {
++        target.type();  // null check
++        this.target = bindSelf ? target.bindTo(this) : target;
++    }
++
++    /**
+      * Returns the type of this call site's target.
+      * Although targets may change, any call site's type is permanent, and can never change to an unequal type.
+      * The {@code setTarget} method enforces this invariant by refusing any new target that does
+diff --git a/src/share/classes/java/lang/invoke/ConstantCallSite.java b/src/share/classes/java/lang/invoke/ConstantCallSite.java
+--- a/src/share/classes/java/lang/invoke/ConstantCallSite.java
++++ b/src/share/classes/java/lang/invoke/ConstantCallSite.java
+@@ -42,6 +42,25 @@
+     }
+ 
+     /**
++     * Creates a call site with a permanent target, possibly bound to the call site itself.
++     * @param target the target to be permanently associated with this call site
++     * @param bindSelf if true, the {@code ConstantCallSite} itself is first
++     *        bound to the given target as if by {@code target.bindTo(this)},
++     *        and the resulting bound method handle becomes the permanent target
++     * @throws NullPointerException if the proposed target is null
++     * @throws IllegalArgumentException if {@code bindSelf} is true
++     *         but the target does not have a
++               leading parameter type that is a reference type
++     * @throws ClassCastException if {@code bindSelf} is true
++     *         but the new {@code ConstantCallSite}'s
++     *         reference cannot be converted
++     *         to the leading parameter type of the target
++     */
++    public ConstantCallSite(MethodHandle target, boolean bindSelf) {
++        super(target, bindSelf);
++    }
++
++    /**
+      * Returns the target method of the call site, which behaves
+      * like a {@code final} field of the {@code ConstantCallSite}.
+      * That is, the the target is always the original value passed
+diff --git a/src/share/classes/java/lang/invoke/MethodType.java b/src/share/classes/java/lang/invoke/MethodType.java
+--- a/src/share/classes/java/lang/invoke/MethodType.java
++++ b/src/share/classes/java/lang/invoke/MethodType.java
+@@ -162,6 +162,7 @@
+     public static
+     MethodType methodType(Class<?> rtype, List<Class<?>> ptypes) {
+         boolean notrust = false;  // random List impl. could return evil ptypes array
++        checkSlotCount(ptypes.size());
+         return makeImpl(rtype, ptypes.toArray(NO_PTYPES), notrust);
+     }
+ 
+@@ -371,6 +372,7 @@
+      * @throws NullPointerException if {@code ptypesToInsert} or any of its elements is null
+      */
+     public MethodType insertParameterTypes(int num, List<Class<?>> ptypesToInsert) {
++        checkSlotCount(ptypesToInsert.size());
+         return insertParameterTypes(num, ptypesToInsert.toArray(NO_PTYPES));
+     }
+ 
+@@ -716,6 +718,7 @@
+     {
+         List<Class<?>> types = BytecodeDescriptor.parseMethod(descriptor, loader);
+         Class<?> rtype = types.remove(types.size() - 1);
++        checkSlotCount(types.size());
+         Class<?>[] ptypes = types.toArray(NO_PTYPES);
+         return makeImpl(rtype, ptypes, true);
+     }
+diff --git a/src/share/classes/java/lang/invoke/package-info.java b/src/share/classes/java/lang/invoke/package-info.java
+--- a/src/share/classes/java/lang/invoke/package-info.java
++++ b/src/share/classes/java/lang/invoke/package-info.java
+@@ -251,7 +251,7 @@
+  * The call site then becomes permanently linked to the dynamic call site.
+  * <p>
+  * As long as each bootstrap method can be correctly invoked
+- * by <code>MethodHandle.invoke</code>, its detailed type is arbitrary.
++ * by {@code MethodHandle.invoke}, its detailed type is arbitrary.
+  * For example, the first argument could be {@code Object}
+  * instead of {@code MethodHandles.Lookup}, and the return type
+  * could also be {@code Object} instead of {@code CallSite}.
+diff --git a/test/java/lang/invoke/InvokeDynamicPrintArgs.java b/test/java/lang/invoke/InvokeDynamicPrintArgs.java
+--- a/test/java/lang/invoke/InvokeDynamicPrintArgs.java
++++ b/test/java/lang/invoke/InvokeDynamicPrintArgs.java
+@@ -106,8 +106,10 @@
+         "Done printing argument lists."
+     };
+ 
++    private static boolean doPrint = true;
+     private static void printArgs(Object bsmInfo, Object... args) {
+-        System.out.println(bsmInfo+Arrays.deepToString(args));
++        String message = bsmInfo+Arrays.deepToString(args);
++        if (doPrint)  System.out.println(message);
+     }
+     private static MethodHandle MH_printArgs() throws ReflectiveOperationException {
+         shouldNotCallThis();

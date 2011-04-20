@@ -1,0 +1,478 @@
+6984311: JSR 292 needs optional bootstrap method parameters
+Summary: Generate new format CONSTANT_InvokeDynamic CP entries.
+Reviewed-by: ?
+
+diff --git a/src/share/classes/com/sun/tools/classfile/ClassWriter.java b/src/share/classes/com/sun/tools/classfile/ClassWriter.java
+--- a/src/share/classes/com/sun/tools/classfile/ClassWriter.java
++++ b/src/share/classes/com/sun/tools/classfile/ClassWriter.java
+@@ -306,6 +306,10 @@
+         public Integer visitInvokeDynamic(CONSTANT_InvokeDynamic_info info, ClassOutputStream out) {
+             out.writeShort(info.bootstrap_method_index);
+             out.writeShort(info.name_and_type_index);
++            int argv[] = info.argument_indexes;
++            out.writeShort(argv.length);
++            for (int arg : argv)
++                out.writeShort(arg);
+             return 1;
+         }
+ 
+diff --git a/src/share/classes/com/sun/tools/classfile/ConstantPool.java b/src/share/classes/com/sun/tools/classfile/ConstantPool.java
+--- a/src/share/classes/com/sun/tools/classfile/ConstantPool.java
++++ b/src/share/classes/com/sun/tools/classfile/ConstantPool.java
+@@ -29,6 +29,7 @@
+ import java.io.IOException;
+ import java.io.OutputStream;
+ import java.util.Iterator;
++import java.util.Arrays;
+ 
+ /**
+  * See JVMS3, section 4.5.
+@@ -116,7 +117,8 @@
+     public static final int CONSTANT_NameAndType = 12;
+     public static final int CONSTANT_MethodHandle = 15;  // JSR 292
+     public static final int CONSTANT_MethodType = 16;  // JSR 292
+-    public static final int CONSTANT_InvokeDynamic = 17;  // JSR 292
++    public static final int CONSTANT_InvokeDynamicTrans = 17;  // JSR 292, pre-FCS only
++    public static final int CONSTANT_InvokeDynamic = 18;  // JSR 292
+ 
+     public static final int REF_getField = 1;
+     public static final int REF_getStatic = 2;
+@@ -188,6 +190,10 @@
+                 pool[i] = new CONSTANT_MethodType_info(this, cr);
+                 break;
+ 
++            case CONSTANT_InvokeDynamicTrans:  //allowTransitionalJSR292
++                pool[i] = new CONSTANT_InvokeDynamic_info(this, cr, true);
++                break;
++
+             case CONSTANT_InvokeDynamic:
+                 pool[i] = new CONSTANT_InvokeDynamic_info(this, cr);
+                 break;
+@@ -840,28 +846,49 @@
+ 
+     public static class CONSTANT_InvokeDynamic_info extends CPInfo {
+         CONSTANT_InvokeDynamic_info(ConstantPool cp, ClassReader cr) throws IOException {
++            this(cp, cr, false);
++        }
++        CONSTANT_InvokeDynamic_info(ConstantPool cp, ClassReader cr, boolean isTransitional) throws IOException {
+             super(cp);
+             bootstrap_method_index = cr.readUnsignedShort();
+             name_and_type_index    = cr.readUnsignedShort();
++            int[] argv = NO_ARGUMENT_INDEXES;
++            if (!isTransitional) {
++                int argc = cr.readUnsignedShort();
++                if (argc > 0)
++                    argv = new int[argc];
++                for (int i = 0; i < argc; i++) {
++                    argv[i] = cr.readUnsignedShort();
++                }
++            }
++            argument_indexes = argv;
+         }
+ 
+         public CONSTANT_InvokeDynamic_info(ConstantPool cp, int bootstrap_method_index, int name_and_type_index) {
++            this(cp, bootstrap_method_index, name_and_type_index, NO_ARGUMENT_INDEXES);
++        }
++        public CONSTANT_InvokeDynamic_info(ConstantPool cp, int bootstrap_method_index, int name_and_type_index,
++                                           int[] argument_indexes) {
+             super(cp);
+             this.bootstrap_method_index = bootstrap_method_index;
+             this.name_and_type_index    = name_and_type_index;
++            this.argument_indexes       = argument_indexes;
+         }
+ 
+         public int getTag() {
++            // CONSTANT_InvokeDynamicTrans only exists on disk in old classfiles
+             return CONSTANT_InvokeDynamic;
+         }
+ 
+         public int byteLength() {
+-            return 5;
++            return 7 + 2*argument_indexes.length;  // tag, bsm, nt, argc, argv[argc]...
+         }
+ 
+         @Override
+         public String toString() {
+-            return "CONSTANT_InvokeDynamic_info[bootstrap_method_index: " + bootstrap_method_index + ", name_and_type_index: " + name_and_type_index + "]";
++            return "CONSTANT_InvokeDynamic_info[bootstrap_method_index: " + bootstrap_method_index + ", name_and_type_index: " + name_and_type_index
++                + (argument_indexes.length == 0 ? "" : " argument_indexes: " + Arrays.toString(argument_indexes))
++                + "]";
+         }
+ 
+         public <R, D> R accept(Visitor<R, D> visitor, D data) {
+@@ -870,6 +897,7 @@
+ 
+         public final int bootstrap_method_index;
+         public final int name_and_type_index;
++        public final int[] argument_indexes;
+ 
+         public CONSTANT_MethodHandle_info getBootstrapMethodInfo() throws ConstantPoolException {
+             if (bootstrap_method_index == 0)  return null;  //allowTransitionalJSR292
+@@ -879,6 +907,18 @@
+         public CONSTANT_NameAndType_info getNameAndTypeInfo() throws ConstantPoolException {
+             return cp.getNameAndTypeInfo(name_and_type_index);
+         }
++
++        public CPInfo[] getArguments() throws ConstantPoolException {
++            if (argument_indexes.length == 0)  return NO_ARGUMENTS;
++            CPInfo[] args = new CPInfo[argument_indexes.length];
++            for (int i = 0; i < args.length; i++) {
++                args[i] = cp.get(argument_indexes[i]);
++            }
++            return args;
++        }
++
++        private static final CPInfo[] NO_ARGUMENTS = {};
++        private static final int[] NO_ARGUMENT_INDEXES = {};
+     }
+ 
+ }
+diff --git a/src/share/classes/com/sun/tools/javac/code/Symbol.java b/src/share/classes/com/sun/tools/javac/code/Symbol.java
+--- a/src/share/classes/com/sun/tools/javac/code/Symbol.java
++++ b/src/share/classes/com/sun/tools/javac/code/Symbol.java
+@@ -1347,6 +1347,8 @@
+      */
+     public static class InvokeDynamicSymbol extends DelegatedSymbol {
+         public MemberReferenceSymbol bootstrapMethod;
++        public Object[] staticArguments = NO_STATIC_ARGUMENTS;
++        private static final Object[] NO_STATIC_ARGUMENTS = { };
+ 
+         public InvokeDynamicSymbol(MemberReferenceSymbol bootstrapMethod, MethodSymbol callMethod) {
+             super(callMethod);
+@@ -1358,6 +1360,8 @@
+         public InvokeDynamicSymbol changeCallMethod(MethodSymbol callMethod) {
+             return new InvokeDynamicSymbol(bootstrapMethod, callMethod);
+         }
++        public Object[] getStaticArguments() { return staticArguments; }
++        public void setStaticArguments(Object[] args) { staticArguments = args; }
+     }
+ 
+     /** A class for predefined operators.
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Attr.java b/src/share/classes/com/sun/tools/javac/comp/Attr.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Attr.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Attr.java
+@@ -1425,17 +1425,15 @@
+                 JCFieldAccess mfield = (JCFieldAccess) tree.meth;
+                 // InvokeDynamic requires an enclosing annotation @BootstrapMethod.
+                 if (mfield.selected.type == syms.invokeDynamicType) {
+-                    Symbol bsm = resolveBootstrapMethod(tree);
+-                    if (!(bsm instanceof MemberReferenceSymbol)) {
+-                        if (!bsm.type.isErroneous()) {
+-                            if (rs.allowTransitionalJSR292)
+-                                log.warning(tree.pos(), "invokedynamic.must.have.bootstrap.method");
+-                            else
+-                                log.error(tree.pos(), "invokedynamic.must.have.bootstrap.method");
+-                        }
+-                        bsm = null;
++                    InvokeDynamicSymbol indy = resolveBootstrapMethod(tree, (MethodSymbol) mfield.sym);
++                    if (indy == null) {
++                        if (rs.allowTransitionalJSR292)
++                            log.warning(tree.pos(), "invokedynamic.must.have.bootstrap.method");
++                        else
++                            log.error(tree.pos(), "invokedynamic.must.have.bootstrap.method");
++                        indy = new InvokeDynamicSymbol(null, (MethodSymbol) mfield.sym);
+                     }
+-                    mfield.sym = new InvokeDynamicSymbol((MemberReferenceSymbol) bsm, (MethodSymbol) mfield.sym);
++                    mfield.sym = indy;
+                 }
+             }
+             if (rs.allowTransitionalJSR292 && tree.meth.getTag() == JCTree.SELECT && !typeargtypes.isEmpty()) {
+@@ -1492,12 +1490,12 @@
+      * Resolve the bootstrap method for an invokedynamic site.
+      * The method is specified by @BootstrapMethod annotation on the
+      * InvokeDynamic's type parameter, or else on an enclosing definition.
+-     * Return noSymbol or errSymbol on failure.
++     * Return null on failure.
+      */
+-    Symbol resolveBootstrapMethod(JCMethodInvocation tree) {
++    InvokeDynamicSymbol resolveBootstrapMethod(JCMethodInvocation tree, MethodSymbol callMethod) {
+         assert rs.recognizeInvokeDynamic;
+         Attribute.Compound bsm = findBootstrapMethod(env);  // look it up in the environment
+-        if (bsm == null)  return syms.noSymbol;
++        if (bsm == null)  return null;
+         assert bsm.type.tsym == syms.bootstrapMethodType.tsym;
+         int bsmPos = tree.pos;  //FIXME: put this on the @BootstrapMethod anno.
+ 
+@@ -1506,39 +1504,70 @@
+         // - name of bootstrap method (or null string, for new & <init>)
+         // - argument types of bootstrap method
+         MethodSymbol[] attrSyms = bootstrapMethodAnnotationSyms();
+-        if (attrSyms == null)  return syms.noSymbol;  // no structure to decode
+         Object[] values = new Object[attrSyms.length];
+         for (int i = 0; i < attrSyms.length; i++) {
++            if (attrSyms[i] == null)  continue;
+             Attribute m = bsm.member(attrSyms[i].name);
+             if (m == null)  m = attrSyms[i].defaultValue;
+             values[i] = (m == null) ? null : m.getValue();
+         }
+-        ClassType classValue = (values[0] instanceof ClassType) ? (ClassType) values[0] : null;
+-        String    nameValue  = (values[1] instanceof String)    ? (String)    values[1] : null;
+-        List<?>   argsValue  = (values[2] instanceof List<?>)   ? (List<?>)   values[2] : null;
++        ClassType classValue  = (values[0] instanceof ClassType) ? (ClassType) values[0] : null;
++        String    nameValue   = (values[1] instanceof String)    ? (String)    values[1] : null;
++        List<?>   reqValues   = (values[2] instanceof List<?>)   ? (List<?>)   values[2] : null;
++        final int argValuePos = 3;
+         Name methName = null;
+         if (nameValue != null)
+             methName = nameValue.equals("") ? names.init : names.fromString(nameValue);
+-        List<JCExpression> sampleArgs = null;
+-        if (argsValue != null) {
+-            ListBuffer<JCExpression> buf = new ListBuffer<JCExpression>();
+-            for (Object ta : argsValue) {
++        if (classValue == null || methName == null) {
++            return null;
++        }
++        ListBuffer<JCExpression> argbuf = new ListBuffer<JCExpression>();
++        if (reqValues != null) {
++            for (Object ta : reqValues) {
+                 if (ta instanceof Attribute) {
+                     Object tval = ((Attribute)ta).getValue();
+                     if (tval instanceof Type) {
+                         Type t = (Type) tval;
+-                        buf.append(make.at(bsmPos).ZeroLiteral(t));
++                        argbuf.append(make.at(bsmPos).ZeroLiteral(t));
+                         continue;
+                     }
+                 }
+                 // If something goes wrong, fall through here.
+-                buf = null;
+-                break;
++                return null;
+             }
+-            if (buf != null)  sampleArgs = buf.toList();
++        } else {
++            // hack something hardwired
++            for (Type t : new Type[]{ syms.classType, syms.stringType, syms.methodTypeType }) {
++                argbuf.append(make.at(bsmPos).ZeroLiteral(t));
++            }
+         }
+-        if (classValue == null || methName == null || sampleArgs == null)
+-            return syms.noSymbol;
++        ListBuffer<Object> staticArgs = new ListBuffer<Object>();
++        for (int i = argValuePos; i < values.length; i++) {
++            List<?> argValues;
++            if (values[i] instanceof List<?>)
++                argValues = (List<?>) values[i];
++            else
++                argValues = List.of(values[i]);
++            for (Object xa : argValues) {
++                if (xa instanceof Attribute) {
++                    Object xval = ((Attribute)xa).getValue();
++                    staticArgs.append(xval);
++                    if (xval instanceof Type) {
++                        Type t = (Type) xval;
++                        argbuf.append(make.at(bsmPos).Select(make.Type(t), names._class));
++                        continue;
++                    }
++                    if (xval instanceof Number || xval instanceof String) {
++                        Type t = ((Attribute)xa).type;
++                        argbuf.append(make.at(bsmPos).Literal(t.tag, xval));
++                        continue;
++                    }
++                }
++                // If something goes wrong, fall through here.
++                return null;
++            }
++        }
++        List<JCExpression> sampleArgs = argbuf.toList();
+         boolean isConstructor = (methName == names.init);
+         JCExpression bootm;
+         if (!isConstructor)
+@@ -1552,17 +1581,25 @@
+         Env<AttrContext> localEnv = env.enclosing(JCTree.CLASSDEF);
+         localEnv = localEnv.dup(tree, localEnv.info.dup());
+         Type bsmtype = attribExpr(make.TypeCast(syms.objectType, bootm), localEnv);
+-        if (bsmtype.isErroneous())  return syms.errSymbol;
++        if (bsmtype.isErroneous()) {
++            // an error has been reported; return something that can move us forward
++            return new InvokeDynamicSymbol(null, callMethod);
++        }
+         Symbol bootsym;
+         if (!isConstructor)
+             bootsym = TreeInfo.symbol(((JCMethodInvocation)bootm).meth);
+         else
+             bootsym = ((JCNewClass)bootm).constructor;
+-        if (!(bootsym instanceof MethodSymbol))  return bootsym;
++        if (!(bootsym instanceof MethodSymbol))  return null;
+         //System.out.println("resolved bsm: "+bootsym);
+         assert isConstructor == bootsym.isConstructor();
+         int refKind = isConstructor ? ClassFile.REF_newInvokeSpecial : ClassFile.REF_invokeStatic;
+-        return new MemberReferenceSymbol(refKind, bootsym);
++        MemberReferenceSymbol bsmRef = new MemberReferenceSymbol(refKind, bootsym);
++        InvokeDynamicSymbol indy = new InvokeDynamicSymbol(bsmRef, callMethod);
++        if (!staticArgs.isEmpty()) {
++            indy.setStaticArguments(staticArgs.toArray());
++        }
++        return indy;
+     }
+     /** Find a default @BootstrapMethod on an enclosing declaration, method, or class. */
+     private Attribute.Compound findBootstrapMethod(Env<AttrContext> innerEnv) {
+@@ -1587,16 +1624,34 @@
+     private MethodSymbol[] bootstrapMethodAnnotationSyms() {
+         assert rs.recognizeInvokeDynamic;
+         if (bootstrapMethodAnnotationSyms == null) {
+-            Scope members = syms.bootstrapMethodType.tsym.members();
+-            Name[] elems = { names.value, names._name, names.arguments };
+-            MethodSymbol[] syms = new MethodSymbol[elems.length];
+-            for (int i = 0; i < elems.length; i++) {
+-                Scope.Entry e = members.lookup(elems[i]);
+-                if (e.sym instanceof MethodSymbol)
+-                    syms[i] = (MethodSymbol) e.sym;
+-                else
+-                    return null;
++            ListBuffer<MethodSymbol> buf = new ListBuffer<MethodSymbol>();
++            MethodSymbol[] fixedSyms = new MethodSymbol[3];
++            for (Scope.Entry e = syms.bootstrapMethodType.tsym.members().elems; e != null; e = e.sibling) {
++                if (e.sym instanceof MethodSymbol) {
++                    MethodSymbol s = (MethodSymbol) e.sym;
++                    if (s.name == names.value) { fixedSyms[0] = s; continue; }
++                    if (s.name == names._name) { fixedSyms[1] = s; continue; }
++                    String nameStr = s.name.toString();
++                    if (nameStr.equals("requiredArgumentTypes")) { fixedSyms[2] = s; continue; }
++                    if (nameStr.endsWith("Arguments")) { buf.append(s); continue; }
++                    if (nameStr.endsWith("Argument")) { buf.append(s); continue; }
++                }
+             }
++            // prepend value, name, requiredArgumentTypes in reversed order:
++            for (int i = fixedSyms.length; --i >= 0; ) {
++                buf.prepend(fixedSyms[i]);
++            }
++            MethodSymbol[] syms = new MethodSymbol[buf.size()];
++            buf.toArray(syms);
++            // sort tail by order of name:
++            Arrays.sort(syms, fixedSyms.length, syms.length,
++                        new Comparator<MethodSymbol>() {
++                    public int compare(MethodSymbol x, MethodSymbol y) {
++                        String xns = x.name.toString();
++                        String yns = y.name.toString();
++                        return xns.compareTo(yns);
++                    }
++                });
+             bootstrapMethodAnnotationSyms = syms;
+         }
+         return bootstrapMethodAnnotationSyms;
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/ClassFile.java b/src/share/classes/com/sun/tools/javac/jvm/ClassFile.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/ClassFile.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/ClassFile.java
+@@ -83,7 +83,8 @@
+ 
+     public final static int CONSTANT_MethodHandle = 15;
+     public final static int CONSTANT_MethodType = 16;
+-    public final static int CONSTANT_InvokeDynamic = 17;
++    public final static int CONSTANT_InvokeDynamicTrans = 17;  //allowTransitionalJSR292 only
++    public final static int CONSTANT_InvokeDynamic = 18;
+ 
+     public final static int REF_getField = 1;
+     public final static int REF_getStatic = 2;
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java b/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
+@@ -433,8 +433,12 @@
+             case CONSTANT_MethodType:
+                 bp = bp + 2;
+                 break;
++            case CONSTANT_InvokeDynamicTrans:
++                bp = bp + 4;
++                break;
+             case CONSTANT_InvokeDynamic:
+                 bp = bp + 4;
++                bp = bp + 2 + 2 * getChar(bp);  // skip variable argv
+                 break;
+             default:
+                 throw badClassFile("bad.const.pool.tag.at",
+@@ -531,7 +535,11 @@
+             MemberReference bsm  = (MemberReference) readPool(getChar(index + 1));
+             NameAndType     nt   = (NameAndType)     readPool(getChar(index + 3));
+             MethodSymbol    call = new MethodSymbol(0, nt.name, nt.type, syms.invokeDynamicType.tsym);
+-            poolObj[i] = new InvokeDynamic(bsm, call);
++            Object[]        arguments = new Object[getChar(index + 5)];
++            for (int j = 0; j < arguments.length; j++) {
++                arguments[j] = readPool(getChar(index + 7 + 2*j));
++            }
++            poolObj[i] = new InvokeDynamic(bsm, call, arguments);
+             break;
+         }
+         default:
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/ClassWriter.java b/src/share/classes/com/sun/tools/javac/jvm/ClassWriter.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/ClassWriter.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/ClassWriter.java
+@@ -546,6 +546,11 @@
+                 else
+                     poolbuf.appendChar(pool.put(indy.bootstrapMethod));
+                 poolbuf.appendChar(pool.put(nameType(indy.callMethod)));
++                Object[] argv = indy.staticArguments;
++                poolbuf.appendChar(argv.length);
++                for (Object arg : argv) {
++                    poolbuf.appendChar(pool.put(arg));
++                }
+             } else {
+                 assert false : "writePool " + value;
+             }
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/Pool.java b/src/share/classes/com/sun/tools/javac/jvm/Pool.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Pool.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/Pool.java
+@@ -278,14 +278,16 @@
+     static class InvokeDynamic {
+         MemberReference bootstrapMethod;
+         MethodSymbol    callMethod;
++        Object[]        staticArguments;
+ 
+-        InvokeDynamic(MemberReference bootstrapMethod, MethodSymbol callMethod) {
++        InvokeDynamic(MemberReference bootstrapMethod, MethodSymbol callMethod, Object[] staticArguments) {
+             this.bootstrapMethod = bootstrapMethod;
+             this.callMethod = callMethod;
++            this.staticArguments = staticArguments;
+         }
+ 
+         InvokeDynamic(InvokeDynamicSymbol value) {
+-            this(MemberReference.from(value.getBootstrapMethod()), value.getCallMethod());
++            this(MemberReference.from(value.getBootstrapMethod()), value.getCallMethod(), value.getStaticArguments());
+         }
+ 
+         MemberReference getBootstrapMethod() {
+@@ -296,9 +298,15 @@
+             return callMethod;
+         }
+ 
++        Object[] getStaticArguments() {
++            return staticArguments;
++        }
++
+         public boolean equals(Object other) {
+             if (!(other instanceof InvokeDynamic)) return false;
+             InvokeDynamic indy = (InvokeDynamic) other;
++            if (!Arrays.equals(staticArguments, indy.staticArguments))
++                return false;
+             if (bootstrapMethod == null)
+                 return indy.bootstrapMethod == null &&
+                     symbolsEqual(callMethod, indy.callMethod);
+@@ -308,7 +316,9 @@
+         }
+ 
+         public int hashCode() {
+-            return (bootstrapMethod == null ? 0 : bootstrapMethod.hashCode() << 8) ^ symbolHash(callMethod);
++            return ((bootstrapMethod == null ? 0 : bootstrapMethod.hashCode() << 8)
++                    ^ symbolHash(callMethod)
++                    ^ (Arrays.hashCode(staticArguments) * 511));
+         }
+     }
+ }
+diff --git a/src/share/classes/com/sun/tools/javac/util/Names.java b/src/share/classes/com/sun/tools/javac/util/Names.java
+--- a/src/share/classes/com/sun/tools/javac/util/Names.java
++++ b/src/share/classes/com/sun/tools/javac/util/Names.java
+@@ -116,7 +116,6 @@
+     public final Name getMessage;
+     public final Name getClass;
+     public final Name invoke;  //allowTransitionalJSR292 only
+-    public final Name arguments;
+     public final Name TYPE;
+     public final Name TYPE_USE;
+     public final Name TYPE_PARAMETER;
+@@ -231,7 +230,6 @@
+         getMessage = fromString("getMessage");
+         getClass = fromString("getClass");
+         invoke = fromString("invoke");  //allowTransitionalJSR292 only
+-        arguments = fromString("arguments");
+ 
+         TYPE = fromString("TYPE");
+         TYPE_USE = fromString("TYPE_USE");

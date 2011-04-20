@@ -1,0 +1,396 @@
+6939203: JSR 292 needs method handle constants
+Summary: Add new CP types CONSTANT_MethodHandle, CONSTANT_MethodType to verifier; put in runtime support upcall.
+Reviewed-by: twisti
+
+diff --git a/src/share/classes/java/dyn/MethodHandles.java b/src/share/classes/java/dyn/MethodHandles.java
+--- a/src/share/classes/java/dyn/MethodHandles.java
++++ b/src/share/classes/java/dyn/MethodHandles.java
+@@ -411,41 +411,68 @@
+ 
+         /**
+          * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+-         * Produce a method handle giving read access to a field.
++         * Produce a method handle giving read access to a non-static field.
+          * The type of the method handle will have a return type of the field's
+          * value type.
+-         * If the field is static, the method handle will take no arguments.
+-         * Otherwise, its single argument will be the instance containing
++         * The method handle's single argument will be the instance containing
+          * the field.
+          * Access checking is performed immediately on behalf of the lookup class.
+          * @param name the field's name
+          * @param type the field's type
+-         * @param isStatic true if and only if the field is static
+          * @return a method handle which can load values from the field
+          * @exception NoAccessException if access checking fails
+          */
+-        public MethodHandle findGetter(Class<?> refc, String name, Class<?> type, boolean isStatic) throws NoAccessException {
+-            return makeAccessor(refc, name, type, isStatic, false);
++        public MethodHandle findGetter(Class<?> refc, String name, Class<?> type) throws NoAccessException {
++            return makeAccessor(refc, name, type, false, false);
+         }
+ 
+         /**
+          * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+-         * Produce a method handle giving write access to a reflected field.
++         * Produce a method handle giving write access to a non-static field.
+          * The type of the method handle will have a void return type.
+-         * If the field is static, the method handle will take a single
+-         * argument, of the field's value type, the value to be stored.
+-         * Otherwise, the two arguments will be the instance containing
++         * The method handle will take two arguments, the instance containing
+          * the field, and the value to be stored.
++         * The second argument will be of the field's value type.
+          * Access checking is performed immediately on behalf of the lookup class.
+          * @param name the field's name
+          * @param type the field's type
+-         * @param isStatic true if and only if the field is static
+-         * @return a method handle which can store values into the reflected field
++         * @return a method handle which can store values into the field
+          * @exception NoAccessException if access checking fails
+          */
+-        public MethodHandle findSetter(Class<?> refc, String name, Class<?> type,
+-                                       boolean isStatic) throws NoAccessException {
+-            return makeAccessor(refc, name, type, isStatic, true);
++        public MethodHandle findSetter(Class<?> refc, String name, Class<?> type) throws NoAccessException {
++            return makeAccessor(refc, name, type, false, true);
++        }
++
++        /**
++         * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
++         * Produce a method handle giving read access to a static field.
++         * The type of the method handle will have a return type of the field's
++         * value type.
++         * The method handle will take no arguments.
++         * Access checking is performed immediately on behalf of the lookup class.
++         * @param name the field's name
++         * @param type the field's type
++         * @return a method handle which can load values from the field
++         * @exception NoAccessException if access checking fails
++         */
++        public MethodHandle findStaticGetter(Class<?> refc, String name, Class<?> type) throws NoAccessException {
++            return makeAccessor(refc, name, type, true, false);
++        }
++
++        /**
++         * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
++         * Produce a method handle giving write access to a static field.
++         * The type of the method handle will have a void return type.
++         * The method handle will take a single
++         * argument, of the field's value type, the value to be stored.
++         * Access checking is performed immediately on behalf of the lookup class.
++         * @param name the field's name
++         * @param type the field's type
++         * @return a method handle which can store values into the field
++         * @exception NoAccessException if access checking fails
++         */
++        public MethodHandle findStaticSetter(Class<?> refc, String name, Class<?> type) throws NoAccessException {
++            return makeAccessor(refc, name, type, true, true);
+         }
+ 
+         /**
+diff --git a/src/share/classes/sun/dyn/MethodHandleNatives.java b/src/share/classes/sun/dyn/MethodHandleNatives.java
+--- a/src/share/classes/sun/dyn/MethodHandleNatives.java
++++ b/src/share/classes/sun/dyn/MethodHandleNatives.java
+@@ -258,6 +258,20 @@
+             //T_ARRAY    = 13
+             T_VOID     = 14;
+             //T_ADDRESS  = 15
++
++        /**
++         * Constant pool reference-kind codes, as used by CONSTANT_MethodHandle CP entries.
++         */
++        static final int
++            REF_getField                = 1,
++            REF_getStatic               = 2,
++            REF_putField                = 3,
++            REF_putStatic               = 4,
++            REF_invokeVirtual           = 5,
++            REF_invokeStatic            = 6,
++            REF_invokeSpecial           = 7,
++            REF_newInvokeSpecial        = 8,
++            REF_invokeInterface         = 9;
+     }
+ 
+     private static native int getNamedCon(int which, Object[] name);
+@@ -304,4 +318,24 @@
+         return MethodTypeImpl.makeImpl(Access.TOKEN, rtype, ptypes, true);
+     }
+ 
++    /**
++     * The JVM is resolving a CONSTANT_MethodHandle CP entry.  And it wants our help.
++     * It will make an up-call to this method.  (Do not change the name or signature.)
++     */
++    static MethodHandle linkMethodHandleConstant(Class<?> callerClass, int refKind,
++                                                 Class<?> defc, String name, Object type) {
++        Lookup lookup = IMPL_LOOKUP.in(callerClass);
++        switch (refKind) {
++        case REF_getField:          return lookup.findGetter(       defc, name, (Class<?>)   type );
++        case REF_getStatic:         return lookup.findStaticGetter( defc, name, (Class<?>)   type );
++        case REF_putField:          return lookup.findSetter(       defc, name, (Class<?>)   type );
++        case REF_putStatic:         return lookup.findStaticSetter( defc, name, (Class<?>)   type );
++        case REF_invokeVirtual:     return lookup.findVirtual(      defc, name, (MethodType) type );
++        case REF_invokeStatic:      return lookup.findStatic(       defc, name, (MethodType) type );
++        case REF_invokeSpecial:     return lookup.findSpecial(      defc, name, (MethodType) type, callerClass );
++        case REF_newInvokeSpecial:  return lookup.findConstructor(  defc,       (MethodType) type );
++        case REF_invokeInterface:   return lookup.findVirtual(      defc, name, (MethodType) type );
++        }
++        throw new IllegalArgumentException("bad MethodHandle constant "+name+" : "+type);
++    }
+ }
+diff --git a/src/share/javavm/export/classfile_constants.h b/src/share/javavm/export/classfile_constants.h
+--- a/src/share/javavm/export/classfile_constants.h
++++ b/src/share/javavm/export/classfile_constants.h
+@@ -84,7 +84,22 @@
+     JVM_CONSTANT_Fieldref               = 9,
+     JVM_CONSTANT_Methodref              = 10,
+     JVM_CONSTANT_InterfaceMethodref     = 11,
+-    JVM_CONSTANT_NameAndType            = 12
++    JVM_CONSTANT_NameAndType            = 12,
++    JVM_CONSTANT_MethodHandle           = 15,  // JSR 292
++    JVM_CONSTANT_MethodType             = 16   // JSR 292
++};
++
++/* JVM_CONSTANT_MethodHandle subtypes */
++enum {
++    JVM_REF_getField                = 1,
++    JVM_REF_getStatic               = 2,
++    JVM_REF_putField                = 3,
++    JVM_REF_putStatic               = 4,
++    JVM_REF_invokeVirtual           = 5,
++    JVM_REF_invokeStatic            = 6,
++    JVM_REF_invokeSpecial           = 7,
++    JVM_REF_newInvokeSpecial        = 8,
++    JVM_REF_invokeInterface         = 9
+ };
+ 
+ /* StackMapTable type item numbers */
+diff --git a/src/share/native/common/check_code.c b/src/share/native/common/check_code.c
+--- a/src/share/native/common/check_code.c
++++ b/src/share/native/common/check_code.c
+@@ -204,6 +204,8 @@
+ 
+ #define LDC_CLASS_MAJOR_VERSION 49
+ 
++#define LDC_METHOD_HANDLE_MAJOR_VERSION 51
++
+ #define ALLOC_STACK_SIZE 16 /* big enough */
+ 
+ typedef struct alloc_stack_type {
+@@ -1181,6 +1183,10 @@
+         if (context->major_version >= LDC_CLASS_MAJOR_VERSION) {
+             types |= 1 << JVM_CONSTANT_Class;
+         }
++        if (context->major_version >= LDC_METHOD_HANDLE_MAJOR_VERSION) {
++            types |= (1 << JVM_CONSTANT_MethodHandle) |
++                     (1 << JVM_CONSTANT_MethodType);
++        }
+         this_idata->operand.i = key;
+         verify_constant_pool_type(context, key, types);
+         break;
+@@ -1194,6 +1200,10 @@
+         if (context->major_version >= LDC_CLASS_MAJOR_VERSION) {
+             types |= 1 << JVM_CONSTANT_Class;
+         }
++        if (context->major_version >= LDC_METHOD_HANDLE_MAJOR_VERSION) {
++            types |= (1 << JVM_CONSTANT_MethodHandle) |
++                     (1 << JVM_CONSTANT_MethodType);
++        }
+         this_idata->operand.i = key;
+         verify_constant_pool_type(context, key, types);
+         break;
+@@ -2667,6 +2677,22 @@
+                     full_info = make_class_info_from_name(context,
+                                                           "java/lang/Class");
+                     break;
++                case JVM_CONSTANT_MethodHandle:
++                case JVM_CONSTANT_MethodType:
++                    if (context->major_version < LDC_METHOD_HANDLE_MAJOR_VERSION)
++                        CCerror(context, "Internal error #3");
++                    stack_results = "A";
++                    switch (type_table[operand]) {
++                    case JVM_CONSTANT_MethodType:
++                      full_info = make_class_info_from_name(context,
++                                                            "java/dyn/MethodType");
++                      break;
++                    default: //JVM_CONSTANT_MethodHandle
++                      full_info = make_class_info_from_name(context,
++                                                            "java/dyn/MethodHandle");
++                      break;
++                    }
++                    break;
+                 default:
+                     CCerror(context, "Internal error #3");
+                     stack_results = ""; /* Never reached: keep lint happy */
+diff --git a/test/java/dyn/MethodHandlesTest.java b/test/java/dyn/MethodHandlesTest.java
+--- a/test/java/dyn/MethodHandlesTest.java
++++ b/test/java/dyn/MethodHandlesTest.java
+@@ -47,6 +47,10 @@
+ public class MethodHandlesTest {
+     // How much output?
+     static int verbosity = 0;
++    static {
++        String vstr = System.getProperty("test.java.dyn.MethodHandlesTest.verbosity");
++        if (vstr != null)  verbosity = Integer.parseInt(vstr);
++    }
+ 
+     // Set this true during development if you want to fast-forward to
+     // a particular new, non-working test.  Tests which are known to
+@@ -109,7 +113,7 @@
+         String vers = properties.getProperty("java.vm.version");
+         String name = properties.getProperty("java.vm.name");
+         String arch = properties.getProperty("os.arch");
+-        if ((arch.equals("i386")  || arch.equals("amd64") ||
++        if ((arch.equals("amd64") || arch.equals("i386") || arch.equals("x86") ||
+              arch.equals("sparc") || arch.equals("sparcv9")) &&
+             (name.contains("Client") || name.contains("Server"))
+             ) {
+@@ -121,6 +125,7 @@
+     }
+ 
+     String testName;
++    static int allPosTests, allNegTests;
+     int posTests, negTests;
+     @After
+     public void printCounts() {
+@@ -128,6 +133,8 @@
+             System.out.println();
+             if (posTests != 0)  System.out.println("=== "+testName+": "+posTests+" positive test cases run");
+             if (negTests != 0)  System.out.println("=== "+testName+": "+negTests+" negative test cases run");
++            allPosTests += posTests;
++            allNegTests += negTests;
+             posTests = negTests = 0;
+         }
+     }
+@@ -153,6 +160,12 @@
+ 
+     @AfterClass
+     public static void tearDownClass() throws Exception {
++        int posTests = allPosTests, negTests = allNegTests;
++        if (verbosity >= 2 && (posTests | negTests) != 0) {
++            System.out.println();
++            if (posTests != 0)  System.out.println("=== "+posTests+" total positive test cases");
++            if (negTests != 0)  System.out.println("=== "+negTests+" total negative test cases");
++        }
+     }
+ 
+     static List<Object> calledLog = new ArrayList<Object>();
+@@ -811,28 +824,52 @@
+         }
+     }
+ 
++    static final int TEST_UNREFLECT = 1, TEST_FIND_FIELD = 2, TEST_FIND_STATIC_FIELD = 3;
++    static boolean testModeMatches(int testMode, boolean isStatic) {
++        switch (testMode) {
++        case TEST_FIND_STATIC_FIELD:    return isStatic;
++        case TEST_FIND_FIELD:           return !isStatic;
++        default:                        return true;  // unreflect matches both
++        }
++    }
++
+     @Test
+     public void testUnreflectGetter() throws Throwable {
++        startTest("unreflectGetter");
++        testGetter(TEST_UNREFLECT);
++    }
++    @Test
++    public void testFindGetter() throws Throwable {
++        startTest("findGetter");
++        testGetter(TEST_FIND_FIELD);
++    }
++    @Test
++    public void testFindStaticGetter() throws Throwable {
++        startTest("findStaticGetter");
++        testGetter(TEST_FIND_STATIC_FIELD);
++    }
++    public void testGetter(int testMode) throws Throwable {
+         Lookup lookup = PRIVATE;  // FIXME: test more lookups than this one
+-        startTest("unreflectGetter");
+         for (Object[] c : HasFields.CASES) {
+             Field f = (Field)c[0];
+             Object value = c[1];
+             Class<?> type = f.getType();
+-            if (type.isPrimitive() && type != int.class)
+-                continue;  //FIXME
+-            testUnreflectGetter(lookup, f, type, value);
++            testGetter(lookup, f, type, value, testMode);
+         }
+     }
+-    public void testUnreflectGetter(MethodHandles.Lookup lookup,
+-            Field f, Class<?> type, Object value) throws Throwable {
++    public void testGetter(MethodHandles.Lookup lookup,
++            Field f, Class<?> type, Object value, int testMode) throws Throwable {
++        boolean isStatic = Modifier.isStatic(f.getModifiers());
++        Class<?> fclass = f.getDeclaringClass();
++        String   fname  = f.getName();
++        Class<?> ftype  = f.getType();
++        if (!testModeMatches(testMode, isStatic))  return;
+         countTest(true);
+-        boolean isStatic = Modifier.isStatic(f.getModifiers());
+         MethodType expType = MethodType.methodType(type, HasFields.class);
+         if (isStatic)  expType = expType.dropParameterTypes(0, 1);
+         MethodHandle mh = lookup.unreflectGetter(f);
+         assertSame(mh.type(), expType);
+-        assertEquals(mh.toString(), f.getName());
++        assertEquals(mh.toString(), fname);
+         HasFields fields = new HasFields();
+         Object sawValue;
+         Class<?> rtype = type;
+@@ -862,26 +899,49 @@
+ 
+     @Test
+     public void testUnreflectSetter() throws Throwable {
++        startTest("unreflectSetter");
++        testSetter(TEST_UNREFLECT);
++    }
++    @Test
++    public void testFindSetter() throws Throwable {
++        startTest("findSetter");
++        testSetter(TEST_FIND_FIELD);
++    }
++    @Test
++    public void testFindStaticSetter() throws Throwable {
++        startTest("findStaticSetter");
++        testSetter(TEST_FIND_STATIC_FIELD);
++    }
++    public void testSetter(int testMode) throws Throwable {
+         Lookup lookup = PRIVATE;  // FIXME: test more lookups than this one
+         startTest("unreflectSetter");
+         for (Object[] c : HasFields.CASES) {
+             Field f = (Field)c[0];
+             Object value = c[1];
+             Class<?> type = f.getType();
+-            if (type.isPrimitive() && type != int.class)
+-                continue;  //FIXME
+-            testUnreflectSetter(lookup, f, type, value);
++            testSetter(lookup, f, type, value, testMode);
+         }
+     }
+-    public void testUnreflectSetter(MethodHandles.Lookup lookup,
+-            Field f, Class<?> type, Object value) throws Throwable {
++    public void testSetter(MethodHandles.Lookup lookup,
++            Field f, Class<?> type, Object value, int testMode) throws Throwable {
++        boolean isStatic = Modifier.isStatic(f.getModifiers());
++        Class<?> fclass = f.getDeclaringClass();
++        String   fname  = f.getName();
++        Class<?> ftype  = f.getType();
++        if (!testModeMatches(testMode, isStatic))  return;
+         countTest(true);
+-        boolean isStatic = Modifier.isStatic(f.getModifiers());
+         MethodType expType = MethodType.methodType(void.class, HasFields.class, type);
+         if (isStatic)  expType = expType.dropParameterTypes(0, 1);
+-        MethodHandle mh = lookup.unreflectSetter(f);
++        MethodHandle mh;
++        if (testMode == TEST_UNREFLECT)
++            mh = lookup.unreflectSetter(f);
++        else if (testMode == TEST_FIND_FIELD)
++            mh = lookup.findSetter(fclass, fname, ftype);
++        else if (testMode == TEST_FIND_STATIC_FIELD)
++            mh = lookup.findStaticSetter(fclass, fname, ftype);
++        else  throw new InternalError();
+         assertSame(mh.type(), expType);
+-        assertEquals(mh.toString(), f.getName());
++        assertEquals(mh.toString(), fname);
+         HasFields fields = new HasFields();
+         Object sawValue;
+         Class<?> vtype = type;

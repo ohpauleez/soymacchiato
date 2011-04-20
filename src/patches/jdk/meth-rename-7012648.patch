@@ -1,0 +1,3202 @@
+7012648: move JSR 292 to package java.lang.invoke and adjust names
+Summary: package and class renaming only; delete unused methods and classes; add @since tags; no code changes
+Reviewed-by: twisti
+
+diff --git a/make/common/Release.gmk b/make/common/Release.gmk
+--- a/make/common/Release.gmk
++++ b/make/common/Release.gmk
+@@ -1,5 +1,5 @@
+ #
+-# Copyright (c) 1997, 2010, Oracle and/or its affiliates. All rights reserved.
++# Copyright (c) 1997, 2011, Oracle and/or its affiliates. All rights reserved.
+ # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ #
+ # This code is free software; you can redistribute it and/or modify it
+@@ -54,9 +54,6 @@
+                         com.sun.java.swing.plaf.motif    \
+                         com.sun.java.swing.plaf.gtk
+ 
+-# This is a stopgap until 6839872 is fixed.
+-EXCLUDE_PROPWARN_PKGS += sun.dyn
+-
+ #
+ # Include the exported private packages in ct.sym.
+ # This is an interim solution until the ct.sym is replaced
+diff --git a/make/docs/CORE_PKGS.gmk b/make/docs/CORE_PKGS.gmk
+--- a/make/docs/CORE_PKGS.gmk
++++ b/make/docs/CORE_PKGS.gmk
+@@ -1,5 +1,5 @@
+ #
+-# Copyright (c) 2001, 2010, Oracle and/or its affiliates. All rights reserved.
++# Copyright (c) 2001, 2011, Oracle and/or its affiliates. All rights reserved.
+ # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ #
+ # This code is free software; you can redistribute it and/or modify it
+@@ -55,7 +55,7 @@
+ # This is a list of regular expressions. So foo.* matches "foo" and "foo.bar".
+ #
+ ACTIVE_JSR_PKGS= \
+-  java.dyn \
++  java.lang.invoke \
+   java.sql  \
+   javax.activation  \
+   javax.annotation.*  \
+@@ -97,11 +97,11 @@
+   java.awt.print                                 \
+   java.beans                                     \
+   java.beans.beancontext                         \
+-  java.dyn                                       \
+   java.io                                        \
+   java.lang                                      \
+   java.lang.annotation                           \
+   java.lang.instrument                           \
++  java.lang.invoke                               \
+   java.lang.management                           \
+   java.lang.ref                                  \
+   java.lang.reflect                              \
+diff --git a/make/java/Makefile b/make/java/Makefile
+--- a/make/java/Makefile
++++ b/make/java/Makefile
+@@ -1,5 +1,5 @@
+ #
+-# Copyright (c) 1995, 2010, Oracle and/or its affiliates. All rights reserved.
++# Copyright (c) 1995, 2011, Oracle and/or its affiliates. All rights reserved.
+ # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ #
+ # This code is free software; you can redistribute it and/or modify it
+@@ -44,7 +44,7 @@
+ SUBDIRS_desktop    = awt applet beans
+ SUBDIRS_management = management
+ SUBDIRS_misc       = npt java_crw_demo java_hprof_demo \
+-                     logging instrument dyn sql rmi
++                     logging instrument invoke sql rmi
+ 
+ 
+ ifeq ($(PLATFORM), solaris)
+diff --git a/make/java/dyn/Makefile b/make/java/invoke/Makefile
+rename from make/java/dyn/Makefile
+rename to make/java/invoke/Makefile
+--- a/make/java/dyn/Makefile
++++ b/make/java/invoke/Makefile
+@@ -1,5 +1,5 @@
+ #
+-# Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
++# Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+ # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ #
+ # This code is free software; you can redistribute it and/or modify it
+@@ -25,18 +25,18 @@
+ 
+ BUILDDIR = ../..
+ 
+-PACKAGE = java.dyn
++PACKAGE = java.lang.invoke
+ PRODUCT = java
+ include $(BUILDDIR)/common/Defs.gmk
+ 
+-AUTO_FILES_JAVA_DIRS = java/dyn sun/dyn
++AUTO_FILES_JAVA_DIRS = java/lang/invoke sun/invoke
++FILES_java = \
++    java/lang/ClassValue.java \
++    java/lang/BootstrapMethodError.java
+ 
+ # The sources built here use new language syntax to generate
+ # method handle calls.  Let's be sure we are using that format.
+ LANGUAGE_VERSION = -source 7
+ CLASS_VERSION = -target 7
+ 
+-# Tell the compiler not to accept transitional forms.
+-OTHER_JAVACFLAGS = -XDallowTransitionalJSR292=no
+-
+ include $(BUILDDIR)/common/Classes.gmk
+diff --git a/src/share/classes/java/dyn/Linkage.java b/src/share/classes/java/dyn/Linkage.java
+deleted file mode 100644
+--- a/src/share/classes/java/dyn/Linkage.java
++++ /dev/null
+@@ -1,119 +0,0 @@
+-/*
+- * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+- *
+- * This code is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License version 2 only, as
+- * published by the Free Software Foundation.  Oracle designates this
+- * particular file as subject to the "Classpath" exception as provided
+- * by Oracle in the LICENSE file that accompanied this code.
+- *
+- * This code is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+- * version 2 for more details (a copy is included in the LICENSE file that
+- * accompanied this code).
+- *
+- * You should have received a copy of the GNU General Public License version
+- * 2 along with this work; if not, write to the Free Software Foundation,
+- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+- *
+- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+- * or visit www.oracle.com if you need additional information or have any
+- * questions.
+- */
+-
+-package java.dyn;
+-
+-import sun.dyn.util.VerifyAccess;
+-import java.dyn.MethodHandles.Lookup;
+-import sun.reflect.Reflection;
+-
+-/**
+- * <em>CLASS WILL BE REMOVED FOR PFD:</em>
+- * Static routines for controlling invokedynamic behavior.
+- * Replaced by non-static APIs.
+- * @author John Rose, JSR 292 EG
+- * @deprecated This class will be removed in the Public Final Draft.
+- */
+-public class Linkage {
+-    private Linkage() {}  // do not instantiate
+-
+-    /**
+-     * <em>METHOD WILL BE REMOVED FOR PFD:</em>
+-     * Register a <em>bootstrap method</em> to use when linking dynamic call sites within
+-     * a given caller class.
+-     * @deprecated Use @{@link BootstrapMethod} annotations instead.
+-     */
+-    public static
+-    void registerBootstrapMethod(Class callerClass, MethodHandle bootstrapMethod) {
+-        Class callc = Reflection.getCallerClass(2);
+-        if (callc != null && !VerifyAccess.isSamePackage(callerClass, callc))
+-            throw new IllegalArgumentException("cannot set bootstrap method on "+callerClass);
+-        MethodHandleImpl.registerBootstrap(callerClass, bootstrapMethod);
+-    }
+-
+-    /**
+-     * <em>METHOD WILL BE REMOVED FOR PFD:</em>
+-     * Simplified version of {@code registerBootstrapMethod} for self-registration,
+-     * to be called from a static initializer.
+-     * @deprecated Use @{@link BootstrapMethod} annotations instead.
+-     */
+-    public static
+-    void registerBootstrapMethod(Class<?> runtime, String name) {
+-        Class callerClass = Reflection.getCallerClass(2);
+-        registerBootstrapMethodLookup(callerClass, runtime, name);
+-    }
+-
+-    /**
+-     * <em>METHOD WILL BE REMOVED FOR PFD:</em>
+-     * Simplified version of {@code registerBootstrapMethod} for self-registration,
+-     * @deprecated Use @{@link BootstrapMethod} annotations instead.
+-     */
+-    public static
+-    void registerBootstrapMethod(String name) {
+-        Class callerClass = Reflection.getCallerClass(2);
+-        registerBootstrapMethodLookup(callerClass, callerClass, name);
+-    }
+-
+-    private static
+-    void registerBootstrapMethodLookup(Class<?> callerClass, Class<?> runtime, String name) {
+-        Lookup lookup = new Lookup(callerClass);
+-        MethodHandle bootstrapMethod;
+-        try {
+-            bootstrapMethod = lookup.findStatic(runtime, name, BOOTSTRAP_METHOD_TYPE);
+-        } catch (ReflectiveOperationException ex) {
+-            throw new IllegalArgumentException("no such bootstrap method in "+runtime+": "+name, ex);
+-        }
+-        MethodHandleImpl.registerBootstrap(callerClass, bootstrapMethod);
+-    }
+-
+-    private static final MethodType BOOTSTRAP_METHOD_TYPE
+-            = MethodType.methodType(CallSite.class,
+-                                    Class.class, String.class, MethodType.class);
+-
+-    /**
+-     * <em>METHOD WILL BE REMOVED FOR PFD:</em>
+-     * Invalidate all <code>invokedynamic</code> call sites everywhere.
+-     * @deprecated Use {@linkplain MutableCallSite#setTarget call site target setting},
+-     * {@link MutableCallSite#syncAll call site update pushing},
+-     * and {@link SwitchPoint#guardWithTest target switching} instead.
+-     */
+-    public static
+-    Object invalidateAll() {
+-        throw new UnsupportedOperationException();
+-    }
+-
+-    /**
+-     * <em>METHOD WILL BE REMOVED FOR PFD:</em>
+-     * Invalidate all {@code invokedynamic} call sites in the bytecodes
+-     * of any methods of the given class.
+-     * @deprecated Use {@linkplain MutableCallSite#setTarget call site target setting},
+-     * {@link MutableCallSite#syncAll call site update pushing},
+-     * and {@link SwitchPoint#guardWithTest target switching} instead.
+-     */
+-    public static
+-    Object invalidateCallerClass(Class<?> callerClass) {
+-        throw new UnsupportedOperationException();
+-    }
+-}
+diff --git a/src/share/classes/java/dyn/InvokeDynamicBootstrapError.java b/src/share/classes/java/lang/BootstrapMethodError.java
+rename from src/share/classes/java/dyn/InvokeDynamicBootstrapError.java
+rename to src/share/classes/java/lang/BootstrapMethodError.java
+--- a/src/share/classes/java/dyn/InvokeDynamicBootstrapError.java
++++ b/src/share/classes/java/lang/BootstrapMethodError.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -23,58 +23,56 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang;
+ 
+ /**
+  * Thrown to indicate that an {@code invokedynamic} instruction has
+- * failed to find its
+- * {@linkplain BootstrapMethod bootstrap method},
+- * or the bootstrap method has
+- * failed to provide a
+- * {@linkplain CallSite call site} with a {@linkplain CallSite#getTarget target}
+- * of the correct {@linkplain MethodHandle#type method type}.
++ * failed to find its bootstrap method,
++ * or the bootstrap method has failed to provide a
++ * {@linkplain java.lang.invoke.CallSite call site} with a {@linkplain java.lang.invoke.CallSite#getTarget target}
++ * of the correct {@linkplain java.lang.invoke.MethodHandle#type method type}.
+  *
+  * @author John Rose, JSR 292 EG
+  * @since 1.7
+  */
+-public class InvokeDynamicBootstrapError extends LinkageError {
++public class BootstrapMethodError extends LinkageError {
+     private static final long serialVersionUID = 292L;
+ 
+     /**
+-     * Constructs an {@code InvokeDynamicBootstrapError} with no detail message.
++     * Constructs an {@code BootstrapMethodError} with no detail message.
+      */
+-    public InvokeDynamicBootstrapError() {
++    public BootstrapMethodError() {
+         super();
+     }
+ 
+     /**
+-     * Constructs an {@code InvokeDynamicBootstrapError} with the specified
++     * Constructs an {@code BootstrapMethodError} with the specified
+      * detail message.
+      *
+      * @param s the detail message.
+      */
+-    public InvokeDynamicBootstrapError(String s) {
++    public BootstrapMethodError(String s) {
+         super(s);
+     }
+ 
+     /**
+-     * Constructs a {@code InvokeDynamicBootstrapError} with the specified
++     * Constructs a {@code BootstrapMethodError} with the specified
+      * detail message and cause.
+      *
+      * @param s the detail message.
+      * @param cause the cause, may be {@code null}.
+      */
+-    public InvokeDynamicBootstrapError(String s, Throwable cause) {
++    public BootstrapMethodError(String s, Throwable cause) {
+         super(s, cause);
+     }
+ 
+     /**
+-     * Constructs a {@code InvokeDynamicBootstrapError} with the specified
++     * Constructs a {@code BootstrapMethodError} with the specified
+      * cause.
+      *
+      * @param cause the cause, may be {@code null}.
+      */
+-    public InvokeDynamicBootstrapError(Throwable cause) {
++    public BootstrapMethodError(Throwable cause) {
+         // cf. Throwable(Throwable cause) constructor.
+         super(cause == null ? null : cause.toString());
+         initCause(cause);
+diff --git a/src/share/classes/java/dyn/ClassValue.java b/src/share/classes/java/lang/ClassValue.java
+rename from src/share/classes/java/dyn/ClassValue.java
+rename to src/share/classes/java/lang/ClassValue.java
+--- a/src/share/classes/java/dyn/ClassValue.java
++++ b/src/share/classes/java/lang/ClassValue.java
+@@ -23,7 +23,7 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang;
+ 
+ import java.util.WeakHashMap;
+ import java.util.concurrent.atomic.AtomicInteger;
+@@ -35,10 +35,11 @@
+  * it can use a {@code ClassValue} to cache information needed to
+  * perform the message send quickly, for each class encountered.
+  * @author John Rose, JSR 292 EG
++ * @since 1.7
+  */
+ public abstract class ClassValue<T> {
+     /**
+-     * Compute the given class's derived value for this {@code ClassValue}.
++     * Computes the given class's derived value for this {@code ClassValue}.
+      * <p>
+      * This method will be invoked within the first thread that accesses
+      * the value with the {@link #get get} method.
+@@ -157,13 +158,7 @@
+     }
+ 
+     /// Implementation...
+-
+-    // The hash code for this type is based on the identity of the object,
+-    // and is well-dispersed for power-of-two tables.
+-    /** @deprecated This override, which is implementation-specific, will be removed for PFD. */
+-    public final int hashCode() { return hashCode; }
+-    private final int hashCode = HASH_CODES.getAndAdd(0x61c88647);
+-    private static final AtomicInteger HASH_CODES = new AtomicInteger();
++    // FIXME: Use a data structure here similar that of ThreadLocal (7030453).
+ 
+     private static final AtomicInteger STORE_BARRIER = new AtomicInteger();
+ 
+diff --git a/src/share/classes/java/dyn/AdapterMethodHandle.java b/src/share/classes/java/lang/invoke/AdapterMethodHandle.java
+rename from src/share/classes/java/dyn/AdapterMethodHandle.java
+rename to src/share/classes/java/lang/invoke/AdapterMethodHandle.java
+--- a/src/share/classes/java/dyn/AdapterMethodHandle.java
++++ b/src/share/classes/java/lang/invoke/AdapterMethodHandle.java
+@@ -23,13 +23,13 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+-import sun.dyn.util.VerifyType;
+-import sun.dyn.util.Wrapper;
++import sun.invoke.util.VerifyType;
++import sun.invoke.util.Wrapper;
+ import java.util.Arrays;
+-import static java.dyn.MethodHandleNatives.Constants.*;
+-import static java.dyn.MethodHandleStatics.*;
++import static java.lang.invoke.MethodHandleNatives.Constants.*;
++import static java.lang.invoke.MethodHandleStatics.*;
+ 
+ /**
+  * This method handle performs simple conversion or checking of a single argument.
+diff --git a/src/share/classes/java/dyn/BoundMethodHandle.java b/src/share/classes/java/lang/invoke/BoundMethodHandle.java
+rename from src/share/classes/java/dyn/BoundMethodHandle.java
+rename to src/share/classes/java/lang/invoke/BoundMethodHandle.java
+--- a/src/share/classes/java/dyn/BoundMethodHandle.java
++++ b/src/share/classes/java/lang/invoke/BoundMethodHandle.java
+@@ -23,11 +23,11 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+-import sun.dyn.util.VerifyType;
+-import sun.dyn.util.Wrapper;
+-import static java.dyn.MethodHandleStatics.*;
++import sun.invoke.util.VerifyType;
++import sun.invoke.util.Wrapper;
++import static java.lang.invoke.MethodHandleStatics.*;
+ 
+ /**
+  * The flavor of method handle which emulates an invoke instruction
+diff --git a/src/share/classes/java/dyn/CallSite.java b/src/share/classes/java/lang/invoke/CallSite.java
+rename from src/share/classes/java/dyn/CallSite.java
+rename to src/share/classes/java/lang/invoke/CallSite.java
+--- a/src/share/classes/java/dyn/CallSite.java
++++ b/src/share/classes/java/lang/invoke/CallSite.java
+@@ -23,12 +23,12 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+-import sun.dyn.empty.Empty;
++import sun.invoke.empty.Empty;
+ import sun.misc.Unsafe;
+-import static java.dyn.MethodHandleStatics.*;
+-import static java.dyn.MethodHandles.Lookup.IMPL_LOOKUP;
++import static java.lang.invoke.MethodHandleStatics.*;
++import static java.lang.invoke.MethodHandles.Lookup.IMPL_LOOKUP;
+ 
+ /**
+  * A {@code CallSite} is a holder for a variable {@link MethodHandle},
+@@ -95,9 +95,6 @@
+     /*package-private*/
+     MethodHandle target;
+ 
+-    // Remove this field for PFD and delete deprecated methods:
+-    private MemberName calleeNameRemoveForPFD;
+-
+     /**
+      * Make a blank call site object with the given method type.
+      * An initial target method is supplied which will throw
+@@ -144,7 +141,7 @@
+                            int        callerBCI) {
+         if (this.vmmethod != null) {
+             // FIXME
+-            throw new InvokeDynamicBootstrapError("call site has already been linked to an invokedynamic instruction");
++            throw new BootstrapMethodError("call site has already been linked to an invokedynamic instruction");
+         }
+         if (!this.type().equals(type)) {
+             throw wrongTargetType(target, type);
+@@ -201,7 +198,7 @@
+     }
+ 
+     /**
+-     * Produce a method handle equivalent to an invokedynamic instruction
++     * Produces a method handle equivalent to an invokedynamic instruction
+      * which has been linked to this call site.
+      * <p>
+      * This method is equivalent to the following code:
+@@ -270,17 +267,7 @@
+                              // Caller information:
+                              MemberName callerMethod, int callerBCI) {
+         Class<?> callerClass = callerMethod.getDeclaringClass();
+-        Object caller;
+-        if (bootstrapMethod.type().parameterType(0) == Class.class && TRANSITIONAL_BEFORE_PFD)
+-            caller = callerClass;  // remove for PFD
+-        else
+-            caller = IMPL_LOOKUP.in(callerClass);
+-        if (bootstrapMethod == null && TRANSITIONAL_BEFORE_PFD) {
+-            // If there is no bootstrap method, throw IncompatibleClassChangeError.
+-            // This is a valid generic error type for resolution (JLS 12.3.3).
+-            throw new IncompatibleClassChangeError
+-                ("Class "+callerClass.getName()+" has not declared a bootstrap method for invokedynamic");
+-        }
++        Object caller = IMPL_LOOKUP.in(callerClass);
+         CallSite site;
+         try {
+             Object binding;
+@@ -293,7 +280,7 @@
+                 Object[] argv = (Object[]) info;
+                 maybeReBoxElements(argv);
+                 if (3 + argv.length > 255)
+-                    throw new InvokeDynamicBootstrapError("too many bootstrap method arguments");
++                    throw new BootstrapMethodError("too many bootstrap method arguments");
+                 MethodType bsmType = bootstrapMethod.type();
+                 if (bsmType.parameterCount() == 4 && bsmType.parameterType(3) == Object[].class)
+                     binding = bootstrapMethod.invokeGeneric(caller, name, type, argv);
+@@ -304,33 +291,22 @@
+             //System.out.println("BSM for "+name+type+" => "+binding);
+             if (binding instanceof CallSite) {
+                 site = (CallSite) binding;
+-            } else if (binding instanceof MethodHandle && TRANSITIONAL_BEFORE_PFD) {
+-                // Transitional!
+-                MethodHandle target = (MethodHandle) binding;
+-                site = new ConstantCallSite(target);
+-            } else {
++            }  else {
+                 throw new ClassCastException("bootstrap method failed to produce a CallSite");
+             }
+-            if (TRANSITIONAL_BEFORE_PFD)
+-                PRIVATE_INITIALIZE_CALL_SITE.invokeExact(site, name, type,
+-                                                         callerMethod, callerBCI);
+             assert(site.getTarget() != null);
+             assert(site.getTarget().type().equals(type));
+         } catch (Throwable ex) {
+-            InvokeDynamicBootstrapError bex;
+-            if (ex instanceof InvokeDynamicBootstrapError)
+-                bex = (InvokeDynamicBootstrapError) ex;
++            BootstrapMethodError bex;
++            if (ex instanceof BootstrapMethodError)
++                bex = (BootstrapMethodError) ex;
+             else
+-                bex = new InvokeDynamicBootstrapError("call site initialization exception", ex);
++                bex = new BootstrapMethodError("call site initialization exception", ex);
+             throw bex;
+         }
+         return site;
+     }
+ 
+-    private static final boolean TRANSITIONAL_BEFORE_PFD = true;  // FIXME: remove for PFD
+-    // booby trap to force removal after package rename:
+-    static { if (TRANSITIONAL_BEFORE_PFD)  assert(CallSite.class.getName().startsWith("java.dyn.")); }
+-
+     private static Object maybeReBox(Object x) {
+         if (x instanceof Integer) {
+             int xi = (int) x;
+@@ -344,20 +320,4 @@
+             xa[i] = maybeReBox(xa[i]);
+         }
+     }
+-
+-    // This method is private in CallSite because it touches private fields in CallSite.
+-    // These private fields (vmmethod, vmindex) are specific to the JVM.
+-    private static final MethodHandle PRIVATE_INITIALIZE_CALL_SITE;
+-    static {
+-        try {
+-            PRIVATE_INITIALIZE_CALL_SITE =
+-            !TRANSITIONAL_BEFORE_PFD ? null :
+-            IMPL_LOOKUP.findVirtual(CallSite.class, "initializeFromJVM",
+-                MethodType.methodType(void.class,
+-                                      String.class, MethodType.class,
+-                                      MemberName.class, int.class));
+-        } catch (ReflectiveOperationException ex) {
+-            throw uncaughtException(ex);
+-        }
+-    }
+ }
+diff --git a/src/share/classes/java/dyn/ConstantCallSite.java b/src/share/classes/java/lang/invoke/ConstantCallSite.java
+rename from src/share/classes/java/dyn/ConstantCallSite.java
+rename to src/share/classes/java/lang/invoke/ConstantCallSite.java
+--- a/src/share/classes/java/dyn/ConstantCallSite.java
++++ b/src/share/classes/java/lang/invoke/ConstantCallSite.java
+@@ -23,7 +23,7 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+ /**
+  * A {@code ConstantCallSite} is a {@link CallSite} whose target is permanent, and can never be changed.
+diff --git a/src/share/classes/java/dyn/DirectMethodHandle.java b/src/share/classes/java/lang/invoke/DirectMethodHandle.java
+rename from src/share/classes/java/dyn/DirectMethodHandle.java
+rename to src/share/classes/java/lang/invoke/DirectMethodHandle.java
+--- a/src/share/classes/java/dyn/DirectMethodHandle.java
++++ b/src/share/classes/java/lang/invoke/DirectMethodHandle.java
+@@ -23,9 +23,9 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+-import static java.dyn.MethodHandleNatives.Constants.*;
++import static java.lang.invoke.MethodHandleNatives.Constants.*;
+ 
+ /**
+  * The flavor of method handle which emulates invokespecial or invokestatic.
+diff --git a/src/share/classes/java/dyn/FilterGeneric.java b/src/share/classes/java/lang/invoke/FilterGeneric.java
+rename from src/share/classes/java/dyn/FilterGeneric.java
+rename to src/share/classes/java/lang/invoke/FilterGeneric.java
+--- a/src/share/classes/java/dyn/FilterGeneric.java
++++ b/src/share/classes/java/lang/invoke/FilterGeneric.java
+@@ -23,11 +23,11 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+ import java.lang.reflect.*;
+-import static java.dyn.MethodHandleStatics.*;
+-import static java.dyn.MethodHandles.Lookup.IMPL_LOOKUP;
++import static java.lang.invoke.MethodHandleStatics.*;
++import static java.lang.invoke.MethodHandles.Lookup.IMPL_LOOKUP;
+ 
+ /**
+  * These adapters apply arbitrary conversions to arguments
+@@ -256,7 +256,7 @@
+                 MethodHandle filter, MethodHandle target);
+         // { return new ThisType(entryPoint, filter, target); }
+ 
+-        static private final String CLASS_PREFIX; // "java.dyn.FilterGeneric$"
++        static private final String CLASS_PREFIX; // "java.lang.invoke.FilterGeneric$"
+         static {
+             String aname = Adapter.class.getName();
+             String sname = Adapter.class.getSimpleName();
+diff --git a/src/share/classes/java/dyn/FilterOneArgument.java b/src/share/classes/java/lang/invoke/FilterOneArgument.java
+rename from src/share/classes/java/dyn/FilterOneArgument.java
+rename to src/share/classes/java/lang/invoke/FilterOneArgument.java
+--- a/src/share/classes/java/dyn/FilterOneArgument.java
++++ b/src/share/classes/java/lang/invoke/FilterOneArgument.java
+@@ -23,10 +23,10 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+-import static java.dyn.MethodHandleStatics.*;
+-import static java.dyn.MethodHandles.Lookup.IMPL_LOOKUP;
++import static java.lang.invoke.MethodHandleStatics.*;
++import static java.lang.invoke.MethodHandles.Lookup.IMPL_LOOKUP;
+ 
+ /**
+  * Unary function composition, useful for many small plumbing jobs.
+diff --git a/src/share/classes/java/dyn/FromGeneric.java b/src/share/classes/java/lang/invoke/FromGeneric.java
+rename from src/share/classes/java/dyn/FromGeneric.java
+rename to src/share/classes/java/lang/invoke/FromGeneric.java
+--- a/src/share/classes/java/dyn/FromGeneric.java
++++ b/src/share/classes/java/lang/invoke/FromGeneric.java
+@@ -23,13 +23,13 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+-import sun.dyn.util.ValueConversions;
+-import sun.dyn.util.Wrapper;
++import sun.invoke.util.ValueConversions;
++import sun.invoke.util.Wrapper;
+ import java.lang.reflect.*;
+-import static java.dyn.MethodHandleStatics.*;
+-import static java.dyn.MethodHandles.Lookup.IMPL_LOOKUP;
++import static java.lang.invoke.MethodHandleStatics.*;
++import static java.lang.invoke.MethodHandles.Lookup.IMPL_LOOKUP;
+ 
+ /**
+  * Adapters which mediate between incoming calls which are generic
+@@ -291,7 +291,7 @@
+         protected Object convert_F(float  result) throws Throwable { return convert.invokeExact(result); }
+         protected Object convert_D(double result) throws Throwable { return convert.invokeExact(result); }
+ 
+-        static private final String CLASS_PREFIX; // "java.dyn.FromGeneric$"
++        static private final String CLASS_PREFIX; // "java.lang.invoke.FromGeneric$"
+         static {
+             String aname = Adapter.class.getName();
+             String sname = Adapter.class.getSimpleName();
+diff --git a/src/share/classes/java/dyn/InvokeDynamic.java b/src/share/classes/java/lang/invoke/InvokeDynamic.java
+rename from src/share/classes/java/dyn/InvokeDynamic.java
+rename to src/share/classes/java/lang/invoke/InvokeDynamic.java
+--- a/src/share/classes/java/dyn/InvokeDynamic.java
++++ b/src/share/classes/java/lang/invoke/InvokeDynamic.java
+@@ -23,7 +23,7 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+ /**
+  * This is a place-holder class.  Some HotSpot implementations need to see it.
+diff --git a/src/share/classes/java/dyn/InvokeGeneric.java b/src/share/classes/java/lang/invoke/InvokeGeneric.java
+rename from src/share/classes/java/dyn/InvokeGeneric.java
+rename to src/share/classes/java/lang/invoke/InvokeGeneric.java
+--- a/src/share/classes/java/dyn/InvokeGeneric.java
++++ b/src/share/classes/java/lang/invoke/InvokeGeneric.java
+@@ -23,10 +23,10 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+-import sun.dyn.util.*;
+-import static java.dyn.MethodHandles.Lookup.IMPL_LOOKUP;
++import sun.invoke.util.*;
++import static java.lang.invoke.MethodHandles.Lookup.IMPL_LOOKUP;
+ 
+ /**
+  * Adapters which manage MethodHandle.invokeGeneric calls.
+diff --git a/src/share/classes/java/dyn/Invokers.java b/src/share/classes/java/lang/invoke/Invokers.java
+rename from src/share/classes/java/dyn/Invokers.java
+rename to src/share/classes/java/lang/invoke/Invokers.java
+--- a/src/share/classes/java/dyn/Invokers.java
++++ b/src/share/classes/java/lang/invoke/Invokers.java
+@@ -23,10 +23,10 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+-import sun.dyn.empty.Empty;
+-import static java.dyn.MethodHandles.Lookup.IMPL_LOOKUP;
++import sun.invoke.empty.Empty;
++import static java.lang.invoke.MethodHandles.Lookup.IMPL_LOOKUP;
+ 
+ /**
+  * Construction and caching of often-used invokers.
+diff --git a/src/share/classes/java/dyn/MemberName.java b/src/share/classes/java/lang/invoke/MemberName.java
+rename from src/share/classes/java/dyn/MemberName.java
+rename to src/share/classes/java/lang/invoke/MemberName.java
+--- a/src/share/classes/java/dyn/MemberName.java
++++ b/src/share/classes/java/lang/invoke/MemberName.java
+@@ -23,9 +23,9 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+-import sun.dyn.util.BytecodeDescriptor;
++import sun.invoke.util.BytecodeDescriptor;
+ import java.lang.reflect.Constructor;
+ import java.lang.reflect.Field;
+ import java.lang.reflect.Method;
+@@ -36,8 +36,8 @@
+ import java.util.Collections;
+ import java.util.Iterator;
+ import java.util.List;
+-import static java.dyn.MethodHandleNatives.Constants.*;
+-import static java.dyn.MethodHandleStatics.*;
++import static java.lang.invoke.MethodHandleNatives.Constants.*;
++import static java.lang.invoke.MethodHandleStatics.*;
+ 
+ /**
+  * A {@code MemberName} is a compact symbolic datum which fully characterizes
+diff --git a/src/share/classes/java/dyn/MethodHandle.java b/src/share/classes/java/lang/invoke/MethodHandle.java
+rename from src/share/classes/java/dyn/MethodHandle.java
+rename to src/share/classes/java/lang/invoke/MethodHandle.java
+--- a/src/share/classes/java/dyn/MethodHandle.java
++++ b/src/share/classes/java/lang/invoke/MethodHandle.java
+@@ -23,10 +23,10 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+ 
+-import static java.dyn.MethodHandleStatics.*;
++import static java.lang.invoke.MethodHandleStatics.*;
+ 
+ /**
+  * A method handle is a typed, directly executable reference to an underlying method,
+@@ -35,14 +35,8 @@
+  * These transformations are quite general, and include such patterns as
+  * {@linkplain #asType conversion},
+  * {@linkplain #bindTo insertion},
+- * {@linkplain java.dyn.MethodHandles#dropArguments deletion},
+- * and {@linkplain java.dyn.MethodHandles#filterArguments substitution}.
+- * <p>
+- * <em>Note: The super-class of MethodHandle is Object.
+- *     Any other super-class visible in the Reference Implementation
+- *     will be removed before the Proposed Final Draft.
+- *     Also, the final version will not include any public or
+- *     protected constructors.</em>
++ * {@linkplain java.lang.invoke.MethodHandles#dropArguments deletion},
++ * and {@linkplain java.lang.invoke.MethodHandles#filterArguments substitution}.
+  *
+  * <h3>Method handle contents</h3>
+  * Method handles are dynamically and strongly typed according to type descriptor.
+@@ -51,7 +45,7 @@
+  * the method handle's own {@linkplain #type method type}.
+  * <p>
+  * Every method handle reports its type via the {@link #type type} accessor.
+- * This type descriptor is a {@link java.dyn.MethodType MethodType} object,
++ * This type descriptor is a {@link java.lang.invoke.MethodType MethodType} object,
+  * whose structure is a series of classes, one of which is
+  * the return type of the method (or {@code void.class} if none).
+  * <p>
+@@ -151,7 +145,7 @@
+  * This allows a more powerful negotiation of method type
+  * between caller and callee.
+  * <p>
+- * (Note: The adjusted method handle {@code M2} is not directly observable,
++ * (<em>Note:</em> The adjusted method handle {@code M2} is not directly observable,
+  * and implementations are therefore not required to materialize it.)
+  *
+  * <h3>Invocation checking</h3>
+@@ -199,11 +193,11 @@
+  * Java code can create a method handle that directly accesses
+  * any method, constructor, or field that is accessible to that code.
+  * This is done via a reflective, capability-based API called
+- * {@link java.dyn.MethodHandles.Lookup MethodHandles.Lookup}
++ * {@link java.lang.invoke.MethodHandles.Lookup MethodHandles.Lookup}
+  * For example, a static method handle can be obtained
+- * from {@link java.dyn.MethodHandles.Lookup#findStatic Lookup.findStatic}.
++ * from {@link java.lang.invoke.MethodHandles.Lookup#findStatic Lookup.findStatic}.
+  * There are also conversion methods from Core Reflection API objects,
+- * such as {@link java.dyn.MethodHandles.Lookup#unreflect Lookup.unreflect}.
++ * such as {@link java.lang.invoke.MethodHandles.Lookup#unreflect Lookup.unreflect}.
+  * <p>
+  * Like classes and strings, method handles that correspond to accessible
+  * fields, methods, and constructors can also be represented directly
+@@ -264,7 +258,7 @@
+ x = mh.invokeExact((Object)1, (Object)2, (Object)3);
+ // invokeExact(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+ assert(x.equals(java.util.Arrays.asList(1,2,3)));
+-// mt is { =&gt; int}
++// mt is int()
+ mt = MethodType.methodType(int.class);
+ mh = lookup.findVirtual(java.util.List.class, "size", mt);
+ i = (int) mh.invokeExact(java.util.Arrays.asList(1,2,3));
+@@ -320,15 +314,15 @@
+  * <p>
+  * For the sake of tools (but not as a programming API), the signature polymorphic
+  * methods are marked with a private yet standard annotation,
+- * {@code @java.dyn.MethodHandle.PolymorphicSignature}.
++ * {@code @java.lang.invoke.MethodHandle.PolymorphicSignature}.
+  * The annotation's retention is {@code RUNTIME}, so that all tools can see it.
+  *
+  * <h3>Formal rules for processing signature polymorphic methods</h3>
+  * <p>
+  * The following methods (and no others) are signature polymorphic:
+  * <ul>
+- * <li>{@link java.dyn.MethodHandle#invokeExact   MethodHandle.invokeExact}
+- * <li>{@link java.dyn.MethodHandle#invokeGeneric MethodHandle.invokeGeneric}
++ * <li>{@link java.lang.invoke.MethodHandle#invokeExact   MethodHandle.invokeExact}
++ * <li>{@link java.lang.invoke.MethodHandle#invokeGeneric MethodHandle.invokeGeneric}
+  * </ul>
+  * <p>
+  * A signature polymorphic method will be declared with the following properties:
+@@ -336,7 +330,7 @@
+  * <li>It must be native.
+  * <li>It must take a single varargs parameter of the form {@code Object...}.
+  * <li>It must produce a return value of type {@code Object}.
+- * <li>It must be contained within the {@code java.dyn} package.
++ * <li>It must be contained within the {@code java.lang.invoke} package.
+  * </ul>
+  * Because of these requirements, a signature polymorphic method is able to accept
+  * any number and type of actual arguments, and can, with a cast, produce a value of any type.
+@@ -349,7 +343,7 @@
+  * <p>
+  * In an argument position of a method invocation on a signature polymorphic method,
+  * a null literal has type {@code java.lang.Void}, unless cast to a reference type.
+- * (Note: This typing rule allows the null type to have its own encoding in linkage information
++ * (<em>Note:</em> This typing rule allows the null type to have its own encoding in linkage information
+  * distinct from other types.
+  * <p>
+  * The linkage information for the return type is derived from a context-dependent target typing convention.
+@@ -369,12 +363,12 @@
+  * and without implicit boxing or unboxing.
+  *
+  * <h3>Interoperation between method handles and the Core Reflection API</h3>
+- * Using factory methods in the {@link java.dyn.MethodHandles.Lookup Lookup} API,
++ * Using factory methods in the {@link java.lang.invoke.MethodHandles.Lookup Lookup} API,
+  * any class member represented by a Core Reflection API object
+  * can be converted to a behaviorally equivalent method handle.
+  * For example, a reflective {@link java.lang.reflect.Method Method} can
+  * be converted to a method handle using
+- * {@link java.dyn.MethodHandles.Lookup#unreflect Lookup.unreflect}.
++ * {@link java.lang.invoke.MethodHandles.Lookup#unreflect Lookup.unreflect}.
+  * The resulting method handles generally provide more direct and efficient
+  * access to the underlying class members.
+  * <p>
+@@ -393,9 +387,9 @@
+  * they will throw {@code UnsupportedOperationException}.
+  * <p>
+  * In order to obtain an invoker method for a particular type descriptor,
+- * use {@link java.dyn.MethodHandles#exactInvoker MethodHandles.exactInvoker},
+- * or {@link java.dyn.MethodHandles#genericInvoker MethodHandles.genericInvoker}.
+- * The {@link java.dyn.MethodHandles.Lookup#findVirtual Lookup.findVirtual}
++ * use {@link java.lang.invoke.MethodHandles#exactInvoker MethodHandles.exactInvoker},
++ * or {@link java.lang.invoke.MethodHandles#genericInvoker MethodHandles.genericInvoker}.
++ * The {@link java.lang.invoke.MethodHandles.Lookup#findVirtual Lookup.findVirtual}
+  * API is also able to return a method handle
+  * to call {@code invokeExact} or {@code invokeGeneric},
+  * for any specified type descriptor .
+@@ -476,7 +470,7 @@
+     private MethodType type;
+ 
+     /**
+-     * Report the type of this method handle.
++     * Reports the type of this method handle.
+      * Every invocation of this method handle via {@code invokeExact} must exactly match this type.
+      * @return the method handle type
+      */
+@@ -487,7 +481,7 @@
+     /**
+      * Package-private constructor for the method handle implementation hierarchy.
+      * Method handle inheritance will be contained completely within
+-     * the {@code java.dyn} package.
++     * the {@code java.lang.invoke} package.
+      */
+     // @param type type (permanently assigned) of the new method handle
+     /*non-public*/ MethodHandle(MethodType type) {
+@@ -496,7 +490,7 @@
+     }
+ 
+     /**
+-     * Invoke the method handle, allowing any caller type descriptor, but requiring an exact type match.
++     * Invokes the method handle, allowing any caller type descriptor, but requiring an exact type match.
+      * The type descriptor at the call site of {@code invokeExact} must
+      * exactly match this method handle's {@link #type type}.
+      * No conversions are allowed on arguments or return values.
+@@ -505,7 +499,7 @@
+      * it will appear as a single native method, taking an object array and returning an object.
+      * If this native method is invoked directly via
+      * {@link java.lang.reflect.Method#invoke Method.invoke}, via JNI,
+-     * or indirectly via {@link java.dyn.MethodHandles.Lookup#unreflect Lookup.unreflect},
++     * or indirectly via {@link java.lang.invoke.MethodHandles.Lookup#unreflect Lookup.unreflect},
+      * it will throw an {@code UnsupportedOperationException}.
+      * @throws WrongMethodTypeException if the target's type is not identical with the caller's type descriptor
+      * @throws Throwable anything thrown by the underlying method propagates unchanged through the method handle call
+@@ -513,7 +507,7 @@
+     public final native @PolymorphicSignature Object invokeExact(Object... args) throws Throwable;
+ 
+     /**
+-     * Invoke the method handle, allowing any caller type descriptor,
++     * Invokes the method handle, allowing any caller type descriptor,
+      * and optionally performing conversions on arguments and return values.
+      * <p>
+      * If the call site type descriptor exactly matches this method handle's {@link #type type},
+@@ -539,7 +533,7 @@
+      * it will appear as a single native method, taking an object array and returning an object.
+      * If this native method is invoked directly via
+      * {@link java.lang.reflect.Method#invoke Method.invoke}, via JNI,
+-     * or indirectly via {@link java.dyn.MethodHandles.Lookup#unreflect Lookup.unreflect},
++     * or indirectly via {@link java.lang.invoke.MethodHandles.Lookup#unreflect Lookup.unreflect},
+      * it will throw an {@code UnsupportedOperationException}.
+      * @throws WrongMethodTypeException if the target's type cannot be adjusted to the caller's type descriptor
+      * @throws ClassCastException if the target's type can be adjusted to the caller, but a reference cast fails
+@@ -548,7 +542,7 @@
+     public final native @PolymorphicSignature Object invokeGeneric(Object... args) throws Throwable;
+ 
+     /**
+-     * Perform a varargs invocation, passing the arguments in the given array
++     * Performs a varargs invocation, passing the arguments in the given array
+      * to the method handle, as if via {@link #invokeGeneric invokeGeneric} from a call site
+      * which mentions only the type {@code Object}, and whose arity is the length
+      * of the argument array.
+@@ -647,14 +641,31 @@
+         MethodHandle invoker = type.invokers().spreadInvoker(0);
+         return invoker.invokeExact(this, arguments);
+     }
+-    /** Equivalent to {@code invokeWithArguments(arguments.toArray())}. */
++
++    /**
++     * Performs a varargs invocation, passing the arguments in the given array
++     * to the method handle, as if via {@link #invokeGeneric invokeGeneric} from a call site
++     * which mentions only the type {@code Object}, and whose arity is the length
++     * of the argument array.
++     * <p>
++     * This method is also equivalent to the following code:
++     * <p><blockquote><pre>
++     * {@link #invokeWithArguments(Object...) invokeWithArguments}(arguments.toArray())
++     * </pre></blockquote>
++     *
++     * @param arguments the arguments to pass to the target
++     * @return the result returned by the target
++     * @throws ClassCastException if an argument cannot be converted by reference casting
++     * @throws WrongMethodTypeException if the target's type cannot be adjusted to take the given number of {@code Object} arguments
++     * @throws Throwable anything thrown by the target method invocation
++     */
+     public Object invokeWithArguments(java.util.List<?> arguments) throws Throwable {
+         return invokeWithArguments(arguments.toArray());
+     }
+ 
+     /**
+-     * Produce an adapter method handle which adapts the type of the
+-     * current method handle to a new type
++     * Produces an adapter method handle which adapts the type of the
++     * current method handle to a new type.
+      * The resulting method handle is guaranteed to report a type
+      * which is equal to the desired new type.
+      * <p>
+@@ -682,7 +693,7 @@
+     }
+ 
+     /**
+-     * Make an adapter which accepts a trailing array argument
++     * Makes an adapter which accepts a trailing array argument
+      * and spreads its elements as positional arguments.
+      * The new method handle adapts, as its <i>target</i>,
+      * the current method handle.  The type of the adapter will be
+@@ -730,7 +741,7 @@
+     }
+ 
+     /**
+-     * Make an adapter which accepts a given number of trailing
++     * Makes an adapter which accepts a given number of trailing
+      * positional arguments and collects them into an array argument.
+      * The new method handle adapts, as its <i>target</i>,
+      * the current method handle.  The type of the adapter will be
+@@ -781,7 +792,7 @@
+     }
+ 
+     /**
+-     * Make a <em>variable arity</em> adapter which is able to accept
++     * Makes a <em>variable arity</em> adapter which is able to accept
+      * any number of trailing positional arguments and collect them
+      * into an array argument.
+      * <p>
+@@ -939,12 +950,12 @@
+     }
+ 
+     /**
+-     * Determine if this method handle
++     * Determines if this method handle
+      * supports {@linkplain #asVarargsCollector variable arity} calls.
+      * Such method handles arise from the following sources:
+      * <ul>
+      * <li>a call to {@linkplain #asVarargsCollector asVarargsCollector}
+-     * <li>a call to a {@linkplain java.dyn.MethodHandles.Lookup lookup method}
++     * <li>a call to a {@linkplain java.lang.invoke.MethodHandles.Lookup lookup method}
+      *     which resolves to a variable arity Java method or constructor
+      * <li>an {@code ldc} instruction of a {@code CONSTANT_MethodHandle}
+      *     which resolves to a variable arity Java method or constructor
+@@ -957,9 +968,9 @@
+     }
+ 
+     /**
+-     * Bind a value {@code x} to the first argument of a method handle, without invoking it.
++     * Binds a value {@code x} to the first argument of a method handle, without invoking it.
+      * The new method handle adapts, as its <i>target</i>,
+-     * to the current method handle.
++     * the current method handle by binding it to the given argument.
+      * The type of the bound handle will be
+      * the same as the type of the target, except that a single leading
+      * reference parameter will be omitted.
+@@ -971,9 +982,12 @@
+      * <p>
+      * The reference {@code x} must be convertible to the first parameter
+      * type of the target.
++     * <p>
++     * (<em>Note:</em>  Because method handles are immutable, the target method handle
++     * retains its original type and behavior.)
+      * @param x  the value to bind to the first argument of the target
+-     * @return a new method handle which collects some trailing argument
+-     *         into an array, before calling the original method handle
++     * @return a new method handle which prepends the given value to the incoming
++     *         argument list, before calling the original method handle
+      * @throws IllegalArgumentException if the target does not have a
+      *         leading parameter type that is a reference type
+      * @throws ClassCastException if {@code x} cannot be converted
+@@ -981,7 +995,15 @@
+      * @see MethodHandles#insertArguments
+      */
+     public MethodHandle bindTo(Object x) {
+-        return MethodHandles.insertArguments(this, 0, x);
++        Class<?> ptype;
++        if (type().parameterCount() == 0 ||
++            (ptype = type().parameterType(0)).isPrimitive())
++            throw newIllegalArgumentException("no leading reference parameter", x);
++        x = MethodHandles.checkValue(ptype, x);
++        // Cf. MethodHandles.insertArguments for the following logic:
++        MethodHandle bmh = MethodHandleImpl.bindReceiver(this, x);
++        if (bmh != null)  return bmh;
++        return MethodHandleImpl.bindArgument(this, 0, x);
+     }
+ 
+     /**
+@@ -993,9 +1015,9 @@
+      * "MethodHandle" + type().toString()
+      * </pre></blockquote>
+      * <p>
+-     * Note:  Future releases of this API may add further information
++     * (<em>Note:</em>  Future releases of this API may add further information
+      * to the string representation.
+-     * Therefore, the present syntax should not be parsed by applications.
++     * Therefore, the present syntax should not be parsed by applications.)
+      *
+      * @return a string representation of the method handle
+      */
+diff --git a/src/share/classes/java/dyn/MethodHandleImpl.java b/src/share/classes/java/lang/invoke/MethodHandleImpl.java
+rename from src/share/classes/java/dyn/MethodHandleImpl.java
+rename to src/share/classes/java/lang/invoke/MethodHandleImpl.java
+--- a/src/share/classes/java/dyn/MethodHandleImpl.java
++++ b/src/share/classes/java/lang/invoke/MethodHandleImpl.java
+@@ -23,20 +23,20 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+-import sun.dyn.util.VerifyType;
++import sun.invoke.util.VerifyType;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.List;
+-import sun.dyn.empty.Empty;
+-import sun.dyn.util.ValueConversions;
+-import sun.dyn.util.Wrapper;
++import sun.invoke.empty.Empty;
++import sun.invoke.util.ValueConversions;
++import sun.invoke.util.Wrapper;
+ import sun.misc.Unsafe;
+-import static java.dyn.MethodHandleStatics.*;
+-import static java.dyn.MethodHandles.Lookup.IMPL_LOOKUP;
++import static java.lang.invoke.MethodHandleStatics.*;
++import static java.lang.invoke.MethodHandles.Lookup.IMPL_LOOKUP;
+ 
+ /**
+  * Trusted implementation code for MethodHandle.
+@@ -52,7 +52,7 @@
+     }
+ 
+     /** Look up a given method.
+-     * Callable only from java.dyn and related packages.
++     * Callable only from sun.invoke and related packages.
+      * <p>
+      * The resulting method handle type will be of the given type,
+      * with a receiver type {@code rcvc} prepended if the member is not static.
+diff --git a/src/share/classes/java/dyn/MethodHandleNatives.java b/src/share/classes/java/lang/invoke/MethodHandleNatives.java
+rename from src/share/classes/java/dyn/MethodHandleNatives.java
+rename to src/share/classes/java/lang/invoke/MethodHandleNatives.java
+--- a/src/share/classes/java/dyn/MethodHandleNatives.java
++++ b/src/share/classes/java/lang/invoke/MethodHandleNatives.java
+@@ -23,13 +23,13 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+-import java.dyn.MethodHandles.Lookup;
++import java.lang.invoke.MethodHandles.Lookup;
+ import java.lang.reflect.AccessibleObject;
+ import java.lang.reflect.Field;
+-import static java.dyn.MethodHandleNatives.Constants.*;
+-import static java.dyn.MethodHandles.Lookup.IMPL_LOOKUP;
++import static java.lang.invoke.MethodHandleNatives.Constants.*;
++import static java.lang.invoke.MethodHandles.Lookup.IMPL_LOOKUP;
+ 
+ /**
+  * The JVM interface for the method handles package is all here.
+@@ -173,9 +173,15 @@
+                 MN_SEARCH_INTERFACES   = 0x00200000, // for MHN.getMembers
+                 VM_INDEX_UNINITIALIZED = -99;
+ 
++        // BoundMethodHandle
++        /** Constants for decoding the vmargslot field, which contains 2 values. */
++        static final int
++            ARG_SLOT_PUSH_SHIFT = 16,
++            ARG_SLOT_MASK = (1<<ARG_SLOT_PUSH_SHIFT)-1;
++
+         // AdapterMethodHandle
+         /** Conversions recognized by the JVM.
+-         *  They must align with the constants in java.dyn_AdapterMethodHandle,
++         *  They must align with the constants in java.lang.invoke.AdapterMethodHandle,
+          *  in the JVM file hotspot/src/share/vm/classfile/javaClasses.hpp.
+          */
+         static final int
+diff --git a/src/share/classes/java/dyn/MethodHandleStatics.java b/src/share/classes/java/lang/invoke/MethodHandleStatics.java
+rename from src/share/classes/java/dyn/MethodHandleStatics.java
+rename to src/share/classes/java/lang/invoke/MethodHandleStatics.java
+--- a/src/share/classes/java/dyn/MethodHandleStatics.java
++++ b/src/share/classes/java/lang/invoke/MethodHandleStatics.java
+@@ -23,12 +23,12 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+ /**
+  * This class consists exclusively of static names internal to the
+  * method handle implementation.
+- * Usage:  {@code import static java.dyn.MethodHandleStatics.*}
++ * Usage:  {@code import static java.lang.invoke.MethodHandleStatics.*}
+  * @author John Rose, JSR 292 EG
+  */
+ /*non-public*/ class MethodHandleStatics {
+diff --git a/src/share/classes/java/dyn/MethodHandles.java b/src/share/classes/java/lang/invoke/MethodHandles.java
+rename from src/share/classes/java/dyn/MethodHandles.java
+rename to src/share/classes/java/lang/invoke/MethodHandles.java
+--- a/src/share/classes/java/dyn/MethodHandles.java
++++ b/src/share/classes/java/lang/invoke/MethodHandles.java
+@@ -23,18 +23,18 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+ import java.lang.reflect.*;
+-import sun.dyn.WrapperInstance;
+-import sun.dyn.util.ValueConversions;
+-import sun.dyn.util.VerifyAccess;
+-import sun.dyn.util.Wrapper;
++import sun.invoke.WrapperInstance;
++import sun.invoke.util.ValueConversions;
++import sun.invoke.util.VerifyAccess;
++import sun.invoke.util.Wrapper;
+ import java.util.List;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import sun.reflect.Reflection;
+-import static java.dyn.MethodHandleStatics.*;
++import static java.lang.invoke.MethodHandleStatics.*;
+ 
+ /**
+  * This class consists exclusively of static methods that operate on or return
+@@ -43,7 +43,7 @@
+  * <li>Lookup methods which help create method handles for methods and fields.
+  * <li>Combinator methods, which combine or transform pre-existing method handles into new ones.
+  * <li>Other factory methods to create method handles that emulate other common JVM operations or control flow patterns.
+- * <li>Wrapper methods which can convert between method handles and other function-like "SAM types".
++ * <li>Wrapper methods which can convert between method handles and interface types.
+  * </ul>
+  * <p>
+  * @author John Rose, JSR 292 EG
+@@ -59,7 +59,7 @@
+     //// Method handle creation from ordinary methods.
+ 
+     /**
+-     * Return a {@link Lookup lookup object} on the caller,
++     * Returns a {@link Lookup lookup object} on the caller,
+      * which has the capability to access any method handle that the caller has access to,
+      * including direct method handles to private fields and methods.
+      * This lookup object is a <em>capability</em> which may be delegated to trusted agents.
+@@ -70,7 +70,7 @@
+     }
+ 
+     /**
+-     * Return a {@link Lookup lookup object} which is trusted minimally.
++     * Returns a {@link Lookup lookup object} which is trusted minimally.
+      * It can only be used to create method handles to
+      * publicly accessible fields and methods.
+      * <p>
+@@ -113,55 +113,55 @@
+      * <table border=1 cellpadding=5 summary="lookup method behaviors">
+      * <tr><th>lookup expression</th><th>member</th><th>behavior</th></tr>
+      * <tr>
+-     *     <td>{@linkplain java.dyn.MethodHandles.Lookup#findGetter lookup.findGetter(C.class,"f",FT.class)}</td>
++     *     <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findGetter lookup.findGetter(C.class,"f",FT.class)}</td>
+      *     <td>FT f;</td><td>(T) this.f;</td>
+      * </tr>
+      * <tr>
+-     *     <td>{@linkplain java.dyn.MethodHandles.Lookup#findStaticGetter lookup.findStaticGetter(C.class,"f",FT.class)}</td>
++     *     <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findStaticGetter lookup.findStaticGetter(C.class,"f",FT.class)}</td>
+      *     <td>static<br>FT f;</td><td>(T) C.f;</td>
+      * </tr>
+      * <tr>
+-     *     <td>{@linkplain java.dyn.MethodHandles.Lookup#findSetter lookup.findSetter(C.class,"f",FT.class)}</td>
++     *     <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findSetter lookup.findSetter(C.class,"f",FT.class)}</td>
+      *     <td>FT f;</td><td>this.f = x;</td>
+      * </tr>
+      * <tr>
+-     *     <td>{@linkplain java.dyn.MethodHandles.Lookup#findStaticSetter lookup.findStaticSetter(C.class,"f",FT.class)}</td>
++     *     <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findStaticSetter lookup.findStaticSetter(C.class,"f",FT.class)}</td>
+      *     <td>static<br>FT f;</td><td>C.f = arg;</td>
+      * </tr>
+      * <tr>
+-     *     <td>{@linkplain java.dyn.MethodHandles.Lookup#findVirtual lookup.findVirtual(C.class,"m",MT)}</td>
++     *     <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findVirtual lookup.findVirtual(C.class,"m",MT)}</td>
+      *     <td>T m(A*);</td><td>(T) this.m(arg*);</td>
+      * </tr>
+      * <tr>
+-     *     <td>{@linkplain java.dyn.MethodHandles.Lookup#findStatic lookup.findStatic(C.class,"m",MT)}</td>
++     *     <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findStatic lookup.findStatic(C.class,"m",MT)}</td>
+      *     <td>static<br>T m(A*);</td><td>(T) C.m(arg*);</td>
+      * </tr>
+      * <tr>
+-     *     <td>{@linkplain java.dyn.MethodHandles.Lookup#findSpecial lookup.findSpecial(C.class,"m",MT,this.class)}</td>
++     *     <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findSpecial lookup.findSpecial(C.class,"m",MT,this.class)}</td>
+      *     <td>T m(A*);</td><td>(T) super.m(arg*);</td>
+      * </tr>
+      * <tr>
+-     *     <td>{@linkplain java.dyn.MethodHandles.Lookup#findConstructor lookup.findConstructor(C.class,MT)}</td>
++     *     <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findConstructor lookup.findConstructor(C.class,MT)}</td>
+      *     <td>C(A*);</td><td>(T) new C(arg*);</td>
+      * </tr>
+      * <tr>
+-     *     <td>{@linkplain java.dyn.MethodHandles.Lookup#unreflectGetter lookup.unreflectGetter(aField)}</td>
++     *     <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#unreflectGetter lookup.unreflectGetter(aField)}</td>
+      *     <td>(static)?<br>FT f;</td><td>(FT) aField.get(thisOrNull);</td>
+      * </tr>
+      * <tr>
+-     *     <td>{@linkplain java.dyn.MethodHandles.Lookup#unreflectSetter lookup.unreflectSetter(aField)}</td>
++     *     <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#unreflectSetter lookup.unreflectSetter(aField)}</td>
+      *     <td>(static)?<br>FT f;</td><td>aField.set(thisOrNull, arg);</td>
+      * </tr>
+      * <tr>
+-     *     <td>{@linkplain java.dyn.MethodHandles.Lookup#unreflect lookup.unreflect(aMethod)}</td>
++     *     <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#unreflect lookup.unreflect(aMethod)}</td>
+      *     <td>(static)?<br>T m(A*);</td><td>(T) aMethod.invoke(thisOrNull, arg*);</td>
+      * </tr>
+      * <tr>
+-     *     <td>{@linkplain java.dyn.MethodHandles.Lookup#unreflectConstructor lookup.unreflectConstructor(aConstructor)}</td>
++     *     <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#unreflectConstructor lookup.unreflectConstructor(aConstructor)}</td>
+      *     <td>C(A*);</td><td>(C) aConstructor.newInstance(arg*);</td>
+      * </tr>
+      * <tr>
+-     *     <td>{@linkplain java.dyn.MethodHandles.Lookup#unreflect lookup.unreflect(aMethod)}</td>
++     *     <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#unreflect lookup.unreflect(aMethod)}</td>
+      *     <td>(static)?<br>T m(A*);</td><td>(T) aMethod.invoke(thisOrNull, arg*);</td>
+      * </tr>
+      * </table>
+@@ -376,10 +376,10 @@
+          *  and {@linkplain #PACKAGE PACKAGE (0x08)}.
+          *  <p>
+          *  A freshly-created lookup object
+-         *  on the {@linkplain java.dyn.MethodHandles#lookup() caller's class}
++         *  on the {@linkplain java.lang.invoke.MethodHandles#lookup() caller's class}
+          *  has all possible bits set, since the caller class can access all its own members.
+          *  A lookup object on a new lookup class
+-         *  {@linkplain java.dyn.MethodHandles.Lookup#in created from a previous lookup object}
++         *  {@linkplain java.lang.invoke.MethodHandles.Lookup#in created from a previous lookup object}
+          *  may have some mode bits set to zero.
+          *  The purpose of this is to restrict access via the new lookup object,
+          *  so that it can access only names which can be reached by the original
+@@ -476,7 +476,7 @@
+ 
+         private static void checkUnprivilegedlookupClass(Class<?> lookupClass) {
+             String name = lookupClass.getName();
+-            if (name.startsWith("java.dyn."))
++            if (name.startsWith("java.lang.invoke."))
+                 throw newIllegalArgumentException("illegal lookupClass: "+lookupClass);
+         }
+ 
+@@ -497,8 +497,8 @@
+          * access (public, package, private, and protected) is allowed.
+          * In this case, no suffix is added.
+          * This is true only of an object obtained originally from
+-         * {@link java.dyn.MethodHandles#lookup MethodHandles.lookup}.
+-         * Objects created by {@link java.dyn.MethodHandles.Lookup#in Lookup.in}
++         * {@link java.lang.invoke.MethodHandles#lookup MethodHandles.lookup}.
++         * Objects created by {@link java.lang.invoke.MethodHandles.Lookup#in Lookup.in}
+          * always have restricted access, and will display a suffix.
+          * <p>
+          * (It may seem strange that protected access should be
+@@ -592,8 +592,8 @@
+          * if the class is {@code MethodHandle} and the name string is
+          * {@code invokeExact} or {@code invokeGeneric}, the resulting
+          * method handle is equivalent to one produced by
+-         * {@link java.dyn.MethodHandles#exactInvoker MethodHandles.exactInvoker} or
+-         * {@link java.dyn.MethodHandles#genericInvoker MethodHandles.genericInvoker}
++         * {@link java.lang.invoke.MethodHandles#exactInvoker MethodHandles.exactInvoker} or
++         * {@link java.lang.invoke.MethodHandles#genericInvoker MethodHandles.genericInvoker}
+          * with the same {@code type} argument.
+          *
+          * @param refc the class or interface from which the method is accessed
+@@ -840,7 +840,7 @@
+         }
+ 
+         /**
+-         * Make a direct method handle to <i>m</i>, if the lookup class has permission.
++         * Makes a direct method handle to <i>m</i>, if the lookup class has permission.
+          * If <i>m</i> is non-static, the receiver argument is treated as an initial argument.
+          * If <i>m</i> is virtual, overriding is respected on every call.
+          * Unlike the Core Reflection API, exceptions are <em>not</em> wrapped.
+@@ -931,7 +931,7 @@
+          * If the field is static, the method handle will take no arguments.
+          * Otherwise, its single argument will be the instance containing
+          * the field.
+-         * If the method's {@code accessible} flag is not set,
++         * If the field's {@code accessible} flag is not set,
+          * access checking is performed immediately on behalf of the lookup class.
+          * @param f the reflected field
+          * @return a method handle which can load values from the reflected field
+@@ -949,7 +949,7 @@
+          * argument, of the field's value type, the value to be stored.
+          * Otherwise, the two arguments will be the instance containing
+          * the field, and the value to be stored.
+-         * If the method's {@code accessible} flag is not set,
++         * If the field's {@code accessible} flag is not set,
+          * access checking is performed immediately on behalf of the lookup class.
+          * @param f the reflected field
+          * @return a method handle which can store values into the reflected field
+@@ -1678,8 +1678,6 @@
+     MethodHandle insertArguments(MethodHandle target, int pos, Object... values) {
+         int insCount = values.length;
+         MethodType oldType = target.type();
+-        ArrayList<Class<?>> ptypes =
+-                new ArrayList<Class<?>>(oldType.parameterList());
+         int outargs = oldType.parameterCount();
+         int inargs  = outargs - insCount;
+         if (inargs < 0)
+@@ -1718,20 +1716,21 @@
+      * <p>
+      * <b>Example:</b>
+      * <p><blockquote><pre>
+-import static java.dyn.MethodHandles.*;
+-import static java.dyn.MethodType.*;
++import static java.lang.invoke.MethodHandles.*;
++import static java.lang.invoke.MethodType.*;
+ ...
+ MethodHandle cat = lookup().findVirtual(String.class,
+   "concat", methodType(String.class, String.class));
+ assertEquals("xy", (String) cat.invokeExact("x", "y"));
+-MethodHandle d0 = dropArguments(cat, 0, String.class);
+-assertEquals("yz", (String) d0.invokeExact("x", "y", "z"));
+-MethodHandle d1 = dropArguments(cat, 1, String.class);
+-assertEquals("xz", (String) d1.invokeExact("x", "y", "z"));
+-MethodHandle d2 = dropArguments(cat, 2, String.class);
+-assertEquals("xy", (String) d2.invokeExact("x", "y", "z"));
+-MethodHandle d12 = dropArguments(cat, 1, int.class, boolean.class);
+-assertEquals("xz", (String) d12.invokeExact("x", 12, true, "z"));
++MethodType bigType = cat.type().insertParameterTypes(0, int.class, String.class);
++MethodHandle d0 = dropArguments(cat, 0, bigType.parameterList().subList(0,2));
++assertEquals(bigType, d0.type());
++assertEquals("yz", (String) d0.invokeExact(123, "x", "y", "z"));
++     * </pre></blockquote>
++     * <p>
++     * This method is also equivalent to the following code:
++     * <p><blockquote><pre>
++     * {@link #dropArguments(MethodHandle,int,Class...) dropArguments}(target, pos, valueTypes.toArray(new Class[0]))
+      * </pre></blockquote>
+      * @param target the method handle to invoke after the arguments are dropped
+      * @param valueTypes the type(s) of the argument(s) to drop
+@@ -1762,10 +1761,34 @@
+      * after dropping the given argument(s) at the given position.
+      * The type of the new method handle will insert the given argument
+      * type(s), at that position, into the original handle's type.
+-     * This method is equivalent to the following code:
+-     * <code>
++     * <p>
++     * The <i>pos</i> may range between zero and <i>N</i>,
++     * where <i>N</i> is the number of argument types in <i>target</i>,
++     * meaning to drop the first or last argument (respectively),
++     * or an argument somewhere in between.
++     * <p>
++     * <b>Example:</b>
++     * <p><blockquote><pre>
++import static java.lang.invoke.MethodHandles.*;
++import static java.lang.invoke.MethodType.*;
++...
++MethodHandle cat = lookup().findVirtual(String.class,
++  "concat", methodType(String.class, String.class));
++assertEquals("xy", (String) cat.invokeExact("x", "y"));
++MethodHandle d0 = dropArguments(cat, 0, String.class);
++assertEquals("yz", (String) d0.invokeExact("x", "y", "z"));
++MethodHandle d1 = dropArguments(cat, 1, String.class);
++assertEquals("xz", (String) d1.invokeExact("x", "y", "z"));
++MethodHandle d2 = dropArguments(cat, 2, String.class);
++assertEquals("xy", (String) d2.invokeExact("x", "y", "z"));
++MethodHandle d12 = dropArguments(cat, 1, int.class, boolean.class);
++assertEquals("xz", (String) d12.invokeExact("x", 12, true, "z"));
++     * </pre></blockquote>
++     * <p>
++     * This method is also equivalent to the following code:
++     * <p><blockquote><pre>
+      * {@link #dropArguments(MethodHandle,int,List) dropArguments}(target, pos, Arrays.asList(valueTypes))
+-     * </code>
++     * </pre></blockquote>
+      * @param target the method handle to invoke after the arguments are dropped
+      * @param valueTypes the type(s) of the argument(s) to drop
+      * @param pos position of first argument to drop (zero for the leftmost)
+@@ -1781,7 +1804,7 @@
+     }
+ 
+     /**
+-     * Adapt a target method handle {@code target} by pre-processing
++     * Adapts a target method handle {@code target} by pre-processing
+      * one or more of its arguments, each with its own unary filter function,
+      * and then calling the target with each pre-processed argument
+      * replaced by the result of its corresponding filter function.
+@@ -1804,8 +1827,8 @@
+      * which do not correspond to argument positions in the target.
+      * <b>Example:</b>
+      * <p><blockquote><pre>
+-import static java.dyn.MethodHandles.*;
+-import static java.dyn.MethodType.*;
++import static java.lang.invoke.MethodHandles.*;
++import static java.lang.invoke.MethodType.*;
+ ...
+ MethodHandle cat = lookup().findVirtual(String.class,
+   "concat", methodType(String.class, String.class));
+@@ -1856,7 +1879,7 @@
+     }
+ 
+     /**
+-     * Adapt a target method handle {@code target} by post-processing
++     * Adapts a target method handle {@code target} by post-processing
+      * its return value with a unary filter function.
+      * <p>
+      * If a filter {@code F} applies to the return value of
+@@ -1868,8 +1891,8 @@
+      * return type of the target.
+      * <b>Example:</b>
+      * <p><blockquote><pre>
+-import static java.dyn.MethodHandles.*;
+-import static java.dyn.MethodType.*;
++import static java.lang.invoke.MethodHandles.*;
++import static java.lang.invoke.MethodType.*;
+ ...
+ MethodHandle cat = lookup().findVirtual(String.class,
+   "concat", methodType(String.class, String.class));
+@@ -1901,7 +1924,7 @@
+     }
+ 
+     /**
+-     * Adapt a target method handle {@code target} by pre-processing
++     * Adapts a target method handle {@code target} by pre-processing
+      * some of its arguments, and then calling the target with
+      * the result of the pre-processing, plus all original arguments.
+      * <p>
+@@ -1962,7 +1985,7 @@
+     }
+ 
+     /**
+-     * Make a method handle which adapts a target method handle,
++     * Makes a method handle which adapts a target method handle,
+      * by guarding it with a test, a boolean-valued method handle.
+      * If the guard fails, a fallback handle is called instead.
+      * All three method handles must have the same corresponding
+@@ -2021,7 +2044,7 @@
+     }
+ 
+     /**
+-     * Make a method handle which adapts a target method handle,
++     * Makes a method handle which adapts a target method handle,
+      * by running it inside an exception handler.
+      * If the target returns normally, the adapter returns that value.
+      * If an exception matching the specified type is thrown, the fallback
+@@ -2103,47 +2126,41 @@
+     }
+ 
+     /**
+-     * Produces an instance of the given "SAM" interface which redirects
++     * Produces an instance of the given single-method interface which redirects
+      * its calls to the given method handle.
+      * <p>
+-     * A SAM interface is an interface which declares a single abstract method.
+-     * When determining the unique abstract method of a SAM interface,
++     * A single-method interface is an interface which declares a unique method.
++     * When determining the unique method of a single-method interface,
+      * the public {@code Object} methods ({@code toString}, {@code equals}, {@code hashCode})
+-     * are disregarded.  For example, {@link java.util.Comparator} is a SAM interface,
++     * are disregarded.  For example, {@link java.util.Comparator} is a single-method interface,
+      * even though it re-declares the {@code Object.equals} method.
+-     * Also, if the SAM interface has a supertype,
+-     * the SAM interface may override an inherited method.
+-     * Any such overrides are respected, and the method handle will be accessible
+-     * by either the inherited method or the SAM method.
+-     * In particular, a {@linkplain java.lang.reflect.Method#isBridge bridge method}
+-     * may be created if the methods have different return types.
+      * <p>
+      * The type must be public.  No additional access checks are performed.
+      * <p>
+-     * The resulting instance of the required SAM type will respond to
+-     * invocation of the SAM type's single abstract method by calling
++     * The resulting instance of the required type will respond to
++     * invocation of the type's single abstract method by calling
+      * the given {@code target} on the incoming arguments,
+      * and returning or throwing whatever the {@code target}
+      * returns or throws.  The invocation will be as if by
+      * {@code target.invokeGeneric}.
+-     * The target's type will be checked before the SAM
++     * The target's type will be checked before the
+      * instance is created, as if by a call to {@code asType},
+      * which may result in a {@code WrongMethodTypeException}.
+      * <p>
+-     * The wrapper instance will implement the requested SAM interface
+-     * and its super-types, but no other SAM types.
+-     * This means that the SAM instance will not unexpectedly
++     * The wrapper instance will implement the requested interface
++     * and its super-types, but no other single-method interfaces.
++     * This means that the instance will not unexpectedly
+      * pass an {@code instanceof} test for any unrequested type.
+      * <p style="font-size:smaller;">
+      * <em>Implementation Note:</em>
+-     * Therefore, each SAM instance must implement a unique SAM type.
++     * Therefore, each instance must implement a unique single-method interface.
+      * Implementations may not bundle together
+-     * multiple SAM types onto single implementation classes
++     * multiple single-method interfaces onto single implementation classes
+      * in the style of {@link java.awt.AWTEventMulticaster}.
+      * <p>
+      * The method handle may throw an <em>undeclared exception</em>,
+      * which means any checked exception (or other checked throwable)
+-     * not declared by the SAM type's single abstract method.
++     * not declared by the requested type's single abstract method.
+      * If this happens, the throwable will be wrapped in an instance of
+      * {@link java.lang.reflect.UndeclaredThrowableException UndeclaredThrowableException}
+      * and thrown in that wrapped form.
+@@ -2153,28 +2170,37 @@
+      * by their behavior.
+      * It is not guaranteed to return a new instance for every call.
+      * <p>
++     * Because of the possibility of {@linkplain java.lang.reflect.Method#isBridge bridge methods}
++     * and other corner cases, the interface may also have several abstract methods
++     * with the same name but having distinct descriptors (types of returns and parameters).
++     * In this case, all the methods are bound in common to the one given {@code target}.
++     * The type check and effective {@code asType} conversion is applied to each
++     * method type descriptor, and all abstract methods are bound to the {@code target} in common.
++     * Beyond this type check, no further checks are made to determine that the
++     * abstract methods are related in any way.
++     * <p>
+      * Future versions of this API may accept additional types,
+      * such as abstract classes with single abstract methods.
+      * Future versions of this API may also equip wrapper instances
+      * with one or more additional public "marker" interfaces.
+      *
+      * @param target the method handle to invoke from the wrapper
+-     * @param samType the desired type of the wrapper, a SAM type
++     * @param smType the desired type of the wrapper, a single-method interface
+      * @return a correctly-typed wrapper for the given {@code target}
+      * @throws NullPointerException if either argument is null
+-     * @throws IllegalArgumentException if the {@code samType} is not a
++     * @throws IllegalArgumentException if the {@code smType} is not a
+      *         valid argument to this method
+      * @throws WrongMethodTypeException if the {@code target} cannot
+-     *         be converted to the type required by the SAM type
++     *         be converted to the type required by the requested interface
+      */
+     // Other notes to implementors:
+     // <p>
+-    // No stable mapping is promised between the SAM type and
++    // No stable mapping is promised between the single-method interface and
+     // the implementation class C.  Over time, several implementation
+-    // classes might be used for the same SAM type.
++    // classes might be used for the same type.
+     // <p>
+     // If the implementation is able
+-    // to prove that a wrapper of the required SAM type
++    // to prove that a wrapper of the required type
+     // has already been created for a given
+     // method handle, or for another method handle with the
+     // same behavior, the implementation may return that wrapper in place of
+@@ -2183,34 +2209,34 @@
+     // This method is designed to apply to common use cases
+     // where a single method handle must interoperate with
+     // an interface that implements a function-like
+-    // API.  Additional variations, such as SAM classes with
++    // API.  Additional variations, such as single-abstract-method classes with
+     // private constructors, or interfaces with multiple but related
+     // entry points, must be covered by hand-written or automatically
+     // generated adapter classes.
+     //
+     public static
+-    <T> T asInstance(final MethodHandle target, final Class<T> samType) {
++    <T> T asInstance(final MethodHandle target, final Class<T> smType) {
+         // POC implementation only; violates the above contract several ways
+-        final Method sam = getSamMethod(samType);
+-        if (sam == null)
+-            throw new IllegalArgumentException("not a SAM type: "+samType.getName());
+-        MethodType samMT = MethodType.methodType(sam.getReturnType(), sam.getParameterTypes());
+-        MethodHandle checkTarget = target.asType(samMT);  // make throw WMT
++        final Method sm = getSingleMethod(smType);
++        if (sm == null)
++            throw new IllegalArgumentException("not a single-method interface: "+smType.getName());
++        MethodType smMT = MethodType.methodType(sm.getReturnType(), sm.getParameterTypes());
++        MethodHandle checkTarget = target.asType(smMT);  // make throw WMT
+         checkTarget = checkTarget.asType(checkTarget.type().changeReturnType(Object.class));
+-        final MethodHandle vaTarget = checkTarget.asSpreader(Object[].class, samMT.parameterCount());
+-        return samType.cast(Proxy.newProxyInstance(
+-                samType.getClassLoader(),
+-                new Class[]{ samType, WrapperInstance.class },
++        final MethodHandle vaTarget = checkTarget.asSpreader(Object[].class, smMT.parameterCount());
++        return smType.cast(Proxy.newProxyInstance(
++                smType.getClassLoader(),
++                new Class[]{ smType, WrapperInstance.class },
+                 new InvocationHandler() {
+                     private Object getArg(String name) {
+                         if ((Object)name == "getWrapperInstanceTarget")  return target;
+-                        if ((Object)name == "getWrapperInstanceType")    return samType;
++                        if ((Object)name == "getWrapperInstanceType")    return smType;
+                         throw new AssertionError();
+                     }
+                     public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+                         if (method.getDeclaringClass() == WrapperInstance.class)
+                             return getArg(method.getName());
+-                        if (method.equals(sam))
++                        if (method.equals(sm))
+                             return vaTarget.invokeExact(args);
+                         if (isObjectMethod(method))
+                             return callObjectMethod(this, method, args);
+@@ -2220,7 +2246,7 @@
+     }
+ 
+     /**
+-     * Determine if the given object was produced by a call to {@link #asInstance asInstance}.
++     * Determines if the given object was produced by a call to {@link #asInstance asInstance}.
+      * @param x any reference
+      * @return true if the reference is not null and points to an object produced by {@code asInstance}
+      */
+@@ -2240,11 +2266,11 @@
+ 
+     /**
+      * Produces or recovers a target method handle which is behaviorally
+-     * equivalent to the SAM method of this wrapper instance.
++     * equivalent to the unique method of this wrapper instance.
+      * The object {@code x} must have been produced by a call to {@link #asInstance asInstance}.
+      * This requirement may be tested via {@link #isWrapperInstance isWrapperInstance}.
+      * @param x any reference
+-     * @return a method handle implementing the SAM method
++     * @return a method handle implementing the unique method
+      * @throws IllegalArgumentException if the reference x is not to a wrapper instance
+      */
+     public static
+@@ -2253,11 +2279,11 @@
+     }
+ 
+     /**
+-     * Recover the SAM type for which this wrapper instance was created.
++     * Recovers the unique single-method interface type for which this wrapper instance was created.
+      * The object {@code x} must have been produced by a call to {@link #asInstance asInstance}.
+      * This requirement may be tested via {@link #isWrapperInstance isWrapperInstance}.
+      * @param x any reference
+-     * @return the SAM type for which the wrapper was created
++     * @return the single-method interface type for which the wrapper was created
+      * @throws IllegalArgumentException if the reference x is not to a wrapper instance
+      */
+     public static
+@@ -2297,24 +2323,24 @@
+     }
+ 
+     private static
+-    Method getSamMethod(Class<?> samType) {
+-        Method sam = null;
+-        for (Method m : samType.getMethods()) {
++    Method getSingleMethod(Class<?> smType) {
++        Method sm = null;
++        for (Method m : smType.getMethods()) {
+             int mod = m.getModifiers();
+             if (Modifier.isAbstract(mod)) {
+-                if (sam != null && !isObjectMethod(sam))
++                if (sm != null && !isObjectMethod(sm))
+                     return null;  // too many abstract methods
+-                sam = m;
++                sm = m;
+             }
+         }
+-        if (!samType.isInterface() && getSamConstructor(samType) == null)
++        if (!smType.isInterface() && getSingleConstructor(smType) == null)
+             return null;  // wrong kind of constructor
+-        return sam;
++        return sm;
+     }
+ 
+     private static
+-    Constructor getSamConstructor(Class<?> samType) {
+-        for (Constructor c : samType.getDeclaredConstructors()) {
++    Constructor getSingleConstructor(Class<?> smType) {
++        for (Constructor c : smType.getDeclaredConstructors()) {
+             if (c.getParameterTypes().length == 0) {
+                 int mod = c.getModifiers();
+                 if (Modifier.isPublic(mod) || Modifier.isProtected(mod))
+diff --git a/src/share/classes/java/dyn/MethodType.java b/src/share/classes/java/lang/invoke/MethodType.java
+rename from src/share/classes/java/dyn/MethodType.java
+rename to src/share/classes/java/lang/invoke/MethodType.java
+--- a/src/share/classes/java/dyn/MethodType.java
++++ b/src/share/classes/java/lang/invoke/MethodType.java
+@@ -23,14 +23,14 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.List;
+-import sun.dyn.util.BytecodeDescriptor;
+-import static java.dyn.MethodHandleStatics.*;
++import sun.invoke.util.BytecodeDescriptor;
++import static java.lang.invoke.MethodHandleStatics.*;
+ 
+ /**
+  * A method type represents the arguments and return type accepted and
+@@ -140,7 +140,7 @@
+     static final Class<?>[] NO_PTYPES = {};
+ 
+     /**
+-     * Find or create an instance of the given method type.
++     * Finds or creates an instance of the given method type.
+      * @param rtype  the return type
+      * @param ptypes the parameter types
+      * @return a method type with the given components
+@@ -490,7 +490,7 @@
+     }
+ 
+     /**
+-     * Convert all wrapper types to their corresponding primitive types.
++     * Converts all wrapper types to their corresponding primitive types.
+      * Convenience method for {@link #methodType(java.lang.Class, java.lang.Class[]) methodType}.
+      * All primitive types (including {@code void}) will remain unchanged.
+      * A return type of {@code java.lang.Void} is changed to {@code void}.
+@@ -629,7 +629,7 @@
+     /// Queries which have to do with the bytecode architecture
+ 
+     /** Reports the number of JVM stack slots required to invoke a method
+-     * of this type.  Note that (for historic reasons) the JVM requires
++     * of this type.  Note that (for historical reasons) the JVM requires
+      * a second stack slot to pass long and double arguments.
+      * So this method returns {@link #parameterCount() parameterCount} plus the
+      * number of long and double parameters (if any).
+@@ -693,7 +693,7 @@
+     }
+ 
+     /**
+-     * Find or create an instance of a method type, given the spelling of its bytecode descriptor.
++     * Finds or creates an instance of a method type, given the spelling of its bytecode descriptor.
+      * Convenience method for {@link #methodType(java.lang.Class, java.lang.Class[]) methodType}.
+      * Any class or interface name embedded in the descriptor string
+      * will be resolved by calling {@link ClassLoader#loadClass(java.lang.String)}
+diff --git a/src/share/classes/java/dyn/MethodTypeForm.java b/src/share/classes/java/lang/invoke/MethodTypeForm.java
+rename from src/share/classes/java/dyn/MethodTypeForm.java
+rename to src/share/classes/java/lang/invoke/MethodTypeForm.java
+--- a/src/share/classes/java/dyn/MethodTypeForm.java
++++ b/src/share/classes/java/lang/invoke/MethodTypeForm.java
+@@ -23,10 +23,10 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+-import sun.dyn.util.Wrapper;
+-import static java.dyn.MethodHandleStatics.*;
++import sun.invoke.util.Wrapper;
++import static java.lang.invoke.MethodHandleStatics.*;
+ 
+ /**
+  * Shared information for a group of method types, which differ
+diff --git a/src/share/classes/java/dyn/MutableCallSite.java b/src/share/classes/java/lang/invoke/MutableCallSite.java
+rename from src/share/classes/java/dyn/MutableCallSite.java
+rename to src/share/classes/java/lang/invoke/MutableCallSite.java
+--- a/src/share/classes/java/dyn/MutableCallSite.java
++++ b/src/share/classes/java/lang/invoke/MutableCallSite.java
+@@ -23,7 +23,7 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+diff --git a/src/share/classes/java/dyn/SpreadGeneric.java b/src/share/classes/java/lang/invoke/SpreadGeneric.java
+rename from src/share/classes/java/dyn/SpreadGeneric.java
+rename to src/share/classes/java/lang/invoke/SpreadGeneric.java
+--- a/src/share/classes/java/dyn/SpreadGeneric.java
++++ b/src/share/classes/java/lang/invoke/SpreadGeneric.java
+@@ -23,14 +23,14 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+-import sun.dyn.util.ValueConversions;
++import sun.invoke.util.ValueConversions;
+ import java.lang.reflect.Constructor;
+ import java.lang.reflect.InvocationTargetException;
+ import java.util.ArrayList;
+-import static java.dyn.MethodHandleStatics.*;
+-import static java.dyn.MethodHandles.Lookup.IMPL_LOOKUP;
++import static java.lang.invoke.MethodHandleStatics.*;
++import static java.lang.invoke.MethodHandles.Lookup.IMPL_LOOKUP;
+ 
+ /**
+  * Generic spread adapter.
+@@ -251,7 +251,7 @@
+             return outer.select(av, n);
+         }
+ 
+-        static private final String CLASS_PREFIX; // "java.dyn.SpreadGeneric$"
++        static private final String CLASS_PREFIX; // "java.lang.invoke.SpreadGeneric$"
+         static {
+             String aname = Adapter.class.getName();
+             String sname = Adapter.class.getSimpleName();
+diff --git a/src/share/classes/java/dyn/SwitchPoint.java b/src/share/classes/java/lang/invoke/SwitchPoint.java
+rename from src/share/classes/java/dyn/SwitchPoint.java
+rename to src/share/classes/java/lang/invoke/SwitchPoint.java
+--- a/src/share/classes/java/dyn/SwitchPoint.java
++++ b/src/share/classes/java/lang/invoke/SwitchPoint.java
+@@ -23,7 +23,7 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+ /**
+  * <p>
+@@ -73,6 +73,10 @@
+  * Switch points are useful without subclassing.  They may also be subclassed.
+  * This may be useful in order to associate application-specific invalidation logic
+  * with the switch point.
++ * Notice that there is no permanent association between a switch point and
++ * the method handles it produces and consumes.
++ * The garbage collector may collect method handles produced or consumed
++ * by a switch point independently of the lifetime of the switch point itself.
+  * <p style="font-size:smaller;">
+  * <em>Implementation Note:</em>
+  * A switch point behaves as if implemented on top of {@link MutableCallSite},
+diff --git a/src/share/classes/java/dyn/ToGeneric.java b/src/share/classes/java/lang/invoke/ToGeneric.java
+rename from src/share/classes/java/dyn/ToGeneric.java
+rename to src/share/classes/java/lang/invoke/ToGeneric.java
+--- a/src/share/classes/java/dyn/ToGeneric.java
++++ b/src/share/classes/java/lang/invoke/ToGeneric.java
+@@ -23,14 +23,14 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+ import java.lang.reflect.Constructor;
+ import java.lang.reflect.InvocationTargetException;
+-import sun.dyn.util.ValueConversions;
+-import sun.dyn.util.Wrapper;
+-import static java.dyn.MethodHandleStatics.*;
+-import static java.dyn.MethodHandles.Lookup.IMPL_LOOKUP;
++import sun.invoke.util.ValueConversions;
++import sun.invoke.util.Wrapper;
++import static java.lang.invoke.MethodHandleStatics.*;
++import static java.lang.invoke.MethodHandles.Lookup.IMPL_LOOKUP;
+ 
+ /**
+  * Adapters which mediate between incoming calls which are not generic
+@@ -395,7 +395,7 @@
+         protected float  return_F(Object res) throws Throwable { return (float) convert.invokeExact(res); }
+         protected double return_D(Object res) throws Throwable { return (double)convert.invokeExact(res); }
+ 
+-        static private final String CLASS_PREFIX; // "java.dyn.ToGeneric$"
++        static private final String CLASS_PREFIX; // "java.lang.invoke.ToGeneric$"
+         static {
+             String aname = Adapter.class.getName();
+             String sname = Adapter.class.getSimpleName();
+@@ -451,14 +451,15 @@
+     static String[] TCHARS = { "L",     "I",      "J",      "F",      "D",     "A" };
+     static String[][] TEMPLATES = { {
+         "@for@ arity=0..3   rcat<=4 nrefs<=99 nints<=99 nlongs<=99",
+-        "@for@ arity=4..5   rcat<=2 nrefs<=99 nints<=99 nlongs<=99",
++        "@for@ arity=4..4   rcat<=4 nrefs<=99 nints<=99 nlongs<=99",
++        "@for@ arity=5..5   rcat<=2 nrefs<=99 nints<=99 nlongs<=99",
+         "@for@ arity=6..10  rcat<=2 nrefs<=99 nints=0   nlongs<=99",
+         "    //@each-cat@",
+         "    static class @cat@ extends Adapter {",
+         "        protected @cat@(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype",
+         "        protected @cat@(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { super(e, i, c, t); }",
+         "        protected @cat@ makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { return new @cat@(e, i, c, t); }",
+-        "        protected Object target(@Ovav@)   throws Throwable { return invoker.invokeExact(target, @av@); }",
++        "        protected Object target(@Ovav@)   throws Throwable { return invoker.invokeExact(target@comma@@av@); }",
+         "        //@each-Tv@",
+         "        protected Object target@cat@(@Tvav@) throws Throwable { return target(@av@); }",
+         "        //@end-Tv@",
+@@ -470,7 +471,7 @@
+         "    }",
+     } };
+     enum VAR {
+-        cat, R, Rc, Tv, av, Tvav, Ovav;
++        cat, R, Rc, Tv, av, comma, Tvav, Ovav;
+         public final String pattern = "@"+toString().replace('_','.')+"@";
+         public String binding;
+         static void makeBindings(boolean topLevel, int rcat, int nrefs, int nints, int nlongs) {
+@@ -492,12 +493,13 @@
+             }
+             VAR.Tv.binding = comma(Tv);
+             VAR.av.binding = comma(av);
++            VAR.comma.binding = (av.length == 0 ? "" : ", ");
+             VAR.Tvav.binding = comma(Tvav);
+             VAR.Ovav.binding = comma(Ovav);
+         }
+         static String arg(int i) { return "a"+i; }
+         static String param(String t, String a) { return t+" "+a; }
+-        static String comma(String[] v) { return comma(v, ""); }
++        static String comma(String[] v) { return comma("", v); }
+         static String comma(String sep, String[] v) {
+             if (v.length == 0)  return "";
+             String res = sep+v[0];
+@@ -734,7 +736,7 @@
+         protected float  invoke_F(long   a0, long   a1, long   a2) throws Throwable { return return_F(targetA3(a0, a1, a2)); }
+         protected double invoke_D(long   a0, long   a1, long   a2) throws Throwable { return return_D(targetA3(a0, a1, a2)); }
+     }
+-//params=[4, 5, 2, 99, 99, 99]
++//params=[4, 4, 4, 99, 99, 99]
+     static class A4 extends Adapter {
+         protected A4(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+         protected A4(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { super(e, i, c, t); }
+@@ -752,31 +754,50 @@
+         protected Object invoke_L(Object a0, Object a1, Object a2, Object a3) throws Throwable { return return_L(targetA4(a0, a1, a2, a3)); }
+         protected int    invoke_I(Object a0, Object a1, Object a2, Object a3) throws Throwable { return return_I(targetA4(a0, a1, a2, a3)); }
+         protected long   invoke_J(Object a0, Object a1, Object a2, Object a3) throws Throwable { return return_J(targetA4(a0, a1, a2, a3)); }
++        protected float  invoke_F(Object a0, Object a1, Object a2, Object a3) throws Throwable { return return_F(targetA4(a0, a1, a2, a3)); }
++        protected double invoke_D(Object a0, Object a1, Object a2, Object a3) throws Throwable { return return_D(targetA4(a0, a1, a2, a3)); }
+         protected Object invoke_L(Object a0, Object a1, Object a2, int    a3) throws Throwable { return return_L(targetA4(a0, a1, a2, a3)); }
+         protected int    invoke_I(Object a0, Object a1, Object a2, int    a3) throws Throwable { return return_I(targetA4(a0, a1, a2, a3)); }
+         protected long   invoke_J(Object a0, Object a1, Object a2, int    a3) throws Throwable { return return_J(targetA4(a0, a1, a2, a3)); }
++        protected float  invoke_F(Object a0, Object a1, Object a2, int    a3) throws Throwable { return return_F(targetA4(a0, a1, a2, a3)); }
++        protected double invoke_D(Object a0, Object a1, Object a2, int    a3) throws Throwable { return return_D(targetA4(a0, a1, a2, a3)); }
+         protected Object invoke_L(Object a0, Object a1, int    a2, int    a3) throws Throwable { return return_L(targetA4(a0, a1, a2, a3)); }
+         protected int    invoke_I(Object a0, Object a1, int    a2, int    a3) throws Throwable { return return_I(targetA4(a0, a1, a2, a3)); }
+         protected long   invoke_J(Object a0, Object a1, int    a2, int    a3) throws Throwable { return return_J(targetA4(a0, a1, a2, a3)); }
++        protected float  invoke_F(Object a0, Object a1, int    a2, int    a3) throws Throwable { return return_F(targetA4(a0, a1, a2, a3)); }
++        protected double invoke_D(Object a0, Object a1, int    a2, int    a3) throws Throwable { return return_D(targetA4(a0, a1, a2, a3)); }
+         protected Object invoke_L(Object a0, int    a1, int    a2, int    a3) throws Throwable { return return_L(targetA4(a0, a1, a2, a3)); }
+         protected int    invoke_I(Object a0, int    a1, int    a2, int    a3) throws Throwable { return return_I(targetA4(a0, a1, a2, a3)); }
+         protected long   invoke_J(Object a0, int    a1, int    a2, int    a3) throws Throwable { return return_J(targetA4(a0, a1, a2, a3)); }
++        protected float  invoke_F(Object a0, int    a1, int    a2, int    a3) throws Throwable { return return_F(targetA4(a0, a1, a2, a3)); }
++        protected double invoke_D(Object a0, int    a1, int    a2, int    a3) throws Throwable { return return_D(targetA4(a0, a1, a2, a3)); }
+         protected Object invoke_L(int    a0, int    a1, int    a2, int    a3) throws Throwable { return return_L(targetA4(a0, a1, a2, a3)); }
+         protected int    invoke_I(int    a0, int    a1, int    a2, int    a3) throws Throwable { return return_I(targetA4(a0, a1, a2, a3)); }
+         protected long   invoke_J(int    a0, int    a1, int    a2, int    a3) throws Throwable { return return_J(targetA4(a0, a1, a2, a3)); }
++        protected float  invoke_F(int    a0, int    a1, int    a2, int    a3) throws Throwable { return return_F(targetA4(a0, a1, a2, a3)); }
++        protected double invoke_D(int    a0, int    a1, int    a2, int    a3) throws Throwable { return return_D(targetA4(a0, a1, a2, a3)); }
+         protected Object invoke_L(Object a0, Object a1, Object a2, long   a3) throws Throwable { return return_L(targetA4(a0, a1, a2, a3)); }
+         protected int    invoke_I(Object a0, Object a1, Object a2, long   a3) throws Throwable { return return_I(targetA4(a0, a1, a2, a3)); }
+         protected long   invoke_J(Object a0, Object a1, Object a2, long   a3) throws Throwable { return return_J(targetA4(a0, a1, a2, a3)); }
++        protected float  invoke_F(Object a0, Object a1, Object a2, long   a3) throws Throwable { return return_F(targetA4(a0, a1, a2, a3)); }
++        protected double invoke_D(Object a0, Object a1, Object a2, long   a3) throws Throwable { return return_D(targetA4(a0, a1, a2, a3)); }
+         protected Object invoke_L(Object a0, Object a1, long   a2, long   a3) throws Throwable { return return_L(targetA4(a0, a1, a2, a3)); }
+         protected int    invoke_I(Object a0, Object a1, long   a2, long   a3) throws Throwable { return return_I(targetA4(a0, a1, a2, a3)); }
+         protected long   invoke_J(Object a0, Object a1, long   a2, long   a3) throws Throwable { return return_J(targetA4(a0, a1, a2, a3)); }
++        protected float  invoke_F(Object a0, Object a1, long   a2, long   a3) throws Throwable { return return_F(targetA4(a0, a1, a2, a3)); }
++        protected double invoke_D(Object a0, Object a1, long   a2, long   a3) throws Throwable { return return_D(targetA4(a0, a1, a2, a3)); }
+         protected Object invoke_L(Object a0, long   a1, long   a2, long   a3) throws Throwable { return return_L(targetA4(a0, a1, a2, a3)); }
+         protected int    invoke_I(Object a0, long   a1, long   a2, long   a3) throws Throwable { return return_I(targetA4(a0, a1, a2, a3)); }
+         protected long   invoke_J(Object a0, long   a1, long   a2, long   a3) throws Throwable { return return_J(targetA4(a0, a1, a2, a3)); }
++        protected float  invoke_F(Object a0, long   a1, long   a2, long   a3) throws Throwable { return return_F(targetA4(a0, a1, a2, a3)); }
++        protected double invoke_D(Object a0, long   a1, long   a2, long   a3) throws Throwable { return return_D(targetA4(a0, a1, a2, a3)); }
+         protected Object invoke_L(long   a0, long   a1, long   a2, long   a3) throws Throwable { return return_L(targetA4(a0, a1, a2, a3)); }
+         protected int    invoke_I(long   a0, long   a1, long   a2, long   a3) throws Throwable { return return_I(targetA4(a0, a1, a2, a3)); }
+         protected long   invoke_J(long   a0, long   a1, long   a2, long   a3) throws Throwable { return return_J(targetA4(a0, a1, a2, a3)); }
++        protected float  invoke_F(long   a0, long   a1, long   a2, long   a3) throws Throwable { return return_F(targetA4(a0, a1, a2, a3)); }
++        protected double invoke_D(long   a0, long   a1, long   a2, long   a3) throws Throwable { return return_D(targetA4(a0, a1, a2, a3)); }
+     }
++//params=[5, 5, 2, 99, 99, 99]
+     static class A5 extends Adapter {
+         protected A5(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+         protected A5(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t) { super(e, i, c, t); }
+diff --git a/src/share/classes/java/dyn/VolatileCallSite.java b/src/share/classes/java/lang/invoke/VolatileCallSite.java
+rename from src/share/classes/java/dyn/VolatileCallSite.java
+rename to src/share/classes/java/lang/invoke/VolatileCallSite.java
+--- a/src/share/classes/java/dyn/VolatileCallSite.java
++++ b/src/share/classes/java/lang/invoke/VolatileCallSite.java
+@@ -23,7 +23,7 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+ /**
+  * A {@code VolatileCallSite} is a {@link CallSite} whose target acts like a volatile variable.
+diff --git a/src/share/classes/java/dyn/WrongMethodTypeException.java b/src/share/classes/java/lang/invoke/WrongMethodTypeException.java
+rename from src/share/classes/java/dyn/WrongMethodTypeException.java
+rename to src/share/classes/java/lang/invoke/WrongMethodTypeException.java
+--- a/src/share/classes/java/dyn/WrongMethodTypeException.java
++++ b/src/share/classes/java/lang/invoke/WrongMethodTypeException.java
+@@ -23,7 +23,7 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+ 
+ /**
+  * Thrown to indicate that code has attempted to call a method handle
+diff --git a/src/share/classes/java/dyn/package-info.java b/src/share/classes/java/lang/invoke/package-info.java
+rename from src/share/classes/java/dyn/package-info.java
+rename to src/share/classes/java/lang/invoke/package-info.java
+--- a/src/share/classes/java/dyn/package-info.java
++++ b/src/share/classes/java/lang/invoke/package-info.java
+@@ -27,21 +27,18 @@
+  * The {@code java.lang.invoke} package contains dynamic language support provided directly by
+  * the Java core class libraries and virtual machine.
+  *
+- * <p style="font-size:smaller;">
+- * <em>Historic Note:</em> In some early versions of Java SE 7,
+- * the name of this package is {@code java.dyn}.
+  * <p>
+  * Certain types in this package have special relations to dynamic
+  * language support in the virtual machine:
+  * <ul>
+- * <li>The class {@link java.dyn.MethodHandle MethodHandle} contains
++ * <li>The class {@link java.lang.invoke.MethodHandle MethodHandle} contains
+  * <a href="MethodHandle.html#sigpoly">signature polymorphic methods</a>
+  * which can be linked regardless of their type descriptor.
+  * Normally, method linkage requires exact matching of type descriptors.
+  * </li>
+  *
+  * <li>The JVM bytecode format supports immediate constants of
+- * the classes {@link java.dyn.MethodHandle MethodHandle} and {@link java.dyn.MethodType MethodType}.
++ * the classes {@link java.lang.invoke.MethodHandle MethodHandle} and {@link java.lang.invoke.MethodType MethodType}.
+  * </li>
+  * </ul>
+  *
+@@ -59,7 +56,7 @@
+  * with tag {@code CONSTANT_InvokeDynamic} (decimal 18).  See below for its format.
+  * The entry specifies the following information:
+  * <ul>
+- * <li>a bootstrap method (a {@link java.dyn.MethodHandle MethodHandle} constant)</li>
++ * <li>a bootstrap method (a {@link java.lang.invoke.MethodHandle MethodHandle} constant)</li>
+  * <li>the dynamic invocation name (a UTF8 string)</li>
+  * <li>the argument and return types of the call (encoded as a type descriptor in a UTF8 string)</li>
+  * <li>optionally, a sequence of additional <em>static arguments</em> to the bootstrap method ({@code ldc}-type constants)</li>
+@@ -75,11 +72,6 @@
+  * A dynamic call site is linked by means of a bootstrap method,
+  * as <a href="#bsm">described below</a>.
+  *
+- * <p style="font-size:smaller;">
+- * <em>Historic Note:</em> Some older JVMs may allow the index of a {@code CONSTANT_NameAndType}
+- * instead of a {@code CONSTANT_InvokeDynamic}.  In earlier, obsolete versions of this API, the
+- * bootstrap method was specified dynamically, in a per-class basis, during class initialization.
+- *
+  * <h3><a name="indycon"></a>constant pool entries for {@code invokedynamic} instructions</h3>
+  * If a constant pool entry has the tag {@code CONSTANT_InvokeDynamic} (decimal 18),
+  * it must contain exactly four more bytes after the tag.
+@@ -95,20 +87,20 @@
+  * except that the bootstrap method specifier reference replaces
+  * the {@code CONSTANT_Class} reference of a {@code CONSTANT_Methodref} entry.
+  *
+- * <h3><a name="mtcon"></a>constant pool entries for {@linkplain java.dyn.MethodType method types}</h3>
++ * <h3><a name="mtcon"></a>constant pool entries for {@linkplain java.lang.invoke.MethodType method types}</h3>
+  * If a constant pool entry has the tag {@code CONSTANT_MethodType} (decimal 16),
+  * it must contain exactly two more bytes, which must be an index to a {@code CONSTANT_Utf8}
+  * entry which represents a method type descriptor.
+  * <p>
+  * The JVM will ensure that on first
+- * execution of an {@code ldc} instruction for this entry, a {@link java.dyn.MethodType MethodType}
++ * execution of an {@code ldc} instruction for this entry, a {@link java.lang.invoke.MethodType MethodType}
+  * will be created which represents the type descriptor.
+  * Any classes mentioned in the {@code MethodType} will be loaded if necessary,
+  * but not initialized.
+  * Access checking and error reporting is performed exactly as it is for
+  * references by {@code ldc} instructions to {@code CONSTANT_Class} constants.
+  *
+- * <h3><a name="mhcon"></a>constant pool entries for {@linkplain java.dyn.MethodHandle method handles}</h3>
++ * <h3><a name="mhcon"></a>constant pool entries for {@linkplain java.lang.invoke.MethodHandle method handles}</h3>
+  * If a constant pool entry has the tag {@code CONSTANT_MethodHandle} (decimal 15),
+  * it must contain exactly three more bytes.  The first byte after the tag is a subtag
+  * value which must be in the range 1 through 9, and the last two must be an index to a
+@@ -119,7 +111,7 @@
+  * must agree according to the table below.
+  * <p>
+  * The JVM will ensure that on first execution of an {@code ldc} instruction
+- * for this entry, a {@link java.dyn.MethodHandle MethodHandle} will be created which represents
++ * for this entry, a {@link java.lang.invoke.MethodHandle MethodHandle} will be created which represents
+  * the field or method reference, according to the specific mode implied by the subtag.
+  * <p>
+  * As with {@code CONSTANT_Class} and {@code CONSTANT_MethodType} constants,
+@@ -135,23 +127,23 @@
+  * <table border=1 cellpadding=5 summary="CONSTANT_MethodHandle subtypes">
+  * <tr><th>N</th><th>subtag name</th><th>member</th><th>MH type</th><th>bytecode behavior</th><th>lookup expression</th></tr>
+  * <tr><td>1</td><td>REF_getField</td><td>C.f:T</td><td>(C)T</td><td>getfield C.f:T</td>
+- *               <td>{@linkplain java.dyn.MethodHandles.Lookup#findGetter findGetter(C.class,"f",T.class)}</td></tr>
++ *               <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findGetter findGetter(C.class,"f",T.class)}</td></tr>
+  * <tr><td>2</td><td>REF_getStatic</td><td>C.f:T</td><td>(&nbsp;)T</td><td>getstatic C.f:T</td>
+- *               <td>{@linkplain java.dyn.MethodHandles.Lookup#findStaticGetter findStaticGetter(C.class,"f",T.class)}</td></tr>
++ *               <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findStaticGetter findStaticGetter(C.class,"f",T.class)}</td></tr>
+  * <tr><td>3</td><td>REF_putField</td><td>C.f:T</td><td>(C,T)void</td><td>putfield C.f:T</td>
+- *               <td>{@linkplain java.dyn.MethodHandles.Lookup#findSetter findSetter(C.class,"f",T.class)}</td></tr>
++ *               <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findSetter findSetter(C.class,"f",T.class)}</td></tr>
+  * <tr><td>4</td><td>REF_putStatic</td><td>C.f:T</td><td>(T)void</td><td>putstatic C.f:T</td>
+- *               <td>{@linkplain java.dyn.MethodHandles.Lookup#findStaticSetter findStaticSetter(C.class,"f",T.class)}</td></tr>
++ *               <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findStaticSetter findStaticSetter(C.class,"f",T.class)}</td></tr>
+  * <tr><td>5</td><td>REF_invokeVirtual</td><td>C.m(A*)T</td><td>(C,A*)T</td><td>invokevirtual C.m(A*)T</td>
+- *               <td>{@linkplain java.dyn.MethodHandles.Lookup#findVirtual findVirtual(C.class,"m",MT)}</td></tr>
++ *               <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findVirtual findVirtual(C.class,"m",MT)}</td></tr>
+  * <tr><td>6</td><td>REF_invokeStatic</td><td>C.m(A*)T</td><td>(C,A*)T</td><td>invokestatic C.m(A*)T</td>
+- *               <td>{@linkplain java.dyn.MethodHandles.Lookup#findStatic findStatic(C.class,"m",MT)}</td></tr>
++ *               <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findStatic findStatic(C.class,"m",MT)}</td></tr>
+  * <tr><td>7</td><td>REF_invokeSpecial</td><td>C.m(A*)T</td><td>(C,A*)T</td><td>invokespecial C.m(A*)T</td>
+- *               <td>{@linkplain java.dyn.MethodHandles.Lookup#findSpecial findSpecial(C.class,"m",MT,this.class)}</td></tr>
++ *               <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findSpecial findSpecial(C.class,"m",MT,this.class)}</td></tr>
+  * <tr><td>8</td><td>REF_newInvokeSpecial</td><td>C.&lt;init&gt;(A*)void</td><td>(A*)C</td><td>new C; dup; invokespecial C.&lt;init&gt;(A*)void</td>
+- *               <td>{@linkplain java.dyn.MethodHandles.Lookup#findConstructor findConstructor(C.class,MT)}</td></tr>
++ *               <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findConstructor findConstructor(C.class,MT)}</td></tr>
+  * <tr><td>9</td><td>REF_invokeInterface</td><td>C.m(A*)T</td><td>(C,A*)T</td><td>invokeinterface C.m(A*)T</td>
+- *               <td>{@linkplain java.dyn.MethodHandles.Lookup#findVirtual findVirtual(C.class,"m",MT)}</td></tr>
++ *               <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findVirtual findVirtual(C.class,"m",MT)}</td></tr>
+  * </table>
+  * </code>
+  * Here, the type {@code C} is taken from the {@code CONSTANT_Class} reference associated
+@@ -169,7 +161,7 @@
+  * and returns the same result (if any) as the corresponding <em>bytecode behavior</em>.
+  * <p>
+  * Each method handle constant also has an equivalent reflective <em>lookup expression</em>,
+- * which is a query to a method in {@link java.dyn.MethodHandles.Lookup}.
++ * which is a query to a method in {@link java.lang.invoke.MethodHandles.Lookup}.
+  * In the example lookup method expression given in the table above, the name {@code MT}
+  * stands for a {@code MethodType} built from {@code T} and the sequence of argument types {@code A*}.
+  * (Note that the type {@code C} is not prepended to the query type {@code MT} even if the member is non-static.)
+@@ -191,7 +183,7 @@
+  * A constant may refer to a method or constructor with the {@code varargs}
+  * bit (hexadecimal {@code 0x0080}) set in its modifier bitmask.
+  * The method handle constant produced for such a method behaves as if
+- * it were created by {@link java.dyn.MethodHandle#asVarargsCollector asVarargsCollector}.
++ * it were created by {@link java.lang.invoke.MethodHandle#asVarargsCollector asVarargsCollector}.
+  * In other words, the constant method handle will exhibit variable arity,
+  * when invoked via {@code invokeGeneric}.
+  * On the other hand, its behavior with respect to {@code invokeExact} will be the same
+@@ -225,7 +217,7 @@
+  * the call site must first be <em>linked</em>.
+  * Linking is accomplished by calling a <em>bootstrap method</em>
+  * which is given the static information content of the call site,
+- * and which must produce a {@link java.dyn.MethodHandle method handle}
++ * and which must produce a {@link java.lang.invoke.MethodHandle method handle}
+  * that gives the behavior of the call site.
+  * <p>
+  * Each {@code invokedynamic} instruction statically specifies its own
+@@ -234,7 +226,7 @@
+  * just like {@code invokevirtual} and the other invoke instructions.
+  * <p>
+  * Linking starts with resolving the constant pool entry for the
+- * bootstrap method, and resolving a {@link java.dyn.MethodType MethodType} object for
++ * bootstrap method, and resolving a {@link java.lang.invoke.MethodType MethodType} object for
+  * the type descriptor of the dynamic call site.
+  * This resolution process may trigger class loading.
+  * It may therefore throw an error if a class fails to load.
+@@ -251,8 +243,8 @@
+  * <li>optionally, one or more <a href="#args">additional static arguments</a> </li>
+  * </ul>
+  * The method handle is then applied to the other values as if by
+- * {@link java.dyn.MethodHandle#invokeGeneric invokeGeneric}.
+- * The returned result must be a {@link java.dyn.CallSite CallSite} (or a subclass).
++ * {@link java.lang.invoke.MethodHandle#invokeGeneric invokeGeneric}.
++ * The returned result must be a {@link java.lang.invoke.CallSite CallSite} (or a subclass).
+  * The type of the call site's target must be exactly equal to the type
+  * derived from the dynamic call site's type descriptor and passed to
+  * the bootstrap method.
+@@ -263,18 +255,12 @@
+  * For example, the first argument could be {@code Object}
+  * instead of {@code MethodHandles.Lookup}, and the return type
+  * could also be {@code Object} instead of {@code CallSite}.
+- * <p>
+- * As with any method handle constant, a {@code varargs} modifier bit
+- * on the bootstrap method is ignored.
+- * <p>
+- * Note that the first argument of the bootstrap method cannot be
+- * a simple {@code Class} reference.  (This is a change from earlier
+- * versions of this specification.  If the caller class is needed,
+- * it is easy to {@linkplain java.dyn.MethodHandles.Lookup#lookupClass() extract it}
+- * from the {@code Lookup} object.)
++ * (Note that the types and number of the stacked arguments limit
++ * the legal kinds of bootstrap methods to appropriately typed
++ * static methods and constructors of {@code CallSite} subclasses.)
+  * <p>
+  * After resolution, the linkage process may fail in a variety of ways.
+- * All failures are reported by an {@link java.dyn.InvokeDynamicBootstrapError InvokeDynamicBootstrapError},
++ * All failures are reported by a {@link java.lang.BootstrapMethodError BootstrapMethodError},
+  * which is thrown as the abnormal termination of the dynamic call
+  * site execution.
+  * The following circumstances will cause this:
+@@ -290,7 +276,7 @@
+  * <li>the bootstrap method has a wrong argument or return type </li>
+  * <li>the bootstrap method invocation completes abnormally </li>
+  * <li>the result from the bootstrap invocation is not a reference to
+- *     an object of type {@link java.dyn.CallSite CallSite} </li>
++ *     an object of type {@link java.lang.invoke.CallSite CallSite} </li>
+  * <li>the target of the {@code CallSite} does not have a target of
+  *     the expected {@code MethodType} </li>
+  * </ul>
+@@ -309,7 +295,7 @@
+  * <p>
+  * In an application which requires dynamic call sites with individually
+  * mutable behaviors, their bootstrap methods should produce distinct
+- * {@link java.dyn.CallSite CallSite} objects, one for each linkage request.
++ * {@link java.lang.invoke.CallSite CallSite} objects, one for each linkage request.
+  * Alternatively, an application can link a single {@code CallSite} object
+  * to several {@code invokedynamic} instructions, in which case
+  * a change to the target method will become visible at each of
+@@ -322,11 +308,12 @@
+  * chosen target object.
+  *
+  * <p style="font-size:smaller;">
+- * <em>Historic Note:</em> Unlike some previous versions of this specification,
+- * these rules do not enable the JVM to duplicate dynamic call sites,
++ * <em>Discussion:</em>
++ * These rules do not enable the JVM to duplicate dynamic call sites,
+  * or to issue &ldquo;causeless&rdquo; bootstrap method calls.
+  * Every dynamic call site transitions at most once from unlinked to linked,
+  * just before its first invocation.
++ * There is no way to undo the effect of a completed bootstrap method call.
+  *
+  * <h3><a name="bsmattr">the {@code BootstrapMethods} attribute </h3>
+  * Each {@code CONSTANT_InvokeDynamic} entry contains an index which references
+@@ -354,7 +341,7 @@
+  * <h3><a name="args">static arguments to the bootstrap method</h3>
+  * An {@code invokedynamic} instruction specifies at least three arguments
+  * to pass to its bootstrap method:
+- * The caller class (expressed as a {@link java.dyn.MethodHandles.Lookup Lookup object},
++ * The caller class (expressed as a {@link java.lang.invoke.MethodHandles.Lookup Lookup object},
+  * the name (extracted from the {@code CONSTANT_NameAndType} entry),
+  * and the type (also extracted from the {@code CONSTANT_NameAndType} entry).
+  * The {@code invokedynamic} instruction may specify additional metadata values
+@@ -382,8 +369,8 @@
+  * <tr><td>CONSTANT_Long</td><td><code>java.lang.Long</code></td><td>the indexed long value</td></tr>
+  * <tr><td>CONSTANT_Float</td><td><code>java.lang.Float</code></td><td>the indexed float value</td></tr>
+  * <tr><td>CONSTANT_Double</td><td><code>java.lang.Double</code></td><td>the indexed double value</td></tr>
+- * <tr><td>CONSTANT_MethodHandle</td><td><code>java.dyn.MethodHandle</code></td><td>the indexed method handle constant</td></tr>
+- * <tr><td>CONSTANT_MethodType</td><td><code>java.dyn.MethodType</code></td><td>the indexed method type constant</td></tr>
++ * <tr><td>CONSTANT_MethodHandle</td><td><code>java.lang.invoke.MethodHandle</code></td><td>the indexed method handle constant</td></tr>
++ * <tr><td>CONSTANT_MethodType</td><td><code>java.lang.invoke.MethodType</code></td><td>the indexed method type constant</td></tr>
+  * </table>
+  * </code>
+  * <p>
+@@ -403,7 +390,7 @@
+  * then some or all of the arguments specified here may be collected into a trailing array parameter.
+  * (This is not a special rule, but rather a useful consequence of the interaction
+  * between {@code CONSTANT_MethodHandle} constants, the modifier bit for variable arity methods,
+- * and the {@code java.dyn.MethodHandle#asVarargsCollector asVarargsCollector} transformation.)
++ * and the {@code java.lang.invoke.MethodHandle#asVarargsCollector asVarargsCollector} transformation.)
+  * <p>
+  * Given these rules, here are examples of legal bootstrap method declarations,
+  * given various numbers {@code N} of extra arguments.
+@@ -436,7 +423,7 @@
+  * constant as an {@code Object}, but the type matching machinery of {@code invokeGeneric}
+  * will cast the reference back to {@code MethodHandle} before invoking the bootstrap method.
+  * (If a string constant were passed instead, by badly generated code, that cast would then fail,
+- * resulting in an {@code InvokeDynamicBootstrapError}.)
++ * resulting in a {@code BootstrapMethodError}.)
+  * <p>
+  * Extra bootstrap method arguments are intended to allow language implementors
+  * to safely and compactly encode metadata.
+@@ -473,6 +460,7 @@
+  * </pre></blockquote>
+  *
+  * @author John Rose, JSR 292 EG
++ * @since 1.7
+  */
+ 
+-package java.dyn;
++package java.lang.invoke;
+diff --git a/src/share/classes/sun/dyn/WrapperInstance.java b/src/share/classes/sun/invoke/WrapperInstance.java
+rename from src/share/classes/sun/dyn/WrapperInstance.java
+rename to src/share/classes/sun/invoke/WrapperInstance.java
+--- a/src/share/classes/sun/dyn/WrapperInstance.java
++++ b/src/share/classes/sun/invoke/WrapperInstance.java
+@@ -23,14 +23,14 @@
+  * questions.
+  */
+ 
+-package sun.dyn;
++package sun.invoke;
+ 
+-import java.dyn.MethodHandle;
++import java.lang.invoke.MethodHandle;
+ 
+ /**
+- * Private API used inside of java.dyn.MethodHandles.
++ * Private API used inside of java.lang.invoke.MethodHandles.
+  * Interface implemented by every object which is produced by
+- * {@link java.dyn.MethodHandles#asInstance MethodHandles.asInstance}.
++ * {@link java.lang.invoke.MethodHandles#asInstance MethodHandles.asInstance}.
+  * The methods of this interface allow a caller to recover the parameters
+  * to {@code asInstance}.
+  * This allows applications to repeatedly convert between method handles
+diff --git a/src/share/classes/sun/dyn/anon/AnonymousClassLoader.java b/src/share/classes/sun/invoke/anon/AnonymousClassLoader.java
+rename from src/share/classes/sun/dyn/anon/AnonymousClassLoader.java
+rename to src/share/classes/sun/invoke/anon/AnonymousClassLoader.java
+--- a/src/share/classes/sun/dyn/anon/AnonymousClassLoader.java
++++ b/src/share/classes/sun/invoke/anon/AnonymousClassLoader.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2009, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -23,7 +23,7 @@
+  * questions.
+  */
+ 
+-package sun.dyn.anon;
++package sun.invoke.anon;
+ 
+ import java.io.IOException;
+ import java.lang.reflect.InvocationTargetException;
+diff --git a/src/share/classes/sun/dyn/anon/ConstantPoolParser.java b/src/share/classes/sun/invoke/anon/ConstantPoolParser.java
+rename from src/share/classes/sun/dyn/anon/ConstantPoolParser.java
+rename to src/share/classes/sun/invoke/anon/ConstantPoolParser.java
+--- a/src/share/classes/sun/dyn/anon/ConstantPoolParser.java
++++ b/src/share/classes/sun/invoke/anon/ConstantPoolParser.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2009, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -23,14 +23,14 @@
+  * questions.
+  */
+ 
+-package sun.dyn.anon;
++package sun.invoke.anon;
+ 
+ import java.io.IOException;
+ import java.io.OutputStream;
+ import java.nio.BufferUnderflowException;
+ import java.nio.ByteBuffer;
+ 
+-import static sun.dyn.anon.ConstantPoolVisitor.*;
++import static sun.invoke.anon.ConstantPoolVisitor.*;
+ 
+ /** A constant pool parser.
+  */
+diff --git a/src/share/classes/sun/dyn/anon/ConstantPoolPatch.java b/src/share/classes/sun/invoke/anon/ConstantPoolPatch.java
+rename from src/share/classes/sun/dyn/anon/ConstantPoolPatch.java
+rename to src/share/classes/sun/invoke/anon/ConstantPoolPatch.java
+--- a/src/share/classes/sun/dyn/anon/ConstantPoolPatch.java
++++ b/src/share/classes/sun/invoke/anon/ConstantPoolPatch.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2009, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -23,7 +23,7 @@
+  * questions.
+  */
+ 
+-package sun.dyn.anon;
++package sun.invoke.anon;
+ 
+ import java.io.IOException;
+ import java.io.OutputStream;
+@@ -32,7 +32,7 @@
+ import java.util.IdentityHashMap;
+ import java.util.Map;
+ 
+-import static sun.dyn.anon.ConstantPoolVisitor.*;
++import static sun.invoke.anon.ConstantPoolVisitor.*;
+ 
+ /** A class and its patched constant pool.
+  *
+diff --git a/src/share/classes/sun/dyn/anon/ConstantPoolVisitor.java b/src/share/classes/sun/invoke/anon/ConstantPoolVisitor.java
+rename from src/share/classes/sun/dyn/anon/ConstantPoolVisitor.java
+rename to src/share/classes/sun/invoke/anon/ConstantPoolVisitor.java
+--- a/src/share/classes/sun/dyn/anon/ConstantPoolVisitor.java
++++ b/src/share/classes/sun/invoke/anon/ConstantPoolVisitor.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2009, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -23,7 +23,7 @@
+  * questions.
+  */
+ 
+-package sun.dyn.anon;
++package sun.invoke.anon;
+ 
+ /**
+  * A visitor called by {@link ConstantPoolParser#parse(ConstantPoolVisitor)}
+diff --git a/src/share/classes/sun/dyn/anon/InvalidConstantPoolFormatException.java b/src/share/classes/sun/invoke/anon/InvalidConstantPoolFormatException.java
+rename from src/share/classes/sun/dyn/anon/InvalidConstantPoolFormatException.java
+rename to src/share/classes/sun/invoke/anon/InvalidConstantPoolFormatException.java
+--- a/src/share/classes/sun/dyn/anon/InvalidConstantPoolFormatException.java
++++ b/src/share/classes/sun/invoke/anon/InvalidConstantPoolFormatException.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2009, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -23,7 +23,7 @@
+  * questions.
+  */
+ 
+-package sun.dyn.anon;
++package sun.invoke.anon;
+ 
+ /** Exception used when there is an error in the constant pool
+  *  format.
+diff --git a/src/share/classes/sun/dyn/empty/Empty.java b/src/share/classes/sun/invoke/empty/Empty.java
+rename from src/share/classes/sun/dyn/empty/Empty.java
+rename to src/share/classes/sun/invoke/empty/Empty.java
+--- a/src/share/classes/sun/dyn/empty/Empty.java
++++ b/src/share/classes/sun/invoke/empty/Empty.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -23,14 +23,14 @@
+  * questions.
+  */
+ 
+-package sun.dyn.empty;
++package sun.invoke.empty;
+ 
+ /**
+  * An empty class in an empty package.
+  * Used as a proxy for unprivileged code, since making access checks
+  * against it will only succeed against public methods in public types.
+  * <p>
+- * This class also stands (internally to sun.dyn) for the type of a
++ * This class also stands (internally to sun.invoke) for the type of a
+  * value that cannot be produced, because the expression of this type
+  * always returns abnormally.  (Cf. Nothing in the closures proposal.)
+  * @author jrose
+diff --git a/src/share/classes/sun/dyn/package-info.java b/src/share/classes/sun/invoke/package-info.java
+rename from src/share/classes/sun/dyn/package-info.java
+rename to src/share/classes/sun/invoke/package-info.java
+--- a/src/share/classes/sun/dyn/package-info.java
++++ b/src/share/classes/sun/invoke/package-info.java
+@@ -24,8 +24,8 @@
+  */
+ 
+ /**
+- * Implementation details for JSR 292 RI, package java.dyn.
++ * Implementation details for JSR 292 RI, package java.lang.invoke.
+  * @author jrose
+  */
+ 
+-package sun.dyn;
++package sun.invoke;
+diff --git a/src/share/classes/sun/dyn/util/BytecodeDescriptor.java b/src/share/classes/sun/invoke/util/BytecodeDescriptor.java
+rename from src/share/classes/sun/dyn/util/BytecodeDescriptor.java
+rename to src/share/classes/sun/invoke/util/BytecodeDescriptor.java
+--- a/src/share/classes/sun/dyn/util/BytecodeDescriptor.java
++++ b/src/share/classes/sun/invoke/util/BytecodeDescriptor.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -23,9 +23,9 @@
+  * questions.
+  */
+ 
+-package sun.dyn.util;
++package sun.invoke.util;
+ 
+-import java.dyn.MethodType;
++import java.lang.invoke.MethodType;
+ import java.util.ArrayList;
+ import java.util.List;
+ 
+diff --git a/src/share/classes/sun/dyn/util/BytecodeName.java b/src/share/classes/sun/invoke/util/BytecodeName.java
+rename from src/share/classes/sun/dyn/util/BytecodeName.java
+rename to src/share/classes/sun/invoke/util/BytecodeName.java
+--- a/src/share/classes/sun/dyn/util/BytecodeName.java
++++ b/src/share/classes/sun/invoke/util/BytecodeName.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2007, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -23,7 +23,7 @@
+  * questions.
+  */
+ 
+-package sun.dyn.util;
++package sun.invoke.util;
+ 
+ /**
+  * Utility routines for dealing with bytecode-level names.
+diff --git a/src/share/classes/sun/dyn/util/ValueConversions.java b/src/share/classes/sun/invoke/util/ValueConversions.java
+rename from src/share/classes/sun/dyn/util/ValueConversions.java
+rename to src/share/classes/sun/invoke/util/ValueConversions.java
+--- a/src/share/classes/sun/dyn/util/ValueConversions.java
++++ b/src/share/classes/sun/invoke/util/ValueConversions.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -23,12 +23,12 @@
+  * questions.
+  */
+ 
+-package sun.dyn.util;
++package sun.invoke.util;
+ 
+-import java.dyn.MethodHandle;
+-import java.dyn.MethodHandles;
+-import java.dyn.MethodHandles.Lookup;
+-import java.dyn.MethodType;
++import java.lang.invoke.MethodHandle;
++import java.lang.invoke.MethodHandles;
++import java.lang.invoke.MethodHandles.Lookup;
++import java.lang.invoke.MethodType;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.EnumMap;
+diff --git a/src/share/classes/sun/dyn/util/VerifyAccess.java b/src/share/classes/sun/invoke/util/VerifyAccess.java
+rename from src/share/classes/sun/dyn/util/VerifyAccess.java
+rename to src/share/classes/sun/invoke/util/VerifyAccess.java
+--- a/src/share/classes/sun/dyn/util/VerifyAccess.java
++++ b/src/share/classes/sun/invoke/util/VerifyAccess.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -23,7 +23,7 @@
+  * questions.
+  */
+ 
+-package sun.dyn.util;
++package sun.invoke.util;
+ 
+ import java.lang.reflect.Modifier;
+ import static java.lang.reflect.Modifier.*;
+diff --git a/src/share/classes/sun/dyn/util/VerifyType.java b/src/share/classes/sun/invoke/util/VerifyType.java
+rename from src/share/classes/sun/dyn/util/VerifyType.java
+rename to src/share/classes/sun/invoke/util/VerifyType.java
+--- a/src/share/classes/sun/dyn/util/VerifyType.java
++++ b/src/share/classes/sun/invoke/util/VerifyType.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -23,10 +23,10 @@
+  * questions.
+  */
+ 
+-package sun.dyn.util;
++package sun.invoke.util;
+ 
+-import java.dyn.MethodType;
+-import sun.dyn.empty.Empty;
++import java.lang.invoke.MethodType;
++import sun.invoke.empty.Empty;
+ 
+ /**
+  * This class centralizes information about the JVM verifier
+diff --git a/src/share/classes/sun/dyn/util/Wrapper.java b/src/share/classes/sun/invoke/util/Wrapper.java
+rename from src/share/classes/sun/dyn/util/Wrapper.java
+rename to src/share/classes/sun/invoke/util/Wrapper.java
+--- a/src/share/classes/sun/dyn/util/Wrapper.java
++++ b/src/share/classes/sun/invoke/util/Wrapper.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -23,7 +23,7 @@
+  * questions.
+  */
+ 
+-package sun.dyn.util;
++package sun.invoke.util;
+ 
+ public enum Wrapper {
+     BOOLEAN(Boolean.class, boolean.class, 'Z', (Boolean)false, Format.unsigned(1)),
+@@ -267,7 +267,7 @@
+             FROM_WRAP[wi] = w;
+             FROM_CHAR[ci] = w;
+         }
+-        //assert(jdk.sun.dyn.util.WrapperTest.test(false));
++        //assert(jdk.sun.invoke.util.WrapperTest.test(false));
+     }
+ 
+     /** What is the primitive type wrapped by this wrapper? */
+diff --git a/src/share/classes/sun/dyn/util/package-info.java b/src/share/classes/sun/invoke/util/package-info.java
+rename from src/share/classes/sun/dyn/util/package-info.java
+rename to src/share/classes/sun/invoke/util/package-info.java
+--- a/src/share/classes/sun/dyn/util/package-info.java
++++ b/src/share/classes/sun/invoke/util/package-info.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2009, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -24,8 +24,8 @@
+  */
+ 
+ /**
+- * Extra support for using JSR 292 RI, package java.dyn.
++ * Extra support for using JSR 292 RI, package java.lang.invoke.
+  * @author jrose
+  */
+ 
+-package sun.dyn.util;
++package sun.invoke.util;
+diff --git a/src/share/native/common/check_code.c b/src/share/native/common/check_code.c
+--- a/src/share/native/common/check_code.c
++++ b/src/share/native/common/check_code.c
+@@ -2685,11 +2685,11 @@
+                     switch (type_table[operand]) {
+                     case JVM_CONSTANT_MethodType:
+                       full_info = make_class_info_from_name(context,
+-                                                            "java/dyn/MethodType");
++                                                            "java/lang/invoke/MethodType");
+                       break;
+                     default: //JVM_CONSTANT_MethodHandle
+                       full_info = make_class_info_from_name(context,
+-                                                            "java/dyn/MethodHandle");
++                                                            "java/lang/invoke/MethodHandle");
+                       break;
+                     }
+                     break;
+diff --git a/test/java/dyn/6987555/Test6987555.java b/test/java/lang/invoke/6987555/Test6987555.java
+rename from test/java/dyn/6987555/Test6987555.java
+rename to test/java/lang/invoke/6987555/Test6987555.java
+--- a/test/java/dyn/6987555/Test6987555.java
++++ b/test/java/lang/invoke/6987555/Test6987555.java
+@@ -30,7 +30,7 @@
+  * @run main/othervm -Xint -ea -XX:+UnlockExperimentalVMOptions -XX:+EnableMethodHandles -XX:+EnableInvokeDynamic -XX:+UnlockDiagnosticVMOptions -XX:+VerifyMethodHandles Test6987555
+  */
+ 
+-import java.dyn.*;
++import java.lang.invoke.*;
+ 
+ public class Test6987555 {
+     private static final Class   CLASS = Test6987555.class;
+diff --git a/test/java/dyn/6991596/Test6991596.java b/test/java/lang/invoke/6991596/Test6991596.java
+rename from test/java/dyn/6991596/Test6991596.java
+rename to test/java/lang/invoke/6991596/Test6991596.java
+--- a/test/java/dyn/6991596/Test6991596.java
++++ b/test/java/lang/invoke/6991596/Test6991596.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2010, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -30,7 +30,7 @@
+  * @run main/othervm -ea -XX:+UnlockExperimentalVMOptions -XX:+EnableMethodHandles -XX:+EnableInvokeDynamic -XX:+UnlockDiagnosticVMOptions -XX:+VerifyMethodHandles Test6991596
+  */
+ 
+-import java.dyn.*;
++import java.lang.invoke.*;
+ 
+ public class Test6991596 {
+     private static final Class   CLASS = Test6991596.class;
+diff --git a/test/java/dyn/ClassValueTest.java b/test/java/lang/invoke/ClassValueTest.java
+rename from test/java/dyn/ClassValueTest.java
+rename to test/java/lang/invoke/ClassValueTest.java
+--- a/test/java/dyn/ClassValueTest.java
++++ b/test/java/lang/invoke/ClassValueTest.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -26,21 +26,21 @@
+ /* @test
+  * @summary tests for class-specific values
+  * @compile ClassValueTest.java
+- * @run junit/othervm test.java.dyn.ClassValueTest
++ * @run junit/othervm test.java.lang.invoke.ClassValueTest
+  */
+ 
+ /*
+   Manually:
+-   $ $JAVA7X_HOME/bin/javac -d foo -cp $JUNIT4_JAR test/java/dyn/ClassValueTest.java
+-   $ $JAVA7X_HOME/bin/java -cp foo:$JUNIT4_JAR org.junit.runner.JUnitCore test.java.dyn.ClassValueTest
++   $ $JAVA7X_HOME/bin/javac -d foo -cp $JUNIT4_JAR test/java/lang/invoke/ClassValueTest.java
++   $ $JAVA7X_HOME/bin/java -cp foo:$JUNIT4_JAR org.junit.runner.JUnitCore test.java.lang.invoke.ClassValueTest
+   Output: .testAdd => 1000 : Integer
+  */
+ 
+-package test.java.dyn;
++package test.java.lang.invoke;
+ 
+ import java.util.*;
+ 
+-import java.dyn.*;
++import java.lang.invoke.*;
+ 
+ import org.junit.*;
+ import static org.junit.Assert.*;
+diff --git a/test/java/dyn/InvokeDynamicPrintArgs.java b/test/java/lang/invoke/InvokeDynamicPrintArgs.java
+rename from test/java/dyn/InvokeDynamicPrintArgs.java
+rename to test/java/lang/invoke/InvokeDynamicPrintArgs.java
+--- a/test/java/dyn/InvokeDynamicPrintArgs.java
++++ b/test/java/lang/invoke/InvokeDynamicPrintArgs.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2010, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -29,19 +29,19 @@
+  *      indify.Indify
+  *      --verify-specifier-count=3 --transitionalJSR292=false
+  *      --expand-properties --classpath ${test.classes}
+- *      --java test.java.dyn.InvokeDynamicPrintArgs --check-output
++ *      --java test.java.lang.invoke.InvokeDynamicPrintArgs --check-output
+  */
+ 
+-package test.java.dyn;
++package test.java.lang.invoke;
+ 
+ import org.junit.Test;
+ 
+ import java.util.*;
+ import java.io.*;
+ 
+-import java.dyn.*;
+-import static java.dyn.MethodHandles.*;
+-import static java.dyn.MethodType.*;
++import java.lang.invoke.*;
++import static java.lang.invoke.MethodHandles.*;
++import static java.lang.invoke.MethodType.*;
+ 
+ public class InvokeDynamicPrintArgs {
+     public static void main(String... av) throws Throwable {
+@@ -65,7 +65,7 @@
+         String[] args = new String[]{
+             "--verify-specifier-count=3", "--transitionalJSR292=false",
+             "--expand-properties", "--classpath", testClassPath,
+-            "--java", "test.java.dyn.InvokeDynamicPrintArgs", "--check-output"
++            "--java", "test.java.lang.invoke.InvokeDynamicPrintArgs", "--check-output"
+         };
+         System.err.println("Indify: "+Arrays.toString(args));
+         indify.Indify.main(args);
+@@ -97,11 +97,11 @@
+     }
+     private static final String[] EXPECT_OUTPUT = {
+         "Printing some argument lists, starting with a empty one:",
+-        "[test.java.dyn.InvokeDynamicPrintArgs, nothing, ()void][]",
+-        "[test.java.dyn.InvokeDynamicPrintArgs, bar, (String,int)void, class java.lang.Void, void type!, 1, 234.5, 67.5, 89][bar arg, 1]",
+-        "[test.java.dyn.InvokeDynamicPrintArgs, bar2, (String,int)void, class java.lang.Void, void type!, 1, 234.5, 67.5, 89][bar2 arg, 222]",
+-        "[test.java.dyn.InvokeDynamicPrintArgs, baz, (String,int,double)void, 1234.5][baz arg, 2, 3.14]",
+-        "[test.java.dyn.InvokeDynamicPrintArgs, foo, (String)void][foo arg]",
++        "[test.java.lang.invoke.InvokeDynamicPrintArgs, nothing, ()void][]",
++        "[test.java.lang.invoke.InvokeDynamicPrintArgs, bar, (String,int)void, class java.lang.Void, void type!, 1, 234.5, 67.5, 89][bar arg, 1]",
++        "[test.java.lang.invoke.InvokeDynamicPrintArgs, bar2, (String,int)void, class java.lang.Void, void type!, 1, 234.5, 67.5, 89][bar2 arg, 222]",
++        "[test.java.lang.invoke.InvokeDynamicPrintArgs, baz, (String,int,double)void, 1234.5][baz arg, 2, 3.14]",
++        "[test.java.lang.invoke.InvokeDynamicPrintArgs, foo, (String)void][foo arg]",
+         "Done printing argument lists."
+     };
+ 
+diff --git a/test/java/dyn/InvokeGenericTest.java b/test/java/lang/invoke/InvokeGenericTest.java
+rename from test/java/dyn/InvokeGenericTest.java
+rename to test/java/lang/invoke/InvokeGenericTest.java
+--- a/test/java/dyn/InvokeGenericTest.java
++++ b/test/java/lang/invoke/InvokeGenericTest.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -24,16 +24,16 @@
+  */
+ 
+ /* @test
+- * @summary unit tests for java.dyn.MethodHandle.invokeGeneric
++ * @summary unit tests for java.lang.invoke.MethodHandle.invokeGeneric
+  * @compile -XDallowTransitionalJSR292=no -target 7 InvokeGenericTest.java
+- * @run junit/othervm -XX:+UnlockExperimentalVMOptions -XX:+EnableMethodHandles test.java.dyn.InvokeGenericTest
++ * @run junit/othervm -XX:+UnlockExperimentalVMOptions -XX:+EnableMethodHandles test.java.lang.invoke.InvokeGenericTest
+  */
+ 
+-package test.java.dyn;
++package test.java.lang.invoke;
+ 
+-import java.dyn.*;
+-import static java.dyn.MethodHandles.*;
+-import static java.dyn.MethodType.*;
++import java.lang.invoke.*;
++import static java.lang.invoke.MethodHandles.*;
++import static java.lang.invoke.MethodType.*;
+ import java.lang.reflect.*;
+ import java.util.*;
+ import org.junit.*;
+@@ -49,7 +49,7 @@
+     // How much output?
+     static int verbosity = 0;
+     static {
+-        String vstr = System.getProperty("test.java.dyn.InvokeGenericTest.verbosity");
++        String vstr = System.getProperty("test.java.lang.invoke.InvokeGenericTest.verbosity");
+         if (vstr != null)  verbosity = Integer.parseInt(vstr);
+     }
+ 
+@@ -216,7 +216,7 @@
+         if (wrap != null) {
+             return wrap;
+         }
+-//        import sun.dyn.util.Wrapper;
++//        import sun.invoke.util.Wrapper;
+ //        Wrapper wrap = Wrapper.forBasicType(dst);
+ //        if (wrap == Wrapper.OBJECT && Wrapper.isWrapperType(dst))
+ //            wrap = Wrapper.forWrapperType(dst);
+diff --git a/test/java/dyn/JavaDocExamplesTest.java b/test/java/lang/invoke/JavaDocExamplesTest.java
+rename from test/java/dyn/JavaDocExamplesTest.java
+rename to test/java/lang/invoke/JavaDocExamplesTest.java
+--- a/test/java/dyn/JavaDocExamplesTest.java
++++ b/test/java/lang/invoke/JavaDocExamplesTest.java
+@@ -24,27 +24,27 @@
+  */
+ 
+ /* @test
+- * @summary example code used in javadoc for java.dyn API
++ * @summary example code used in javadoc for java.lang.invoke API
+  * @compile -XDallowTransitionalJSR292=no JavaDocExamplesTest.java
+- * @run junit/othervm -XX:+UnlockExperimentalVMOptions -XX:+EnableMethodHandles test.java.dyn.JavaDocExamplesTest
++ * @run junit/othervm -XX:+UnlockExperimentalVMOptions -XX:+EnableMethodHandles test.java.lang.invoke.JavaDocExamplesTest
+  */
+ 
+ /*
+ ---- To run outside jtreg:
+ $ $JAVA7X_HOME/bin/javac -cp $JUNIT4_JAR -d /tmp/Classes \
+-   $DAVINCI/sources/jdk/test/java/dyn/JavaDocExamplesTest.java
++   $DAVINCI/sources/jdk/test/java/lang/invoke/JavaDocExamplesTest.java
+ $ $JAVA7X_HOME/bin/java   -cp $JUNIT4_JAR:/tmp/Classes \
+    -XX:+UnlockExperimentalVMOptions -XX:+EnableMethodHandles \
+-   -Dtest.java.dyn.JavaDocExamplesTest.verbosity=1 \
+-     test.java.dyn.JavaDocExamplesTest
++   -Dtest.java.lang.invoke.JavaDocExamplesTest.verbosity=1 \
++     test.java.lang.invoke.JavaDocExamplesTest
+ ----
+ */
+ 
+-package test.java.dyn;
++package test.java.lang.invoke;
+ 
+-import java.dyn.*;
+-import static java.dyn.MethodHandles.*;
+-import static java.dyn.MethodType.*;
++import java.lang.invoke.*;
++import static java.lang.invoke.MethodHandles.*;
++import static java.lang.invoke.MethodType.*;
+ 
+ import java.lang.reflect.*;
+ import java.util.*;
+@@ -65,7 +65,7 @@
+         org.junit.runner.JUnitCore.runClasses(JavaDocExamplesTest.class);
+     }
+     // How much output?
+-    static int verbosity = Integer.getInteger("test.java.dyn.JavaDocExamplesTest.verbosity", 0);
++    static int verbosity = Integer.getInteger("test.java.lang.invoke.JavaDocExamplesTest.verbosity", 0);
+ 
+ {}
+ static final private Lookup LOOKUP = lookup();
+@@ -108,6 +108,16 @@
+ MethodHandle cat = lookup().findVirtual(String.class,
+   "concat", methodType(String.class, String.class));
+ assertEquals("xy", (String) cat.invokeExact("x", "y"));
++MethodType bigType = cat.type().insertParameterTypes(0, int.class, String.class);
++MethodHandle d0 = dropArguments(cat, 0, bigType.parameterList().subList(0,2));
++assertEquals(bigType, d0.type());
++assertEquals("yz", (String) d0.invokeExact(123, "x", "y", "z"));
++            }}
++        {{
++{} /// JAVADOC
++MethodHandle cat = lookup().findVirtual(String.class,
++  "concat", methodType(String.class, String.class));
++assertEquals("xy", (String) cat.invokeExact("x", "y"));
+ MethodHandle d0 = dropArguments(cat, 0, String.class);
+ assertEquals("yz", (String) d0.invokeExact("x", "y", "z"));
+ MethodHandle d1 = dropArguments(cat, 1, String.class);
+diff --git a/test/java/dyn/MethodHandlesTest.java b/test/java/lang/invoke/MethodHandlesTest.java
+rename from test/java/dyn/MethodHandlesTest.java
+rename to test/java/lang/invoke/MethodHandlesTest.java
+--- a/test/java/dyn/MethodHandlesTest.java
++++ b/test/java/lang/invoke/MethodHandlesTest.java
+@@ -24,15 +24,15 @@
+  */
+ 
+ /* @test
+- * @summary unit tests for java.dyn.MethodHandles
++ * @summary unit tests for java.lang.invoke.MethodHandles
+  * @compile -source 7 -target 7 -XDallowTransitionalJSR292=no MethodHandlesTest.java
+- * @run junit/othervm -XX:+UnlockExperimentalVMOptions -XX:+EnableMethodHandles test.java.dyn.MethodHandlesTest
++ * @run junit/othervm -XX:+UnlockExperimentalVMOptions -XX:+EnableMethodHandles test.java.lang.invoke.MethodHandlesTest
+  */
+ 
+-package test.java.dyn;
++package test.java.lang.invoke;
+ 
+-import java.dyn.*;
+-import java.dyn.MethodHandles.Lookup;
++import java.lang.invoke.*;
++import java.lang.invoke.MethodHandles.Lookup;
+ import java.lang.reflect.*;
+ import java.util.*;
+ import org.junit.*;
+@@ -48,7 +48,7 @@
+     // How much output?
+     static int verbosity = 0;
+     static {
+-        String vstr = System.getProperty("test.java.dyn.MethodHandlesTest.verbosity");
++        String vstr = System.getProperty("test.java.lang.invoke.MethodHandlesTest.verbosity");
+         if (vstr != null)  verbosity = Integer.parseInt(vstr);
+     }
+ 
+@@ -258,7 +258,7 @@
+         if (wrap != null) {
+             return wrap;
+         }
+-//        import sun.dyn.util.Wrapper;
++//        import sun.invoke.util.Wrapper;
+ //        Wrapper wrap = Wrapper.forBasicType(dst);
+ //        if (wrap == Wrapper.OBJECT && Wrapper.isWrapperType(dst))
+ //            wrap = Wrapper.forWrapperType(dst);
+@@ -2264,7 +2264,7 @@
+         }
+     }
+ }
+-// Local abbreviated copy of sun.dyn.util.ValueConversions
++// Local abbreviated copy of sun.invoke.util.ValueConversions
+ class ValueConversions {
+     private static final Lookup IMPL_LOOKUP = MethodHandles.lookup();
+     private static final Object[] NO_ARGS_ARRAY = {};
+diff --git a/test/java/dyn/MethodTypeTest.java b/test/java/lang/invoke/MethodTypeTest.java
+rename from test/java/dyn/MethodTypeTest.java
+rename to test/java/lang/invoke/MethodTypeTest.java
+--- a/test/java/dyn/MethodTypeTest.java
++++ b/test/java/lang/invoke/MethodTypeTest.java
+@@ -24,14 +24,14 @@
+  */
+ 
+ /* @test
+- * @summary unit tests for java.dyn.MethodType
++ * @summary unit tests for java.lang.invoke.MethodType
+  * @compile MethodTypeTest.java
+- * @run junit/othervm -XX:+UnlockExperimentalVMOptions -XX:+EnableMethodHandles test.java.dyn.MethodTypeTest
++ * @run junit/othervm -XX:+UnlockExperimentalVMOptions -XX:+EnableMethodHandles test.java.lang.invoke.MethodTypeTest
+  */
+ 
+-package test.java.dyn;
++package test.java.lang.invoke;
+ 
+-import java.dyn.MethodType;
++import java.lang.invoke.MethodType;
+ import java.lang.reflect.Method;
+ 
+ import java.util.*;
+@@ -463,10 +463,13 @@
+     @Test
+     public void testPortableSerialFormat() throws Throwable {
+         System.out.println("portable serial format");
++        boolean generateData = false;
++        //generateData = true;  // set this true to generate the following input data:
+         Object[][] cases = {
+             { mt_vv, new byte[] {  // ()void
+-                    (byte)0xac, (byte)0xed, (byte)0x00, (byte)0x05, (byte)0x73, (byte)0x72, (byte)0x00, (byte)0x13,
+-                    (byte)0x6a, (byte)0x61, (byte)0x76, (byte)0x61, (byte)0x2e, (byte)0x64, (byte)0x79, (byte)0x6e,
++                    (byte)0xac, (byte)0xed, (byte)0x00, (byte)0x05, (byte)0x73, (byte)0x72, (byte)0x00, (byte)0x1b,
++                    (byte)0x6a, (byte)0x61, (byte)0x76, (byte)0x61, (byte)0x2e, (byte)0x6c, (byte)0x61, (byte)0x6e,
++                    (byte)0x67, (byte)0x2e, (byte)0x69, (byte)0x6e, (byte)0x76, (byte)0x6f, (byte)0x6b, (byte)0x65,
+                     (byte)0x2e, (byte)0x4d, (byte)0x65, (byte)0x74, (byte)0x68, (byte)0x6f, (byte)0x64, (byte)0x54,
+                     (byte)0x79, (byte)0x70, (byte)0x65, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00,
+                     (byte)0x00, (byte)0x01, (byte)0x24, (byte)0x03, (byte)0x00, (byte)0x00, (byte)0x78, (byte)0x70,
+@@ -480,8 +483,9 @@
+                     (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x78,
+                 } },
+             { mt_OO, new byte[] {  // (Object)Object
+-                    (byte)0xac, (byte)0xed, (byte)0x00, (byte)0x05, (byte)0x73, (byte)0x72, (byte)0x00, (byte)0x13,
+-                    (byte)0x6a, (byte)0x61, (byte)0x76, (byte)0x61, (byte)0x2e, (byte)0x64, (byte)0x79, (byte)0x6e,
++                    (byte)0xac, (byte)0xed, (byte)0x00, (byte)0x05, (byte)0x73, (byte)0x72, (byte)0x00, (byte)0x1b,
++                    (byte)0x6a, (byte)0x61, (byte)0x76, (byte)0x61, (byte)0x2e, (byte)0x6c, (byte)0x61, (byte)0x6e,
++                    (byte)0x67, (byte)0x2e, (byte)0x69, (byte)0x6e, (byte)0x76, (byte)0x6f, (byte)0x6b, (byte)0x65,
+                     (byte)0x2e, (byte)0x4d, (byte)0x65, (byte)0x74, (byte)0x68, (byte)0x6f, (byte)0x64, (byte)0x54,
+                     (byte)0x79, (byte)0x70, (byte)0x65, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00,
+                     (byte)0x00, (byte)0x01, (byte)0x24, (byte)0x03, (byte)0x00, (byte)0x00, (byte)0x78, (byte)0x70,
+@@ -496,14 +500,47 @@
+                     (byte)0x00, (byte)0x00, (byte)0x78, (byte)0x70, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x01,
+                     (byte)0x71, (byte)0x00, (byte)0x7e, (byte)0x00, (byte)0x03, (byte)0x78,
+                 } },
++            { mt_vOiSzA, new byte[] {  // (Object,int,String,boolean,Object[])void
++                    (byte)0xac, (byte)0xed, (byte)0x00, (byte)0x05, (byte)0x73, (byte)0x72, (byte)0x00, (byte)0x1b,
++                    (byte)0x6a, (byte)0x61, (byte)0x76, (byte)0x61, (byte)0x2e, (byte)0x6c, (byte)0x61, (byte)0x6e,
++                    (byte)0x67, (byte)0x2e, (byte)0x69, (byte)0x6e, (byte)0x76, (byte)0x6f, (byte)0x6b, (byte)0x65,
++                    (byte)0x2e, (byte)0x4d, (byte)0x65, (byte)0x74, (byte)0x68, (byte)0x6f, (byte)0x64, (byte)0x54,
++                    (byte)0x79, (byte)0x70, (byte)0x65, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00,
++                    (byte)0x00, (byte)0x01, (byte)0x24, (byte)0x03, (byte)0x00, (byte)0x00, (byte)0x78, (byte)0x70,
++                    (byte)0x76, (byte)0x72, (byte)0x00, (byte)0x04, (byte)0x76, (byte)0x6f, (byte)0x69, (byte)0x64,
++                    (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00,
++                    (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x78, (byte)0x70, (byte)0x75, (byte)0x72, (byte)0x00,
++                    (byte)0x12, (byte)0x5b, (byte)0x4c, (byte)0x6a, (byte)0x61, (byte)0x76, (byte)0x61, (byte)0x2e,
++                    (byte)0x6c, (byte)0x61, (byte)0x6e, (byte)0x67, (byte)0x2e, (byte)0x43, (byte)0x6c, (byte)0x61,
++                    (byte)0x73, (byte)0x73, (byte)0x3b, (byte)0xab, (byte)0x16, (byte)0xd7, (byte)0xae, (byte)0xcb,
++                    (byte)0xcd, (byte)0x5a, (byte)0x99, (byte)0x02, (byte)0x00, (byte)0x00, (byte)0x78, (byte)0x70,
++                    (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x05, (byte)0x76, (byte)0x72, (byte)0x00, (byte)0x10,
++                    (byte)0x6a, (byte)0x61, (byte)0x76, (byte)0x61, (byte)0x2e, (byte)0x6c, (byte)0x61, (byte)0x6e,
++                    (byte)0x67, (byte)0x2e, (byte)0x4f, (byte)0x62, (byte)0x6a, (byte)0x65, (byte)0x63, (byte)0x74,
++                    (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00,
++                    (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x78, (byte)0x70, (byte)0x76, (byte)0x72, (byte)0x00,
++                    (byte)0x03, (byte)0x69, (byte)0x6e, (byte)0x74, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00,
++                    (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x78,
++                    (byte)0x70, (byte)0x76, (byte)0x72, (byte)0x00, (byte)0x10, (byte)0x6a, (byte)0x61, (byte)0x76,
++                    (byte)0x61, (byte)0x2e, (byte)0x6c, (byte)0x61, (byte)0x6e, (byte)0x67, (byte)0x2e, (byte)0x53,
++                    (byte)0x74, (byte)0x72, (byte)0x69, (byte)0x6e, (byte)0x67, (byte)0xa0, (byte)0xf0, (byte)0xa4,
++                    (byte)0x38, (byte)0x7a, (byte)0x3b, (byte)0xb3, (byte)0x42, (byte)0x02, (byte)0x00, (byte)0x00,
++                    (byte)0x78, (byte)0x70, (byte)0x76, (byte)0x72, (byte)0x00, (byte)0x07, (byte)0x62, (byte)0x6f,
++                    (byte)0x6f, (byte)0x6c, (byte)0x65, (byte)0x61, (byte)0x6e, (byte)0x00, (byte)0x00, (byte)0x00,
++                    (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00,
++                    (byte)0x78, (byte)0x70, (byte)0x76, (byte)0x72, (byte)0x00, (byte)0x13, (byte)0x5b, (byte)0x4c,
++                    (byte)0x6a, (byte)0x61, (byte)0x76, (byte)0x61, (byte)0x2e, (byte)0x6c, (byte)0x61, (byte)0x6e,
++                    (byte)0x67, (byte)0x2e, (byte)0x4f, (byte)0x62, (byte)0x6a, (byte)0x65, (byte)0x63, (byte)0x74,
++                    (byte)0x3b, (byte)0x90, (byte)0xce, (byte)0x58, (byte)0x9f, (byte)0x10, (byte)0x73, (byte)0x29,
++                    (byte)0x6c, (byte)0x02, (byte)0x00, (byte)0x00, (byte)0x78, (byte)0x70, (byte)0x78,
++                } },
+         };
+-        boolean generateData = false;
+-        //generateData = true;
+         for (Object[] c : cases) {
+             MethodType mt = (MethodType) c[0];
+             System.out.println("deserialize "+mt);
+             byte[] wire = (byte[]) c[1];
+             if (generateData) {
++                System.out.println("<generateData>");
+                 wire = writeSerial(mt);
+                 final String INDENT = "                ";
+                 System.out.print("{  // "+mt);
+@@ -515,6 +552,7 @@
+                 }
+                 System.out.println();
+                 System.out.println(INDENT+"}");
++                System.out.println("</generateData>");
+                 System.out.flush();
+             }
+             Object decode;
+diff --git a/test/java/dyn/indify/Indify.java b/test/java/lang/invoke/indify/Indify.java
+rename from test/java/dyn/indify/Indify.java
+rename to test/java/lang/invoke/indify/Indify.java
+--- a/test/java/dyn/indify/Indify.java
++++ b/test/java/lang/invoke/indify/Indify.java
+@@ -47,9 +47,9 @@
+  * and {@code CONSTANT_MethodType} "ldc" instructions.
+  * The stereotyped code must create method types by calls to {@code methodType} or
+  * {@code fromMethodDescriptorString}.  The "lookup" argument must be created
+- * by calls to {@code java.dyn.MethodHandles#lookup MethodHandles.lookup}.
++ * by calls to {@code java.lang.invoke.MethodHandles#lookup MethodHandles.lookup}.
+  * The class and string arguments must be constant.
+- * The following methods of {@code java.dyn.MethodHandle.Lookup Lookup} are
++ * The following methods of {@code java.lang.invoke.MethodHandle.Lookup Lookup} are
+  * allowed for method handle creation: {@code findStatic}, {@code findVirtual},
+  * {@code findConstructor}, {@code findSpecial},
+  * {@code findGetter}, {@code findSetter},
+@@ -350,10 +350,15 @@
+         }
+         protected Class<?> findClass(String name) throws ClassNotFoundException {
+             try {
+-                return transformAndLoadClass(findClassInPath(name));
++                File f = findClassInPath(name);
++                if (f != null) {
++                    Class<?> c = transformAndLoadClass(f);
++                    if (c != null)  return c;
++                }
+             } catch (IOException ex) {
+                 throw new ClassNotFoundException("IO error", ex);
+             }
++            throw new ClassNotFoundException();
+         }
+         private Class<?> transformAndLoadClass(File f) throws ClassNotFoundException, IOException {
+             if (verbose)  System.err.println("Loading class from "+f);
+@@ -592,7 +597,9 @@
+             if (s.startsWith("MT_"))                return 'T';
+             else if (s.startsWith("MH_"))           return 'H';
+             else if (s.startsWith("INDY_"))         return 'I';
+-            else if (s.startsWith("java/dyn/"))     return 'D';
++            else if (transitionalJSR292 &&
++                     s.startsWith("java/dyn/"))     return 'D';
++            else if (s.startsWith("java/lang/invoke/"))  return 'D';
+             else if (s.startsWith("java/lang/"))    return 'J';
+             return 0;
+         }
+@@ -605,15 +612,24 @@
+             String descr = cf.pool.getString(CONSTANT_Utf8, n2);
+             String requiredType;
+             switch (poolMarks[(char)n1]) {
+-            case 'H': requiredType = "()Ljava/dyn/MethodHandle;";  break;
+-            case 'T': requiredType = "()Ljava/dyn/MethodType;";    break;
+-            case 'I': requiredType = "()Ljava/dyn/MethodHandle;";  break;
++            case 'H': requiredType = "()Ljava/lang/invoke/MethodHandle;";  break;
++            case 'T': requiredType = "()Ljava/lang/invoke/MethodType;";    break;
++            case 'I': requiredType = "()Ljava/lang/invoke/MethodHandle;";  break;
+             default:  return 0;
+             }
+-            if (descr.equals(requiredType))  return mark;
++            if (matchType(descr, requiredType))  return mark;
+             return 0;
+         }
+ 
++        boolean matchType(String descr, String requiredType) {
++            if (descr.equals(requiredType))  return true;
++            if (transitionalJSR292) {
++                String oldType = requiredType.replace("Ljava/lang/invoke/", "Ljava/dyn/");
++                if (descr.equals(oldType))  return true;
++            }
++            return false;
++        }
++
+         private class JVMState {
+             final List<Object> stack = new ArrayList<>();
+             int sp() { return stack.size(); }

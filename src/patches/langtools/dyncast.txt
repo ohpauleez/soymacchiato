@@ -1,0 +1,23 @@
+0000000: writing libraries in Java for non-Java languages requires permissive Dynamic type
+Summary: javac allows additional conversions (relaxed but safe) to and from Dynamic
+
+javac needs to support library development for non-Java langauges
+
+http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=0[TBD]0
+
+Features:
+- conversions to java.dyn.Dynamic always succeed, without a "checkcast" operation
+- this is safe, because the JVM verifier does not verify interface types (really!)
+- casts from java.dyn.Dynamic always succeed
+- conversions from primitives to Dynamic use autoboxing
+- conversions to primitives from Dynamic use autoboxing, according to the target type
+- the non-static method java.dyn.Dynamic.<T>zzz(AAA)T always exists for Dynamic references
+- the syntax x.<T>zzz(aaa) is in all ways equivalent to Dynamic.<T>zzz(aaa)
+- if the return type parameter <T> is omitted, it defaults to Dynamic, allowing chained calls
+- null values of type Dynamic can appear in receiver position; no null check is performed
+
+Rationale:
+- promote the type Dynamic as a "flex" type for concisely forming invokedynamic calls
+
+Authors:
+- John Rose (Sun)

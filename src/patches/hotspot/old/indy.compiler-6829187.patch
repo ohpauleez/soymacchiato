@@ -1,0 +1,1300 @@
+6829187: compiler optimizations required for JSR 292
+Summary: C2 implementation for invokedynamic support.
+Reviewed-by: kvn, never
+
+diff --git a/src/cpu/sparc/vm/sparc.ad b/src/cpu/sparc/vm/sparc.ad
+--- a/src/cpu/sparc/vm/sparc.ad
++++ b/src/cpu/sparc/vm/sparc.ad
+@@ -1885,6 +1885,10 @@
+   return RegMask();
+ }
+ 
++const RegMask Matcher::method_handle_invoke_SP_save_mask() {
++  return RegMask();
++}
++
+ %}
+ 
+ 
+diff --git a/src/cpu/x86/vm/frame_x86.inline.hpp b/src/cpu/x86/vm/frame_x86.inline.hpp
+--- a/src/cpu/x86/vm/frame_x86.inline.hpp
++++ b/src/cpu/x86/vm/frame_x86.inline.hpp
+@@ -225,11 +225,12 @@
+ // top of expression stack
+ inline intptr_t* frame::interpreter_frame_tos_address() const {
+   intptr_t* last_sp = interpreter_frame_last_sp();
+-  if (last_sp == NULL ) {
++  if (last_sp == NULL) {
+     return sp();
+   } else {
+-    // sp() may have been extended by an adapter
+-    assert(last_sp < fp() && last_sp >= sp(), "bad tos");
++    // sp() may have been extended or shrunk by an adapter.  At least
++    // check that we don't fall behind the legal region.
++    assert(last_sp < (intptr_t*) interpreter_frame_monitor_begin(), "bad tos");
+     return last_sp;
+   }
+ }
+diff --git a/src/cpu/x86/vm/x86_32.ad b/src/cpu/x86/vm/x86_32.ad
+--- a/src/cpu/x86/vm/x86_32.ad
++++ b/src/cpu/x86/vm/x86_32.ad
+@@ -268,22 +268,36 @@
+ static jlong *float_signflip_pool  = double_quadword(&fp_signmask_pool[3*2], CONST64(0x8000000080000000), CONST64(0x8000000080000000));
+ static jlong *double_signflip_pool = double_quadword(&fp_signmask_pool[4*2], CONST64(0x8000000000000000), CONST64(0x8000000000000000));
+ 
++// Offset hacking within calls.
++static int pre_call_FPU_size() {
++  if (Compile::current()->in_24_bit_fp_mode())
++    return 6; // fldcw
++  return 0;
++}
++
++static int preserve_SP_size() {
++  return LP64_ONLY(1 +) 2;  // [rex,] op, rm(reg/reg)
++}
++
+ // !!!!! Special hack to get all type of calls to specify the byte offset
+ //       from the start of the call to the point where the return address
+ //       will point.
+ int MachCallStaticJavaNode::ret_addr_offset() {
+-  return 5 + (Compile::current()->in_24_bit_fp_mode() ? 6 : 0);  // 5 bytes from start of call to where return address points
++  int offset = 5 + pre_call_FPU_size();  // 5 bytes from start of call to where return address points
++  if (_method_handle_invoke)
++    offset += preserve_SP_size();
++  return offset;
+ }
+ 
+ int MachCallDynamicJavaNode::ret_addr_offset() {
+-  return 10 + (Compile::current()->in_24_bit_fp_mode() ? 6 : 0);  // 10 bytes from start of call to where return address points
++  return 10 + pre_call_FPU_size();  // 10 bytes from start of call to where return address points
+ }
+ 
+ static int sizeof_FFree_Float_Stack_All = -1;
+ 
+ int MachCallRuntimeNode::ret_addr_offset() {
+   assert(sizeof_FFree_Float_Stack_All != -1, "must have been emitted already");
+-  return sizeof_FFree_Float_Stack_All + 5 + (Compile::current()->in_24_bit_fp_mode() ? 6 : 0);
++  return sizeof_FFree_Float_Stack_All + 5 + pre_call_FPU_size();
+ }
+ 
+ // Indicate if the safepoint node needs the polling page as an input.
+@@ -299,8 +313,16 @@
+ // The address of the call instruction needs to be 4-byte aligned to
+ // ensure that it does not span a cache line so that it can be patched.
+ int CallStaticJavaDirectNode::compute_padding(int current_offset) const {
+-  if (Compile::current()->in_24_bit_fp_mode())
+-    current_offset += 6;    // skip fldcw in pre_call_FPU, if any
++  current_offset += pre_call_FPU_size();  // skip fldcw, if any
++  current_offset += 1;      // skip call opcode byte
++  return round_to(current_offset, alignment_required()) - current_offset;
++}
++
++// The address of the call instruction needs to be 4-byte aligned to
++// ensure that it does not span a cache line so that it can be patched.
++int CallStaticJavaHandleNode::compute_padding(int current_offset) const {
++  current_offset += pre_call_FPU_size();  // skip fldcw, if any
++  current_offset += preserve_SP_size();   // skip mov rbp, rsp
+   current_offset += 1;      // skip call opcode byte
+   return round_to(current_offset, alignment_required()) - current_offset;
+ }
+@@ -308,8 +330,7 @@
+ // The address of the call instruction needs to be 4-byte aligned to
+ // ensure that it does not span a cache line so that it can be patched.
+ int CallDynamicJavaDirectNode::compute_padding(int current_offset) const {
+-  if (Compile::current()->in_24_bit_fp_mode())
+-    current_offset += 6;    // skip fldcw in pre_call_FPU, if any
++  current_offset += pre_call_FPU_size();  // skip fldcw, if any
+   current_offset += 5;      // skip MOV instruction
+   current_offset += 1;      // skip call opcode byte
+   return round_to(current_offset, alignment_required()) - current_offset;
+@@ -1460,6 +1481,10 @@
+   return RegMask();
+ }
+ 
++const RegMask Matcher::method_handle_invoke_SP_save_mask() {
++  return EBP_REG_mask;
++}
++
+ %}
+ 
+ //----------ENCODING BLOCK-----------------------------------------------------
+@@ -1772,10 +1797,13 @@
+ 
+   enc_class pre_call_FPU %{
+     // If method sets FPU control word restore it here
++    debug_only(int off0 = cbuf.code_size());
+     if( Compile::current()->in_24_bit_fp_mode() ) {
+       MacroAssembler masm(&cbuf);
+       masm.fldcw(ExternalAddress(StubRoutines::addr_fpu_cntrl_wrd_std()));
+     }
++    debug_only(int off1 = cbuf.code_size());
++    assert(off1 - off0 == pre_call_FPU_size(), "correct size prediction");
+   %}
+ 
+   enc_class post_call_FPU %{
+@@ -1786,6 +1814,21 @@
+     }
+   %}
+ 
++  enc_class preserve_SP %{
++    debug_only(int off0 = cbuf.code_size());
++    MacroAssembler _masm(&cbuf);
++    // RBP is preserved across all calls, even compiled calls.
++    // Use it to preserve RSP in places where the callee might change the SP.
++    __ movptr(rbp, rsp);
++    debug_only(int off1 = cbuf.code_size());
++    assert(off1 - off0 == preserve_SP_size(), "correct size prediction");
++  %}
++
++  enc_class restore_SP %{
++    MacroAssembler _masm(&cbuf);
++    __ movptr(rsp, rbp);
++  %}
++
+   enc_class Java_Static_Call (method meth) %{    // JAVA STATIC CALL
+     // CALL to fixup routine.  Fixup routine uses ScopeDesc info to determine
+     // who we intended to call.
+@@ -13406,6 +13449,7 @@
+ //       compute_padding() functions will have to be adjusted.
+ instruct CallStaticJavaDirect(method meth) %{
+   match(CallStaticJava);
++  predicate(! ((CallStaticJavaNode*)n)->is_method_handle_invoke());
+   effect(USE meth);
+ 
+   ins_cost(300);
+@@ -13420,6 +13464,30 @@
+   ins_alignment(4);
+ %}
+ 
++// Call Java Static Instruction (method handle version)
++// Note: If this code changes, the corresponding ret_addr_offset() and
++//       compute_padding() functions will have to be adjusted.
++instruct CallStaticJavaHandle(method meth, eBPRegP ebp) %{
++  match(CallStaticJava);
++  predicate(((CallStaticJavaNode*)n)->is_method_handle_invoke());
++  effect(USE meth);
++  // EBP is saved by all callees (for interpreter stack correction).
++  // We use it here for a similar purpose, in {preserve,restore}_SP.
++
++  ins_cost(300);
++  format %{ "CALL,static/MethodHandle " %}
++  opcode(0xE8); /* E8 cd */
++  ins_encode( pre_call_FPU,
++              preserve_SP,
++              Java_Static_Call( meth ),
++              restore_SP,
++              call_epilog,
++              post_call_FPU );
++  ins_pipe( pipe_slow );
++  ins_pc_relative(1);
++  ins_alignment(4);
++%}
++
+ // Call Java Dynamic Instruction
+ // Note: If this code changes, the corresponding ret_addr_offset() and
+ //       compute_padding() functions will have to be adjusted.
+diff --git a/src/cpu/x86/vm/x86_64.ad b/src/cpu/x86/vm/x86_64.ad
+--- a/src/cpu/x86/vm/x86_64.ad
++++ b/src/cpu/x86/vm/x86_64.ad
+@@ -551,12 +551,19 @@
+ 
+ #define __ _masm.
+ 
++static int preserve_SP_size() {
++  return LP64_ONLY(1 +) 2;  // [rex,] op, rm(reg/reg)
++}
++
+ // !!!!! Special hack to get all types of calls to specify the byte offset
+ //       from the start of the call to the point where the return address
+ //       will point.
+ int MachCallStaticJavaNode::ret_addr_offset()
+ {
+-  return 5; // 5 bytes from start of call to where return address points
++  int offset = 5; // 5 bytes from start of call to where return address points
++  if (_method_handle_invoke)
++    offset += preserve_SP_size();
++  return offset;
+ }
+ 
+ int MachCallDynamicJavaNode::ret_addr_offset()
+@@ -589,6 +596,15 @@
+ 
+ // The address of the call instruction needs to be 4-byte aligned to
+ // ensure that it does not span a cache line so that it can be patched.
++int CallStaticJavaHandleNode::compute_padding(int current_offset) const
++{
++  current_offset += preserve_SP_size();   // skip mov rbp, rsp
++  current_offset += 1; // skip call opcode byte
++  return round_to(current_offset, alignment_required()) - current_offset;
++}
++
++// The address of the call instruction needs to be 4-byte aligned to
++// ensure that it does not span a cache line so that it can be patched.
+ int CallDynamicJavaDirectNode::compute_padding(int current_offset) const
+ {
+   current_offset += 11; // skip movq instruction + call opcode byte
+@@ -2113,6 +2129,10 @@
+   return LONG_RDX_REG_mask;
+ }
+ 
++const RegMask Matcher::method_handle_invoke_SP_save_mask() {
++  return PTR_RBP_REG_mask;
++}
++
+ static Address build_address(int b, int i, int s, int d) {
+   Register index = as_Register(i);
+   Address::ScaleFactor scale = (Address::ScaleFactor)s;
+@@ -2608,6 +2628,21 @@
+                    RELOC_DISP32);
+   %}
+ 
++  enc_class preserve_SP %{
++    debug_only(int off0 = cbuf.code_size());
++    MacroAssembler _masm(&cbuf);
++    // RBP is preserved across all calls, even compiled calls.
++    // Use it to preserve RSP in places where the callee might change the SP.
++    __ movptr(rbp, rsp);
++    debug_only(int off1 = cbuf.code_size());
++    assert(off1 - off0 == preserve_SP_size(), "correct size prediction");
++  %}
++
++  enc_class restore_SP %{
++    MacroAssembler _masm(&cbuf);
++    __ movptr(rsp, rbp);
++  %}
++
+   enc_class Java_Static_Call(method meth)
+   %{
+     // JAVA STATIC CALL
+@@ -12526,9 +12561,9 @@
+ // Call Java Static Instruction
+ // Note: If this code changes, the corresponding ret_addr_offset() and
+ //       compute_padding() functions will have to be adjusted.
+-instruct CallStaticJavaDirect(method meth)
+-%{
++instruct CallStaticJavaDirect(method meth) %{
+   match(CallStaticJava);
++  predicate(!((CallStaticJavaNode*) n)->is_method_handle_invoke());
+   effect(USE meth);
+ 
+   ins_cost(300);
+@@ -12540,6 +12575,28 @@
+   ins_alignment(4);
+ %}
+ 
++// Call Java Static Instruction (method handle version)
++// Note: If this code changes, the corresponding ret_addr_offset() and
++//       compute_padding() functions will have to be adjusted.
++instruct CallStaticJavaHandle(method meth, rbp_RegP rbp) %{
++  match(CallStaticJava);
++  predicate(((CallStaticJavaNode*) n)->is_method_handle_invoke());
++  effect(USE meth);
++  // RBP is saved by all callees (for interpreter stack correction).
++  // We use it here for a similar purpose, in {preserve,restore}_SP.
++
++  ins_cost(300);
++  format %{ "call,static/MethodHandle " %}
++  opcode(0xE8); /* E8 cd */
++  ins_encode(preserve_SP,
++             Java_Static_Call(meth),
++             restore_SP,
++             call_epilog);
++  ins_pipe(pipe_slow);
++  ins_pc_relative(1);
++  ins_alignment(4);
++%}
++
+ // Call Java Dynamic Instruction
+ // Note: If this code changes, the corresponding ret_addr_offset() and
+ //       compute_padding() functions will have to be adjusted.
+diff --git a/src/share/vm/ci/ciCPCache.cpp b/src/share/vm/ci/ciCPCache.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/share/vm/ci/ciCPCache.cpp
+@@ -0,0 +1,48 @@
++/*
++ * Copyright 2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ *
++ */
++
++#include "incls/_precompiled.incl"
++#include "incls/_ciCPCache.cpp.incl"
++
++// ciCPCache
++
++// ------------------------------------------------------------------
++// ciCPCache::get_f1_offset
++size_t ciCPCache::get_f1_offset(int index) {
++  // Calculate the offset from the constantPoolCacheOop to the f1
++  // field.
++  ByteSize f1_offset =
++    constantPoolCacheOopDesc::entry_offset(index) +
++    ConstantPoolCacheEntry::f1_offset();
++
++  return in_bytes(f1_offset);
++}
++
++// ------------------------------------------------------------------
++// ciCPCache::print
++//
++// Print debugging information about the cache.
++void ciCPCache::print() {
++  Unimplemented();
++}
+diff --git a/src/share/vm/ci/ciCPCache.hpp b/src/share/vm/ci/ciCPCache.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/share/vm/ci/ciCPCache.hpp
+@@ -0,0 +1,43 @@
++/*
++ * Copyright 2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ *
++ */
++
++// ciCPCache
++//
++// This class represents a constant pool cache.
++//
++// Note: This class is called ciCPCache as ciConstantPoolCache is used
++// for something different.
++class ciCPCache : public ciObject {
++public:
++  ciCPCache(constantPoolCacheHandle cpcache) : ciObject(cpcache) {}
++
++  // What kind of ciObject is this?
++  bool is_cpcache() const { return true; }
++
++  // Get the offset in bytes from the oop to the f1 field of the
++  // requested entry.
++  size_t get_f1_offset(int index);
++
++  void print();
++};
+diff --git a/src/share/vm/ci/ciClassList.hpp b/src/share/vm/ci/ciClassList.hpp
+--- a/src/share/vm/ci/ciClassList.hpp
++++ b/src/share/vm/ci/ciClassList.hpp
+@@ -25,6 +25,7 @@
+ class ciEnv;
+ class ciObjectFactory;
+ class ciConstantPoolCache;
++class ciCPCache;
+ 
+ class ciField;
+ class ciConstant;
+diff --git a/src/share/vm/ci/ciEnv.cpp b/src/share/vm/ci/ciEnv.cpp
+--- a/src/share/vm/ci/ciEnv.cpp
++++ b/src/share/vm/ci/ciEnv.cpp
+@@ -41,6 +41,7 @@
+ ciInstanceKlass* ciEnv::_ArrayStoreException;
+ ciInstanceKlass* ciEnv::_Class;
+ ciInstanceKlass* ciEnv::_ClassCastException;
++ciInstanceKlass* ciEnv::_InvokeDynamic;
+ ciInstanceKlass* ciEnv::_Object;
+ ciInstanceKlass* ciEnv::_Throwable;
+ ciInstanceKlass* ciEnv::_Thread;
+@@ -736,6 +737,35 @@
+ 
+ 
+ // ------------------------------------------------------------------
++// ciEnv::get_fake_invokedynamic_method_impl
++ciMethod* ciEnv::get_fake_invokedynamic_method_impl(ciInstanceKlass* accessor,
++                                                    int index, Bytecodes::Code bc) {
++  assert(bc == Bytecodes::_invokedynamic, "must be invokedynamic");
++  assert(accessor->get_instanceKlass()->is_linked(), "must be linked before accessing constant pool");
++  constantPoolHandle cpool = accessor->get_instanceKlass()->constants();
++
++  // Get the CallSite from the constant pool cache.
++  ConstantPoolCacheEntry* cpc_entry = cpool->cache()->secondary_entry_at(index);
++  assert(cpc_entry != NULL && cpc_entry->is_secondary_entry(), "sanity");
++  Handle call_site = cpc_entry->f1();
++
++  // Call site might not be linked yet.
++  if (call_site.is_null()) {
++    ciInstanceKlass* mh_klass = get_object(SystemDictionary::MethodHandle_klass())->as_instance_klass();
++    ciSymbol*       sig_sym   = get_object(cpool->signature_ref_at(index))->as_symbol();
++    return get_unloaded_method(mh_klass, ciSymbol::invoke_name(), sig_sym);
++  }
++
++  // Get the methodOop from the CallSite.
++  methodOop method_oop = (methodOop) java_dyn_CallSite::vmmethod(call_site());
++  assert(method_oop != NULL, "sanity");
++  assert(method_oop->is_method_handle_invoke(), "consistent");
++
++  return get_object(method_oop)->as_method();
++}
++
++
++// ------------------------------------------------------------------
+ // ciEnv::get_instance_klass_for_declared_method_holder
+ ciInstanceKlass* ciEnv::get_instance_klass_for_declared_method_holder(ciKlass* method_holder) {
+   // For the case of <array>.clone(), the method holder can be a ciArrayKlass
+@@ -757,15 +787,18 @@
+ }
+ 
+ 
+-
+-
+ // ------------------------------------------------------------------
+ // ciEnv::get_method_by_index
+ ciMethod* ciEnv::get_method_by_index(ciInstanceKlass* accessor,
+                                      int index, Bytecodes::Code bc) {
+-  GUARDED_VM_ENTRY(return get_method_by_index_impl(accessor, index, bc);)
++  if (bc == Bytecodes::_invokedynamic) {
++    GUARDED_VM_ENTRY(return get_fake_invokedynamic_method_impl(accessor, index, bc);)
++  } else {
++    GUARDED_VM_ENTRY(return get_method_by_index_impl(accessor, index, bc);)
++  }
+ }
+ 
++
+ // ------------------------------------------------------------------
+ // ciEnv::name_buffer
+ char *ciEnv::name_buffer(int req_len) {
+diff --git a/src/share/vm/ci/ciEnv.hpp b/src/share/vm/ci/ciEnv.hpp
+--- a/src/share/vm/ci/ciEnv.hpp
++++ b/src/share/vm/ci/ciEnv.hpp
+@@ -77,6 +77,7 @@
+   static ciInstanceKlass* _ArrayStoreException;
+   static ciInstanceKlass* _Class;
+   static ciInstanceKlass* _ClassCastException;
++  static ciInstanceKlass* _InvokeDynamic;
+   static ciInstanceKlass* _Object;
+   static ciInstanceKlass* _Throwable;
+   static ciInstanceKlass* _Thread;
+@@ -151,6 +152,8 @@
+                                      int field_index);
+   ciMethod*  get_method_by_index_impl(ciInstanceKlass* loading_klass,
+                                       int method_index, Bytecodes::Code bc);
++  ciMethod*  get_fake_invokedynamic_method_impl(ciInstanceKlass* accessor,
++                                                int index, Bytecodes::Code bc);
+ 
+   // Helper methods
+   bool       check_klass_accessibility(ciKlass* accessing_klass,
+@@ -301,6 +304,9 @@
+   ciInstanceKlass* ClassCastException_klass() {
+     return _ClassCastException;
+   }
++  ciInstanceKlass* InvokeDynamic_klass() {
++    return _InvokeDynamic;
++  }
+   ciInstanceKlass* Object_klass() {
+     return _Object;
+   }
+diff --git a/src/share/vm/ci/ciMethod.cpp b/src/share/vm/ci/ciMethod.cpp
+--- a/src/share/vm/ci/ciMethod.cpp
++++ b/src/share/vm/ci/ciMethod.cpp
+@@ -687,7 +687,7 @@
+ // ------------------------------------------------------------------
+ // invokedynamic support
+ //
+-bool ciMethod::is_method_handle_invoke() {
++bool ciMethod::is_method_handle_invoke() const {
+   check_is_loaded();
+   bool flag = ((flags().as_int() & JVM_MH_INVOKE_BITS) == JVM_MH_INVOKE_BITS);
+ #ifdef ASSERT
+diff --git a/src/share/vm/ci/ciMethod.hpp b/src/share/vm/ci/ciMethod.hpp
+--- a/src/share/vm/ci/ciMethod.hpp
++++ b/src/share/vm/ci/ciMethod.hpp
+@@ -213,7 +213,7 @@
+   bool check_call(int refinfo_index, bool is_static) const;
+   void build_method_data();  // make sure it exists in the VM also
+   int scale_count(int count, float prof_factor = 1.);  // make MDO count commensurate with IIC
+-  bool is_method_handle_invoke();
++  bool is_method_handle_invoke() const;
+   ciInstance* method_handle_type();
+ 
+   // What kind of ciObject is this?
+diff --git a/src/share/vm/ci/ciObject.hpp b/src/share/vm/ci/ciObject.hpp
+--- a/src/share/vm/ci/ciObject.hpp
++++ b/src/share/vm/ci/ciObject.hpp
+@@ -131,6 +131,7 @@
+ 
+   // What kind of ciObject is this?
+   virtual bool is_null_object() const       { return false; }
++  virtual bool is_cpcache() const           { return false; }
+   virtual bool is_instance()                { return false; }
+   virtual bool is_method()                  { return false; }
+   virtual bool is_method_data()             { return false; }
+@@ -185,6 +186,10 @@
+     assert(is_null_object(), "bad cast");
+     return (ciNullObject*)this;
+   }
++  ciCPCache*               as_cpcache() {
++    assert(is_cpcache(), "bad cast");
++    return (ciCPCache*) this;
++  }
+   ciInstance*              as_instance() {
+     assert(is_instance(), "bad cast");
+     return (ciInstance*)this;
+diff --git a/src/share/vm/ci/ciObjectFactory.cpp b/src/share/vm/ci/ciObjectFactory.cpp
+--- a/src/share/vm/ci/ciObjectFactory.cpp
++++ b/src/share/vm/ci/ciObjectFactory.cpp
+@@ -153,6 +153,10 @@
+   ciEnv::_ClassCastException =
+     get(SystemDictionary::ClassCastException_klass())
+       ->as_instance_klass();
++  if (EnableInvokeDynamic) {
++    ciEnv::_InvokeDynamic =
++      get(SystemDictionary::InvokeDynamic_klass())->as_instance_klass();
++  }
+   ciEnv::_Object =
+     get(SystemDictionary::object_klass())
+       ->as_instance_klass();
+@@ -340,6 +344,9 @@
+   } else if (o->is_typeArray()) {
+     typeArrayHandle h_ta(THREAD, (typeArrayOop)o);
+     return new (arena()) ciTypeArray(h_ta);
++  } else if (o->is_constantPoolCache()) {
++    constantPoolCacheHandle h_cpc(THREAD, (constantPoolCacheOop) o);
++    return new (arena()) ciCPCache(h_cpc);
+   }
+ 
+   // The oop is of some type not supported by the compiler interface.
+diff --git a/src/share/vm/ci/ciStreams.cpp b/src/share/vm/ci/ciStreams.cpp
+--- a/src/share/vm/ci/ciStreams.cpp
++++ b/src/share/vm/ci/ciStreams.cpp
+@@ -321,7 +321,7 @@
+ //
+ // If this is a method invocation bytecode, get the invoked method.
+ ciMethod* ciBytecodeStream::get_method(bool& will_link) {
+-  ciMethod* m = CURRENT_ENV->get_method_by_index(_holder, get_method_index(),cur_bc());
++  ciMethod* m = CURRENT_ENV->get_method_by_index(_holder, get_method_index(), cur_bc());
+   will_link = m->is_loaded();
+   return m;
+ }
+@@ -370,3 +370,14 @@
+   int name_and_type_index = cpool->name_and_type_ref_index_at(method_index);
+   return cpool->signature_ref_index_at(name_and_type_index);
+ }
++
++// ------------------------------------------------------------------
++// ciBytecodeStream::get_cpcache
++ciCPCache* ciBytecodeStream::get_cpcache() {
++  VM_ENTRY_MARK;
++  // Get the constant pool.
++  constantPoolOop      cpool   = _holder->get_instanceKlass()->constants();
++  constantPoolCacheOop cpcache = cpool->cache();
++
++  return CURRENT_ENV->get_object(cpcache)->as_cpcache();
++}
+diff --git a/src/share/vm/ci/ciStreams.hpp b/src/share/vm/ci/ciStreams.hpp
+--- a/src/share/vm/ci/ciStreams.hpp
++++ b/src/share/vm/ci/ciStreams.hpp
+@@ -232,6 +232,8 @@
+   int       get_method_holder_index();
+   int       get_method_signature_index();
+ 
++  ciCPCache* get_cpcache();
++
+  private:
+   void assert_index_size(int required_size) const {
+ #ifdef ASSERT
+diff --git a/src/share/vm/ci/ciTypeFlow.cpp b/src/share/vm/ci/ciTypeFlow.cpp
+--- a/src/share/vm/ci/ciTypeFlow.cpp
++++ b/src/share/vm/ci/ciTypeFlow.cpp
+@@ -635,8 +635,15 @@
+   ciMethod* method = str->get_method(will_link);
+   if (!will_link) {
+     // We weren't able to find the method.
+-    ciKlass* unloaded_holder = method->holder();
+-    trap(str, unloaded_holder, str->get_method_holder_index());
++    if (str->cur_bc() == Bytecodes::_invokedynamic) {
++      trap(str, NULL,
++           Deoptimization::make_trap_request
++           (Deoptimization::Reason_uninitialized,
++            Deoptimization::Action_reinterpret));
++    } else {
++      ciKlass* unloaded_holder = method->holder();
++      trap(str, unloaded_holder, str->get_method_holder_index());
++    }
+   } else {
+     ciSignature* signature = method->signature();
+     ciSignatureStream sigstr(signature);
+@@ -1292,8 +1299,8 @@
+   case Bytecodes::_invokeinterface: do_invoke(str, true);           break;
+   case Bytecodes::_invokespecial:   do_invoke(str, true);           break;
+   case Bytecodes::_invokestatic:    do_invoke(str, false);          break;
+-
+   case Bytecodes::_invokevirtual:   do_invoke(str, true);           break;
++  case Bytecodes::_invokedynamic:   do_invoke(str, false);          break;
+ 
+   case Bytecodes::_istore:   store_local_int(str->get_index());     break;
+   case Bytecodes::_istore_0: store_local_int(0);                    break;
+diff --git a/src/share/vm/includeDB_compiler2 b/src/share/vm/includeDB_compiler2
+--- a/src/share/vm/includeDB_compiler2
++++ b/src/share/vm/includeDB_compiler2
+@@ -155,6 +155,7 @@
+ callGenerator.cpp                       cfgnode.hpp
+ callGenerator.cpp                       compileLog.hpp
+ callGenerator.cpp                       connode.hpp
++callGenerator.cpp                       ciCPCache.hpp
+ callGenerator.cpp                       parse.hpp
+ callGenerator.cpp                       rootnode.hpp
+ callGenerator.cpp                       runtime.hpp
+diff --git a/src/share/vm/includeDB_core b/src/share/vm/includeDB_core
+--- a/src/share/vm/includeDB_core
++++ b/src/share/vm/includeDB_core
+@@ -532,6 +532,12 @@
+ ciConstantPoolCache.hpp                 growableArray.hpp
+ ciConstantPoolCache.hpp                 resourceArea.hpp
+ 
++ciCPCache.cpp                           cpCacheOop.hpp
++ciCPCache.cpp                           ciCPCache.hpp
++
++ciCPCache.hpp                           ciClassList.hpp
++ciCPCache.hpp                           ciObject.hpp
++
+ ciEnv.cpp                               allocation.inline.hpp
+ ciEnv.cpp                               ciConstant.hpp
+ ciEnv.cpp                               ciEnv.hpp
+@@ -755,6 +761,7 @@
+ ciObject.hpp                            jniHandles.hpp
+ 
+ ciObjectFactory.cpp                     allocation.inline.hpp
++ciObjectFactory.cpp                     ciCPCache.hpp
+ ciObjectFactory.cpp                     ciInstance.hpp
+ ciObjectFactory.cpp                     ciInstanceKlass.hpp
+ ciObjectFactory.cpp                     ciInstanceKlassKlass.hpp
+diff --git a/src/share/vm/opto/bytecodeInfo.cpp b/src/share/vm/opto/bytecodeInfo.cpp
+--- a/src/share/vm/opto/bytecodeInfo.cpp
++++ b/src/share/vm/opto/bytecodeInfo.cpp
+@@ -322,14 +322,17 @@
+     // stricter than callee_holder->is_initialized()
+     ciBytecodeStream iter(caller_method);
+     iter.force_bci(caller_bci);
+-    int index = iter.get_index_int();
+-    if( !caller_method->is_klass_loaded(index, true) ) {
+-      return false;
+-    }
+-    // Try to do constant pool resolution if running Xcomp
+     Bytecodes::Code call_bc = iter.cur_bc();
+-    if( !caller_method->check_call(index, call_bc == Bytecodes::_invokestatic) ) {
+-      return false;
++    // An invokedynamic instruction does not have a klass.
++    if (call_bc != Bytecodes::_invokedynamic) {
++      int index = iter.get_index_int();
++      if (!caller_method->is_klass_loaded(index, true)) {
++        return false;
++      }
++      // Try to do constant pool resolution if running Xcomp
++      if( !caller_method->check_call(index, call_bc == Bytecodes::_invokestatic) ) {
++        return false;
++      }
+     }
+   }
+   // We will attempt to see if a class/field/etc got properly loaded.  If it
+diff --git a/src/share/vm/opto/callGenerator.cpp b/src/share/vm/opto/callGenerator.cpp
+--- a/src/share/vm/opto/callGenerator.cpp
++++ b/src/share/vm/opto/callGenerator.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2000-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 2000-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -136,6 +136,8 @@
+     }
+     // Mark the call node as virtual, sort of:
+     call->set_optimized_virtual(true);
++    if (method()->is_method_handle_invoke())
++      call->set_method_handle_invoke(true);
+   }
+   kit.set_arguments_for_java_call(call);
+   kit.set_edges_for_java_call(call, false, _separate_io_proj);
+@@ -145,6 +147,71 @@
+   return kit.transfer_exceptions_into_jvms();
+ }
+ 
++//---------------------------DynamicCallGenerator-----------------------------
++// Internal class which handles all out-of-line dynamic calls.
++class DynamicCallGenerator : public CallGenerator {
++public:
++  DynamicCallGenerator(ciMethod* method)
++    : CallGenerator(method)
++  {
++  }
++  virtual JVMState* generate(JVMState* jvms);
++};
++
++JVMState* DynamicCallGenerator::generate(JVMState* jvms) {
++  GraphKit kit(jvms);
++
++  if (kit.C->log() != NULL) {
++    kit.C->log()->elem("dynamic_call bci='%d'", jvms->bci());
++  }
++
++  // Get the constant pool cache from the caller class.
++  ciMethod* caller_method = jvms->method();
++  ciBytecodeStream str(caller_method);
++  str.force_bci(jvms->bci());  // Set the stream to the invokedynamic bci.
++  assert(str.cur_bc() == Bytecodes::_invokedynamic, "wrong place to issue a dynamic call!");
++  ciCPCache* cpcache = str.get_cpcache();
++
++  // Get the offset of the CallSite from the constant pool cache
++  // pointer.
++  int index = str.get_method_index();
++  size_t call_site_offset = cpcache->get_f1_offset(index);
++
++  // Load the CallSite object from the constant pool cache.
++  const TypeOopPtr* cpcache_ptr = TypeOopPtr::make_from_constant(cpcache);
++  Node* cpc = kit.makecon(cpcache_ptr);
++  Node* adr = kit.basic_plus_adr(cpc, cpc, call_site_offset);
++  Node* call_site = kit.make_load(kit.control(), adr, TypeInstPtr::BOTTOM, T_OBJECT, Compile::AliasIdxRaw);
++
++  // Load the MethodHandle (target) from the CallSite object.
++  Node* mh_adr = kit.basic_plus_adr(call_site, call_site, java_dyn_CallSite::target_offset_in_bytes());
++  Node* mh = kit.make_load(kit.control(), mh_adr, TypeInstPtr::BOTTOM, T_OBJECT);
++
++  address stub = SharedRuntime::get_resolve_opt_virtual_call_stub();
++
++  CallStaticJavaNode *call = new (kit.C, tf()->domain()->cnt()) CallStaticJavaNode(tf(), stub, method(), kit.bci());
++  // invokedynamic is treated as an optimized invokevirtual.
++  call->set_optimized_virtual(true);
++  // Take extra care (in the presence of argument motion) not to trash the SP:
++  call->set_method_handle_invoke(true);
++
++  // Pass the MethodHandle as first argument and shift the other
++  // arguments.
++  call->init_req(0 + TypeFunc::Parms, mh);
++  uint nargs = call->method()->arg_size();
++  for (uint i = 1; i < nargs; i++) {
++    Node* arg = kit.argument(i - 1);
++    call->init_req(i + TypeFunc::Parms, arg);
++  }
++
++  kit.set_edges_for_java_call(call);
++  Node* ret = kit.set_results_for_java_call(call);
++  kit.push_node(method()->return_type()->basic_type(), ret);
++  return kit.transfer_exceptions_into_jvms();
++}
++
++//--------------------------VirtualCallGenerator------------------------------
++// Internal class which handles all out-of-line calls checking receiver type.
+ class VirtualCallGenerator : public CallGenerator {
+ private:
+   int _vtable_index;
+@@ -159,8 +226,6 @@
+   virtual JVMState* generate(JVMState* jvms);
+ };
+ 
+-//--------------------------VirtualCallGenerator------------------------------
+-// Internal class which handles all out-of-line calls checking receiver type.
+ JVMState* VirtualCallGenerator::generate(JVMState* jvms) {
+   GraphKit kit(jvms);
+   Node* receiver = kit.argument(0);
+@@ -253,8 +318,14 @@
+   return new DirectCallGenerator(m, separate_io_proj);
+ }
+ 
++CallGenerator* CallGenerator::for_dynamic_call(ciMethod* m) {
++  assert(m->is_method_handle_invoke(), "for_dynamic_call mismatch");
++  return new DynamicCallGenerator(m);
++}
++
+ CallGenerator* CallGenerator::for_virtual_call(ciMethod* m, int vtable_index) {
+   assert(!m->is_static(), "for_virtual_call mismatch");
++  assert(!m->is_method_handle_invoke(), "should be a direct call");
+   return new VirtualCallGenerator(m, vtable_index);
+ }
+ 
+diff --git a/src/share/vm/opto/callGenerator.hpp b/src/share/vm/opto/callGenerator.hpp
+--- a/src/share/vm/opto/callGenerator.hpp
++++ b/src/share/vm/opto/callGenerator.hpp
+@@ -100,6 +100,7 @@
+ 
+   // How to generate vanilla out-of-line call sites:
+   static CallGenerator* for_direct_call(ciMethod* m, bool separate_io_projs = false);   // static, special
++  static CallGenerator* for_dynamic_call(ciMethod* m);  // invokedynamic
+   static CallGenerator* for_virtual_call(ciMethod* m, int vtable_index);  // virtual, interface
+ 
+   // How to generate a replace a direct call with an inline version
+diff --git a/src/share/vm/opto/callnode.hpp b/src/share/vm/opto/callnode.hpp
+--- a/src/share/vm/opto/callnode.hpp
++++ b/src/share/vm/opto/callnode.hpp
+@@ -562,12 +562,15 @@
+   virtual uint size_of() const; // Size is bigger
+ 
+   bool    _optimized_virtual;
++  bool    _method_handle_invoke;
+   ciMethod* _method;            // Method being direct called
+ public:
+   const int       _bci;         // Byte Code Index of call byte code
+   CallJavaNode(const TypeFunc* tf , address addr, ciMethod* method, int bci)
+     : CallNode(tf, addr, TypePtr::BOTTOM),
+-      _method(method), _bci(bci), _optimized_virtual(false)
++      _method(method), _bci(bci),
++      _optimized_virtual(false),
++      _method_handle_invoke(false)
+   {
+     init_class_id(Class_CallJava);
+   }
+@@ -577,6 +580,8 @@
+   void  set_method(ciMethod *m)           { _method = m; }
+   void  set_optimized_virtual(bool f)     { _optimized_virtual = f; }
+   bool  is_optimized_virtual() const      { return _optimized_virtual; }
++  void  set_method_handle_invoke(bool f)  { _method_handle_invoke = f; }
++  bool  is_method_handle_invoke() const   { return _method_handle_invoke; }
+ 
+ #ifndef PRODUCT
+   virtual void  dump_spec(outputStream *st) const;
+diff --git a/src/share/vm/opto/doCall.cpp b/src/share/vm/opto/doCall.cpp
+--- a/src/share/vm/opto/doCall.cpp
++++ b/src/share/vm/opto/doCall.cpp
+@@ -228,6 +228,12 @@
+   // Use a more generic tactic, like a simple call.
+   if (call_is_virtual) {
+     return CallGenerator::for_virtual_call(call_method, vtable_index);
++  } else if (call_method->is_method_handle_invoke()) {
++    if (jvms->method()->java_code_at_bci(jvms->bci()) == Bytecodes::_invokedynamic)
++      return CallGenerator::for_dynamic_call(call_method);
++    else
++      // %%% if the target MH is a compile-time constant, we should try to inline it
++      return CallGenerator::for_direct_call(call_method);
+   } else {
+     // Class Hierarchy Analysis or Type Profile reveals a unique target,
+     // or it is a static or special call.
+@@ -299,7 +305,7 @@
+   // Interface classes can be loaded & linked and never get around to
+   // being initialized.  Uncommon-trap for not-initialized static or
+   // v-calls.  Let interface calls happen.
+-  ciInstanceKlass* holder_klass  = dest_method->holder();
++  ciInstanceKlass* holder_klass = dest_method->holder();
+   if (!holder_klass->is_initialized() &&
+       !holder_klass->is_interface()) {
+     uncommon_trap(Deoptimization::Reason_uninitialized,
+@@ -307,14 +313,6 @@
+                   holder_klass);
+     return true;
+   }
+-  if (dest_method->is_method_handle_invoke()
+-      && holder_klass->name() == ciSymbol::java_dyn_InvokeDynamic()) {
+-    // FIXME: NYI
+-    uncommon_trap(Deoptimization::Reason_unhandled,
+-                  Deoptimization::Action_none,
+-                  holder_klass);
+-    return true;
+-  }
+ 
+   assert(dest_method->will_link(method()->holder(), klass, bc()), "dest_method: typeflow responsibility");
+   return false;
+@@ -333,6 +331,7 @@
+   bool is_virtual = bc() == Bytecodes::_invokevirtual;
+   bool is_virtual_or_interface = is_virtual || bc() == Bytecodes::_invokeinterface;
+   bool has_receiver = is_virtual_or_interface || bc() == Bytecodes::_invokespecial;
++  bool is_invokedynamic = bc() == Bytecodes::_invokedynamic;
+ 
+   // Find target being called
+   bool             will_link;
+@@ -341,7 +340,8 @@
+   ciKlass* holder = iter().get_declared_method_holder();
+   ciInstanceKlass* klass = ciEnv::get_instance_klass_for_declared_method_holder(holder);
+ 
+-  int   nargs    = dest_method->arg_size();
++  int nargs = dest_method->arg_size();
++  if (is_invokedynamic)  nargs -= 1;
+ 
+   // uncommon-trap when callee is unloaded, uninitialized or will not link
+   // bailout when too many arguments for register representation
+@@ -355,7 +355,7 @@
+     return;
+   }
+   assert(holder_klass->is_loaded(), "");
+-  assert(dest_method->is_static() == !has_receiver, "must match bc");
++  assert((dest_method->is_static() || is_invokedynamic) == !has_receiver , "must match bc");
+   // Note: this takes into account invokeinterface of methods declared in java/lang/Object,
+   // which should be invokevirtuals but according to the VM spec may be invokeinterfaces
+   assert(holder_klass->is_interface() || holder_klass->super() == NULL || (bc() != Bytecodes::_invokeinterface), "must match bc");
+diff --git a/src/share/vm/opto/graphKit.cpp b/src/share/vm/opto/graphKit.cpp
+--- a/src/share/vm/opto/graphKit.cpp
++++ b/src/share/vm/opto/graphKit.cpp
+@@ -981,14 +981,19 @@
+   case Bytecodes::_invokedynamic:
+   case Bytecodes::_invokeinterface:
+     {
+-      bool is_static = (depth == 0);
+       bool ignore;
+       ciBytecodeStream iter(method());
+       iter.reset_to_bci(bci());
+       iter.next();
+       ciMethod* method = iter.get_method(ignore);
+       inputs = method->arg_size_no_receiver();
+-      if (!is_static)  inputs += 1;
++      // Add a receiver argument, maybe:
++      if (code != Bytecodes::_invokestatic &&
++          code != Bytecodes::_invokedynamic)
++        inputs += 1;
++      // (Do not use ciMethod::arg_size(), because
++      // it might be an unloaded method, which doesn't
++      // know whether it is static or not.)
+       int size = method->return_type()->size();
+       depth = size - inputs;
+     }
+diff --git a/src/share/vm/opto/lcm.cpp b/src/share/vm/opto/lcm.cpp
+--- a/src/share/vm/opto/lcm.cpp
++++ b/src/share/vm/opto/lcm.cpp
+@@ -542,6 +542,16 @@
+   // pointers as far as the kill mask goes.
+   bool exclude_soe = op == Op_CallRuntime;
+ 
++  // If the call is a MethodHandle invoke, we need to exclude the
++  // register which is used to save the SP value over MH invokes from
++  // the mask.  Otherwise this register could be used for
++  // deoptimization information.
++  if (op == Op_CallStaticJava) {
++    MachCallStaticJavaNode* mcallstaticjava = (MachCallStaticJavaNode*) mcall;
++    if (mcallstaticjava->_method_handle_invoke)
++      proj->_rout.OR(Matcher::method_handle_invoke_SP_save_mask());
++  }
++
+   // Fill in the kill mask for the call
+   for( OptoReg::Name r = OptoReg::Name(0); r < _last_Mach_Reg; r=OptoReg::add(r,1) ) {
+     if( !regs.Member(r) ) {     // Not already defined by the call
+diff --git a/src/share/vm/opto/machnode.cpp b/src/share/vm/opto/machnode.cpp
+--- a/src/share/vm/opto/machnode.cpp
++++ b/src/share/vm/opto/machnode.cpp
+@@ -636,7 +636,9 @@
+ }
+ #ifndef PRODUCT
+ void MachCallJavaNode::dump_spec(outputStream *st) const {
+-  if( _method ) {
++  if (_method_handle_invoke)
++    st->print("MethodHandle ");
++  if (_method) {
+     _method->print_short_name(st);
+     st->print(" ");
+   }
+@@ -644,6 +646,20 @@
+ }
+ #endif
+ 
++//------------------------------Registers--------------------------------------
++const RegMask &MachCallJavaNode::in_RegMask(uint idx) const {
++  // Values in the domain use the users calling convention, embodied in the
++  // _in_rms array of RegMasks.
++  if (idx < tf()->domain()->cnt())  return _in_rms[idx];
++  // Values outside the domain represent debug info
++  Matcher* m = Compile::current()->matcher();
++  // If this call is a MethodHandle invoke we have to use a different
++  // debugmask which does not include the register we use to save the
++  // SP over MH invokes.
++  RegMask** debugmask = _method_handle_invoke ? m->idealreg2mhdebugmask : m->idealreg2debugmask;
++  return *debugmask[in(idx)->ideal_reg()];
++}
++
+ //=============================================================================
+ uint MachCallStaticJavaNode::size_of() const { return sizeof(*this); }
+ uint MachCallStaticJavaNode::cmp( const Node &n ) const {
+diff --git a/src/share/vm/opto/machnode.hpp b/src/share/vm/opto/machnode.hpp
+--- a/src/share/vm/opto/machnode.hpp
++++ b/src/share/vm/opto/machnode.hpp
+@@ -662,9 +662,13 @@
+   ciMethod* _method;             // Method being direct called
+   int        _bci;               // Byte Code index of call byte code
+   bool       _optimized_virtual; // Tells if node is a static call or an optimized virtual
++  bool       _method_handle_invoke;   // Tells if the call has to preserve SP
+   MachCallJavaNode() : MachCallNode() {
+     init_class_id(Class_MachCallJava);
+   }
++
++  virtual const RegMask &in_RegMask(uint) const;
++
+ #ifndef PRODUCT
+   virtual void dump_spec(outputStream *st) const;
+ #endif
+diff --git a/src/share/vm/opto/matcher.cpp b/src/share/vm/opto/matcher.cpp
+--- a/src/share/vm/opto/matcher.cpp
++++ b/src/share/vm/opto/matcher.cpp
+@@ -70,19 +70,27 @@
+   _dontcare(&_states_arena) {
+   C->set_matcher(this);
+ 
+-  idealreg2spillmask[Op_RegI] = NULL;
+-  idealreg2spillmask[Op_RegN] = NULL;
+-  idealreg2spillmask[Op_RegL] = NULL;
+-  idealreg2spillmask[Op_RegF] = NULL;
+-  idealreg2spillmask[Op_RegD] = NULL;
+-  idealreg2spillmask[Op_RegP] = NULL;
++  idealreg2spillmask  [Op_RegI] = NULL;
++  idealreg2spillmask  [Op_RegN] = NULL;
++  idealreg2spillmask  [Op_RegL] = NULL;
++  idealreg2spillmask  [Op_RegF] = NULL;
++  idealreg2spillmask  [Op_RegD] = NULL;
++  idealreg2spillmask  [Op_RegP] = NULL;
+ 
+-  idealreg2debugmask[Op_RegI] = NULL;
+-  idealreg2debugmask[Op_RegN] = NULL;
+-  idealreg2debugmask[Op_RegL] = NULL;
+-  idealreg2debugmask[Op_RegF] = NULL;
+-  idealreg2debugmask[Op_RegD] = NULL;
+-  idealreg2debugmask[Op_RegP] = NULL;
++  idealreg2debugmask  [Op_RegI] = NULL;
++  idealreg2debugmask  [Op_RegN] = NULL;
++  idealreg2debugmask  [Op_RegL] = NULL;
++  idealreg2debugmask  [Op_RegF] = NULL;
++  idealreg2debugmask  [Op_RegD] = NULL;
++  idealreg2debugmask  [Op_RegP] = NULL;
++
++  idealreg2mhdebugmask[Op_RegI] = NULL;
++  idealreg2mhdebugmask[Op_RegN] = NULL;
++  idealreg2mhdebugmask[Op_RegL] = NULL;
++  idealreg2mhdebugmask[Op_RegF] = NULL;
++  idealreg2mhdebugmask[Op_RegD] = NULL;
++  idealreg2mhdebugmask[Op_RegP] = NULL;
++
+   debug_only(_mem_node = NULL;)   // Ideal memory node consumed by mach node
+ }
+ 
+@@ -389,19 +397,28 @@
+ void Matcher::init_first_stack_mask() {
+ 
+   // Allocate storage for spill masks as masks for the appropriate load type.
+-  RegMask *rms = (RegMask*)C->comp_arena()->Amalloc_D(sizeof(RegMask)*12);
+-  idealreg2spillmask[Op_RegN] = &rms[0];
+-  idealreg2spillmask[Op_RegI] = &rms[1];
+-  idealreg2spillmask[Op_RegL] = &rms[2];
+-  idealreg2spillmask[Op_RegF] = &rms[3];
+-  idealreg2spillmask[Op_RegD] = &rms[4];
+-  idealreg2spillmask[Op_RegP] = &rms[5];
+-  idealreg2debugmask[Op_RegN] = &rms[6];
+-  idealreg2debugmask[Op_RegI] = &rms[7];
+-  idealreg2debugmask[Op_RegL] = &rms[8];
+-  idealreg2debugmask[Op_RegF] = &rms[9];
+-  idealreg2debugmask[Op_RegD] = &rms[10];
+-  idealreg2debugmask[Op_RegP] = &rms[11];
++  RegMask *rms = (RegMask*)C->comp_arena()->Amalloc_D(sizeof(RegMask) * 3*6);
++
++  idealreg2spillmask  [Op_RegN] = &rms[0];
++  idealreg2spillmask  [Op_RegI] = &rms[1];
++  idealreg2spillmask  [Op_RegL] = &rms[2];
++  idealreg2spillmask  [Op_RegF] = &rms[3];
++  idealreg2spillmask  [Op_RegD] = &rms[4];
++  idealreg2spillmask  [Op_RegP] = &rms[5];
++
++  idealreg2debugmask  [Op_RegN] = &rms[6];
++  idealreg2debugmask  [Op_RegI] = &rms[7];
++  idealreg2debugmask  [Op_RegL] = &rms[8];
++  idealreg2debugmask  [Op_RegF] = &rms[9];
++  idealreg2debugmask  [Op_RegD] = &rms[10];
++  idealreg2debugmask  [Op_RegP] = &rms[11];
++
++  idealreg2mhdebugmask[Op_RegN] = &rms[12];
++  idealreg2mhdebugmask[Op_RegI] = &rms[13];
++  idealreg2mhdebugmask[Op_RegL] = &rms[14];
++  idealreg2mhdebugmask[Op_RegF] = &rms[15];
++  idealreg2mhdebugmask[Op_RegD] = &rms[16];
++  idealreg2mhdebugmask[Op_RegP] = &rms[17];
+ 
+   OptoReg::Name i;
+ 
+@@ -442,12 +459,19 @@
+   // Make up debug masks.  Any spill slot plus callee-save registers.
+   // Caller-save registers are assumed to be trashable by the various
+   // inline-cache fixup routines.
+-  *idealreg2debugmask[Op_RegN]= *idealreg2spillmask[Op_RegN];
+-  *idealreg2debugmask[Op_RegI]= *idealreg2spillmask[Op_RegI];
+-  *idealreg2debugmask[Op_RegL]= *idealreg2spillmask[Op_RegL];
+-  *idealreg2debugmask[Op_RegF]= *idealreg2spillmask[Op_RegF];
+-  *idealreg2debugmask[Op_RegD]= *idealreg2spillmask[Op_RegD];
+-  *idealreg2debugmask[Op_RegP]= *idealreg2spillmask[Op_RegP];
++  *idealreg2debugmask  [Op_RegN]= *idealreg2spillmask[Op_RegN];
++  *idealreg2debugmask  [Op_RegI]= *idealreg2spillmask[Op_RegI];
++  *idealreg2debugmask  [Op_RegL]= *idealreg2spillmask[Op_RegL];
++  *idealreg2debugmask  [Op_RegF]= *idealreg2spillmask[Op_RegF];
++  *idealreg2debugmask  [Op_RegD]= *idealreg2spillmask[Op_RegD];
++  *idealreg2debugmask  [Op_RegP]= *idealreg2spillmask[Op_RegP];
++
++  *idealreg2mhdebugmask[Op_RegN]= *idealreg2spillmask[Op_RegN];
++  *idealreg2mhdebugmask[Op_RegI]= *idealreg2spillmask[Op_RegI];
++  *idealreg2mhdebugmask[Op_RegL]= *idealreg2spillmask[Op_RegL];
++  *idealreg2mhdebugmask[Op_RegF]= *idealreg2spillmask[Op_RegF];
++  *idealreg2mhdebugmask[Op_RegD]= *idealreg2spillmask[Op_RegD];
++  *idealreg2mhdebugmask[Op_RegP]= *idealreg2spillmask[Op_RegP];
+ 
+   // Prevent stub compilations from attempting to reference
+   // callee-saved registers from debug info
+@@ -458,14 +482,31 @@
+     if( _register_save_policy[i] == 'C' ||
+         _register_save_policy[i] == 'A' ||
+         (_register_save_policy[i] == 'E' && exclude_soe) ) {
+-      idealreg2debugmask[Op_RegN]->Remove(i);
+-      idealreg2debugmask[Op_RegI]->Remove(i); // Exclude save-on-call
+-      idealreg2debugmask[Op_RegL]->Remove(i); // registers from debug
+-      idealreg2debugmask[Op_RegF]->Remove(i); // masks
+-      idealreg2debugmask[Op_RegD]->Remove(i);
+-      idealreg2debugmask[Op_RegP]->Remove(i);
++      idealreg2debugmask  [Op_RegN]->Remove(i);
++      idealreg2debugmask  [Op_RegI]->Remove(i); // Exclude save-on-call
++      idealreg2debugmask  [Op_RegL]->Remove(i); // registers from debug
++      idealreg2debugmask  [Op_RegF]->Remove(i); // masks
++      idealreg2debugmask  [Op_RegD]->Remove(i);
++      idealreg2debugmask  [Op_RegP]->Remove(i);
++
++      idealreg2mhdebugmask[Op_RegN]->Remove(i);
++      idealreg2mhdebugmask[Op_RegI]->Remove(i);
++      idealreg2mhdebugmask[Op_RegL]->Remove(i);
++      idealreg2mhdebugmask[Op_RegF]->Remove(i);
++      idealreg2mhdebugmask[Op_RegD]->Remove(i);
++      idealreg2mhdebugmask[Op_RegP]->Remove(i);
+     }
+   }
++
++  // Subtract the register we use to save the SP for MethodHandle
++  // invokes to from the debug mask.
++  const RegMask save_mask = method_handle_invoke_SP_save_mask();
++  idealreg2mhdebugmask[Op_RegN]->SUBTRACT(save_mask);
++  idealreg2mhdebugmask[Op_RegI]->SUBTRACT(save_mask);
++  idealreg2mhdebugmask[Op_RegL]->SUBTRACT(save_mask);
++  idealreg2mhdebugmask[Op_RegF]->SUBTRACT(save_mask);
++  idealreg2mhdebugmask[Op_RegD]->SUBTRACT(save_mask);
++  idealreg2mhdebugmask[Op_RegP]->SUBTRACT(save_mask);
+ }
+ 
+ //---------------------------is_save_on_entry----------------------------------
+@@ -989,6 +1030,7 @@
+   CallNode *call;
+   const TypeTuple *domain;
+   ciMethod*        method = NULL;
++  bool             is_method_handle_invoke = false;  // for special kill effects
+   if( sfpt->is_Call() ) {
+     call = sfpt->as_Call();
+     domain = call->tf()->domain();
+@@ -1013,6 +1055,8 @@
+       mcall_java->_method = method;
+       mcall_java->_bci = call_java->_bci;
+       mcall_java->_optimized_virtual = call_java->is_optimized_virtual();
++      is_method_handle_invoke = call_java->is_method_handle_invoke();
++      mcall_java->_method_handle_invoke = is_method_handle_invoke;
+       if( mcall_java->is_MachCallStaticJava() )
+         mcall_java->as_MachCallStaticJava()->_name =
+          call_java->as_CallStaticJava()->_name;
+@@ -1126,6 +1170,15 @@
+     mcall->_argsize = out_arg_limit_per_call - begin_out_arg_area;
+   }
+ 
++  if (is_method_handle_invoke) {
++    // Kill some extra stack space in case method handles want to do
++    // a little in-place argument insertion.
++    int regs_per_word  = NOT_LP64(1) LP64_ONLY(2); // %%% make a global const!
++    out_arg_limit_per_call += MethodHandlePushLimit * regs_per_word;
++    // Do not update mcall->_argsize because (a) the extra space is not
++    // pushed as arguments and (b) _argsize is dead (not used anywhere).
++  }
++
+   // Compute the max stack slot killed by any call.  These will not be
+   // available for debug info, and will be used to adjust FIRST_STACK_mask
+   // after all call sites have been visited.
+diff --git a/src/share/vm/opto/matcher.hpp b/src/share/vm/opto/matcher.hpp
+--- a/src/share/vm/opto/matcher.hpp
++++ b/src/share/vm/opto/matcher.hpp
+@@ -117,8 +117,9 @@
+   static const int base2reg[];        // Map Types to machine register types
+   // Convert ideal machine register to a register mask for spill-loads
+   static const RegMask *idealreg2regmask[];
+-  RegMask *idealreg2spillmask[_last_machine_leaf];
+-  RegMask *idealreg2debugmask[_last_machine_leaf];
++  RegMask *idealreg2spillmask  [_last_machine_leaf];
++  RegMask *idealreg2debugmask  [_last_machine_leaf];
++  RegMask *idealreg2mhdebugmask[_last_machine_leaf];
+   void init_spill_mask( Node *ret );
+   // Convert machine register number to register mask
+   static uint mreg2regmask_max;
+@@ -297,6 +298,8 @@
+   // Register for MODL projection of divmodL
+   static RegMask modL_proj_mask();
+ 
++  static const RegMask method_handle_invoke_SP_save_mask();
++
+   // Java-Interpreter calling convention
+   // (what you use when calling between compiled-Java and Interpreted-Java
+ 
+diff --git a/src/share/vm/opto/output.cpp b/src/share/vm/opto/output.cpp
+--- a/src/share/vm/opto/output.cpp
++++ b/src/share/vm/opto/output.cpp
+@@ -794,6 +794,7 @@
+ #endif
+ 
+   int safepoint_pc_offset = current_offset;
++  bool is_method_handle_invoke = false;
+ 
+   // Add the safepoint in the DebugInfoRecorder
+   if( !mach->is_MachCall() ) {
+@@ -801,6 +802,11 @@
+     debug_info()->add_safepoint(safepoint_pc_offset, sfn->_oop_map);
+   } else {
+     mcall = mach->as_MachCall();
++
++    // Is the call a MethodHandle call?
++    if (mcall->is_MachCallJava())
++      is_method_handle_invoke = mcall->as_MachCallJava()->_method_handle_invoke;
++
+     safepoint_pc_offset += mcall->ret_addr_offset();
+     debug_info()->add_safepoint(safepoint_pc_offset, mcall->_oop_map);
+   }
+@@ -913,7 +919,6 @@
+     assert(jvms->bci() >= InvocationEntryBci && jvms->bci() <= 0x10000, "must be a valid or entry BCI");
+     assert(!jvms->should_reexecute() || depth == max_depth, "reexecute allowed only for the youngest");
+     // Now we can describe the scope.
+-    bool is_method_handle_invoke = false;
+     debug_info()->describe_scope(safepoint_pc_offset, scope_method, jvms->bci(), jvms->should_reexecute(), is_method_handle_invoke, locvals, expvals, monvals);
+   } // End jvms loop
+ 
+diff --git a/src/share/vm/opto/type.cpp b/src/share/vm/opto/type.cpp
+--- a/src/share/vm/opto/type.cpp
++++ b/src/share/vm/opto/type.cpp
+@@ -2431,7 +2431,7 @@
+ //------------------------------make_from_constant-----------------------------
+ // Make a java pointer from an oop constant
+ const TypeOopPtr* TypeOopPtr::make_from_constant(ciObject* o, bool require_constant) {
+-  if (o->is_method_data() || o->is_method()) {
++  if (o->is_method_data() || o->is_method() || o->is_cpcache()) {
+     // Treat much like a typeArray of bytes, like below, but fake the type...
+     const Type* etype = (Type*)get_const_basic_type(T_BYTE);
+     const TypeAry* arr0 = TypeAry::make(etype, TypeInt::POS);
+@@ -3966,7 +3966,7 @@
+   const TypeFunc* tf = C->last_tf(method); // check cache
+   if (tf != NULL)  return tf;  // The hit rate here is almost 50%.
+   const TypeTuple *domain;
+-  if (method->flags().is_static()) {
++  if (method->is_static()) {
+     domain = TypeTuple::make_domain(NULL, method->signature());
+   } else {
+     domain = TypeTuple::make_domain(method->holder(), method->signature());

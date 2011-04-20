@@ -1,0 +1,102 @@
+6829189: Java programming with JSR 292 needs language support
+6754038: writing libraries in Java for non-Java languages requires method handle invocation
+Summary: javac recognizes implicit methods assigned by JVM to MethodHandle and InvokeDynamic
+
+javac needs to support library development for non-Java langauges
+
+Language changes are documented in http://wikis.sun.com/display/mlvm/ProjectCoinProposal
+
+http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=6754038
+
+Features:
+- the method java.dyn.MethodHandle.<T>invoke(AAA)T exists, even if not explicitly found
+- the static method java.dyn.InvokeDynamic.<T>zzz(AAA)T always exists, even if not explicitly found
+- the return type parameter <T> may be a primitive type or void
+- the return type parameter <T> may be omitted and defaults to Object
+- the signature of the implicit method is obtained by erasing actual argument types
+- null arguments are treated as of type java.lang.Void (which can only be a null reference)
+- no implicit conversions are performed on these calls; use a cast if you want conversion
+
+Discussion:
+See, for example, April-May 2009 discussions like the following:
+  http://mail.openjdk.java.net/pipermail/coin-dev/2009-April/001617.html
+  http://mail.openjdk.java.net/pipermail/coin-dev/2009-April/001418.html
+
+Examples from the unit test:
+    void test(MethodHandle mh) {
+        mh.invoke("world", 123);
+        // previous line generates invokevirtual MethodHandle.invoke(String,int)Object
+        InvokeDynamic.greet("hello", "world", 123);
+        // previous line generates invokedynamic greet(Object,String,int)Object
+    }
+
+Note that actual argument types can be overridden by casts, as in:
+  mh.invoke((Object)"foo", (Integer)123)
+  // previous line generates invokevirtual MethodHandle.invoke(Object,Integer)Object
+
+The return type defaults to Object, unless specified by a type argument.
+
+The syntax for return type specification is:
+  mh.<R>invoke(aaa)  // generates signature (AAA)R
+  mh.<String>invoke("foo", 123)  // signature is (String,int)String
+  mh.<void>invoke("foo", 123)  // signature is (String,int)void
+
+The syntax for the receiverless formulation of invokedynamic is:
+  InvokeDynamic.<R>zzz(obj,aaa)  // generates signature (Object,AAA)R
+  InvokeDynamic.zzz(AAA)  // return type is Object by default
+  InvokeDynamic.greet((Object)"hello", "world", 123)
+  // previous line generates invokedynamic greet(Object,String,int)Object
+  InvokeDynamic.<void>greet("hello", "world", 123)
+  // previous line generates invokedynamic greet(Object,String,int)void
+  // or (in a later JVM version) invokedynamic greet(String,String,int)void
+
+Notes & Status:
+- The syntax for invokedynamic is receiverless; the signature describes all stacked args.
+- The instruction uses a new code point (186) and takes a NameAndType reference, plus two zero bytes.
+- The flag -XDinvokedynamic also enables the new instruction, without otherwise changing the target.
+
+Authors:
+- John Rose (Sun)
+
+Tests:
+- unit tests test/tools/javac/meth/*
+
+Incremental testing:
+
+---- Using the Command Line ----
+
+This does not require a full JDK build.
+
+$ cd .../langtools
+$ hg qpush meth.patch
+$ (cd make; make)
+
+$ mkdir ./dist/cp1
+$ ./dist/bin/javac -d dist/cp1 -target 7 test/tools/javac/meth/Invoke{Dyn,MH}.java
+$ ./dist/bin/javap -c -classpath dist/cp1 meth.Invoke{Dyn,MH}  # observe call sites
+
+(Note:  Your $PATH may need to include a $JAVA_HOME for Java 6.)
+
+---- Using NetBeans ----
+
+(Assuming a link farm folder at ~/env/.)
+$ ln -s <some copy of jtreg> ~/env/JTREG_HOME
+$ ln -s <some java6 JRE> ~/env/JAVA6_HOME
+$ ln -s <some java6 JRE> ~/env/TARGET_JAVA_HOME
+$ ln -s <langtools dir> ~/env/LANGTOOLS
+
+Also, make sure your NetBeans is running Java 6 not Java 5.
+$ mkdir ~/.HOME/.netbeans/6.5/etc
+$ echo >> ~/.HOME/.netbeans/6.5/etc/netbeans.conf \
+    "netbeans_jdkhome = $HOME/env/JAVA6_HOME
+
+Configure the OpenJDK build file properties:
+$ echo >> ~/.openjdk/build.properties    boot.java.home = ~/env/JAVA_HOME
+$ echo >> ~/.openjdk/build.properties    target.java.home = /Users/jrose/env/TARGET_JAVA_HOME
+$ echo >> ~/.openjdk/build.properties    jtreg.home = /Users/jrose/env/JTREG_HOME
+$ mkdir ~/env/LANGTOOLS/dist/cp0
+
+Right-click on the "langtools" project in NetBeans Project window, get 'select-tool'.
+Actually, the resulting config file changes like this:
+$ echo >> ~/env/LANGTOOLS/make/netbeans/langtools/nbproject/private/langtools.properties \
+    javac.args = -d ~/env/LANGTOOLS/dist/cp0 -XDinvokedynamic ~/env/LANGTOOLS/test/tools/javac/meth/InvokeDyn.java

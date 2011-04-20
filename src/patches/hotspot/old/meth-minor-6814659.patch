@@ -1,0 +1,1884 @@
+6814659: separable cleanups and subroutines for 6655638
+Summary: preparatory but separable changes for method handles
+Reviewed-by: kvn, never
+
+diff --git a/src/cpu/sparc/vm/assembler_sparc.cpp b/src/cpu/sparc/vm/assembler_sparc.cpp
+--- a/src/cpu/sparc/vm/assembler_sparc.cpp
++++ b/src/cpu/sparc/vm/assembler_sparc.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -2615,12 +2615,12 @@
+   }
+ }
+ 
+-RegisterConstant MacroAssembler::delayed_value(intptr_t* delayed_value_addr,
+-                                               Register tmp,
+-                                               int offset) {
++RegisterOrConstant MacroAssembler::delayed_value_impl(intptr_t* delayed_value_addr,
++                                                      Register tmp,
++                                                      int offset) {
+   intptr_t value = *delayed_value_addr;
+   if (value != 0)
+-    return RegisterConstant(value + offset);
++    return RegisterOrConstant(value + offset);
+ 
+   // load indirectly to solve generation ordering problem
+   Address a(tmp, (address) delayed_value_addr);
+@@ -2634,11 +2634,11 @@
+   if (offset != 0)
+     add(tmp, offset, tmp);
+ 
+-  return RegisterConstant(tmp);
+-}
+-
+-
+-void MacroAssembler::regcon_inc_ptr( RegisterConstant& dest, RegisterConstant src, Register temp ) {
++  return RegisterOrConstant(tmp);
++}
++
++
++void MacroAssembler::regcon_inc_ptr( RegisterOrConstant& dest, RegisterOrConstant src, Register temp ) {
+   assert(dest.register_or_noreg() != G0, "lost side effect");
+   if ((src.is_constant() && src.as_constant() == 0) ||
+       (src.is_register() && src.as_register() == G0)) {
+@@ -2647,15 +2647,15 @@
+     add(dest.as_register(), ensure_rs2(src, temp), dest.as_register());
+   } else if (src.is_constant()) {
+     intptr_t res = dest.as_constant() + src.as_constant();
+-    dest = RegisterConstant(res); // side effect seen by caller
++    dest = RegisterOrConstant(res); // side effect seen by caller
+   } else {
+     assert(temp != noreg, "cannot handle constant += register");
+     add(src.as_register(), ensure_rs2(dest, temp), temp);
+-    dest = RegisterConstant(temp); // side effect seen by caller
+-  }
+-}
+-
+-void MacroAssembler::regcon_sll_ptr( RegisterConstant& dest, RegisterConstant src, Register temp ) {
++    dest = RegisterOrConstant(temp); // side effect seen by caller
++  }
++}
++
++void MacroAssembler::regcon_sll_ptr( RegisterOrConstant& dest, RegisterOrConstant src, Register temp ) {
+   assert(dest.register_or_noreg() != G0, "lost side effect");
+   if (!is_simm13(src.constant_or_zero()))
+     src = (src.as_constant() & 0xFF);
+@@ -2666,12 +2666,12 @@
+     sll_ptr(dest.as_register(), src, dest.as_register());
+   } else if (src.is_constant()) {
+     intptr_t res = dest.as_constant() << src.as_constant();
+-    dest = RegisterConstant(res); // side effect seen by caller
++    dest = RegisterOrConstant(res); // side effect seen by caller
+   } else {
+     assert(temp != noreg, "cannot handle constant <<= register");
+     set(dest.as_constant(), temp);
+     sll_ptr(temp, src, temp);
+-    dest = RegisterConstant(temp); // side effect seen by caller
++    dest = RegisterOrConstant(temp); // side effect seen by caller
+   }
+ }
+ 
+@@ -2683,7 +2683,7 @@
+ // On failure, execution transfers to the given label.
+ void MacroAssembler::lookup_interface_method(Register recv_klass,
+                                              Register intf_klass,
+-                                             RegisterConstant itable_index,
++                                             RegisterOrConstant itable_index,
+                                              Register method_result,
+                                              Register scan_temp,
+                                              Register sethi_temp,
+@@ -2720,7 +2720,7 @@
+   add(recv_klass, scan_temp, scan_temp);
+ 
+   // Adjust recv_klass by scaled itable_index, so we can free itable_index.
+-  RegisterConstant itable_offset = itable_index;
++  RegisterOrConstant itable_offset = itable_index;
+   regcon_sll_ptr(itable_offset, exact_log2(itableMethodEntry::size() * wordSize));
+   regcon_inc_ptr(itable_offset, itableMethodEntry::method_offset_in_bytes());
+   add(recv_klass, ensure_rs2(itable_offset, sethi_temp), recv_klass);
+@@ -2805,7 +2805,7 @@
+                                                    Label* L_success,
+                                                    Label* L_failure,
+                                                    Label* L_slow_path,
+-                                        RegisterConstant super_check_offset,
++                                        RegisterOrConstant super_check_offset,
+                                         Register instanceof_hack) {
+   int sc_offset = (klassOopDesc::header_size() * HeapWordSize +
+                    Klass::secondary_super_cache_offset_in_bytes());
+@@ -2867,7 +2867,7 @@
+   if (must_load_sco) {
+     // The super check offset is always positive...
+     lduw(super_klass, sco_offset, temp2_reg);
+-    super_check_offset = RegisterConstant(temp2_reg);
++    super_check_offset = RegisterOrConstant(temp2_reg);
+   }
+   ld_ptr(sub_klass, super_check_offset, temp_reg);
+   cmp(super_klass, temp_reg);
+@@ -4472,7 +4472,7 @@
+ }
+ 
+ // Loading values by size and signed-ness
+-void MacroAssembler::load_sized_value(Register s1, RegisterConstant s2, Register d,
++void MacroAssembler::load_sized_value(Register s1, RegisterOrConstant s2, Register d,
+                                       int size_in_bytes, bool is_signed) {
+   switch (size_in_bytes ^ (is_signed ? -1 : 0)) {
+   case ~8:  // fall through:
+diff --git a/src/cpu/sparc/vm/assembler_sparc.hpp b/src/cpu/sparc/vm/assembler_sparc.hpp
+--- a/src/cpu/sparc/vm/assembler_sparc.hpp
++++ b/src/cpu/sparc/vm/assembler_sparc.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -1088,8 +1088,8 @@
+   inline void add(    Register s1, Register s2, Register d );
+   inline void add(    Register s1, int simm13a, Register d, relocInfo::relocType rtype = relocInfo::none);
+   inline void add(    Register s1, int simm13a, Register d, RelocationHolder const& rspec);
+-  inline void add(    Register s1, RegisterConstant s2, Register d, int offset = 0);
+-  inline void add(    const Address&  a,              Register d, int offset = 0);
++  inline void add(    Register s1, RegisterOrConstant s2, Register d, int offset = 0);
++  inline void add(    const Address&  a,                  Register d, int offset = 0);
+ 
+   void addcc(  Register s1, Register s2, Register d ) { emit_long( op(arith_op) | rd(d) | op3(add_op3  | cc_bit_op3) | rs1(s1) | rs2(s2) ); }
+   void addcc(  Register s1, int simm13a, Register d ) { emit_long( op(arith_op) | rd(d) | op3(add_op3  | cc_bit_op3) | rs1(s1) | immed(true) | simm(simm13a, 13) ); }
+@@ -1305,15 +1305,15 @@
+   inline void ld(   const Address& a, Register d, int offset = 0 );
+   inline void ldd(  const Address& a, Register d, int offset = 0 );
+ 
+-  inline void ldub(  Register s1, RegisterConstant s2, Register d );
+-  inline void ldsb(  Register s1, RegisterConstant s2, Register d );
+-  inline void lduh(  Register s1, RegisterConstant s2, Register d );
+-  inline void ldsh(  Register s1, RegisterConstant s2, Register d );
+-  inline void lduw(  Register s1, RegisterConstant s2, Register d );
+-  inline void ldsw(  Register s1, RegisterConstant s2, Register d );
+-  inline void ldx(   Register s1, RegisterConstant s2, Register d );
+-  inline void ld(    Register s1, RegisterConstant s2, Register d );
+-  inline void ldd(   Register s1, RegisterConstant s2, Register d );
++  inline void ldub(  Register s1, RegisterOrConstant s2, Register d );
++  inline void ldsb(  Register s1, RegisterOrConstant s2, Register d );
++  inline void lduh(  Register s1, RegisterOrConstant s2, Register d );
++  inline void ldsh(  Register s1, RegisterOrConstant s2, Register d );
++  inline void lduw(  Register s1, RegisterOrConstant s2, Register d );
++  inline void ldsw(  Register s1, RegisterOrConstant s2, Register d );
++  inline void ldx(   Register s1, RegisterOrConstant s2, Register d );
++  inline void ld(    Register s1, RegisterOrConstant s2, Register d );
++  inline void ldd(   Register s1, RegisterOrConstant s2, Register d );
+ 
+   // pp 177
+ 
+@@ -1535,12 +1535,12 @@
+   inline void st(   Register d, const Address& a, int offset = 0 );
+   inline void std(  Register d, const Address& a, int offset = 0 );
+ 
+-  inline void stb(  Register d, Register s1, RegisterConstant s2 );
+-  inline void sth(  Register d, Register s1, RegisterConstant s2 );
+-  inline void stw(  Register d, Register s1, RegisterConstant s2 );
+-  inline void stx(  Register d, Register s1, RegisterConstant s2 );
+-  inline void std(  Register d, Register s1, RegisterConstant s2 );
+-  inline void st(   Register d, Register s1, RegisterConstant s2 );
++  inline void stb(  Register d, Register s1, RegisterOrConstant s2 );
++  inline void sth(  Register d, Register s1, RegisterOrConstant s2 );
++  inline void stw(  Register d, Register s1, RegisterOrConstant s2 );
++  inline void stx(  Register d, Register s1, RegisterOrConstant s2 );
++  inline void std(  Register d, Register s1, RegisterOrConstant s2 );
++  inline void st(   Register d, Register s1, RegisterOrConstant s2 );
+ 
+   // pp 177
+ 
+@@ -1859,7 +1859,7 @@
+   // Functions for isolating 64 bit shifts for LP64
+   inline void sll_ptr( Register s1, Register s2, Register d );
+   inline void sll_ptr( Register s1, int imm6a,   Register d );
+-  inline void sll_ptr( Register s1, RegisterConstant s2, Register d );
++  inline void sll_ptr( Register s1, RegisterOrConstant s2, Register d );
+   inline void srl_ptr( Register s1, Register s2, Register d );
+   inline void srl_ptr( Register s1, int imm6a,   Register d );
+ 
+@@ -1965,26 +1965,26 @@
+   // st_ptr will perform st for 32 bit VM's and stx for 64 bit VM's
+   inline void ld_ptr(   Register s1, Register s2, Register d );
+   inline void ld_ptr(   Register s1, int simm13a, Register d);
+-  inline void ld_ptr(   Register s1, RegisterConstant s2, Register d );
++  inline void ld_ptr(   Register s1, RegisterOrConstant s2, Register d );
+   inline void ld_ptr(  const Address& a, Register d, int offset = 0 );
+   inline void st_ptr(  Register d, Register s1, Register s2 );
+   inline void st_ptr(  Register d, Register s1, int simm13a);
+-  inline void st_ptr(  Register d, Register s1, RegisterConstant s2 );
++  inline void st_ptr(  Register d, Register s1, RegisterOrConstant s2 );
+   inline void st_ptr(  Register d, const Address& a, int offset = 0 );
+ 
+   // ld_long will perform ld for 32 bit VM's and ldx for 64 bit VM's
+   // st_long will perform st for 32 bit VM's and stx for 64 bit VM's
+   inline void ld_long( Register s1, Register s2, Register d );
+   inline void ld_long( Register s1, int simm13a, Register d );
+-  inline void ld_long( Register s1, RegisterConstant s2, Register d );
++  inline void ld_long( Register s1, RegisterOrConstant s2, Register d );
+   inline void ld_long( const Address& a, Register d, int offset = 0 );
+   inline void st_long( Register d, Register s1, Register s2 );
+   inline void st_long( Register d, Register s1, int simm13a );
+-  inline void st_long( Register d, Register s1, RegisterConstant s2 );
++  inline void st_long( Register d, Register s1, RegisterOrConstant s2 );
+   inline void st_long( Register d, const Address& a, int offset = 0 );
+ 
+   // Loading values by size and signed-ness
+-  void load_sized_value(Register s1, RegisterConstant s2, Register d,
++  void load_sized_value(Register s1, RegisterOrConstant s2, Register d,
+                         int size_in_bytes, bool is_signed);
+ 
+   // Helpers for address formation.
+@@ -1994,11 +1994,11 @@
+   // is required, and becomes the result.
+   // If dest is a register and src is a non-simm13 constant,
+   // the temp argument is required, and is used to materialize the constant.
+-  void regcon_inc_ptr( RegisterConstant& dest, RegisterConstant src,
++  void regcon_inc_ptr( RegisterOrConstant& dest, RegisterOrConstant src,
+                        Register temp = noreg );
+-  void regcon_sll_ptr( RegisterConstant& dest, RegisterConstant src,
++  void regcon_sll_ptr( RegisterOrConstant& dest, RegisterOrConstant src,
+                        Register temp = noreg );
+-  RegisterConstant ensure_rs2(RegisterConstant rs2, Register sethi_temp) {
++  RegisterOrConstant ensure_rs2(RegisterOrConstant rs2, Register sethi_temp) {
+     guarantee(sethi_temp != noreg, "constant offset overflow");
+     if (is_simm13(rs2.constant_or_zero()))
+       return rs2;               // register or short constant
+@@ -2322,7 +2322,7 @@
+   // interface method calling
+   void lookup_interface_method(Register recv_klass,
+                                Register intf_klass,
+-                               RegisterConstant itable_index,
++                               RegisterOrConstant itable_index,
+                                Register method_result,
+                                Register temp_reg, Register temp2_reg,
+                                Label& no_such_interface);
+@@ -2341,7 +2341,7 @@
+                                      Label* L_success,
+                                      Label* L_failure,
+                                      Label* L_slow_path,
+-                RegisterConstant super_check_offset = RegisterConstant(-1),
++                RegisterOrConstant super_check_offset = RegisterOrConstant(-1),
+                 Register instanceof_hack = noreg);
+ 
+   // The rest of the type check; must be wired to a corresponding fast path.
+@@ -2381,7 +2381,7 @@
+   // stack overflow + shadow pages.  Clobbers tsp and scratch registers.
+   void bang_stack_size(Register Rsize, Register Rtsp, Register Rscratch);
+ 
+-  virtual RegisterConstant delayed_value(intptr_t* delayed_value_addr, Register tmp, int offset);
++  virtual RegisterOrConstant delayed_value_impl(intptr_t* delayed_value_addr, Register tmp, int offset);
+ 
+   void verify_tlab();
+ 
+diff --git a/src/cpu/sparc/vm/assembler_sparc.inline.hpp b/src/cpu/sparc/vm/assembler_sparc.inline.hpp
+--- a/src/cpu/sparc/vm/assembler_sparc.inline.hpp
++++ b/src/cpu/sparc/vm/assembler_sparc.inline.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2006 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -143,45 +143,45 @@
+ inline void Assembler::ld(  Register s1, int simm13a, Register d) { lduw( s1, simm13a, d); }
+ #endif
+ 
+-inline void Assembler::ldub(  Register s1, RegisterConstant s2, Register d) {
++inline void Assembler::ldub(  Register s1, RegisterOrConstant s2, Register d) {
+   if (s2.is_register())  ldsb(s1, s2.as_register(), d);
+   else                   ldsb(s1, s2.as_constant(), d);
+ }
+-inline void Assembler::ldsb(  Register s1, RegisterConstant s2, Register d) {
++inline void Assembler::ldsb(  Register s1, RegisterOrConstant s2, Register d) {
+   if (s2.is_register())  ldsb(s1, s2.as_register(), d);
+   else                   ldsb(s1, s2.as_constant(), d);
+ }
+-inline void Assembler::lduh(  Register s1, RegisterConstant s2, Register d) {
++inline void Assembler::lduh(  Register s1, RegisterOrConstant s2, Register d) {
+   if (s2.is_register())  ldsh(s1, s2.as_register(), d);
+   else                   ldsh(s1, s2.as_constant(), d);
+ }
+-inline void Assembler::ldsh(  Register s1, RegisterConstant s2, Register d) {
++inline void Assembler::ldsh(  Register s1, RegisterOrConstant s2, Register d) {
+   if (s2.is_register())  ldsh(s1, s2.as_register(), d);
+   else                   ldsh(s1, s2.as_constant(), d);
+ }
+-inline void Assembler::lduw(  Register s1, RegisterConstant s2, Register d) {
++inline void Assembler::lduw(  Register s1, RegisterOrConstant s2, Register d) {
+   if (s2.is_register())  ldsw(s1, s2.as_register(), d);
+   else                   ldsw(s1, s2.as_constant(), d);
+ }
+-inline void Assembler::ldsw(  Register s1, RegisterConstant s2, Register d) {
++inline void Assembler::ldsw(  Register s1, RegisterOrConstant s2, Register d) {
+   if (s2.is_register())  ldsw(s1, s2.as_register(), d);
+   else                   ldsw(s1, s2.as_constant(), d);
+ }
+-inline void Assembler::ldx(   Register s1, RegisterConstant s2, Register d) {
++inline void Assembler::ldx(   Register s1, RegisterOrConstant s2, Register d) {
+   if (s2.is_register())  ldx(s1, s2.as_register(), d);
+   else                   ldx(s1, s2.as_constant(), d);
+ }
+-inline void Assembler::ld(    Register s1, RegisterConstant s2, Register d) {
++inline void Assembler::ld(    Register s1, RegisterOrConstant s2, Register d) {
+   if (s2.is_register())  ld(s1, s2.as_register(), d);
+   else                   ld(s1, s2.as_constant(), d);
+ }
+-inline void Assembler::ldd(   Register s1, RegisterConstant s2, Register d) {
++inline void Assembler::ldd(   Register s1, RegisterOrConstant s2, Register d) {
+   if (s2.is_register())  ldd(s1, s2.as_register(), d);
+   else                   ldd(s1, s2.as_constant(), d);
+ }
+ 
+ // form effective addresses this way:
+-inline void Assembler::add(   Register s1, RegisterConstant s2, Register d, int offset) {
++inline void Assembler::add(   Register s1, RegisterOrConstant s2, Register d, int offset) {
+   if (s2.is_register())  add(s1, s2.as_register(), d);
+   else                 { add(s1, s2.as_constant() + offset, d); offset = 0; }
+   if (offset != 0)       add(d,  offset,                    d);
+@@ -243,23 +243,23 @@
+ inline void Assembler::st(  Register d, Register s1, Register s2) { stw(d, s1, s2); }
+ inline void Assembler::st(  Register d, Register s1, int simm13a) { stw(d, s1, simm13a); }
+ 
+-inline void Assembler::stb(  Register d, Register s1, RegisterConstant s2) {
++inline void Assembler::stb(  Register d, Register s1, RegisterOrConstant s2) {
+   if (s2.is_register())  stb(d, s1, s2.as_register());
+   else                   stb(d, s1, s2.as_constant());
+ }
+-inline void Assembler::sth(  Register d, Register s1, RegisterConstant s2) {
++inline void Assembler::sth(  Register d, Register s1, RegisterOrConstant s2) {
+   if (s2.is_register())  sth(d, s1, s2.as_register());
+   else                   sth(d, s1, s2.as_constant());
+ }
+-inline void Assembler::stx(  Register d, Register s1, RegisterConstant s2) {
++inline void Assembler::stx(  Register d, Register s1, RegisterOrConstant s2) {
+   if (s2.is_register())  stx(d, s1, s2.as_register());
+   else                   stx(d, s1, s2.as_constant());
+ }
+-inline void Assembler::std( Register d, Register s1, RegisterConstant s2) {
++inline void Assembler::std( Register d, Register s1, RegisterOrConstant s2) {
+   if (s2.is_register())  std(d, s1, s2.as_register());
+   else                   std(d, s1, s2.as_constant());
+ }
+-inline void Assembler::st(  Register d, Register s1, RegisterConstant s2) {
++inline void Assembler::st(  Register d, Register s1, RegisterOrConstant s2) {
+   if (s2.is_register())  st(d, s1, s2.as_register());
+   else                   st(d, s1, s2.as_constant());
+ }
+@@ -308,7 +308,7 @@
+ #endif
+ }
+ 
+-inline void MacroAssembler::ld_ptr( Register s1, RegisterConstant s2, Register d ) {
++inline void MacroAssembler::ld_ptr( Register s1, RegisterOrConstant s2, Register d ) {
+ #ifdef _LP64
+   Assembler::ldx( s1, s2, d);
+ #else
+@@ -340,7 +340,7 @@
+ #endif
+ }
+ 
+-inline void MacroAssembler::st_ptr( Register d, Register s1, RegisterConstant s2 ) {
++inline void MacroAssembler::st_ptr( Register d, Register s1, RegisterOrConstant s2 ) {
+ #ifdef _LP64
+   Assembler::stx( d, s1, s2);
+ #else
+@@ -373,7 +373,7 @@
+ #endif
+ }
+ 
+-inline void MacroAssembler::ld_long( Register s1, RegisterConstant s2, Register d ) {
++inline void MacroAssembler::ld_long( Register s1, RegisterOrConstant s2, Register d ) {
+ #ifdef _LP64
+   Assembler::ldx(s1, s2, d);
+ #else
+@@ -405,7 +405,7 @@
+ #endif
+ }
+ 
+-inline void MacroAssembler::st_long( Register d, Register s1, RegisterConstant s2 ) {
++inline void MacroAssembler::st_long( Register d, Register s1, RegisterOrConstant s2 ) {
+ #ifdef _LP64
+   Assembler::stx(d, s1, s2);
+ #else
+@@ -455,7 +455,7 @@
+ #endif
+ }
+ 
+-inline void MacroAssembler::sll_ptr( Register s1, RegisterConstant s2, Register d ) {
++inline void MacroAssembler::sll_ptr( Register s1, RegisterOrConstant s2, Register d ) {
+   if (s2.is_register())  sll_ptr(s1, s2.as_register(), d);
+   else                   sll_ptr(s1, s2.as_constant(), d);
+ }
+diff --git a/src/cpu/sparc/vm/c1_LIRAssembler_sparc.cpp b/src/cpu/sparc/vm/c1_LIRAssembler_sparc.cpp
+--- a/src/cpu/sparc/vm/c1_LIRAssembler_sparc.cpp
++++ b/src/cpu/sparc/vm/c1_LIRAssembler_sparc.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2000-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 2000-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -2489,7 +2489,7 @@
+         __ check_klass_subtype_fast_path(klass_RInfo, k_RInfo, Rtmp1, noreg,
+                                          (need_slow_path ? &done : NULL),
+                                          stub->entry(), NULL,
+-                                         RegisterConstant(k->super_check_offset()));
++                                         RegisterOrConstant(k->super_check_offset()));
+       } else {
+         // perform the fast part of the checking logic
+         __ check_klass_subtype_fast_path(klass_RInfo, k_RInfo, Rtmp1, O7,
+@@ -2550,14 +2550,14 @@
+         __ check_klass_subtype_fast_path(klass_RInfo, k_RInfo, O7, noreg,
+                                          (need_slow_path ? &done : NULL),
+                                          (need_slow_path ? &done : NULL), NULL,
+-                                         RegisterConstant(k->super_check_offset()),
++                                         RegisterOrConstant(k->super_check_offset()),
+                                          dst);
+       } else {
+         assert(dst != klass_RInfo && dst != k_RInfo, "need 3 registers");
+         // perform the fast part of the checking logic
+         __ check_klass_subtype_fast_path(klass_RInfo, k_RInfo, O7, dst,
+                                          &done, &done, NULL,
+-                                         RegisterConstant(-1),
++                                         RegisterOrConstant(-1),
+                                          dst);
+       }
+       if (need_slow_path) {
+diff --git a/src/cpu/x86/vm/assembler_x86.cpp b/src/cpu/x86/vm/assembler_x86.cpp
+--- a/src/cpu/x86/vm/assembler_x86.cpp
++++ b/src/cpu/x86/vm/assembler_x86.cpp
+@@ -7082,7 +7082,7 @@
+ // On failure, execution transfers to the given label.
+ void MacroAssembler::lookup_interface_method(Register recv_klass,
+                                              Register intf_klass,
+-                                             RegisterConstant itable_index,
++                                             RegisterOrConstant itable_index,
+                                              Register method_result,
+                                              Register scan_temp,
+                                              Label& L_no_such_interface) {
+@@ -7167,7 +7167,7 @@
+                                                    Label* L_success,
+                                                    Label* L_failure,
+                                                    Label* L_slow_path,
+-                                        RegisterConstant super_check_offset) {
++                                        RegisterOrConstant super_check_offset) {
+   assert_different_registers(sub_klass, super_klass, temp_reg);
+   bool must_load_sco = (super_check_offset.constant_or_zero() == -1);
+   if (super_check_offset.is_register()) {
+@@ -7216,7 +7216,7 @@
+   if (must_load_sco) {
+     // Positive movl does right thing on LP64.
+     movl(temp_reg, super_check_offset_addr);
+-    super_check_offset = RegisterConstant(temp_reg);
++    super_check_offset = RegisterOrConstant(temp_reg);
+   }
+   Address super_check_addr(sub_klass, super_check_offset, Address::times_1, 0);
+   cmpptr(super_klass, super_check_addr); // load displayed supertype
+@@ -7414,12 +7414,12 @@
+ }
+ 
+ 
+-RegisterConstant MacroAssembler::delayed_value(intptr_t* delayed_value_addr,
+-                                               Register tmp,
+-                                               int offset) {
++RegisterOrConstant MacroAssembler::delayed_value_impl(intptr_t* delayed_value_addr,
++                                                      Register tmp,
++                                                      int offset) {
+   intptr_t value = *delayed_value_addr;
+   if (value != 0)
+-    return RegisterConstant(value + offset);
++    return RegisterOrConstant(value + offset);
+ 
+   // load indirectly to solve generation ordering problem
+   movptr(tmp, ExternalAddress((address) delayed_value_addr));
+@@ -7435,7 +7435,7 @@
+   if (offset != 0)
+     addptr(tmp, offset);
+ 
+-  return RegisterConstant(tmp);
++  return RegisterOrConstant(tmp);
+ }
+ 
+ 
+diff --git a/src/cpu/x86/vm/assembler_x86.hpp b/src/cpu/x86/vm/assembler_x86.hpp
+--- a/src/cpu/x86/vm/assembler_x86.hpp
++++ b/src/cpu/x86/vm/assembler_x86.hpp
+@@ -212,7 +212,7 @@
+            "inconsistent address");
+   }
+ 
+-  Address(Register base, RegisterConstant index, ScaleFactor scale = times_1, int disp = 0)
++  Address(Register base, RegisterOrConstant index, ScaleFactor scale = times_1, int disp = 0)
+     : _base (base),
+       _index(index.register_or_noreg()),
+       _scale(scale),
+@@ -256,7 +256,7 @@
+            "inconsistent address");
+   }
+ 
+-  Address(Register base, RegisterConstant index, ScaleFactor scale, ByteSize disp)
++  Address(Register base, RegisterOrConstant index, ScaleFactor scale, ByteSize disp)
+     : _base (base),
+       _index(index.register_or_noreg()),
+       _scale(scale),
+@@ -1768,7 +1768,7 @@
+   // interface method calling
+   void lookup_interface_method(Register recv_klass,
+                                Register intf_klass,
+-                               RegisterConstant itable_index,
++                               RegisterOrConstant itable_index,
+                                Register method_result,
+                                Register scan_temp,
+                                Label& no_such_interface);
+@@ -1785,7 +1785,7 @@
+                                      Label* L_success,
+                                      Label* L_failure,
+                                      Label* L_slow_path,
+-                RegisterConstant super_check_offset = RegisterConstant(-1));
++                RegisterOrConstant super_check_offset = RegisterOrConstant(-1));
+ 
+   // The rest of the type check; must be wired to a corresponding fast path.
+   // It does not repeat the fast path logic, so don't use it standalone.
+@@ -1849,9 +1849,9 @@
+   // stack overflow + shadow pages.  Also, clobbers tmp
+   void bang_stack_size(Register size, Register tmp);
+ 
+-  virtual RegisterConstant delayed_value(intptr_t* delayed_value_addr,
+-                                         Register tmp,
+-                                         int offset);
++  virtual RegisterOrConstant delayed_value_impl(intptr_t* delayed_value_addr,
++                                                Register tmp,
++                                                int offset);
+ 
+   // Support for serializing memory accesses between threads
+   void serialize_memory(Register thread, Register tmp);
+diff --git a/src/share/vm/asm/assembler.hpp b/src/share/vm/asm/assembler.hpp
+--- a/src/share/vm/asm/assembler.hpp
++++ b/src/share/vm/asm/assembler.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2006 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -143,15 +143,15 @@
+ // A union type for code which has to assemble both constant and
+ // non-constant operands, when the distinction cannot be made
+ // statically.
+-class RegisterConstant VALUE_OBJ_CLASS_SPEC {
++class RegisterOrConstant VALUE_OBJ_CLASS_SPEC {
+  private:
+   Register _r;
+   intptr_t _c;
+ 
+  public:
+-  RegisterConstant(): _r(noreg), _c(0) {}
+-  RegisterConstant(Register r): _r(r), _c(0) {}
+-  RegisterConstant(intptr_t c): _r(noreg), _c(c) {}
++  RegisterOrConstant(): _r(noreg), _c(0) {}
++  RegisterOrConstant(Register r): _r(r), _c(0) {}
++  RegisterOrConstant(intptr_t c): _r(noreg), _c(c) {}
+ 
+   Register as_register() const { assert(is_register(),""); return _r; }
+   intptr_t as_constant() const { assert(is_constant(),""); return _c; }
+@@ -311,13 +311,13 @@
+   // offsets in code which must be generated before the object class is loaded.
+   // Field offsets are never zero, since an object's header (mark word)
+   // is located at offset zero.
+-  RegisterConstant delayed_value(int(*value_fn)(), Register tmp, int offset = 0) {
+-    return delayed_value(delayed_value_addr(value_fn), tmp, offset);
++  RegisterOrConstant delayed_value(int(*value_fn)(), Register tmp, int offset = 0) {
++    return delayed_value_impl(delayed_value_addr(value_fn), tmp, offset);
+   }
+-  RegisterConstant delayed_value(address(*value_fn)(), Register tmp, int offset = 0) {
+-    return delayed_value(delayed_value_addr(value_fn), tmp, offset);
++  RegisterOrConstant delayed_value(address(*value_fn)(), Register tmp, int offset = 0) {
++    return delayed_value_impl(delayed_value_addr(value_fn), tmp, offset);
+   }
+-  virtual RegisterConstant delayed_value(intptr_t* delayed_value_addr, Register tmp, int offset) = 0;
++  virtual RegisterOrConstant delayed_value_impl(intptr_t* delayed_value_addr, Register tmp, int offset) = 0;
+   // Last overloading is platform-dependent; look in assembler_<arch>.cpp.
+   static intptr_t* delayed_value_addr(int(*constant_fn)());
+   static intptr_t* delayed_value_addr(address(*constant_fn)());
+diff --git a/src/share/vm/classfile/javaClasses.cpp b/src/share/vm/classfile/javaClasses.cpp
+--- a/src/share/vm/classfile/javaClasses.cpp
++++ b/src/share/vm/classfile/javaClasses.cpp
+@@ -239,21 +239,19 @@
+   typeArrayOop value  = java_lang_String::value(obj);
+   int          offset = java_lang_String::offset(obj);
+   int          length = java_lang_String::length(obj);
++  jchar* base = value->char_at_addr(offset);
++  symbolOop sym = SymbolTable::lookup_unicode(base, length, THREAD);
++  return symbolHandle(THREAD, sym);
++}
+ 
+-  ResourceMark rm(THREAD);
+-  symbolHandle result;
++symbolOop java_lang_String::as_symbol_or_null(oop java_string) {
++  typeArrayOop value  = java_lang_String::value(java_string);
++  int          offset = java_lang_String::offset(java_string);
++  int          length = java_lang_String::length(java_string);
++  jchar* base = value->char_at_addr(offset);
++  return SymbolTable::probe_unicode(base, length);
++}
+ 
+-  if (length > 0) {
+-    int utf8_length = UNICODE::utf8_length(value->char_at_addr(offset), length);
+-    char* chars = NEW_RESOURCE_ARRAY(char, utf8_length + 1);
+-    UNICODE::convert_to_utf8(value->char_at_addr(offset), length, chars);
+-    // Allocate the symbol
+-    result = oopFactory::new_symbol_handle(chars, utf8_length, CHECK_(symbolHandle()));
+-  } else {
+-    result = oopFactory::new_symbol_handle("", 0, CHECK_(symbolHandle()));
+-  }
+-  return result;
+-}
+ 
+ int java_lang_String::utf8_length(oop java_string) {
+   typeArrayOop value  = java_lang_String::value(java_string);
+@@ -385,6 +383,48 @@
+ }
+ 
+ 
++void java_lang_Class::print_signature(oop java_class, outputStream* st) {
++  assert(java_lang_Class::is_instance(java_class), "must be a Class object");
++  symbolOop name = NULL;
++  bool is_instance = false;
++  if (is_primitive(java_class)) {
++    name = vmSymbols::type_signature(primitive_type(java_class));
++  } else {
++    klassOop k = as_klassOop(java_class);
++    is_instance = Klass::cast(k)->oop_is_instance();
++    name = Klass::cast(k)->name();
++  }
++  if (name == NULL) {
++    st->print("<null>");
++    return;
++  }
++  if (is_instance)  st->print("L");
++  st->write((char*) name->base(), (int) name->utf8_length());
++  if (is_instance)  st->print(";");
++}
++
++symbolOop java_lang_Class::as_signature(oop java_class, bool intern_if_not_found, TRAPS) {
++  assert(java_lang_Class::is_instance(java_class), "must be a Class object");
++  symbolOop name = NULL;
++  if (is_primitive(java_class)) {
++    return vmSymbols::type_signature(primitive_type(java_class));
++  } else {
++    klassOop k = as_klassOop(java_class);
++    if (!Klass::cast(k)->oop_is_instance()) {
++      return Klass::cast(k)->name();
++    } else {
++      ResourceMark rm;
++      const char* sigstr = Klass::cast(k)->signature_name();
++      int         siglen = (int) strlen(sigstr);
++      if (!intern_if_not_found)
++        return SymbolTable::probe(sigstr, siglen);
++      else
++        return oopFactory::new_symbol(sigstr, siglen, THREAD);
++    }
++  }
++}
++
++
+ klassOop java_lang_Class::array_klass(oop java_class) {
+   klassOop k = klassOop(java_class->obj_field(array_klass_offset));
+   assert(k == NULL || k->is_klass() && Klass::cast(k)->oop_is_javaArray(), "should be array klass");
+@@ -412,6 +452,8 @@
+ 
+ 
+ bool java_lang_Class::is_primitive(oop java_class) {
++  // should assert:
++  //assert(java_lang_Class::is_instance(java_class), "must be a Class object");
+   klassOop k = klassOop(java_class->obj_field(klass_offset));
+   return k == NULL;
+ }
+@@ -431,6 +473,19 @@
+   return type;
+ }
+ 
++BasicType java_lang_Class::as_BasicType(oop java_class, klassOop* reference_klass) {
++  assert(java_lang_Class::is_instance(java_class), "must be a Class object");
++  if (is_primitive(java_class)) {
++    if (reference_klass != NULL)
++      (*reference_klass) = NULL;
++    return primitive_type(java_class);
++  } else {
++    if (reference_klass != NULL)
++      (*reference_klass) = as_klassOop(java_class);
++    return T_OBJECT;
++  }
++}
++
+ 
+ oop java_lang_Class::primitive_mirror(BasicType t) {
+   oop mirror = Universe::java_mirror(t);
+@@ -1988,6 +2043,21 @@
+ }
+ 
+ 
++void java_lang_boxing_object::print(BasicType type, jvalue* value, outputStream* st) {
++  switch (type) {
++  case T_BOOLEAN:   st->print("%s", value->z ? "true" : "false");   break;
++  case T_CHAR:      st->print("%d", value->c);                      break;
++  case T_BYTE:      st->print("%d", value->b);                      break;
++  case T_SHORT:     st->print("%d", value->s);                      break;
++  case T_INT:       st->print("%d", value->i);                      break;
++  case T_LONG:      st->print(INT64_FORMAT, value->j);              break;
++  case T_FLOAT:     st->print("%f", value->f);                      break;
++  case T_DOUBLE:    st->print("%lf", value->d);                     break;
++  default:          st->print("type %d?", type);                    break;
++  }
++}
++
++
+ // Support for java_lang_ref_Reference
+ oop java_lang_ref_Reference::pending_list_lock() {
+   instanceKlass* ik = instanceKlass::cast(SystemDictionary::reference_klass());
+diff --git a/src/share/vm/classfile/javaClasses.hpp b/src/share/vm/classfile/javaClasses.hpp
+--- a/src/share/vm/classfile/javaClasses.hpp
++++ b/src/share/vm/classfile/javaClasses.hpp
+@@ -107,6 +107,7 @@
+ 
+   // Conversion
+   static symbolHandle as_symbol(Handle java_string, TRAPS);
++  static symbolOop as_symbol_or_null(oop java_string);
+ 
+   // Testers
+   static bool is_instance(oop obj) {
+@@ -149,6 +150,9 @@
+   static oop  create_basic_type_mirror(const char* basic_type_name, BasicType type, TRAPS);
+   // Conversion
+   static klassOop as_klassOop(oop java_class);
++  static BasicType as_BasicType(oop java_class, klassOop* reference_klass = NULL);
++  static symbolOop as_signature(oop java_class, bool intern_if_not_found, TRAPS);
++  static void print_signature(oop java_class, outputStream *st);
+   // Testing
+   static bool is_instance(oop obj) {
+     return obj != NULL && obj->klass() == SystemDictionary::class_klass();
+@@ -668,6 +672,8 @@
+   static BasicType basic_type(oop box);
+   static bool is_instance(oop box)                 { return basic_type(box) != T_ILLEGAL; }
+   static bool is_instance(oop box, BasicType type) { return basic_type(box) == type; }
++  static void print(oop box, outputStream* st)     { jvalue value;  print(get_value(box, &value), &value, st); }
++  static void print(BasicType type, jvalue* value, outputStream* st);
+ 
+   static int value_offset_in_bytes(BasicType type) {
+     return ( type == T_LONG || type == T_DOUBLE ) ? long_value_offset :
+diff --git a/src/share/vm/classfile/loaderConstraints.hpp b/src/share/vm/classfile/loaderConstraints.hpp
+--- a/src/share/vm/classfile/loaderConstraints.hpp
++++ b/src/share/vm/classfile/loaderConstraints.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2003-2006 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 2003-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -60,8 +60,10 @@
+   bool add_entry(symbolHandle name, klassOop klass1, Handle loader1,
+                                     klassOop klass2, Handle loader2);
+ 
+-  void check_signature_loaders(symbolHandle signature, Handle loader1,
+-                               Handle loader2, bool is_method, TRAPS);
++  // Note:  The main entry point for this module is via SystemDictionary.
++  // SystemDictionary::check_signature_loaders(symbolHandle signature,
++  //                                           Handle loader1, Handle loader2,
++  //                                           bool is_method, TRAPS)
+ 
+   klassOop find_constrained_klass(symbolHandle name, Handle loader);
+   klassOop find_constrained_elem_klass(symbolHandle name, symbolHandle elem_name,
+diff --git a/src/share/vm/classfile/symbolTable.cpp b/src/share/vm/classfile/symbolTable.cpp
+--- a/src/share/vm/classfile/symbolTable.cpp
++++ b/src/share/vm/classfile/symbolTable.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2006 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -109,6 +109,40 @@
+   return the_table()->lookup(index, name, len, hash);
+ }
+ 
++// Suggestion: Push unicode-based lookup all the way into the hashing
++// and probing logic, so there is no need for convert_to_utf8 until
++// an actual new symbolOop is created.
++symbolOop SymbolTable::lookup_unicode(const jchar* name, int utf16_length, TRAPS) {
++  int utf8_length = UNICODE::utf8_length((jchar*) name, utf16_length);
++  char stack_buf[128];
++  if (utf8_length < (int) sizeof(stack_buf)) {
++    char* chars = stack_buf;
++    UNICODE::convert_to_utf8(name, utf16_length, chars);
++    return lookup(chars, utf8_length, THREAD);
++  } else {
++    ResourceMark rm(THREAD);
++    char* chars = NEW_RESOURCE_ARRAY(char, utf8_length + 1);;
++    UNICODE::convert_to_utf8(name, utf16_length, chars);
++    return lookup(chars, utf8_length, THREAD);
++  }
++}
++
++symbolOop SymbolTable::lookup_only_unicode(const jchar* name, int utf16_length,
++                                           unsigned int& hash) {
++  int utf8_length = UNICODE::utf8_length((jchar*) name, utf16_length);
++  char stack_buf[128];
++  if (utf8_length < (int) sizeof(stack_buf)) {
++    char* chars = stack_buf;
++    UNICODE::convert_to_utf8(name, utf16_length, chars);
++    return lookup_only(chars, utf8_length, hash);
++  } else {
++    ResourceMark rm;
++    char* chars = NEW_RESOURCE_ARRAY(char, utf8_length + 1);;
++    UNICODE::convert_to_utf8(name, utf16_length, chars);
++    return lookup_only(chars, utf8_length, hash);
++  }
++}
++
+ void SymbolTable::add(constantPoolHandle cp, int names_count,
+                       const char** names, int* lengths, int* cp_indices,
+                       unsigned int* hashValues, TRAPS) {
+@@ -126,15 +160,6 @@
+   }
+ }
+ 
+-// Needed for preloading classes in signatures when compiling.
+-
+-symbolOop SymbolTable::probe(const char* name, int len) {
+-  unsigned int hashValue = hash_symbol(name, len);
+-  int index = the_table()->hash_to_index(hashValue);
+-  return the_table()->lookup(index, name, len, hashValue);
+-}
+-
+-
+ symbolOop SymbolTable::basic_add(int index, u1 *name, int len,
+                                  unsigned int hashValue, TRAPS) {
+   assert(!Universe::heap()->is_in_reserved(name) || GC_locker::is_active(),
+diff --git a/src/share/vm/classfile/symbolTable.hpp b/src/share/vm/classfile/symbolTable.hpp
+--- a/src/share/vm/classfile/symbolTable.hpp
++++ b/src/share/vm/classfile/symbolTable.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2006 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -91,6 +91,10 @@
+   // Only copy to C string to be added if lookup failed.
+   static symbolOop lookup(symbolHandle sym, int begin, int end, TRAPS);
+ 
++  // jchar (utf16) version of lookups
++  static symbolOop lookup_unicode(const jchar* name, int len, TRAPS);
++  static symbolOop lookup_only_unicode(const jchar* name, int len, unsigned int& hash);
++
+   static void add(constantPoolHandle cp, int names_count,
+                   const char** names, int* lengths, int* cp_indices,
+                   unsigned int* hashValues, TRAPS);
+@@ -112,7 +116,14 @@
+   // Needed for preloading classes in signatures when compiling.
+   // Returns the symbol is already present in symbol table, otherwise
+   // NULL.  NO ALLOCATION IS GUARANTEED!
+-  static symbolOop probe(const char* name, int len);
++  static symbolOop probe(const char* name, int len) {
++    unsigned int ignore_hash;
++    return lookup_only(name, len, ignore_hash);
++  }
++  static symbolOop probe_unicode(const jchar* name, int len) {
++    unsigned int ignore_hash;
++    return lookup_only_unicode(name, len, ignore_hash);
++  }
+ 
+   // Histogram
+   static void print_histogram()     PRODUCT_RETURN;
+diff --git a/src/share/vm/classfile/systemDictionary.cpp b/src/share/vm/classfile/systemDictionary.cpp
+--- a/src/share/vm/classfile/systemDictionary.cpp
++++ b/src/share/vm/classfile/systemDictionary.cpp
+@@ -1964,6 +1964,13 @@
+   return T_OBJECT;
+ }
+ 
++KlassHandle SystemDictionaryHandles::box_klass(BasicType t) {
++  if (t >= T_BOOLEAN && t <= T_VOID)
++    return KlassHandle(&SystemDictionary::_box_klasses[t], true);
++  else
++    return KlassHandle();
++}
++
+ // Constraints on class loaders. The details of the algorithm can be
+ // found in the OOPSLA'98 paper "Dynamic Class Loading in the Java
+ // Virtual Machine" by Sheng Liang and Gilad Bracha.  The basic idea is
+@@ -2174,11 +2181,56 @@
+ }
+ 
+ 
++// Signature constraints ensure that callers and callees agree about
++// the meaning of type names in their signatures.  This routine is the
++// intake for constraints.  It collects them from several places:
++//
++//  * LinkResolver::resolve_method (if check_access is true) requires
++//    that the resolving class (the caller) and the defining class of
++//    the resolved method (the callee) agree on each type in the
++//    method's signature.
++//
++//  * LinkResolver::resolve_interface_method performs exactly the same
++//    checks.
++//
++//  * LinkResolver::resolve_field requires that the constant pool
++//    attempting to link to a field agree with the field's defining
++//    class about the type of the field signature.
++//
++//  * klassVtable::initialize_vtable requires that, when a class
++//    overrides a vtable entry allocated by a superclass, that the
++//    overriding method (i.e., the callee) agree with the superclass
++//    on each type in the method's signature.
++//
++//  * klassItable::initialize_itable requires that, when a class fills
++//    in its itables, for each non-abstract method installed in an
++//    itable, the method (i.e., the callee) agree with the interface
++//    on each type in the method's signature.
++//
++// All those methods have a boolean (check_access, checkconstraints)
++// which turns off the checks.  This is used from specialized contexts
++// such as bootstrapping, dumping, and debugging.
++//
++// No direct constraint is placed between the class and its
++// supertypes.  Constraints are only placed along linked relations
++// between callers and callees.  When a method overrides or implements
++// an abstract method in a supertype (superclass or interface), the
++// constraints are placed as if the supertype were the caller to the
++// overriding method.  (This works well, since callers to the
++// supertype have already established agreement between themselves and
++// the supertype.)  As a result of all this, a class can disagree with
++// its supertype about the meaning of a type name, as long as that
++// class neither calls a relevant method of the supertype, nor is
++// called (perhaps via an override) from the supertype.
++//
++//
++// SystemDictionary::check_signature_loaders(sig, l1, l2)
++//
+ // Make sure all class components (including arrays) in the given
+ // signature will be resolved to the same class in both loaders.
+ // Returns the name of the type that failed a loader constraint check, or
+ // NULL if no constraint failed. The returned C string needs cleaning up
+-// with a ResourceMark in the caller
++// with a ResourceMark in the caller.  No exception except OOME is thrown.
+ char* SystemDictionary::check_signature_loaders(symbolHandle signature,
+                                                Handle loader1, Handle loader2,
+                                                bool is_method, TRAPS)  {
+diff --git a/src/share/vm/classfile/systemDictionary.hpp b/src/share/vm/classfile/systemDictionary.hpp
+--- a/src/share/vm/classfile/systemDictionary.hpp
++++ b/src/share/vm/classfile/systemDictionary.hpp
+@@ -161,6 +161,7 @@
+ class SystemDictionary : AllStatic {
+   friend class VMStructs;
+   friend class CompactingPermGenGen;
++  friend class SystemDictionaryHandles;
+   NOT_PRODUCT(friend class instanceKlassKlass;)
+ 
+  public:
+@@ -595,3 +596,18 @@
+   static bool _has_loadClassInternal;
+   static bool _has_checkPackageAccess;
+ };
++
++// Cf. vmSymbols vs. vmSymbolHandles
++class SystemDictionaryHandles : AllStatic {
++public:
++  #define WK_KLASS_HANDLE_DECLARE(name, ignore_symbol, option) \
++    static KlassHandle name() { \
++      SystemDictionary::name(); \
++      klassOop* loc = &SystemDictionary::_well_known_klasses[SystemDictionary::WK_KLASS_ENUM_NAME(name)]; \
++      return KlassHandle(loc, true); \
++    }
++  WK_KLASSES_DO(WK_KLASS_HANDLE_DECLARE);
++  #undef WK_KLASS_HANDLE_DECLARE
++
++  static KlassHandle box_klass(BasicType t);
++};
+diff --git a/src/share/vm/gc_implementation/parallelScavenge/parallelScavengeHeap.cpp b/src/share/vm/gc_implementation/parallelScavenge/parallelScavengeHeap.cpp
+--- a/src/share/vm/gc_implementation/parallelScavenge/parallelScavengeHeap.cpp
++++ b/src/share/vm/gc_implementation/parallelScavenge/parallelScavengeHeap.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2001-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 2001-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -799,6 +799,7 @@
+   if (young_gen()->is_in_reserved(addr)) {
+     assert(young_gen()->is_in(addr),
+            "addr should be in allocated part of young gen");
++    if (Debugging)  return NULL;  // called from find() in debug.cpp
+     Unimplemented();
+   } else if (old_gen()->is_in_reserved(addr)) {
+     assert(old_gen()->is_in(addr),
+diff --git a/src/share/vm/oops/instanceKlass.cpp b/src/share/vm/oops/instanceKlass.cpp
+--- a/src/share/vm/oops/instanceKlass.cpp
++++ b/src/share/vm/oops/instanceKlass.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -1813,6 +1813,8 @@
+                                           oop class_loader2, symbolOop class_name2) {
+   if (class_loader1 != class_loader2) {
+     return false;
++  } else if (class_name1 == class_name2) {
++    return true;                // skip painful bytewise comparison
+   } else {
+     ResourceMark rm;
+ 
+@@ -1859,6 +1861,55 @@
+   }
+ }
+ 
++/* defined for now in jvm.cpp, for historical reasons *--
++klassOop instanceKlass::compute_enclosing_class_impl(instanceKlassHandle self,
++                                                     symbolOop& simple_name_result, TRAPS) {
++  ...
++}
++*/
++
++// tell if two classes have the same enclosing class (at package level)
++bool instanceKlass::is_same_package_member_impl(instanceKlassHandle class1,
++                                                klassOop class2_oop, TRAPS) {
++  if (class2_oop == class1->as_klassOop())          return true;
++  if (!Klass::cast(class2_oop)->oop_is_instance())  return false;
++  instanceKlassHandle class2(THREAD, class2_oop);
++
++  // must be in same package before we try anything else
++  if (!class1->is_same_class_package(class2->class_loader(), class2->name()))
++    return false;
++
++  // As long as there is an outer1.getEnclosingClass,
++  // shift the search outward.
++  instanceKlassHandle outer1 = class1;
++  for (;;) {
++    // As we walk along, look for equalities between outer1 and class2.
++    // Eventually, the walks will terminate as outer1 stops
++    // at the top-level class around the original class.
++    symbolOop ignore_name;
++    klassOop next = outer1->compute_enclosing_class(ignore_name, CHECK_false);
++    if (next == NULL)  break;
++    if (next == class2())  return true;
++    outer1 = instanceKlassHandle(THREAD, next);
++  }
++
++  // Now do the same for class2.
++  instanceKlassHandle outer2 = class2;
++  for (;;) {
++    symbolOop ignore_name;
++    klassOop next = outer2->compute_enclosing_class(ignore_name, CHECK_false);
++    if (next == NULL)  break;
++    // Might as well check the new outer against all available values.
++    if (next == class1())  return true;
++    if (next == outer1())  return true;
++    outer2 = instanceKlassHandle(THREAD, next);
++  }
++
++  // If by this point we have not found an equality between the
++  // two classes, we know they are in separate package members.
++  return false;
++}
++
+ 
+ jint instanceKlass::compute_modifier_flags(TRAPS) const {
+   klassOop k = as_klassOop();
+@@ -1996,9 +2047,11 @@
+ 
+ // Printing
+ 
++#define BULLET  " - "
++
+ void FieldPrinter::do_field(fieldDescriptor* fd) {
+-   if (fd->is_static() == (_obj == NULL)) {
+-     _st->print("   - ");
++  _st->print(BULLET);
++   if (fd->is_static() || (_obj == NULL)) {
+      fd->print_on(_st);
+      _st->cr();
+    } else {
+@@ -2019,7 +2072,7 @@
+         value->is_typeArray() &&
+         offset          <= (juint) value->length() &&
+         offset + length <= (juint) value->length()) {
+-      st->print("string: ");
++      st->print(BULLET"string: ");
+       Handle h_obj(obj);
+       java_lang_String::print(h_obj, st);
+       st->cr();
+@@ -2027,23 +2080,26 @@
+     }
+   }
+ 
+-  st->print_cr("fields:");
++  st->print_cr(BULLET"---- fields (total size %d words):", oop_size(obj));
+   FieldPrinter print_nonstatic_field(st, obj);
+   do_nonstatic_fields(&print_nonstatic_field);
+ 
+   if (as_klassOop() == SystemDictionary::class_klass()) {
++    st->print(BULLET"signature: ");
++    java_lang_Class::print_signature(obj, st);
++    st->cr();
+     klassOop mirrored_klass = java_lang_Class::as_klassOop(obj);
+-    st->print("   - fake entry for mirror: ");
++    st->print(BULLET"fake entry for mirror: ");
+     mirrored_klass->print_value_on(st);
+     st->cr();
+-    st->print("   - fake entry resolved_constructor: ");
++    st->print(BULLET"fake entry resolved_constructor: ");
+     methodOop ctor = java_lang_Class::resolved_constructor(obj);
+     ctor->print_value_on(st);
+     klassOop array_klass = java_lang_Class::array_klass(obj);
+-    st->print("   - fake entry for array: ");
++    st->cr();
++    st->print(BULLET"fake entry for array: ");
+     array_klass->print_value_on(st);
+     st->cr();
+-    st->cr();
+   }
+ }
+ 
+@@ -2051,6 +2107,28 @@
+   st->print("a ");
+   name()->print_value_on(st);
+   obj->print_address_on(st);
++  if (as_klassOop() == SystemDictionary::string_klass()
++      && java_lang_String::value(obj) != NULL) {
++    ResourceMark rm;
++    int len = java_lang_String::length(obj);
++    int plen = (len < 24 ? len : 12);
++    char* str = java_lang_String::as_utf8_string(obj, 0, plen);
++    st->print(" = \"%s\"", str);
++    if (len > plen)
++      st->print("...[%d]", len);
++  } else if (as_klassOop() == SystemDictionary::class_klass()) {
++    klassOop k = java_lang_Class::as_klassOop(obj);
++    st->print(" = ");
++    if (k != NULL) {
++      k->print_value_on(st);
++    } else {
++      const char* tname = type2name(java_lang_Class::primitive_type(obj));
++      st->print("%s", tname ? tname : "type?");
++    }
++  } else if (java_lang_boxing_object::is_instance(obj)) {
++    st->print(" = ");
++    java_lang_boxing_object::print(obj, st);
++  }
+ }
+ 
+ #endif // ndef PRODUCT
+diff --git a/src/share/vm/oops/instanceKlass.hpp b/src/share/vm/oops/instanceKlass.hpp
+--- a/src/share/vm/oops/instanceKlass.hpp
++++ b/src/share/vm/oops/instanceKlass.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -308,6 +308,22 @@
+   bool is_same_class_package(oop classloader2, symbolOop classname2);
+   static bool is_same_class_package(oop class_loader1, symbolOop class_name1, oop class_loader2, symbolOop class_name2);
+ 
++  // find an enclosing class (defined where original code was, in jvm.cpp!)
++  klassOop compute_enclosing_class(symbolOop& simple_name_result, TRAPS) {
++    instanceKlassHandle self(THREAD, this->as_klassOop());
++    return compute_enclosing_class_impl(self, simple_name_result, THREAD);
++  }
++  static klassOop compute_enclosing_class_impl(instanceKlassHandle self,
++                                               symbolOop& simple_name_result, TRAPS);
++
++  // tell if two classes have the same enclosing class (at package level)
++  bool is_same_package_member(klassOop class2, TRAPS) {
++    instanceKlassHandle self(THREAD, this->as_klassOop());
++    return is_same_package_member_impl(self, class2, THREAD);
++  }
++  static bool is_same_package_member_impl(instanceKlassHandle self,
++                                          klassOop class2, TRAPS);
++
+   // initialization state
+   bool is_loaded() const                   { return _init_state >= loaded; }
+   bool is_linked() const                   { return _init_state >= linked; }
+diff --git a/src/share/vm/oops/instanceKlassKlass.cpp b/src/share/vm/oops/instanceKlassKlass.cpp
+--- a/src/share/vm/oops/instanceKlassKlass.cpp
++++ b/src/share/vm/oops/instanceKlassKlass.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -487,6 +487,8 @@
+ 
+ // Printing
+ 
++#define BULLET  " - "
++
+ static const char* state_names[] = {
+   "unparseable_by_gc", "allocated", "loaded", "linked", "being_initialized", "fully_initialized", "initialization_error"
+ };
+@@ -497,13 +499,13 @@
+   instanceKlass* ik = instanceKlass::cast(klassOop(obj));
+   klassKlass::oop_print_on(obj, st);
+ 
+-  st->print(" - instance size:     %d", ik->size_helper());                        st->cr();
+-  st->print(" - klass size:        %d", ik->object_size());                        st->cr();
+-  st->print(" - access:            "); ik->access_flags().print_on(st);            st->cr();
+-  st->print(" - state:             "); st->print_cr(state_names[ik->_init_state]);
+-  st->print(" - name:              "); ik->name()->print_value_on(st);             st->cr();
+-  st->print(" - super:             "); ik->super()->print_value_on(st);            st->cr();
+-  st->print(" - sub:               ");
++  st->print(BULLET"instance size:     %d", ik->size_helper());                        st->cr();
++  st->print(BULLET"klass size:        %d", ik->object_size());                        st->cr();
++  st->print(BULLET"access:            "); ik->access_flags().print_on(st);            st->cr();
++  st->print(BULLET"state:             "); st->print_cr(state_names[ik->_init_state]);
++  st->print(BULLET"name:              "); ik->name()->print_value_on(st);             st->cr();
++  st->print(BULLET"super:             "); ik->super()->print_value_on(st);            st->cr();
++  st->print(BULLET"sub:               ");
+   Klass* sub = ik->subklass();
+   int n;
+   for (n = 0; sub != NULL; n++, sub = sub->next_sibling()) {
+@@ -516,12 +518,12 @@
+   st->cr();
+ 
+   if (ik->is_interface()) {
+-    st->print_cr(" - nof implementors:  %d", ik->nof_implementors());
++    st->print_cr(BULLET"nof implementors:  %d", ik->nof_implementors());
+     int print_impl = 0;
+     for (int i = 0; i < instanceKlass::implementors_limit; i++) {
+       if (ik->implementor(i) != NULL) {
+         if (++print_impl == 1)
+-          st->print_cr(" - implementor:    ");
++          st->print_cr(BULLET"implementor:    ");
+         st->print("   ");
+         ik->implementor(i)->print_value_on(st);
+       }
+@@ -529,34 +531,33 @@
+     if (print_impl > 0)  st->cr();
+   }
+ 
+-  st->print(" - arrays:            "); ik->array_klasses()->print_value_on(st);     st->cr();
+-  st->print(" - methods:           "); ik->methods()->print_value_on(st);           st->cr();
++  st->print(BULLET"arrays:            "); ik->array_klasses()->print_value_on(st);     st->cr();
++  st->print(BULLET"methods:           "); ik->methods()->print_value_on(st);           st->cr();
+   if (Verbose) {
+     objArrayOop methods = ik->methods();
+     for(int i = 0; i < methods->length(); i++) {
+       tty->print("%d : ", i); methods->obj_at(i)->print_value(); tty->cr();
+     }
+   }
+-  st->print(" - method ordering:   "); ik->method_ordering()->print_value_on(st);       st->cr();
+-  st->print(" - local interfaces:  "); ik->local_interfaces()->print_value_on(st);      st->cr();
+-  st->print(" - trans. interfaces: "); ik->transitive_interfaces()->print_value_on(st); st->cr();
+-  st->print(" - constants:         "); ik->constants()->print_value_on(st);         st->cr();
+-  st->print(" - class loader:      "); ik->class_loader()->print_value_on(st);      st->cr();
+-  st->print(" - protection domain: "); ik->protection_domain()->print_value_on(st); st->cr();
+-  st->print(" - host class: ");        ik->host_klass()->print_value_on(st);        st->cr();
+-  st->print(" - signers:           "); ik->signers()->print_value_on(st);           st->cr();
++  st->print(BULLET"method ordering:   "); ik->method_ordering()->print_value_on(st);       st->cr();
++  st->print(BULLET"local interfaces:  "); ik->local_interfaces()->print_value_on(st);      st->cr();
++  st->print(BULLET"trans. interfaces: "); ik->transitive_interfaces()->print_value_on(st); st->cr();
++  st->print(BULLET"constants:         "); ik->constants()->print_value_on(st);         st->cr();
++  st->print(BULLET"class loader:      "); ik->class_loader()->print_value_on(st);      st->cr();
++  st->print(BULLET"protection domain: "); ik->protection_domain()->print_value_on(st); st->cr();
++  st->print(BULLET"host class:        "); ik->host_klass()->print_value_on(st);        st->cr();
++  st->print(BULLET"signers:           "); ik->signers()->print_value_on(st);           st->cr();
+   if (ik->source_file_name() != NULL) {
+-    st->print(" - source file:       ");
++    st->print(BULLET"source file:       ");
+     ik->source_file_name()->print_value_on(st);
+     st->cr();
+   }
+   if (ik->source_debug_extension() != NULL) {
+-    st->print(" - source debug extension:       ");
++    st->print(BULLET"source debug extension:       ");
+     ik->source_debug_extension()->print_value_on(st);
+     st->cr();
+   }
+ 
+-  st->print_cr(" - previous version:       ");
+   {
+     ResourceMark rm;
+     // PreviousVersionInfo objects returned via PreviousVersionWalker
+@@ -564,38 +565,43 @@
+     // GrowableArray _after_ the PreviousVersionWalker destructor
+     // has destroyed the handles.
+     {
++      bool have_pv = false;
+       PreviousVersionWalker pvw(ik);
+       for (PreviousVersionInfo * pv_info = pvw.next_previous_version();
+            pv_info != NULL; pv_info = pvw.next_previous_version()) {
++        if (!have_pv)
++          st->print(BULLET"previous version:  ");
++        have_pv = true;
+         pv_info->prev_constant_pool_handle()()->print_value_on(st);
+       }
+-      st->cr();
++      if (have_pv)  st->cr();
+     } // pvw is cleaned up
+   } // rm is cleaned up
+ 
+   if (ik->generic_signature() != NULL) {
+-    st->print(" - generic signature:            ");
++    st->print(BULLET"generic signature: ");
+     ik->generic_signature()->print_value_on(st);
++    st->cr();
+   }
+-  st->print(" - inner classes:     "); ik->inner_classes()->print_value_on(st);     st->cr();
+-  st->print(" - java mirror:       "); ik->java_mirror()->print_value_on(st);       st->cr();
+-  st->print(" - vtable length      %d  (start addr: " INTPTR_FORMAT ")", ik->vtable_length(), ik->start_of_vtable());  st->cr();
+-  st->print(" - itable length      %d (start addr: " INTPTR_FORMAT ")", ik->itable_length(), ik->start_of_itable()); st->cr();
+-  st->print_cr(" - static fields:");
++  st->print(BULLET"inner classes:     "); ik->inner_classes()->print_value_on(st);     st->cr();
++  st->print(BULLET"java mirror:       "); ik->java_mirror()->print_value_on(st);       st->cr();
++  st->print(BULLET"vtable length      %d  (start addr: " INTPTR_FORMAT ")", ik->vtable_length(), ik->start_of_vtable());  st->cr();
++  st->print(BULLET"itable length      %d (start addr: " INTPTR_FORMAT ")", ik->itable_length(), ik->start_of_itable()); st->cr();
++  st->print_cr(BULLET"---- static fields (%d words):", ik->static_field_size());
+   FieldPrinter print_static_field(st);
+   ik->do_local_static_fields(&print_static_field);
+-  st->print_cr(" - non-static fields:");
+-  FieldPrinter print_nonstatic_field(st, obj);
++  st->print_cr(BULLET"---- non-static fields (%d words):", ik->nonstatic_field_size());
++  FieldPrinter print_nonstatic_field(st);
+   ik->do_nonstatic_fields(&print_nonstatic_field);
+ 
+-  st->print(" - static oop maps:     ");
++  st->print(BULLET"static oop maps:     ");
+   if (ik->static_oop_field_size() > 0) {
+     int first_offset = ik->offset_of_static_fields();
+     st->print("%d-%d", first_offset, first_offset + ik->static_oop_field_size() - 1);
+   }
+   st->cr();
+ 
+-  st->print(" - non-static oop maps: ");
++  st->print(BULLET"non-static oop maps: ");
+   OopMapBlock* map     = ik->start_of_nonstatic_oop_maps();
+   OopMapBlock* end_map = map + ik->nonstatic_oop_map_size();
+   while (map < end_map) {
+diff --git a/src/share/vm/oops/klassVtable.cpp b/src/share/vm/oops/klassVtable.cpp
+--- a/src/share/vm/oops/klassVtable.cpp
++++ b/src/share/vm/oops/klassVtable.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -1150,6 +1150,27 @@
+   return index;
+ }
+ 
++
++// inverse to compute_itable_index
++methodOop klassItable::method_for_itable_index(klassOop intf, int itable_index) {
++  assert(instanceKlass::cast(intf)->is_interface(), "sanity check");
++  objArrayOop methods = instanceKlass::cast(intf)->methods();
++
++  int index = itable_index;
++  // Adjust for <clinit>, which is left out of table if first method
++  if (methods->length() > 0 && ((methodOop)methods->obj_at(0))->name() == vmSymbols::class_initializer_name()) {
++    index++;
++  }
++
++  if (itable_index < 0 || index >= methods->length())
++    return NULL;                // help caller defend against bad indexes
++
++  methodOop m = (methodOop)methods->obj_at(index);
++  assert(compute_itable_index(m) == itable_index, "correct inverse");
++
++  return m;
++}
++
+ void klassVtable::verify(outputStream* st, bool forced) {
+   // make sure table is initialized
+   if (!Universe::is_fully_initialized()) return;
+diff --git a/src/share/vm/oops/klassVtable.hpp b/src/share/vm/oops/klassVtable.hpp
+--- a/src/share/vm/oops/klassVtable.hpp
++++ b/src/share/vm/oops/klassVtable.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2006 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -298,6 +298,8 @@
+ 
+   // Resolving of method to index
+   static int compute_itable_index(methodOop m);
++  // ...and back again:
++  static methodOop method_for_itable_index(klassOop klass, int itable_index);
+ 
+   // Debugging/Statistics
+   static void print_statistics() PRODUCT_RETURN;
+diff --git a/src/share/vm/oops/methodKlass.cpp b/src/share/vm/oops/methodKlass.cpp
+--- a/src/share/vm/oops/methodKlass.cpp
++++ b/src/share/vm/oops/methodKlass.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2007 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -247,9 +247,14 @@
+   st->print_cr(" - size of params:    %d",   m->size_of_parameters());
+   st->print_cr(" - method size:       %d",   m->method_size());
+   st->print_cr(" - vtable index:      %d",   m->_vtable_index);
++  st->print_cr(" - i2i entry:         " INTPTR_FORMAT, m->interpreter_entry());
++  st->print_cr(" - adapter:           " INTPTR_FORMAT, m->adapter());
++  st->print_cr(" - compiled entry     " INTPTR_FORMAT, m->from_compiled_entry());
+   st->print_cr(" - code size:         %d",   m->code_size());
+-  st->print_cr(" - code start:        " INTPTR_FORMAT, m->code_base());
+-  st->print_cr(" - code end (excl):   " INTPTR_FORMAT, m->code_base() + m->code_size());
++  if (m->code_size() != 0) {
++    st->print_cr(" - code start:        " INTPTR_FORMAT, m->code_base());
++    st->print_cr(" - code end (excl):   " INTPTR_FORMAT, m->code_base() + m->code_size());
++  }
+   if (m->method_data() != NULL) {
+     st->print_cr(" - method data:       " INTPTR_FORMAT, (address)m->method_data());
+   }
+@@ -293,6 +298,10 @@
+     m->code()->print_value_on(st);
+     st->cr();
+   }
++  if (m->is_native()) {
++    st->print_cr(" - native function:   " INTPTR_FORMAT, m->native_function());
++    st->print_cr(" - signature handler: " INTPTR_FORMAT, m->signature_handler());
++  }
+ }
+ 
+ 
+diff --git a/src/share/vm/oops/objArrayKlass.cpp b/src/share/vm/oops/objArrayKlass.cpp
+--- a/src/share/vm/oops/objArrayKlass.cpp
++++ b/src/share/vm/oops/objArrayKlass.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -502,12 +502,25 @@
+   }
+ }
+ 
++static int max_objArray_print_length = 4;
+ 
+ void objArrayKlass::oop_print_value_on(oop obj, outputStream* st) {
+   assert(obj->is_objArray(), "must be objArray");
++  st->print("a ");
+   element_klass()->print_value_on(st);
+-  st->print("a [%d] ", objArrayOop(obj)->length());
+-  as_klassOop()->klass()->print_value_on(st);
++  int len = objArrayOop(obj)->length();
++  st->print("[%d] ", len);
++  obj->print_address_on(st);
++  if (PrintOopAddress || PrintMiscellaneous && (WizardMode || Verbose)) {
++    st->print("{");
++    for (int i = 0; i < len; i++) {
++      if (i > max_objArray_print_length) {
++        st->print("..."); break;
++      }
++      st->print(" "INTPTR_FORMAT, (intptr_t)(void*)objArrayOop(obj)->obj_at(i));
++    }
++    st->print(" }");
++  }
+ }
+ 
+ #endif // PRODUCT
+diff --git a/src/share/vm/oops/oop.cpp b/src/share/vm/oops/oop.cpp
+--- a/src/share/vm/oops/oop.cpp
++++ b/src/share/vm/oops/oop.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -65,11 +65,7 @@
+ 
+ void oopDesc::print_address_on(outputStream* st) const {
+   if (PrintOopAddress) {
+-    st->print("{");
+-    if (PrintOopAddress) {
+-      st->print(INTPTR_FORMAT, this);
+-    }
+-    st->print("}");
++    st->print("{"INTPTR_FORMAT"}", this);
+   }
+ }
+ 
+diff --git a/src/share/vm/prims/jvm.cpp b/src/share/vm/prims/jvm.cpp
+--- a/src/share/vm/prims/jvm.cpp
++++ b/src/share/vm/prims/jvm.cpp
+@@ -1242,7 +1242,7 @@
+ 
+            // Throws an exception if outer klass has not declared k as
+            // an inner klass
+-           Reflection::check_for_inner_class(k, inner_klass, CHECK_NULL);
++           Reflection::check_for_inner_class(k, inner_klass, true, CHECK_NULL);
+ 
+            result->obj_at_put(members, inner_klass->java_mirror());
+            members++;
+@@ -1265,16 +1265,29 @@
+ 
+ 
+ JVM_ENTRY(jclass, JVM_GetDeclaringClass(JNIEnv *env, jclass ofClass))
+-  const int inner_class_info_index = 0;
+-  const int outer_class_info_index = 1;
+-
++{
+   // ofClass is a reference to a java_lang_Class object.
+   if (java_lang_Class::is_primitive(JNIHandles::resolve_non_null(ofClass)) ||
+       ! Klass::cast(java_lang_Class::as_klassOop(JNIHandles::resolve_non_null(ofClass)))->oop_is_instance()) {
+     return NULL;
+   }
+ 
+-  instanceKlassHandle k(thread, java_lang_Class::as_klassOop(JNIHandles::resolve_non_null(ofClass)));
++  symbolOop simple_name = NULL;
++  klassOop outer_klass
++    = instanceKlass::cast(java_lang_Class::as_klassOop(JNIHandles::resolve_non_null(ofClass))
++                          )->compute_enclosing_class(simple_name, CHECK_NULL);
++  if (outer_klass == NULL)  return NULL;  // already a top-level class
++  if (simple_name == NULL)  return NULL;  // an anonymous class (inside a method)
++  return (jclass) JNIHandles::make_local(env, Klass::cast(outer_klass)->java_mirror());
++}
++JVM_END
++
++// should be in instanceKlass.cpp, but is here for historical reasons
++klassOop instanceKlass::compute_enclosing_class_impl(instanceKlassHandle k,
++                                                     symbolOop& simple_name_result, TRAPS) {
++  Thread* thread = THREAD;
++  const int inner_class_info_index = inner_class_inner_class_info_offset;
++  const int outer_class_info_index = inner_class_outer_class_info_offset;
+ 
+   if (k->inner_classes()->length() == 0) {
+     // No inner class info => no declaring class
+@@ -1288,35 +1301,51 @@
+   bool found = false;
+   klassOop ok;
+   instanceKlassHandle outer_klass;
++  bool inner_is_member = false;
++  int simple_name_index = 0;
+ 
+   // Find inner_klass attribute
+-  for(int i = 0; i < i_length && !found; i+= 4) {
++  for (int i = 0; i < i_length && !found; i += inner_class_next_offset) {
+     int ioff = i_icls->ushort_at(i + inner_class_info_index);
+     int ooff = i_icls->ushort_at(i + outer_class_info_index);
+-
+-    if (ioff != 0 && ooff != 0) {
++    int noff = i_icls->ushort_at(i + inner_class_inner_name_offset);
++    if (ioff != 0) {
+       // Check to see if the name matches the class we're looking for
+       // before attempting to find the class.
+       if (i_cp->klass_name_at_matches(k, ioff)) {
+         klassOop inner_klass = i_cp->klass_at(ioff, CHECK_NULL);
+-        if (k() == inner_klass) {
+-          found = true;
++        found = (k() == inner_klass);
++        if (found && ooff != 0) {
+           ok = i_cp->klass_at(ooff, CHECK_NULL);
+           outer_klass = instanceKlassHandle(thread, ok);
+-        }
+-      }
++          simple_name_index = noff;
++          inner_is_member = true;
++        }
++      }
++    }
++  }
++
++  if (found && outer_klass.is_null()) {
++    // It may be anonymous; try for that.
++    int encl_method_class_idx = k->enclosing_method_class_index();
++    if (encl_method_class_idx != 0) {
++      ok = i_cp->klass_at(encl_method_class_idx, CHECK_NULL);
++      outer_klass = instanceKlassHandle(thread, ok);
++      inner_is_member = false;
+     }
+   }
+ 
+   // If no inner class attribute found for this class.
+-  if (!found) return NULL;
++  if (outer_klass.is_null())  return NULL;
+ 
+   // Throws an exception if outer klass has not declared k as an inner klass
+-  Reflection::check_for_inner_class(outer_klass, k, CHECK_NULL);
+-
+-  return (jclass)JNIHandles::make_local(env, outer_klass->java_mirror());
+-JVM_END
+-
++  // We need evidence that each klass knows about the other, or else
++  // the system could allow a spoof of an inner class to gain access rights.
++  Reflection::check_for_inner_class(outer_klass, k, inner_is_member, CHECK_NULL);
++
++  simple_name_result = (inner_is_member ? i_cp->symbol_at(simple_name_index) : symbolOop(NULL));
++  return outer_klass();
++}
+ 
+ JVM_ENTRY(jstring, JVM_GetClassSignature(JNIEnv *env, jclass cls))
+   assert (cls != NULL, "illegal class");
+diff --git a/src/share/vm/runtime/fieldDescriptor.cpp b/src/share/vm/runtime/fieldDescriptor.cpp
+--- a/src/share/vm/runtime/fieldDescriptor.cpp
++++ b/src/share/vm/runtime/fieldDescriptor.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2005 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -107,13 +107,14 @@
+ void fieldDescriptor::print_on_for(outputStream* st, oop obj) {
+   print_on(st);
+   BasicType ft = field_type();
+-  jint as_int;
++  jint as_int = 0;
+   switch (ft) {
+     case T_BYTE:
+       as_int = (jint)obj->byte_field(offset());
+       st->print(" %d", obj->byte_field(offset()));
+       break;
+     case T_CHAR:
++      as_int = (jint)obj->char_field(offset());
+       {
+         jchar c = obj->char_field(offset());
+         as_int = c;
+@@ -128,6 +129,7 @@
+       st->print(" %f", obj->float_field(offset()));
+       break;
+     case T_INT:
++      as_int = obj->int_field(offset());
+       st->print(" %d", obj->int_field(offset()));
+       break;
+     case T_LONG:
+@@ -144,12 +146,12 @@
+       break;
+     case T_ARRAY:
+       st->print(" ");
+-      as_int = obj->int_field(offset());
++      NOT_LP64(as_int = obj->int_field(offset()));
+       obj->obj_field(offset())->print_value_on(st);
+       break;
+     case T_OBJECT:
+       st->print(" ");
+-      as_int = obj->int_field(offset());
++      NOT_LP64(as_int = obj->int_field(offset()));
+       obj->obj_field(offset())->print_value_on(st);
+       break;
+     default:
+@@ -158,9 +160,9 @@
+   }
+   // Print a hint as to the underlying integer representation. This can be wrong for
+   // pointers on an LP64 machine
+-  if (ft == T_LONG || ft == T_DOUBLE) {
++  if (ft == T_LONG || ft == T_DOUBLE LP64_ONLY(|| !is_java_primitive(ft)) ) {
+     st->print(" (%x %x)", obj->int_field(offset()), obj->int_field(offset()+sizeof(jint)));
+-  } else {
++  } else if (as_int < 0 || as_int > 9) {
+     st->print(" (%x)", as_int);
+   }
+ }
+diff --git a/src/share/vm/runtime/handles.hpp b/src/share/vm/runtime/handles.hpp
+--- a/src/share/vm/runtime/handles.hpp
++++ b/src/share/vm/runtime/handles.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2007 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -137,6 +137,14 @@
+     assert(is_null() || obj()->is_klass(), "not a klassOop");
+   }
+ 
++  // Direct interface, use very sparingly.
++  // Used by SystemDictionaryHandles to create handles on existing WKKs.
++  // The obj of such a klass handle may be null, because the handle is formed
++  // during system bootstrapping.
++  KlassHandle(klassOop *handle, bool dummy) : Handle((oop*)handle, dummy) {
++    assert(SharedSkipVerify || is_null() || obj() == NULL || obj()->is_klass(), "not a klassOop");
++  }
++
+   // General access
+   klassOop    operator () () const               { return obj(); }
+   Klass*      operator -> () const               { return as_klass(); }
+diff --git a/src/share/vm/runtime/reflection.cpp b/src/share/vm/runtime/reflection.cpp
+--- a/src/share/vm/runtime/reflection.cpp
++++ b/src/share/vm/runtime/reflection.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -554,10 +554,18 @@
+   return instanceKlass::cast(class1)->is_same_class_package(class2);
+ }
+ 
++bool Reflection::is_same_package_member(klassOop class1, klassOop class2, TRAPS) {
++  return instanceKlass::cast(class1)->is_same_package_member(class2, THREAD);
++}
++
+ 
+ // Checks that the 'outer' klass has declared 'inner' as being an inner klass. If not,
+ // throw an incompatible class change exception
+-void Reflection::check_for_inner_class(instanceKlassHandle outer, instanceKlassHandle inner, TRAPS) {
++// If inner_is_member, require the inner to be a member of the outer.
++// If !inner_is_member, require the inner to be anonymous (a non-member).
++// Caller is responsible for figuring out in advance which case must be true.
++void Reflection::check_for_inner_class(instanceKlassHandle outer, instanceKlassHandle inner,
++                                       bool inner_is_member, TRAPS) {
+   const int inner_class_info_index = 0;
+   const int outer_class_info_index = 1;
+ 
+@@ -567,7 +575,7 @@
+      int ioff = icls->ushort_at(i + inner_class_info_index);
+      int ooff = icls->ushort_at(i + outer_class_info_index);
+ 
+-     if (ioff != 0 && ooff != 0) {
++     if (inner_is_member && ioff != 0 && ooff != 0) {
+         klassOop o = cp->klass_at(ooff, CHECK);
+         if (o == outer()) {
+           klassOop i = cp->klass_at(ioff, CHECK);
+@@ -576,6 +584,13 @@
+           }
+         }
+      }
++     if (!inner_is_member && ioff != 0 && ooff == 0 &&
++         cp->klass_name_at_matches(inner, ioff)) {
++        klassOop i = cp->klass_at(ioff, CHECK);
++        if (i == inner()) {
++          return;
++        }
++     }
+   }
+ 
+   // 'inner' not declared as an inner klass in outer
+diff --git a/src/share/vm/runtime/reflection.hpp b/src/share/vm/runtime/reflection.hpp
+--- a/src/share/vm/runtime/reflection.hpp
++++ b/src/share/vm/runtime/reflection.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2006 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -87,12 +87,18 @@
+                                       bool classloader_only,
+                                       bool protected_restriction = false);
+   static bool     is_same_class_package(klassOop class1, klassOop class2);
++  static bool     is_same_package_member(klassOop class1, klassOop class2, TRAPS);
+ 
+   static bool can_relax_access_check_for(
+     klassOop accessor, klassOop accesee, bool classloader_only);
+ 
+   // inner class reflection
+-  static void check_for_inner_class(instanceKlassHandle outer, instanceKlassHandle inner, TRAPS);
++  // raise an ICCE unless the required relationship can be proven to hold
++  // If inner_is_member, require the inner to be a member of the outer.
++  // If !inner_is_member, require the inner to be anonymous (a non-member).
++  // Caller is responsible for figuring out in advance which case must be true.
++  static void check_for_inner_class(instanceKlassHandle outer, instanceKlassHandle inner,
++                                    bool inner_is_member, TRAPS);
+ 
+   //
+   // Support for reflection based on dynamic bytecode generation (JDK 1.4)
+diff --git a/src/share/vm/runtime/sharedRuntime.cpp b/src/share/vm/runtime/sharedRuntime.cpp
+--- a/src/share/vm/runtime/sharedRuntime.cpp
++++ b/src/share/vm/runtime/sharedRuntime.cpp
+@@ -649,48 +649,6 @@
+ JRT_END
+ 
+ 
+-// ---------------------------------------------------------------------------------------------------------
+-// Non-product code
+-#ifndef PRODUCT
+-
+-void SharedRuntime::verify_caller_frame(frame caller_frame, methodHandle callee_method) {
+-  ResourceMark rm;
+-  assert (caller_frame.is_interpreted_frame(), "sanity check");
+-  assert (callee_method->has_compiled_code(), "callee must be compiled");
+-  methodHandle caller_method (Thread::current(), caller_frame.interpreter_frame_method());
+-  jint bci = caller_frame.interpreter_frame_bci();
+-  methodHandle method = find_callee_method_inside_interpreter(caller_frame, caller_method, bci);
+-  assert (callee_method == method, "incorrect method");
+-}
+-
+-methodHandle SharedRuntime::find_callee_method_inside_interpreter(frame caller_frame, methodHandle caller_method, int bci) {
+-  EXCEPTION_MARK;
+-  Bytecode_invoke* bytecode = Bytecode_invoke_at(caller_method, bci);
+-  methodHandle staticCallee = bytecode->static_target(CATCH); // Non-product code
+-
+-  bytecode = Bytecode_invoke_at(caller_method, bci);
+-  int bytecode_index = bytecode->index();
+-  Bytecodes::Code bc = bytecode->adjusted_invoke_code();
+-
+-  Handle receiver;
+-  if (bc == Bytecodes::_invokeinterface ||
+-      bc == Bytecodes::_invokevirtual ||
+-      bc == Bytecodes::_invokespecial) {
+-    symbolHandle signature (THREAD, staticCallee->signature());
+-    receiver = Handle(THREAD, retrieve_receiver(signature, caller_frame));
+-  } else {
+-    receiver = Handle();
+-  }
+-  CallInfo result;
+-  constantPoolHandle constants (THREAD, caller_method->constants());
+-  LinkResolver::resolve_invoke(result, receiver, constants, bytecode_index, bc, CATCH); // Non-product code
+-  methodHandle calleeMethod = result.selected_method();
+-  return calleeMethod;
+-}
+-
+-#endif  // PRODUCT
+-
+-
+ JRT_ENTRY_NO_ASYNC(void, SharedRuntime::register_finalizer(JavaThread* thread, oopDesc* obj))
+   assert(obj->is_oop(), "must be a valid oop");
+   assert(obj->klass()->klass_part()->has_finalizer(), "shouldn't be here otherwise");
+diff --git a/src/share/vm/runtime/sharedRuntime.hpp b/src/share/vm/runtime/sharedRuntime.hpp
+--- a/src/share/vm/runtime/sharedRuntime.hpp
++++ b/src/share/vm/runtime/sharedRuntime.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -177,9 +177,6 @@
+ 
+   static oop retrieve_receiver( symbolHandle sig, frame caller );
+ 
+-  static void verify_caller_frame(frame caller_frame, methodHandle callee_method) PRODUCT_RETURN;
+-  static methodHandle find_callee_method_inside_interpreter(frame caller_frame, methodHandle caller_method, int bci) PRODUCT_RETURN_(return methodHandle(););
+-
+   static void register_finalizer(JavaThread* thread, oopDesc* obj);
+ 
+   // dtrace notifications

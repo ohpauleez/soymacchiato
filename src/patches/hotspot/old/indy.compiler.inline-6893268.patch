@@ -1,0 +1,3582 @@
+diff --git a/src/share/vm/ci/ciCPCache.cpp b/src/share/vm/ci/ciCPCache.cpp
+--- a/src/share/vm/ci/ciCPCache.cpp
++++ b/src/share/vm/ci/ciCPCache.cpp
+@@ -39,6 +39,7 @@
+   return in_bytes(f1_offset);
+ }
+ 
++
+ // ------------------------------------------------------------------
+ // ciCPCache::print
+ //
+diff --git a/src/share/vm/ci/ciCallSite.cpp b/src/share/vm/ci/ciCallSite.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/share/vm/ci/ciCallSite.cpp
+@@ -0,0 +1,46 @@
++/*
++ * Copyright 2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ *
++ */
++
++#include "incls/_precompiled.incl"
++#include "incls/_ciCallSite.cpp.incl"
++
++// ciCallSite
++
++// ------------------------------------------------------------------
++// ciCallSite::get_target
++//
++// Return the target MethodHandle of this CallSite.
++ciMethodHandle* ciCallSite::get_target() const {
++  VM_ENTRY_MARK;
++  oop method_handle_oop = java_dyn_CallSite::target(get_oop());
++  return CURRENT_ENV->get_object(method_handle_oop)->as_method_handle();
++}
++
++// ------------------------------------------------------------------
++// ciCallSite::print
++//
++// Print debugging information about the CallSite.
++void ciCallSite::print() {
++  Unimplemented();
++}
+diff --git a/src/share/vm/ci/ciCallSite.hpp b/src/share/vm/ci/ciCallSite.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/share/vm/ci/ciCallSite.hpp
+@@ -0,0 +1,39 @@
++/*
++ * Copyright 2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ *
++ */
++
++// ciCallSite
++//
++// The class represents a java.dyn.CallSite object.
++class ciCallSite : public ciInstance {
++public:
++  ciCallSite(instanceHandle h_i) : ciInstance(h_i) {}
++
++  // What kind of ciObject is this?
++  bool is_call_site() const { return true; }
++
++  // Return the target MethodHandle of this CallSite.
++  ciMethodHandle* get_target() const;
++
++  void print();
++};
+diff --git a/src/share/vm/ci/ciClassList.hpp b/src/share/vm/ci/ciClassList.hpp
+--- a/src/share/vm/ci/ciClassList.hpp
++++ b/src/share/vm/ci/ciClassList.hpp
+@@ -43,6 +43,8 @@
+ class ciObject;
+ class   ciNullObject;
+ class   ciInstance;
++class     ciCallSite;
++class     ciMethodHandle;
+ class   ciMethod;
+ class   ciMethodData;
+ class     ciReceiverTypeData;  // part of ciMethodData
+@@ -79,6 +81,7 @@
+ // Any more access must be given explicitly.
+ #define CI_PACKAGE_ACCESS_TO           \
+ friend class ciObjectFactory;          \
++friend class ciCallSite;               \
+ friend class ciConstantPoolCache;      \
+ friend class ciField;                  \
+ friend class ciConstant;               \
+@@ -94,6 +97,7 @@
+ friend class ciInstance;               \
+ friend class ciMethod;                 \
+ friend class ciMethodData;             \
++friend class ciMethodHandle;           \
+ friend class ciReceiverTypeData;       \
+ friend class ciSymbol;                 \
+ friend class ciArray;                  \
+diff --git a/src/share/vm/ci/ciEnv.cpp b/src/share/vm/ci/ciEnv.cpp
+--- a/src/share/vm/ci/ciEnv.cpp
++++ b/src/share/vm/ci/ciEnv.cpp
+@@ -443,12 +443,11 @@
+ // ciEnv::get_klass_by_index_impl
+ //
+ // Implementation of get_klass_by_index.
+-ciKlass* ciEnv::get_klass_by_index_impl(ciInstanceKlass* accessor,
++ciKlass* ciEnv::get_klass_by_index_impl(constantPoolHandle cpool,
+                                         int index,
+-                                        bool& is_accessible) {
+-  assert(accessor->get_instanceKlass()->is_linked(), "must be linked before accessing constant pool");
++                                        bool& is_accessible,
++                                        ciInstanceKlass* accessor) {
+   EXCEPTION_CONTEXT;
+-  constantPoolHandle cpool(THREAD, accessor->get_instanceKlass()->constants());
+   KlassHandle klass (THREAD, constantPoolOopDesc::klass_at_if_loaded(cpool, index));
+   symbolHandle klass_name;
+   if (klass.is_null()) {
+@@ -510,22 +509,21 @@
+ // ciEnv::get_klass_by_index
+ //
+ // Get a klass from the constant pool.
+-ciKlass* ciEnv::get_klass_by_index(ciInstanceKlass* accessor,
++ciKlass* ciEnv::get_klass_by_index(constantPoolHandle cpool,
+                                    int index,
+-                                   bool& is_accessible) {
+-  GUARDED_VM_ENTRY(return get_klass_by_index_impl(accessor, index, is_accessible);)
++                                   bool& is_accessible,
++                                   ciInstanceKlass* accessor) {
++  GUARDED_VM_ENTRY(return get_klass_by_index_impl(cpool, index, is_accessible, accessor);)
+ }
+ 
+ // ------------------------------------------------------------------
+ // ciEnv::get_constant_by_index_impl
+ //
+ // Implementation of get_constant_by_index().
+-ciConstant ciEnv::get_constant_by_index_impl(ciInstanceKlass* accessor,
+-                                             int index) {
++ciConstant ciEnv::get_constant_by_index_impl(constantPoolHandle cpool,
++                                             int index,
++                                             ciInstanceKlass* accessor) {
+   EXCEPTION_CONTEXT;
+-  instanceKlass* ik_accessor = accessor->get_instanceKlass();
+-  assert(ik_accessor->is_linked(), "must be linked before accessing constant pool");
+-  constantPoolOop cpool = ik_accessor->constants();
+   constantTag tag = cpool->tag_at(index);
+   if (tag.is_int()) {
+     return ciConstant(T_INT, (jint)cpool->int_at(index));
+@@ -553,7 +551,7 @@
+   } else if (tag.is_klass() || tag.is_unresolved_klass()) {
+     // 4881222: allow ldc to take a class type
+     bool ignore;
+-    ciKlass* klass = get_klass_by_index_impl(accessor, index, ignore);
++    ciKlass* klass = get_klass_by_index_impl(cpool, index, ignore, accessor);
+     if (HAS_PENDING_EXCEPTION) {
+       CLEAR_PENDING_EXCEPTION;
+       record_out_of_memory_failure();
+@@ -562,6 +560,11 @@
+     assert (klass->is_instance_klass() || klass->is_array_klass(),
+             "must be an instance or array klass ");
+     return ciConstant(T_OBJECT, klass);
++  } else if (tag.is_object()) {
++    oop obj = cpool->object_at(index);
++    assert(obj->is_instance(), "must be an instance");
++    ciObject* ciobj = get_object(obj);
++    return ciConstant(T_OBJECT, ciobj);
+   } else {
+     ShouldNotReachHere();
+     return ciConstant();
+@@ -598,9 +601,10 @@
+ // Pull a constant out of the constant pool.  How appropriate.
+ //
+ // Implementation note: this query is currently in no way cached.
+-ciConstant ciEnv::get_constant_by_index(ciInstanceKlass* accessor,
+-                                        int index) {
+-  GUARDED_VM_ENTRY(return get_constant_by_index_impl(accessor, index); )
++ciConstant ciEnv::get_constant_by_index(constantPoolHandle cpool,
++                                        int index,
++                                        ciInstanceKlass* accessor) {
++  GUARDED_VM_ENTRY(return get_constant_by_index_impl(cpool, index, accessor);)
+ }
+ 
+ // ------------------------------------------------------------------
+@@ -610,7 +614,7 @@
+ //
+ // Implementation note: this query is currently in no way cached.
+ bool ciEnv::is_unresolved_string(ciInstanceKlass* accessor,
+-                                        int index) const {
++                                 int index) const {
+   GUARDED_VM_ENTRY(return is_unresolved_string_impl(accessor->get_instanceKlass(), index); )
+ }
+ 
+@@ -621,7 +625,7 @@
+ //
+ // Implementation note: this query is currently in no way cached.
+ bool ciEnv::is_unresolved_klass(ciInstanceKlass* accessor,
+-                                        int index) const {
++                                int index) const {
+   GUARDED_VM_ENTRY(return is_unresolved_klass_impl(accessor->get_instanceKlass(), index); )
+ }
+ 
+@@ -702,15 +706,12 @@
+ 
+ // ------------------------------------------------------------------
+ // ciEnv::get_method_by_index_impl
+-ciMethod* ciEnv::get_method_by_index_impl(ciInstanceKlass* accessor,
+-                                     int index, Bytecodes::Code bc) {
+-  // Get the method's declared holder.
+-
+-  assert(accessor->get_instanceKlass()->is_linked(), "must be linked before accessing constant pool");
+-  constantPoolHandle cpool = accessor->get_instanceKlass()->constants();
++ciMethod* ciEnv::get_method_by_index_impl(constantPoolHandle cpool,
++                                          int index, Bytecodes::Code bc,
++                                          ciInstanceKlass* accessor) {
+   int holder_index = cpool->klass_ref_index_at(index);
+   bool holder_is_accessible;
+-  ciKlass* holder = get_klass_by_index_impl(accessor, holder_index, holder_is_accessible);
++  ciKlass* holder = get_klass_by_index_impl(cpool, holder_index, holder_is_accessible, accessor);
+   ciInstanceKlass* declared_holder = get_instance_klass_for_declared_method_holder(holder);
+ 
+   // Get the method's name and signature.
+@@ -738,11 +739,9 @@
+ 
+ // ------------------------------------------------------------------
+ // ciEnv::get_fake_invokedynamic_method_impl
+-ciMethod* ciEnv::get_fake_invokedynamic_method_impl(ciInstanceKlass* accessor,
++ciMethod* ciEnv::get_fake_invokedynamic_method_impl(constantPoolHandle cpool,
+                                                     int index, Bytecodes::Code bc) {
+   assert(bc == Bytecodes::_invokedynamic, "must be invokedynamic");
+-  assert(accessor->get_instanceKlass()->is_linked(), "must be linked before accessing constant pool");
+-  constantPoolHandle cpool = accessor->get_instanceKlass()->constants();
+ 
+   // Get the CallSite from the constant pool cache.
+   ConstantPoolCacheEntry* cpc_entry = cpool->cache()->secondary_entry_at(index);
+@@ -789,12 +788,13 @@
+ 
+ // ------------------------------------------------------------------
+ // ciEnv::get_method_by_index
+-ciMethod* ciEnv::get_method_by_index(ciInstanceKlass* accessor,
+-                                     int index, Bytecodes::Code bc) {
++ciMethod* ciEnv::get_method_by_index(constantPoolHandle cpool,
++                                     int index, Bytecodes::Code bc,
++                                     ciInstanceKlass* accessor) {
+   if (bc == Bytecodes::_invokedynamic) {
+-    GUARDED_VM_ENTRY(return get_fake_invokedynamic_method_impl(accessor, index, bc);)
++    GUARDED_VM_ENTRY(return get_fake_invokedynamic_method_impl(cpool, index, bc);)
+   } else {
+-    GUARDED_VM_ENTRY(return get_method_by_index_impl(accessor, index, bc);)
++    GUARDED_VM_ENTRY(return get_method_by_index_impl(cpool, index, bc, accessor);)
+   }
+ }
+ 
+diff --git a/src/share/vm/ci/ciEnv.hpp b/src/share/vm/ci/ciEnv.hpp
+--- a/src/share/vm/ci/ciEnv.hpp
++++ b/src/share/vm/ci/ciEnv.hpp
+@@ -121,38 +121,44 @@
+                              bool require_local);
+ 
+   // Constant pool access.
+-  ciKlass*   get_klass_by_index(ciInstanceKlass* loading_klass,
++  ciKlass*   get_klass_by_index(constantPoolHandle cpool,
+                                 int klass_index,
+-                                bool& is_accessible);
+-  ciConstant get_constant_by_index(ciInstanceKlass* loading_klass,
+-                                   int constant_index);
++                                bool& is_accessible,
++                                ciInstanceKlass* loading_klass);
++  ciConstant get_constant_by_index(constantPoolHandle cpool,
++                                   int constant_index,
++                                   ciInstanceKlass* accessor);
+   bool       is_unresolved_string(ciInstanceKlass* loading_klass,
+                                    int constant_index) const;
+   bool       is_unresolved_klass(ciInstanceKlass* loading_klass,
+                                    int constant_index) const;
+   ciField*   get_field_by_index(ciInstanceKlass* loading_klass,
+                                 int field_index);
+-  ciMethod*  get_method_by_index(ciInstanceKlass* loading_klass,
+-                                 int method_index, Bytecodes::Code bc);
++  ciMethod*  get_method_by_index(constantPoolHandle cpool,
++                                 int method_index, Bytecodes::Code bc,
++                                 ciInstanceKlass* loading_klass);
+ 
+   // Implementation methods for loading and constant pool access.
+   ciKlass* get_klass_by_name_impl(ciKlass* accessing_klass,
+                                   ciSymbol* klass_name,
+                                   bool require_local);
+-  ciKlass*   get_klass_by_index_impl(ciInstanceKlass* loading_klass,
++  ciKlass*   get_klass_by_index_impl(constantPoolHandle cpool,
+                                      int klass_index,
+-                                     bool& is_accessible);
+-  ciConstant get_constant_by_index_impl(ciInstanceKlass* loading_klass,
+-                                        int constant_index);
++                                     bool& is_accessible,
++                                     ciInstanceKlass* loading_klass);
++  ciConstant get_constant_by_index_impl(constantPoolHandle cpool,
++                                        int constant_index,
++                                        ciInstanceKlass* loading_klass);
+   bool       is_unresolved_string_impl (instanceKlass* loading_klass,
+                                         int constant_index) const;
+   bool       is_unresolved_klass_impl (instanceKlass* loading_klass,
+                                         int constant_index) const;
+   ciField*   get_field_by_index_impl(ciInstanceKlass* loading_klass,
+                                      int field_index);
+-  ciMethod*  get_method_by_index_impl(ciInstanceKlass* loading_klass,
+-                                      int method_index, Bytecodes::Code bc);
+-  ciMethod*  get_fake_invokedynamic_method_impl(ciInstanceKlass* accessor,
++  ciMethod*  get_method_by_index_impl(constantPoolHandle cpool,
++                                      int method_index, Bytecodes::Code bc,
++                                      ciInstanceKlass* loading_klass);
++  ciMethod*  get_fake_invokedynamic_method_impl(constantPoolHandle cpool,
+                                                 int index, Bytecodes::Code bc);
+ 
+   // Helper methods
+diff --git a/src/share/vm/ci/ciExceptionHandler.cpp b/src/share/vm/ci/ciExceptionHandler.cpp
+--- a/src/share/vm/ci/ciExceptionHandler.cpp
++++ b/src/share/vm/ci/ciExceptionHandler.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2003 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -34,12 +34,16 @@
+ //
+ // Get the exception klass that this handler catches.
+ ciInstanceKlass* ciExceptionHandler::catch_klass() {
++  VM_ENTRY_MARK;
+   assert(!is_catch_all(), "bad index");
+   if (_catch_klass == NULL) {
+     bool will_link;
+-    ciKlass* k = CURRENT_ENV->get_klass_by_index(_loading_klass,
++    assert(_loading_klass->get_instanceKlass()->is_linked(), "must be linked before accessing constant pool");
++    constantPoolHandle cpool(_loading_klass->get_instanceKlass()->constants());
++    ciKlass* k = CURRENT_ENV->get_klass_by_index(cpool,
+                                                  _catch_klass_index,
+-                                                 will_link);
++                                                 will_link,
++                                                 _loading_klass);
+     if (!will_link && k->is_loaded()) {
+       GUARDED_VM_ENTRY(
+         k = CURRENT_ENV->get_unloaded_klass(_loading_klass, k->name());
+diff --git a/src/share/vm/ci/ciField.cpp b/src/share/vm/ci/ciField.cpp
+--- a/src/share/vm/ci/ciField.cpp
++++ b/src/share/vm/ci/ciField.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2007 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -86,7 +86,7 @@
+     bool ignore;
+     // This is not really a class reference; the index always refers to the
+     // field's type signature, as a symbol.  Linkage checks do not apply.
+-    _type = ciEnv::current(thread)->get_klass_by_index(klass, sig_index, ignore);
++    _type = ciEnv::current(thread)->get_klass_by_index(cpool, sig_index, ignore, klass);
+   } else {
+     _type = ciType::make(field_type);
+   }
+@@ -100,9 +100,9 @@
+   int holder_index = cpool->klass_ref_index_at(index);
+   bool holder_is_accessible;
+   ciInstanceKlass* declared_holder =
+-    ciEnv::current(thread)->get_klass_by_index(klass, holder_index,
+-                                               holder_is_accessible)
+-      ->as_instance_klass();
++    ciEnv::current(thread)->get_klass_by_index(cpool, holder_index,
++                                               holder_is_accessible,
++                                               klass)->as_instance_klass();
+ 
+   // The declared holder of this field may not have been loaded.
+   // Bail out with partial field information.
+@@ -168,8 +168,18 @@
+   _holder = CURRENT_ENV->get_object(fd->field_holder())->as_instance_klass();
+ 
+   // Check to see if the field is constant.
+-  if (_holder->is_initialized() &&
+-      this->is_final() && this->is_static()) {
++  if (_holder->is_initialized() && this->is_final()) {
++    if (!this->is_static()) {
++      // A field can be constant if it's a final static field or if it's
++      // a final non-static field of a trusted class ({java,sun}.dyn).
++      if (_holder->is_in_package("java/dyn") || _holder->is_in_package("sun/dyn")) {
++        _is_constant = true;
++        return;
++      }
++      _is_constant = false;
++      return;
++    }
++
+     // This field just may be constant.  The only cases where it will
+     // not be constant are:
+     //
+diff --git a/src/share/vm/ci/ciField.hpp b/src/share/vm/ci/ciField.hpp
+--- a/src/share/vm/ci/ciField.hpp
++++ b/src/share/vm/ci/ciField.hpp
+@@ -138,10 +138,18 @@
+ 
+   // Get the constant value of this field.
+   ciConstant constant_value() {
+-    assert(is_constant(), "illegal call to constant_value()");
++    assert(is_static() && is_constant(), "illegal call to constant_value()");
+     return _constant_value;
+   }
+ 
++  // Get the constant value of non-static final field in the given
++  // object.
++  ciConstant constant_value_of(ciObject* object) {
++    assert(!is_static() && is_constant(), "only if field is non-static constant");
++    assert(object->is_instance(), "must be instance");
++    return object->as_instance()->field_value(this);
++  }
++
+   // Check for link time errors.  Accessing a field from a
+   // certain class via a certain bytecode may or may not be legal.
+   // This call checks to see if an exception may be raised by
+diff --git a/src/share/vm/ci/ciInstanceKlass.cpp b/src/share/vm/ci/ciInstanceKlass.cpp
+--- a/src/share/vm/ci/ciInstanceKlass.cpp
++++ b/src/share/vm/ci/ciInstanceKlass.cpp
+@@ -232,8 +232,48 @@
+ // ------------------------------------------------------------------
+ // ciInstanceKlass::uses_default_loader
+ bool ciInstanceKlass::uses_default_loader() {
+-  VM_ENTRY_MARK;
+-  return loader() == NULL;
++  // Note:  We do not need to resolve the handle or enter the VM
++  // in order to test null-ness.
++  return _loader == NULL;
++}
++
++// ------------------------------------------------------------------
++// ciInstanceKlass::is_in_package
++//
++// Is this klass in the given package?
++bool ciInstanceKlass::is_in_package(const char* packagename, int len) {
++  // To avoid class loader mischief, this test always rejects application classes.
++  if (!uses_default_loader())
++    return false;
++  GUARDED_VM_ENTRY(
++    return is_in_package_impl(packagename, len);
++  )
++}
++
++bool ciInstanceKlass::is_in_package_impl(const char* packagename, int len) {
++  ASSERT_IN_VM;
++
++  // If packagename contains trailing '/' exclude it from the
++  // prefix-test since we test for it explicitly.
++  if (packagename[len - 1] == '/')
++    len--;
++
++  if (!name()->starts_with(packagename, len))
++    return false;
++
++  // Test if the class name is something like "java/lang".
++  if ((len + 1) > name()->utf8_length())
++    return false;
++
++  // Test for trailing '/'
++  if ((char) name()->byte_at(len) != '/')
++    return false;
++
++  // Make sure it's not actually in a subpackage:
++  if (name()->index_of_at(len+1, "/", 1) >= 0)
++    return false;
++
++  return true;
+ }
+ 
+ // ------------------------------------------------------------------
+diff --git a/src/share/vm/ci/ciInstanceKlass.hpp b/src/share/vm/ci/ciInstanceKlass.hpp
+--- a/src/share/vm/ci/ciInstanceKlass.hpp
++++ b/src/share/vm/ci/ciInstanceKlass.hpp
+@@ -29,10 +29,11 @@
+ // be loaded.
+ class ciInstanceKlass : public ciKlass {
+   CI_PACKAGE_ACCESS
++  friend class ciBytecodeStream;
+   friend class ciEnv;
++  friend class ciExceptionHandler;
+   friend class ciMethod;
+   friend class ciField;
+-  friend class ciBytecodeStream;
+ 
+ private:
+   jobject                _loader;
+@@ -78,6 +79,8 @@
+ 
+   const char* type_string() { return "ciInstanceKlass"; }
+ 
++  bool is_in_package_impl(const char* packagename, int len);
++
+   void print_impl(outputStream* st);
+ 
+   ciConstantPoolCache* field_cache();
+@@ -196,6 +199,12 @@
+ 
+   bool is_java_lang_Object();
+ 
++  // Is this klass in the given package?
++  bool is_in_package(const char* packagename) {
++    return is_in_package(packagename, (int) strlen(packagename));
++  }
++  bool is_in_package(const char* packagename, int len);
++
+   // What kind of ciObject is this?
+   bool is_instance_klass() { return true; }
+   bool is_java_klass()     { return true; }
+diff --git a/src/share/vm/ci/ciKlass.cpp b/src/share/vm/ci/ciKlass.cpp
+--- a/src/share/vm/ci/ciKlass.cpp
++++ b/src/share/vm/ci/ciKlass.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2007 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+diff --git a/src/share/vm/ci/ciKlass.hpp b/src/share/vm/ci/ciKlass.hpp
+--- a/src/share/vm/ci/ciKlass.hpp
++++ b/src/share/vm/ci/ciKlass.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2007 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -69,7 +69,7 @@
+   ciKlass(KlassHandle k_h);
+ 
+   // What is the name of this klass?
+-  ciSymbol* name() { return _name; }
++  ciSymbol* name() const { return _name; }
+ 
+   // What is its layout helper value?
+   jint layout_helper() { return _layout_helper; }
+diff --git a/src/share/vm/ci/ciMethod.hpp b/src/share/vm/ci/ciMethod.hpp
+--- a/src/share/vm/ci/ciMethod.hpp
++++ b/src/share/vm/ci/ciMethod.hpp
+@@ -38,6 +38,8 @@
+   CI_PACKAGE_ACCESS
+   friend class ciEnv;
+   friend class ciExceptionHandlerStream;
++  friend class ciBytecodeStream;
++  friend class ciMethodHandle;
+ 
+  private:
+   // General method information.
+@@ -251,4 +253,10 @@
+   // Print the name of this method in various incarnations.
+   void print_name(outputStream* st = tty);
+   void print_short_name(outputStream* st = tty);
++
++  methodOop get_method_handle_target() {
++    klassOop receiver_limit_oop = NULL;
++    int flags = 0;
++    return MethodHandles::decode_method(get_oop(), receiver_limit_oop, flags);
++  }
+ };
+diff --git a/src/share/vm/ci/ciMethodHandle.cpp b/src/share/vm/ci/ciMethodHandle.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/share/vm/ci/ciMethodHandle.cpp
+@@ -0,0 +1,52 @@
++/*
++ * Copyright 2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ *
++ */
++
++#include "incls/_precompiled.incl"
++#include "incls/_ciMethodHandle.cpp.incl"
++
++// ciMethodHandle
++
++// ------------------------------------------------------------------
++// ciMethodHandle::get_adapter
++//
++// Return an adapter for this MethodHandle.
++ciMethod* ciMethodHandle::get_adapter(bool is_invokedynamic) const {
++  VM_ENTRY_MARK;
++
++  Handle h(get_oop());
++  methodHandle callee(_callee->get_methodOop());
++  MethodHandleCompiler mhc(h, callee, is_invokedynamic, THREAD);
++  methodHandle m = mhc.compile(CHECK_NULL);
++  return CURRENT_ENV->get_object(m())->as_method();
++}
++
++
++// ------------------------------------------------------------------
++// ciMethodHandle::print_impl
++//
++// Implementation of the print method.
++void ciMethodHandle::print_impl(outputStream* st) {
++  st->print(" type=");
++  get_oop()->print();
++}
+diff --git a/src/share/vm/ci/ciMethodHandle.hpp b/src/share/vm/ci/ciMethodHandle.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/share/vm/ci/ciMethodHandle.hpp
+@@ -0,0 +1,56 @@
++/*
++ * Copyright 2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ *
++ */
++
++// ciMethodHandle
++//
++// The class represents a java.dyn.MethodHandle object.
++class ciMethodHandle : public ciInstance {
++private:
++  ciMethod* _callee;
++
++  // Return an adapter for this MethodHandle.
++  ciMethod* get_adapter(bool is_invokedynamic) const;
++
++protected:
++  void print_impl(outputStream* st);
++
++public:
++  ciMethodHandle(instanceHandle h_i) : ciInstance(h_i) {};
++
++  // What kind of ciObject is this?
++  bool is_method_handle() const { return true; }
++
++  ciMethod* callee() const { return _callee; }
++  void  set_callee(ciMethod* m) { _callee = m; }
++
++  // Return an adapter for a MethodHandle call.
++  ciMethod* get_method_handle_adapter() const {
++    return get_adapter(false);
++  }
++
++  // Return an adapter for an invokedynamic call.
++  ciMethod* get_invokedynamic_adapter() const {
++    return get_adapter(true);
++  }
++};
+diff --git a/src/share/vm/ci/ciObject.hpp b/src/share/vm/ci/ciObject.hpp
+--- a/src/share/vm/ci/ciObject.hpp
++++ b/src/share/vm/ci/ciObject.hpp
+@@ -131,10 +131,12 @@
+ 
+   // What kind of ciObject is this?
+   virtual bool is_null_object() const       { return false; }
++  virtual bool is_call_site() const         { return false; }
+   virtual bool is_cpcache() const           { return false; }
+   virtual bool is_instance()                { return false; }
+   virtual bool is_method()                  { return false; }
+   virtual bool is_method_data()             { return false; }
++  virtual bool is_method_handle() const     { return false; }
+   virtual bool is_array()                   { return false; }
+   virtual bool is_obj_array()               { return false; }
+   virtual bool is_type_array()              { return false; }
+@@ -186,6 +188,10 @@
+     assert(is_null_object(), "bad cast");
+     return (ciNullObject*)this;
+   }
++  ciCallSite*              as_call_site() {
++    assert(is_call_site(), "bad cast");
++    return (ciCallSite*) this;
++  }
+   ciCPCache*               as_cpcache() {
+     assert(is_cpcache(), "bad cast");
+     return (ciCPCache*) this;
+@@ -202,6 +208,10 @@
+     assert(is_method_data(), "bad cast");
+     return (ciMethodData*)this;
+   }
++  ciMethodHandle*          as_method_handle() {
++    assert(is_method_handle(), "bad cast");
++    return (ciMethodHandle*) this;
++  }
+   ciArray*                 as_array() {
+     assert(is_array(), "bad cast");
+     return (ciArray*)this;
+diff --git a/src/share/vm/ci/ciObjectFactory.cpp b/src/share/vm/ci/ciObjectFactory.cpp
+--- a/src/share/vm/ci/ciObjectFactory.cpp
++++ b/src/share/vm/ci/ciObjectFactory.cpp
+@@ -337,7 +337,12 @@
+     return new (arena()) ciMethodData(h_md);
+   } else if (o->is_instance()) {
+     instanceHandle h_i(THREAD, (instanceOop)o);
+-    return new (arena()) ciInstance(h_i);
++    if (java_dyn_CallSite::is_instance(o))
++      return new (arena()) ciCallSite(h_i);
++    else if (java_dyn_MethodHandle::is_instance(o))
++      return new (arena()) ciMethodHandle(h_i);
++    else
++      return new (arena()) ciInstance(h_i);
+   } else if (o->is_objArray()) {
+     objArrayHandle h_oa(THREAD, (objArrayOop)o);
+     return new (arena()) ciObjArray(h_oa);
+diff --git a/src/share/vm/ci/ciStreams.cpp b/src/share/vm/ci/ciStreams.cpp
+--- a/src/share/vm/ci/ciStreams.cpp
++++ b/src/share/vm/ci/ciStreams.cpp
+@@ -186,8 +186,9 @@
+ // If this bytecode is a new, newarray, multianewarray, instanceof,
+ // or checkcast, get the referenced klass.
+ ciKlass* ciBytecodeStream::get_klass(bool& will_link) {
+-  return CURRENT_ENV->get_klass_by_index(_holder, get_klass_index(),
+-                                         will_link);
++  VM_ENTRY_MARK;
++  constantPoolHandle cpool(_method->get_methodOop()->constants());
++  return CURRENT_ENV->get_klass_by_index(cpool, get_klass_index(), will_link, _holder);
+ }
+ 
+ // ------------------------------------------------------------------
+@@ -213,7 +214,9 @@
+ // If this bytecode is one of the ldc variants, get the referenced
+ // constant.
+ ciConstant ciBytecodeStream::get_constant() {
+-  return CURRENT_ENV->get_constant_by_index(_holder, get_constant_index());
++  VM_ENTRY_MARK;
++  constantPoolHandle cpool(_method->get_methodOop()->constants());
++  return CURRENT_ENV->get_constant_by_index(cpool, get_constant_index(), _holder);
+ }
+ 
+ // ------------------------------------------------------------------
+@@ -264,9 +267,11 @@
+ // There is no "will_link" result passed back.  The user is responsible
+ // for checking linkability when retrieving the associated field.
+ ciInstanceKlass* ciBytecodeStream::get_declared_field_holder() {
++  VM_ENTRY_MARK;
++  constantPoolHandle cpool(_method->get_methodOop()->constants());
+   int holder_index = get_field_holder_index();
+   bool ignore;
+-  return CURRENT_ENV->get_klass_by_index(_holder, holder_index, ignore)
++  return CURRENT_ENV->get_klass_by_index(cpool, holder_index, ignore, _holder)
+       ->as_instance_klass();
+ }
+ 
+@@ -277,9 +282,10 @@
+ // referenced by the current bytecode.  Used for generating
+ // deoptimization information.
+ int ciBytecodeStream::get_field_holder_index() {
+-  VM_ENTRY_MARK;
+-  constantPoolOop cpool = _holder->get_instanceKlass()->constants();
+-  return cpool->klass_ref_index_at(get_field_index());
++  GUARDED_VM_ENTRY(
++    constantPoolOop cpool = _holder->get_instanceKlass()->constants();
++    return cpool->klass_ref_index_at(get_field_index());
++  )
+ }
+ 
+ // ------------------------------------------------------------------
+@@ -321,7 +327,9 @@
+ //
+ // If this is a method invocation bytecode, get the invoked method.
+ ciMethod* ciBytecodeStream::get_method(bool& will_link) {
+-  ciMethod* m = CURRENT_ENV->get_method_by_index(_holder, get_method_index(), cur_bc());
++  VM_ENTRY_MARK;
++  constantPoolHandle cpool(_method->get_methodOop()->constants());
++  ciMethod* m = CURRENT_ENV->get_method_by_index(cpool, get_method_index(), cur_bc(), _holder);
+   will_link = m->is_loaded();
+   return m;
+ }
+@@ -338,11 +346,13 @@
+ // There is no "will_link" result passed back.  The user is responsible
+ // for checking linkability when retrieving the associated method.
+ ciKlass* ciBytecodeStream::get_declared_method_holder() {
++  VM_ENTRY_MARK;
++  constantPoolHandle cpool(_method->get_methodOop()->constants());
+   bool ignore;
+   // report as InvokeDynamic for invokedynamic, which is syntactically classless
+   if (cur_bc() == Bytecodes::_invokedynamic)
+     return CURRENT_ENV->get_klass_by_name(_holder, ciSymbol::java_dyn_InvokeDynamic(), false);
+-  return CURRENT_ENV->get_klass_by_index(_holder, get_method_holder_index(), ignore);
++  return CURRENT_ENV->get_klass_by_index(cpool, get_method_holder_index(), ignore, _holder);
+ }
+ 
+ // ------------------------------------------------------------------
+@@ -352,8 +362,7 @@
+ // referenced by the current bytecode.  Used for generating
+ // deoptimization information.
+ int ciBytecodeStream::get_method_holder_index() {
+-  VM_ENTRY_MARK;
+-  constantPoolOop cpool = _holder->get_instanceKlass()->constants();
++  constantPoolOop cpool = _method->get_methodOop()->constants();
+   return cpool->klass_ref_index_at(get_method_index());
+ }
+ 
+@@ -381,3 +390,20 @@
+ 
+   return CURRENT_ENV->get_object(cpcache)->as_cpcache();
+ }
++
++// ------------------------------------------------------------------
++// ciBytecodeStream::get_call_site
++ciCallSite* ciBytecodeStream::get_call_site() {
++  VM_ENTRY_MARK;
++  // Get the constant pool.
++  constantPoolOop      cpool   = _holder->get_instanceKlass()->constants();
++  constantPoolCacheOop cpcache = cpool->cache();
++
++  // Get the CallSite from the constant pool cache.
++  int method_index = get_method_index();
++  ConstantPoolCacheEntry* cpcache_entry = cpcache->secondary_entry_at(method_index);
++  oop call_site_oop = cpcache_entry->f1();
++
++  // Create a CallSite object and return it.
++  return CURRENT_ENV->get_object(call_site_oop)->as_call_site();
++}
+diff --git a/src/share/vm/ci/ciStreams.hpp b/src/share/vm/ci/ciStreams.hpp
+--- a/src/share/vm/ci/ciStreams.hpp
++++ b/src/share/vm/ci/ciStreams.hpp
+@@ -232,7 +232,8 @@
+   int       get_method_holder_index();
+   int       get_method_signature_index();
+ 
+-  ciCPCache* get_cpcache();
++  ciCPCache*  get_cpcache();
++  ciCallSite* get_call_site();
+ 
+  private:
+   void assert_index_size(int required_size) const {
+diff --git a/src/share/vm/ci/ciSymbol.cpp b/src/share/vm/ci/ciSymbol.cpp
+--- a/src/share/vm/ci/ciSymbol.cpp
++++ b/src/share/vm/ci/ciSymbol.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2007 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -60,6 +60,22 @@
+ }
+ 
+ // ------------------------------------------------------------------
++// ciSymbol::starts_with
++//
++// Tests if the symbol starts with the given prefix.
++bool ciSymbol::starts_with(const char* prefix, int len) const {
++  GUARDED_VM_ENTRY(return get_symbolOop()->starts_with(prefix, len);)
++}
++
++// ------------------------------------------------------------------
++// ciSymbol::index_of
++//
++// Determines where the symbol contains the given substring.
++int ciSymbol::index_of_at(int i, const char* str, int len) const {
++  GUARDED_VM_ENTRY(return get_symbolOop()->index_of_at(i, str, len);)
++}
++
++// ------------------------------------------------------------------
+ // ciSymbol::utf8_length
+ int ciSymbol::utf8_length() {
+   GUARDED_VM_ENTRY(return get_symbolOop()->utf8_length();)
+diff --git a/src/share/vm/ci/ciSymbol.hpp b/src/share/vm/ci/ciSymbol.hpp
+--- a/src/share/vm/ci/ciSymbol.hpp
++++ b/src/share/vm/ci/ciSymbol.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2001 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -28,6 +28,7 @@
+ // machine.
+ class ciSymbol : public ciObject {
+   CI_PACKAGE_ACCESS
++  // These friends all make direct use of get_symbolOop:
+   friend class ciEnv;
+   friend class ciInstanceKlass;
+   friend class ciSignature;
+@@ -38,13 +39,13 @@
+   ciSymbol(symbolOop s) : ciObject(s) {}
+   ciSymbol(symbolHandle s);   // for use with vmSymbolHandles
+ 
+-  symbolOop get_symbolOop() { return (symbolOop)get_oop(); }
++  symbolOop get_symbolOop() const { return (symbolOop)get_oop(); }
+ 
+   const char* type_string() { return "ciSymbol"; }
+ 
+   void print_impl(outputStream* st);
+ 
+-  int         byte_at(int i);
++  // This is public in symbolOop but private here, because the base can move:
+   jbyte*      base();
+ 
+   // Make a ciSymbol from a C string (implementation).
+@@ -55,6 +56,15 @@
+   const char* as_utf8();
+   int         utf8_length();
+ 
++  // Return the i-th utf8 byte, where i < utf8_length
++  int         byte_at(int i);
++
++  // Tests if the symbol starts with the given prefix.
++  bool starts_with(const char* prefix, int len) const;
++
++  // Determines where the symbol contains the given substring.
++  int index_of_at(int i, const char* str, int len) const;
++
+   // What kind of ciObject is this?
+   bool is_symbol() { return true; }
+ 
+diff --git a/src/share/vm/classfile/classFileParser.cpp b/src/share/vm/classfile/classFileParser.cpp
+--- a/src/share/vm/classfile/classFileParser.cpp
++++ b/src/share/vm/classfile/classFileParser.cpp
+@@ -643,7 +643,7 @@
+       guarantee_property(value_type.is_int(), "Inconsistent constant value type in class file %s", CHECK);
+       break;
+     case T_OBJECT:
+-      guarantee_property((cp->symbol_at(signature_index)->equals("Ljava/lang/String;", 18)
++      guarantee_property((cp->symbol_at(signature_index)->equals("Ljava/lang/String;")
+                          && (value_type.is_string() || value_type.is_unresolved_string())),
+                          "Bad string initial value in class file %s", CHECK);
+       break;
+@@ -1718,9 +1718,7 @@
+   m->set_exception_table(exception_handlers());
+ 
+   // Copy byte codes
+-  if (code_length > 0) {
+-    memcpy(m->code_base(), code_start, code_length);
+-  }
++  m->set_code(code_start);
+ 
+   // Copy line number table
+   if (linenumber_table != NULL) {
+diff --git a/src/share/vm/classfile/vmSymbols.cpp b/src/share/vm/classfile/vmSymbols.cpp
+--- a/src/share/vm/classfile/vmSymbols.cpp
++++ b/src/share/vm/classfile/vmSymbols.cpp
+@@ -299,6 +299,20 @@
+   return wrapper_intrinsic(type, true);
+ }
+ 
++vmIntrinsics::ID vmIntrinsics::for_raw_conversion(BasicType src, BasicType dest) {
++#define SRC_DEST(s,d) (((int)(s) << 4) + (int)(d))
++  switch (SRC_DEST(src, dest)) {
++  case SRC_DEST(T_INT, T_FLOAT):   return vmIntrinsics::_intBitsToFloat;
++  case SRC_DEST(T_FLOAT, T_INT):   return vmIntrinsics::_floatToRawIntBits;
++
++  case SRC_DEST(T_LONG, T_DOUBLE): return vmIntrinsics::_longBitsToDouble;
++  case SRC_DEST(T_DOUBLE, T_LONG): return vmIntrinsics::_doubleToRawLongBits;
++  }
++#undef SRC_DEST
++
++  return vmIntrinsics::_none;
++}
++
+ methodOop vmIntrinsics::method_for(vmIntrinsics::ID id) {
+   if (id == _none)  return NULL;
+   symbolOop cname = vmSymbols::symbol_at(class_for(id));
+diff --git a/src/share/vm/classfile/vmSymbols.hpp b/src/share/vm/classfile/vmSymbols.hpp
+--- a/src/share/vm/classfile/vmSymbols.hpp
++++ b/src/share/vm/classfile/vmSymbols.hpp
+@@ -1084,4 +1084,7 @@
+   // Wrapper object methods:
+   static ID for_boxing(BasicType type);
+   static ID for_unboxing(BasicType type);
++
++  // Raw conversion:
++  static ID for_raw_conversion(BasicType src, BasicType dest);
+ };
+diff --git a/src/share/vm/code/nmethod.cpp b/src/share/vm/code/nmethod.cpp
+--- a/src/share/vm/code/nmethod.cpp
++++ b/src/share/vm/code/nmethod.cpp
+@@ -1724,9 +1724,9 @@
+   if (!method()->is_native()) {
+     SimpleScopeDesc ssd(this, fr.pc());
+     Bytecode_invoke* call = Bytecode_invoke_at(ssd.method(), ssd.bci());
+-    bool is_static = call->is_invokestatic();
++    bool has_receiver = call->has_receiver();
+     symbolOop signature = call->signature();
+-    fr.oops_compiled_arguments_do(signature, is_static, reg_map, f);
++    fr.oops_compiled_arguments_do(signature, has_receiver, reg_map, f);
+   }
+ }
+ 
+diff --git a/src/share/vm/includeDB_compiler2 b/src/share/vm/includeDB_compiler2
+--- a/src/share/vm/includeDB_compiler2
++++ b/src/share/vm/includeDB_compiler2
+@@ -156,6 +156,8 @@
+ callGenerator.cpp                       compileLog.hpp
+ callGenerator.cpp                       connode.hpp
+ callGenerator.cpp                       ciCPCache.hpp
++callGenerator.cpp                       ciMethodHandle.hpp
++callGenerator.cpp                       javaClasses.hpp
+ callGenerator.cpp                       parse.hpp
+ callGenerator.cpp                       rootnode.hpp
+ callGenerator.cpp                       runtime.hpp
+@@ -392,6 +394,9 @@
+ 
+ doCall.cpp                              addnode.hpp
+ doCall.cpp                              callGenerator.hpp
++doCall.cpp                              ciCallSite.hpp
++doCall.cpp                              ciCPCache.hpp
++doCall.cpp                              ciMethodHandle.hpp
+ doCall.cpp                              cfgnode.hpp
+ doCall.cpp                              compileLog.hpp
+ doCall.cpp                              linkResolver.hpp
+diff --git a/src/share/vm/includeDB_core b/src/share/vm/includeDB_core
+--- a/src/share/vm/includeDB_core
++++ b/src/share/vm/includeDB_core
+@@ -516,6 +516,11 @@
+ 
+ ciCallProfile.hpp                       ciClassList.hpp
+ 
++ciCallSite.cpp                          ciCallSite.hpp
++ciCallSite.cpp                          ciUtilities.hpp
++
++ciCallSite.hpp                          ciInstance.hpp
++
+ ciConstant.cpp                          allocation.hpp
+ ciConstant.cpp                          allocation.inline.hpp
+ ciConstant.cpp                          ciConstant.hpp
+@@ -599,6 +604,7 @@
+ ciField.hpp                             ciClassList.hpp
+ ciField.hpp                             ciConstant.hpp
+ ciField.hpp                             ciFlags.hpp
++ciField.hpp                             ciInstance.hpp
+ 
+ ciFlags.cpp                             ciFlags.hpp
+ 
+@@ -685,6 +691,7 @@
+ ciMethod.hpp                            ciInstanceKlass.hpp
+ ciMethod.hpp                            ciObject.hpp
+ ciMethod.hpp                            ciSignature.hpp
++ciMethod.hpp                            methodHandles.hpp
+ ciMethod.hpp                            methodLiveness.hpp
+ 
+ ciMethodBlocks.cpp                      bytecode.hpp
+@@ -716,6 +723,15 @@
+ ciMethodKlass.hpp                       ciKlass.hpp
+ ciMethodKlass.hpp                       ciSymbol.hpp
+ 
++ciMethodHandle.cpp                      ciClassList.hpp
++ciMethodHandle.cpp                      ciInstance.hpp
++ciMethodHandle.cpp                      ciMethodHandle.hpp
++ciMethodHandle.cpp                      ciUtilities.hpp
++ciMethodHandle.cpp                      methodHandles.hpp
++ciMethodHandle.cpp                      methodHandleWalk.hpp
++
++ciMethodHandle.hpp                      methodHandles.hpp
++
+ ciNullObject.cpp                        ciNullObject.hpp
+ 
+ ciNullObject.hpp                        ciClassList.hpp
+@@ -761,12 +777,14 @@
+ ciObject.hpp                            jniHandles.hpp
+ 
+ ciObjectFactory.cpp                     allocation.inline.hpp
++ciObjectFactory.cpp                     ciCallSite.hpp
+ ciObjectFactory.cpp                     ciCPCache.hpp
+ ciObjectFactory.cpp                     ciInstance.hpp
+ ciObjectFactory.cpp                     ciInstanceKlass.hpp
+ ciObjectFactory.cpp                     ciInstanceKlassKlass.hpp
+ ciObjectFactory.cpp                     ciMethod.hpp
+ ciObjectFactory.cpp                     ciMethodData.hpp
++ciObjectFactory.cpp                     ciMethodHandle.hpp
+ ciObjectFactory.cpp                     ciMethodKlass.hpp
+ ciObjectFactory.cpp                     ciNullObject.hpp
+ ciObjectFactory.cpp                     ciObjArray.hpp
+@@ -800,6 +818,7 @@
+ ciSignature.hpp                         globalDefinitions.hpp
+ ciSignature.hpp                         growableArray.hpp
+ 
++ciStreams.cpp                           ciCallSite.hpp
+ ciStreams.cpp                           ciConstant.hpp
+ ciStreams.cpp                           ciField.hpp
+ ciStreams.cpp                           ciStreams.hpp
+@@ -2824,6 +2843,8 @@
+ methodHandleWalk.hpp                    methodHandles.hpp
+ 
+ methodHandleWalk.cpp                    methodHandleWalk.hpp
++methodHandleWalk.cpp                    oopFactory.hpp
++methodHandleWalk.cpp                    rewriter.hpp
+ 
+ methodHandles.hpp                       frame.inline.hpp
+ methodHandles.hpp                       globals.hpp
+diff --git a/src/share/vm/interpreter/bytecode.hpp b/src/share/vm/interpreter/bytecode.hpp
+--- a/src/share/vm/interpreter/bytecode.hpp
++++ b/src/share/vm/interpreter/bytecode.hpp
+@@ -205,6 +205,7 @@
+   bool is_invokespecial() const                  { return adjusted_invoke_code() == Bytecodes::_invokespecial; }
+   bool is_invokedynamic() const                  { return adjusted_invoke_code() == Bytecodes::_invokedynamic; }
+ 
++  bool has_receiver() const                      { return !is_invokestatic() && !is_invokedynamic(); }
+   bool has_giant_index() const                   { return is_invokedynamic(); }
+ 
+   bool is_valid() const                          { return is_invokeinterface() ||
+diff --git a/src/share/vm/interpreter/bytecodeTracer.cpp b/src/share/vm/interpreter/bytecodeTracer.cpp
+--- a/src/share/vm/interpreter/bytecodeTracer.cpp
++++ b/src/share/vm/interpreter/bytecodeTracer.cpp
+@@ -270,6 +270,8 @@
+     st->print_cr(" %s", constants->resolved_klass_at(i)->klass_part()->external_name());
+   } else if (tag.is_unresolved_klass()) {
+     st->print_cr(" <unresolved klass at %d>", i);
++  } else if (tag.is_object()) {
++    st->print_cr(" " PTR_FORMAT, constants->object_at(i));
+   } else {
+     st->print_cr(" bad tag=%d at %d", tag.value(), i);
+   }
+diff --git a/src/share/vm/interpreter/interpreterRuntime.cpp b/src/share/vm/interpreter/interpreterRuntime.cpp
+--- a/src/share/vm/interpreter/interpreterRuntime.cpp
++++ b/src/share/vm/interpreter/interpreterRuntime.cpp
+@@ -1250,7 +1250,7 @@
+   methodHandle mh(thread, fr.interpreter_frame_method());
+   Bytecode_invoke* invoke = Bytecode_invoke_at(mh, bci);
+   ArgumentSizeComputer asc(invoke->signature());
+-  int size_of_arguments = (asc.size() + (invoke->is_invokestatic() ? 0 : 1)); // receiver
++  int size_of_arguments = (asc.size() + (invoke->has_receiver() ? 1 : 0)); // receiver
+   Copy::conjoint_bytes(src_address, dest_address,
+                        size_of_arguments * Interpreter::stackElementSize());
+ IRT_END
+diff --git a/src/share/vm/interpreter/rewriter.cpp b/src/share/vm/interpreter/rewriter.cpp
+--- a/src/share/vm/interpreter/rewriter.cpp
++++ b/src/share/vm/interpreter/rewriter.cpp
+@@ -247,15 +247,22 @@
+ 
+ void Rewriter::rewrite(instanceKlassHandle klass, TRAPS) {
+   ResourceMark rm(THREAD);
+-  Rewriter     rw(klass, CHECK);
++  Rewriter     rw(klass, klass->constants(), klass->methods(), CHECK);
+   // (That's all, folks.)
+ }
+ 
+-Rewriter::Rewriter(instanceKlassHandle klass, TRAPS)
++
++void Rewriter::rewrite(instanceKlassHandle klass, constantPoolHandle cpool, objArrayHandle methods, TRAPS) {
++  ResourceMark rm(THREAD);
++  Rewriter     rw(klass, cpool, methods, CHECK);
++  // (That's all, folks.)
++}
++
++
++Rewriter::Rewriter(instanceKlassHandle klass, constantPoolHandle cpool, objArrayHandle methods, TRAPS)
+   : _klass(klass),
+-    // gather starting points
+-    _pool(   THREAD, klass->constants()),
+-    _methods(THREAD, klass->methods())
++    _pool(cpool),
++    _methods(methods)
+ {
+   assert(_pool->cache() == NULL, "constant pool cache must not be set yet");
+ 
+diff --git a/src/share/vm/interpreter/rewriter.hpp b/src/share/vm/interpreter/rewriter.hpp
+--- a/src/share/vm/interpreter/rewriter.hpp
++++ b/src/share/vm/interpreter/rewriter.hpp
+@@ -57,7 +57,7 @@
+   }
+ 
+   // All the work goes in here:
+-  Rewriter(instanceKlassHandle klass, TRAPS);
++  Rewriter(instanceKlassHandle klass, constantPoolHandle cpool, objArrayHandle methods, TRAPS);
+ 
+   void compute_index_maps();
+   void make_constant_pool_cache(TRAPS);
+@@ -70,6 +70,7 @@
+  public:
+   // Driver routine:
+   static void rewrite(instanceKlassHandle klass, TRAPS);
++  static void rewrite(instanceKlassHandle klass, constantPoolHandle cpool, objArrayHandle methods, TRAPS);
+ 
+   enum {
+     _secondary_entry_tag = nth_bit(30)
+diff --git a/src/share/vm/oops/constMethodOop.hpp b/src/share/vm/oops/constMethodOop.hpp
+--- a/src/share/vm/oops/constMethodOop.hpp
++++ b/src/share/vm/oops/constMethodOop.hpp
+@@ -258,6 +258,11 @@
+   LocalVariableTableElement* localvariable_table_start() const;
+ 
+   // byte codes
++  void    set_code(address code) {
++    if (code_size() > 0) {
++      memcpy(code_base(), code, code_size());
++    }
++  }
+   address code_base() const            { return (address) (this+1); }
+   address code_end() const             { return code_base() + code_size(); }
+   bool    contains(address bcp) const  { return code_base() <= bcp
+diff --git a/src/share/vm/oops/constantPoolOop.hpp b/src/share/vm/oops/constantPoolOop.hpp
+--- a/src/share/vm/oops/constantPoolOop.hpp
++++ b/src/share/vm/oops/constantPoolOop.hpp
+@@ -191,6 +191,16 @@
+     }
+   }
+ 
++  void object_at_put(int which, oop str) {
++    oop_store((volatile oop*) obj_at_addr(which), str);
++    release_tag_at_put(which, JVM_CONSTANT_Object);
++    if (UseConcMarkSweepGC) {
++      // In case the earlier card-mark was consumed by a concurrent
++      // marking thread before the tag was updated, redirty the card.
++      oop_store_without_check((volatile oop*) obj_at_addr(which), str);
++    }
++  }
++
+   // For temporary use while constructing constant pool
+   void string_index_at_put(int which, int string_index) {
+     tag_at_put(which, JVM_CONSTANT_StringIndex);
+@@ -228,7 +238,8 @@
+       tag.is_unresolved_klass() ||
+       tag.is_symbol() ||
+       tag.is_unresolved_string() ||
+-      tag.is_string();
++      tag.is_string() ||
++      tag.is_object();
+   }
+ 
+   // Fetching constants
+@@ -291,6 +302,11 @@
+     return string_at_impl(h_this, which, CHECK_NULL);
+   }
+ 
++  oop object_at(int which) {
++    assert(tag_at(which).is_object(), "Corrupted constant pool");
++    return *obj_at_addr(which);
++  }
++
+   // A "pseudo-string" is an non-string oop that has found is way into
+   // a String entry.
+   // Under AnonymousClasses this can happen if the user patches a live
+diff --git a/src/share/vm/oops/generateOopMap.cpp b/src/share/vm/oops/generateOopMap.cpp
+--- a/src/share/vm/oops/generateOopMap.cpp
++++ b/src/share/vm/oops/generateOopMap.cpp
+@@ -1556,13 +1556,13 @@
+     case Bytecodes::_getfield:          do_field(true,  false, itr->get_index_big(), itr->bci()); break;
+     case Bytecodes::_putfield:          do_field(false, false, itr->get_index_big(), itr->bci()); break;
+ 
+-   case Bytecodes::_invokevirtual:
+-   case Bytecodes::_invokespecial:     do_method(false, false, itr->get_index_big(), itr->bci()); break;
+-   case Bytecodes::_invokestatic:      do_method(true,  false, itr->get_index_big(), itr->bci()); break;
++    case Bytecodes::_invokevirtual:
++    case Bytecodes::_invokespecial:     do_method(false, false, itr->get_index_big(), itr->bci()); break;
++    case Bytecodes::_invokestatic:      do_method(true,  false, itr->get_index_big(), itr->bci()); break;
+     case Bytecodes::_invokedynamic:     do_method(true,  false, itr->get_index_int(), itr->bci()); break;
+-   case Bytecodes::_invokeinterface:   do_method(false, true,  itr->get_index_big(), itr->bci()); break;
+-   case Bytecodes::_newarray:
+-   case Bytecodes::_anewarray:         pp_new_ref(vCTS, itr->bci()); break;
++    case Bytecodes::_invokeinterface:   do_method(false, true,  itr->get_index_big(), itr->bci()); break;
++    case Bytecodes::_newarray:
++    case Bytecodes::_anewarray:         pp_new_ref(vCTS, itr->bci()); break;
+     case Bytecodes::_checkcast:         do_checkcast(); break;
+     case Bytecodes::_arraylength:
+     case Bytecodes::_instanceof:        pp(rCTS, vCTS); break;
+@@ -1830,12 +1830,8 @@
+ 
+ 
+ void GenerateOopMap::do_ldc(int idx, int bci) {
+-  constantPoolOop cp = method()->constants();
+-  constantTag tag    = cp->tag_at(idx);
+-
+-  CellTypeState cts = (tag.is_string() || tag.is_unresolved_string() ||
+-                       tag.is_klass()  || tag.is_unresolved_klass())
+-                    ? CellTypeState::make_line_ref(bci) : valCTS;
++  constantPoolOop cp  = method()->constants();
++  CellTypeState   cts = cp->is_pointer_entry(idx) ? CellTypeState::make_line_ref(bci) : valCTS;
+   ppush1(cts);
+ }
+ 
+diff --git a/src/share/vm/oops/methodOop.hpp b/src/share/vm/oops/methodOop.hpp
+--- a/src/share/vm/oops/methodOop.hpp
++++ b/src/share/vm/oops/methodOop.hpp
+@@ -365,6 +365,7 @@
+ #endif
+ 
+   // byte codes
++  void    set_code(address code)      { return constMethod()->set_code(code); }
+   address code_base() const           { return constMethod()->code_base(); }
+   bool    contains(address bcp) const { return constMethod()->contains(bcp); }
+ 
+diff --git a/src/share/vm/oops/symbolOop.cpp b/src/share/vm/oops/symbolOop.cpp
+--- a/src/share/vm/oops/symbolOop.cpp
++++ b/src/share/vm/oops/symbolOop.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2005 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -25,6 +25,11 @@
+ # include "incls/_precompiled.incl"
+ # include "incls/_symbolOop.cpp.incl"
+ 
++
++// ------------------------------------------------------------------
++// symbolOopDesc::equals
++//
++// Compares the symbol with a string of the given length.
+ bool symbolOopDesc::equals(const char* str, int len) const {
+   int l = utf8_length();
+   if (l != len) return false;
+@@ -36,6 +41,48 @@
+   return true;
+ }
+ 
++
++// ------------------------------------------------------------------
++// symbolOopDesc::starts_with
++//
++// Tests if the symbol starts with the specified prefix of the given
++// length.
++bool symbolOopDesc::starts_with(const char* prefix, int len) const {
++  if (len > utf8_length()) return false;
++  while (len-- > 0) {
++    if (prefix[len] != (char) byte_at(len))
++      return false;
++  }
++  assert(len == -1, "we should be at the beginning");
++  return true;
++}
++
++
++// ------------------------------------------------------------------
++// symbolOopDesc::index_of
++//
++// Finds if the given string is a substring of this symbol's utf8 bytes.
++// Return -1 on failure.  Otherwise return the first index where str occurs.
++int symbolOopDesc::index_of_at(int i, const char* str, int len) const {
++  assert(i >= 0 && i <= utf8_length(), "oob");
++  if (len <= 0)  return 0;
++  char first_char = str[0];
++  address bytes = (address) ((symbolOopDesc*)this)->base();
++  address limit = bytes + utf8_length() - len;  // inclusive limit
++  address scan = bytes + i;
++  if (scan > limit)
++    return -1;
++  for (;;) {
++    scan = (address) memchr(scan, first_char, (limit + 1 - scan));
++    if (scan == NULL)
++      return -1;  // not found
++    assert(scan >= bytes+i && scan <= limit, "scan oob");
++    if (memcmp(scan, str, len) == 0)
++      return (int)(scan - bytes);
++  }
++}
++
++
+ char* symbolOopDesc::as_C_string(char* buf, int size) const {
+   if (size > 0) {
+     int len = MIN2(size - 1, utf8_length());
+diff --git a/src/share/vm/oops/symbolOop.hpp b/src/share/vm/oops/symbolOop.hpp
+--- a/src/share/vm/oops/symbolOop.hpp
++++ b/src/share/vm/oops/symbolOop.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2005 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -70,8 +70,21 @@
+ 
+   void set_utf8_length(int len) { _length = len; }
+ 
+-  // Compares the symbol with a string
++  // Compares the symbol with a string.
+   bool equals(const char* str, int len) const;
++  bool equals(const char* str) const { return equals(str, (int) strlen(str)); }
++
++  // Tests if the symbol starts with the given prefix.
++  bool starts_with(const char* prefix, int len) const;
++  bool starts_with(const char* prefix) const {
++    return starts_with(prefix, (int) strlen(prefix));
++  }
++
++  // Tests if the symbol starts with the given prefix.
++  int index_of_at(int i, const char* str, int len) const;
++  int index_of_at(int i, const char* str) const {
++    return index_of_at(i, str, (int) strlen(str));
++  }
+ 
+   // Three-way compare for sorting; returns -1/0/1 if receiver is </==/> than arg
+   // note that the ordering is not alfabetical
+diff --git a/src/share/vm/opto/bytecodeInfo.cpp b/src/share/vm/opto/bytecodeInfo.cpp
+--- a/src/share/vm/opto/bytecodeInfo.cpp
++++ b/src/share/vm/opto/bytecodeInfo.cpp
+@@ -180,6 +180,10 @@
+     return NULL;
+   }
+ 
++  // Always inline MethodHandle methods.
++  if (callee_method->is_method_handle_invoke())
++    return NULL;
++
+   // First check all inlining restrictions which are required for correctness
+   if (callee_method->is_abstract())               return "abstract method";
+   // note: we allow ik->is_abstract()
+diff --git a/src/share/vm/opto/callGenerator.cpp b/src/share/vm/opto/callGenerator.cpp
+--- a/src/share/vm/opto/callGenerator.cpp
++++ b/src/share/vm/opto/callGenerator.cpp
+@@ -148,7 +148,7 @@
+ }
+ 
+ //---------------------------DynamicCallGenerator-----------------------------
+-// Internal class which handles all out-of-line dynamic calls.
++// Internal class which handles all out-of-line invokedynamic calls.
+ class DynamicCallGenerator : public CallGenerator {
+ public:
+   DynamicCallGenerator(ciMethod* method)
+@@ -179,25 +179,25 @@
+ 
+   // Load the CallSite object from the constant pool cache.
+   const TypeOopPtr* cpcache_ptr = TypeOopPtr::make_from_constant(cpcache);
+-  Node* cpc = kit.makecon(cpcache_ptr);
+-  Node* adr = kit.basic_plus_adr(cpc, cpc, call_site_offset);
+-  Node* call_site = kit.make_load(kit.control(), adr, TypeInstPtr::BOTTOM, T_OBJECT, Compile::AliasIdxRaw);
++  Node* cpcache_adr = kit.makecon(cpcache_ptr);
++  Node* call_site_adr = kit.basic_plus_adr(cpcache_adr, cpcache_adr, call_site_offset);
++  Node* call_site = kit.make_load(kit.control(), call_site_adr, TypeInstPtr::BOTTOM, T_OBJECT, Compile::AliasIdxRaw);
+ 
+-  // Load the MethodHandle (target) from the CallSite object.
+-  Node* mh_adr = kit.basic_plus_adr(call_site, call_site, java_dyn_CallSite::target_offset_in_bytes());
+-  Node* mh = kit.make_load(kit.control(), mh_adr, TypeInstPtr::BOTTOM, T_OBJECT);
++  // Load the target MethodHandle from the CallSite object.
++  Node* target_mh_adr = kit.basic_plus_adr(call_site, call_site, java_dyn_CallSite::target_offset_in_bytes());
++  Node* target_mh = kit.make_load(kit.control(), target_mh_adr, TypeInstPtr::BOTTOM, T_OBJECT);
+ 
+-  address stub = SharedRuntime::get_resolve_opt_virtual_call_stub();
++  address resolve_stub = SharedRuntime::get_resolve_opt_virtual_call_stub();
+ 
+-  CallStaticJavaNode *call = new (kit.C, tf()->domain()->cnt()) CallStaticJavaNode(tf(), stub, method(), kit.bci());
++  CallStaticJavaNode *call = new (kit.C, tf()->domain()->cnt()) CallStaticJavaNode(tf(), resolve_stub, method(), kit.bci());
+   // invokedynamic is treated as an optimized invokevirtual.
+   call->set_optimized_virtual(true);
+   // Take extra care (in the presence of argument motion) not to trash the SP:
+   call->set_method_handle_invoke(true);
+ 
+-  // Pass the MethodHandle as first argument and shift the other
+-  // arguments.
+-  call->init_req(0 + TypeFunc::Parms, mh);
++  // Pass the target MethodHandle as first argument and shift the
++  // other arguments.
++  call->init_req(0 + TypeFunc::Parms, target_mh);
+   uint nargs = call->method()->arg_size();
+   for (uint i = 1; i < nargs; i++) {
+     Node* arg = kit.argument(i - 1);
+@@ -647,6 +647,155 @@
+ }
+ 
+ 
++//------------------------PredictedDynamicCallGenerator-----------------------
++// Internal class which handles all out-of-line calls checking receiver type.
++class PredictedDynamicCallGenerator : public CallGenerator {
++  ciMethodHandle* _predicted_method_handle;
++  CallGenerator*  _if_missed;
++  CallGenerator*  _if_hit;
++  float           _hit_prob;
++
++public:
++  PredictedDynamicCallGenerator(ciMethodHandle* predicted_method_handle,
++                                CallGenerator* if_missed,
++                                CallGenerator* if_hit,
++                                float hit_prob)
++    : CallGenerator(if_missed->method()),
++      _predicted_method_handle(predicted_method_handle),
++      _if_missed(if_missed),
++      _if_hit(if_hit),
++      _hit_prob(hit_prob)
++  {}
++
++  virtual bool is_inline()   const { return _if_hit->is_inline(); }
++  virtual bool is_deferred() const { return _if_hit->is_deferred(); }
++
++  virtual JVMState* generate(JVMState* jvms);
++};
++
++
++CallGenerator* CallGenerator::for_predicted_dynamic_call(ciMethodHandle* predicted_method_handle,
++                                                         CallGenerator* if_missed,
++                                                         CallGenerator* if_hit,
++                                                         float hit_prob) {
++  return new PredictedDynamicCallGenerator(predicted_method_handle, if_missed, if_hit, hit_prob);
++}
++
++
++JVMState* PredictedDynamicCallGenerator::generate(JVMState* jvms) {
++  GraphKit kit(jvms);
++  PhaseGVN& gvn = kit.gvn();
++
++  CompileLog* log = kit.C->log();
++  if (log != NULL) {
++    log->elem("predicted_dynamic_call bci='%d'", jvms->bci());
++  }
++
++  // Get the constant pool cache from the caller class.
++  ciMethod* caller_method = jvms->method();
++  ciBytecodeStream str(caller_method);
++  str.force_bci(jvms->bci());  // Set the stream to the invokedynamic bci.
++  ciCPCache* cpcache = str.get_cpcache();
++
++  // Get the offset of the CallSite from the constant pool cache
++  // pointer.
++  int index = str.get_method_index();
++  size_t call_site_offset = cpcache->get_f1_offset(index);
++
++  // Load the CallSite object from the constant pool cache.
++  const TypeOopPtr* cpcache_ptr = TypeOopPtr::make_from_constant(cpcache);
++  Node* cpcache_adr   = kit.makecon(cpcache_ptr);
++  Node* call_site_adr = kit.basic_plus_adr(cpcache_adr, cpcache_adr, call_site_offset);
++  Node* call_site     = kit.make_load(kit.control(), call_site_adr, TypeInstPtr::BOTTOM, T_OBJECT, Compile::AliasIdxRaw);
++
++  // Load the target MethodHandle from the CallSite object.
++  Node* target_adr = kit.basic_plus_adr(call_site, call_site, java_dyn_CallSite::target_offset_in_bytes());
++  Node* target_mh  = kit.make_load(kit.control(), target_adr, TypeInstPtr::BOTTOM, T_OBJECT);
++
++  // Check if the MethodHandle is still the same.
++  const TypeOopPtr* predicted_mh_ptr = TypeOopPtr::make_from_constant(_predicted_method_handle, true);
++  Node* predicted_mh = kit.makecon(predicted_mh_ptr);
++
++  Node* cmp = gvn.transform(new(kit.C, 3) CmpPNode(target_mh, predicted_mh));
++  Node* bol = gvn.transform(new(kit.C, 2) BoolNode(cmp, BoolTest::eq) );
++  IfNode* iff = kit.create_and_xform_if(kit.control(), bol, _hit_prob, COUNT_UNKNOWN);
++  kit.set_control( gvn.transform(new(kit.C, 1) IfTrueNode (iff)));
++  Node* slow_ctl = gvn.transform(new(kit.C, 1) IfFalseNode(iff));
++
++  SafePointNode* slow_map = NULL;
++  JVMState* slow_jvms;
++  { PreserveJVMState pjvms(&kit);
++    kit.set_control(slow_ctl);
++    if (!kit.stopped()) {
++      slow_jvms = _if_missed->generate(kit.sync_jvms());
++      assert(slow_jvms != NULL, "miss path must not fail to generate");
++      kit.add_exception_states_from(slow_jvms);
++      kit.set_map(slow_jvms->map());
++      if (!kit.stopped())
++        slow_map = kit.stop();
++    }
++  }
++
++  if (kit.stopped()) {
++    // Instance exactly does not matches the desired type.
++    kit.set_jvms(slow_jvms);
++    return kit.transfer_exceptions_into_jvms();
++  }
++
++  // Make the hot call:
++  JVMState* new_jvms = _if_hit->generate(kit.sync_jvms());
++  if (new_jvms == NULL) {
++    // Inline failed, so make a direct call.
++    assert(_if_hit->is_inline(), "must have been a failed inline");
++    CallGenerator* cg = CallGenerator::for_direct_call(_if_hit->method());
++    new_jvms = cg->generate(kit.sync_jvms());
++  }
++  kit.add_exception_states_from(new_jvms);
++  kit.set_jvms(new_jvms);
++
++  // Need to merge slow and fast?
++  if (slow_map == NULL) {
++    // The fast path is the only path remaining.
++    return kit.transfer_exceptions_into_jvms();
++  }
++
++  if (kit.stopped()) {
++    // Inlined method threw an exception, so it's just the slow path after all.
++    kit.set_jvms(slow_jvms);
++    return kit.transfer_exceptions_into_jvms();
++  }
++
++  // Finish the diamond.
++  kit.C->set_has_split_ifs(true); // Has chance for split-if optimization
++  RegionNode* region = new (kit.C, 3) RegionNode(3);
++  region->init_req(1, kit.control());
++  region->init_req(2, slow_map->control());
++  kit.set_control(gvn.transform(region));
++  Node* iophi = PhiNode::make(region, kit.i_o(), Type::ABIO);
++  iophi->set_req(2, slow_map->i_o());
++  kit.set_i_o(gvn.transform(iophi));
++  kit.merge_memory(slow_map->merged_memory(), region, 2);
++  uint tos = kit.jvms()->stkoff() + kit.sp();
++  uint limit = slow_map->req();
++  for (uint i = TypeFunc::Parms; i < limit; i++) {
++    // Skip unused stack slots; fast forward to monoff();
++    if (i == tos) {
++      i = kit.jvms()->monoff();
++      if( i >= limit ) break;
++    }
++    Node* m = kit.map()->in(i);
++    Node* n = slow_map->in(i);
++    if (m != n) {
++      const Type* t = gvn.type(m)->meet(gvn.type(n));
++      Node* phi = PhiNode::make(region, m, t);
++      phi->set_req(2, n);
++      kit.map()->set_req(i, gvn.transform(phi));
++    }
++  }
++  return kit.transfer_exceptions_into_jvms();
++}
++
++
+ //-------------------------UncommonTrapCallGenerator-----------------------------
+ // Internal class which handles all out-of-line calls checking receiver type.
+ class UncommonTrapCallGenerator : public CallGenerator {
+diff --git a/src/share/vm/opto/callGenerator.hpp b/src/share/vm/opto/callGenerator.hpp
+--- a/src/share/vm/opto/callGenerator.hpp
++++ b/src/share/vm/opto/callGenerator.hpp
+@@ -117,6 +117,12 @@
+                                            CallGenerator* if_hit,
+                                            float hit_prob);
+ 
++  // How to make a call that optimistically assumes a MethodHandle target:
++  static CallGenerator* for_predicted_dynamic_call(ciMethodHandle* predicted_method_handle,
++                                                   CallGenerator* if_missed,
++                                                   CallGenerator* if_hit,
++                                                   float hit_prob);
++
+   // How to make a call that gives up and goes back to the interpreter:
+   static CallGenerator* for_uncommon_trap(ciMethod* m,
+                                           Deoptimization::DeoptReason reason,
+diff --git a/src/share/vm/opto/doCall.cpp b/src/share/vm/opto/doCall.cpp
+--- a/src/share/vm/opto/doCall.cpp
++++ b/src/share/vm/opto/doCall.cpp
+@@ -224,16 +224,61 @@
+     }
+   }
+ 
++  // Do MethodHandle calls.
++  if (call_method->is_method_handle_invoke()) {
++    if (jvms->method()->java_code_at_bci(jvms->bci()) != Bytecodes::_invokedynamic) {
++      GraphKit kit(jvms);
++      Node* n = kit.argument(0);
++
++      if (n->Opcode() == Op_ConP) {
++        const TypeOopPtr* oop_ptr = n->bottom_type()->is_oopptr();
++        ciObject* const_oop = oop_ptr->const_oop();
++        ciMethodHandle* method_handle = const_oop->as_method_handle();
++
++        // Set the actually called method to have access to the class
++        // and signature in the MethodHandleCompiler.
++        method_handle->set_callee(call_method);
++
++        // Get an adapter for the MethodHandle.
++        ciMethod* target_method = method_handle->get_method_handle_adapter();
++
++        CallGenerator* hit_cg = this->call_generator(target_method, vtable_index, false, jvms, true, prof_factor);
++        if (hit_cg != NULL && hit_cg->is_inline())
++          return hit_cg;
++      }
++
++      return CallGenerator::for_direct_call(call_method);
++    }
++    else {
++      // Get the MethodHandle from the CallSite.
++      ciMethod* caller_method = jvms->method();
++      ciBytecodeStream str(caller_method);
++      str.force_bci(jvms->bci());  // Set the stream to the invokedynamic bci.
++      ciCallSite*     call_site     = str.get_call_site();
++      ciMethodHandle* method_handle = call_site->get_target();
++
++      // Set the actually called method to have access to the class
++      // and signature in the MethodHandleCompiler.
++      method_handle->set_callee(call_method);
++
++      // Get an adapter for the MethodHandle.
++      ciMethod* target_method = method_handle->get_invokedynamic_adapter();
++
++      CallGenerator* hit_cg = this->call_generator(target_method, vtable_index, false, jvms, true, prof_factor);
++      if (hit_cg != NULL && hit_cg->is_inline()) {
++        CallGenerator* miss_cg = CallGenerator::for_dynamic_call(call_method);
++        return CallGenerator::for_predicted_dynamic_call(method_handle, miss_cg, hit_cg, prof_factor);
++      }
++
++      // If something failed, generate a normal dynamic call.
++      return CallGenerator::for_dynamic_call(call_method);
++    }
++  }
++
+   // There was no special inlining tactic, or it bailed out.
+   // Use a more generic tactic, like a simple call.
+   if (call_is_virtual) {
+     return CallGenerator::for_virtual_call(call_method, vtable_index);
+-  } else if (call_method->is_method_handle_invoke()) {
+-    if (jvms->method()->java_code_at_bci(jvms->bci()) == Bytecodes::_invokedynamic)
+-      return CallGenerator::for_dynamic_call(call_method);
+-    else
+-      // %%% if the target MH is a compile-time constant, we should try to inline it
+-      return CallGenerator::for_direct_call(call_method);
+   } else {
+     // Class Hierarchy Analysis or Type Profile reveals a unique target,
+     // or it is a static or special call.
+diff --git a/src/share/vm/opto/parse3.cpp b/src/share/vm/opto/parse3.cpp
+--- a/src/share/vm/opto/parse3.cpp
++++ b/src/share/vm/opto/parse3.cpp
+@@ -125,7 +125,25 @@
+ 
+ void Parse::do_get_xxx(const TypePtr* obj_type, Node* obj, ciField* field, bool is_field) {
+   // Does this field have a constant value?  If so, just push the value.
+-  if (field->is_constant() && push_constant(field->constant_value()))  return;
++  if (field->is_constant()) {
++    if (field->is_static()) {
++      // final static field
++      if (push_constant(field->constant_value()))
++        return;
++    }
++    else {
++      // final non-static field of a trusted class ({java,sun}.dyn
++      // classes).
++      if (obj->is_Con()) {
++        const TypeOopPtr* oop_ptr = obj->bottom_type()->isa_oopptr();
++        ciObject* constant_oop = oop_ptr->const_oop();
++        ciConstant constant = field->constant_value_of(constant_oop);
++
++        if (push_constant(constant, true))
++          return;
++      }
++    }
++  }
+ 
+   ciType* field_klass = field->type();
+   bool is_vol = field->is_volatile();
+@@ -145,7 +163,7 @@
+     if (!field->type()->is_loaded()) {
+       type = TypeInstPtr::BOTTOM;
+       must_assert_null = true;
+-    } else if (field->is_constant()) {
++    } else if (field->is_constant() && field->is_static()) {
+       // This can happen if the constant oop is non-perm.
+       ciObject* con = field->constant_value().as_object();
+       // Do not "join" in the previous type; it doesn't add value,
+diff --git a/src/share/vm/prims/methodHandleWalk.cpp b/src/share/vm/prims/methodHandleWalk.cpp
+--- a/src/share/vm/prims/methodHandleWalk.cpp
++++ b/src/share/vm/prims/methodHandleWalk.cpp
+@@ -29,6 +29,10 @@
+ #include "incls/_precompiled.incl"
+ #include "incls/_methodHandleWalk.cpp.incl"
+ 
++
++// -----------------------------------------------------------------------------
++// MethodHandleChain
++
+ void MethodHandleChain::set_method_handle(Handle mh, TRAPS) {
+   if (!java_dyn_MethodHandle::is_instance(mh()))  lose("bad method handle", CHECK);
+ 
+@@ -58,7 +62,8 @@
+     if (!is_bound() || java_dyn_MethodHandle::is_instance(target)) {
+       _arg_type = compute_bound_arg_type(target, NULL, _arg_slot, CHECK);
+     } else if (target != NULL && target->is_method()) {
+-      _arg_type = compute_bound_arg_type(NULL, (methodOop)target, _arg_slot, CHECK);
++      methodOop m = (methodOop) target;
++      _arg_type = compute_bound_arg_type(NULL, m, _arg_slot, CHECK);
+       set_last_method(mh(), CHECK);
+     } else {
+       _is_bound = false;  // lose!
+@@ -72,6 +77,7 @@
+   }
+ }
+ 
++
+ void MethodHandleChain::set_last_method(oop target, TRAPS) {
+   _is_last = true;
+   klassOop receiver_limit_oop = NULL;
+@@ -88,6 +94,7 @@
+     _last_invoke = Bytecodes::_invokevirtual;
+ }
+ 
++
+ BasicType MethodHandleChain::compute_bound_arg_type(oop target, methodOop m, int arg_slot, TRAPS) {
+   // There is no direct indication of whether the argument is primitive or not.
+   // It is implied by the _vmentry code, and by the MethodType of the target.
+@@ -126,7 +133,9 @@
+   return arg_type;
+ }
+ 
++
+ void MethodHandleChain::lose(const char* msg, TRAPS) {
++  assert(false, "lose");
+   _lose_message = msg;
+   if (!THREAD->is_Java_thread() || ((JavaThread*)THREAD)->thread_state() != _thread_in_vm) {
+     // throw a preallocated exception
+@@ -135,6 +144,10 @@
+   THROW_MSG(vmSymbols::java_lang_InternalError(), msg);
+ }
+ 
++
++// -----------------------------------------------------------------------------
++// MethodHandleWalker
++
+ Bytecodes::Code MethodHandleWalker::conversion_code(BasicType src, BasicType dest) {
+   if (is_subword_type(src)) {
+     src = T_INT;          // all subword src types act like int
+@@ -170,9 +183,15 @@
+   return Bytecodes::_illegal;
+ }
+ 
++
++// -----------------------------------------------------------------------------
++// MethodHandleWalker::walk
++//
+ MethodHandleWalker::ArgToken
+ MethodHandleWalker::walk(TRAPS) {
+-  walk_incoming_state(CHECK_NULL);
++  ArgToken empty = ArgToken();  // Empty return value.
++
++  walk_incoming_state(CHECK_(empty));
+ 
+   for (;;) {
+     set_method_handle(chain().method_handle_oop());
+@@ -185,26 +204,77 @@
+       SlotState* arg_state = slot_state(arg_slot);
+       if (arg_state == NULL
+           && conv_op > sun_dyn_AdapterMethodHandle::OP_RETYPE_RAW) {
+-        lose("bad argument index", CHECK_NULL);
++        lose("bad argument index", CHECK_(empty));
+       }
+ 
+       // perform the adapter action
+       switch (chain().adapter_conversion_op()) {
+       case sun_dyn_AdapterMethodHandle::OP_RETYPE_ONLY:
+-      case sun_dyn_AdapterMethodHandle::OP_RETYPE_RAW:
+         // No changes to arguments; pass the bits through.
+-        // The only difference between the two ops is that the "only" version
+-        // is fully compatible with the verifier, while the "raw" version
+-        // performs a few extra bitwise conversions (like long <-> double).
+         break;
+ 
++      case sun_dyn_AdapterMethodHandle::OP_RETYPE_RAW: {
++        // To keep the verifier happy, emit bitwise ("raw") conversions as needed.
++        // See MethodHandles::same_basic_type_for_arguments for allowed conversions.
++        Handle incoming_mtype(THREAD, chain().method_type_oop());
++        oop outgoing_mh_oop = chain().vmtarget_oop();
++        if (!java_dyn_MethodHandle::is_instance(outgoing_mh_oop))
++          lose("outgoing target not a MethodHandle", CHECK_(empty));
++        Handle outgoing_mtype(THREAD, java_dyn_MethodHandle::type(outgoing_mh_oop));
++        outgoing_mh_oop = NULL;  // GC safety
++
++        int nptypes = java_dyn_MethodType::ptype_count(outgoing_mtype());
++        if (nptypes != java_dyn_MethodType::ptype_count(incoming_mtype()))
++          lose("incoming and outgoing parameter count do not agree", CHECK_(empty));
++
++        for (int i = 0, slot = _outgoing.length() - 1; slot >= 0; slot--) {
++          SlotState* arg_state = slot_state(slot);
++          if (arg_state->_type == T_VOID)  continue;
++          ArgToken arg = _outgoing.at(slot)._arg;
++
++          klassOop  in_klass  = NULL;
++          klassOop  out_klass = NULL;
++          BasicType inpbt  = java_lang_Class::as_BasicType(java_dyn_MethodType::ptype(incoming_mtype(), i), &in_klass);
++          BasicType outpbt = java_lang_Class::as_BasicType(java_dyn_MethodType::ptype(outgoing_mtype(), i), &out_klass);
++          assert(inpbt == arg.basic_type(), "sanity");
++
++          if (inpbt != outpbt) {
++            vmIntrinsics::ID iid = vmIntrinsics::for_raw_conversion(inpbt, outpbt);
++            if (iid == vmIntrinsics::_none) {
++              lose("no raw conversion method", CHECK_(empty));
++            }
++            ArgToken arglist[2];
++            arglist[0] = arg;         // outgoing 'this'
++            arglist[1] = ArgToken();  // sentinel
++            arg = make_invoke(NULL, iid, Bytecodes::_invokestatic, false, 1, &arglist[0], CHECK_(empty));
++            change_argument(inpbt, slot, outpbt, arg);
++          }
++
++          i++;  // We need to skip void slots at the top of the loop.
++        }
++
++        BasicType inrbt  = java_lang_Class::as_BasicType(java_dyn_MethodType::rtype(incoming_mtype()));
++        BasicType outrbt = java_lang_Class::as_BasicType(java_dyn_MethodType::rtype(outgoing_mtype()));
++        if (inrbt != outrbt) {
++          if (inrbt == T_INT && outrbt == T_VOID) {
++            // See comments in MethodHandles::same_basic_type_for_arguments.
++          } else {
++            assert(false, "IMPLEMENT ME");
++            lose("no raw conversion method", CHECK_(empty));
++          }
++        }
++        break;
++      }
++
+       case sun_dyn_AdapterMethodHandle::OP_CHECK_CAST: {
+         // checkcast the Nth outgoing argument in place
+         klassOop dest_klass = NULL;
+         BasicType dest = java_lang_Class::as_BasicType(chain().adapter_arg_oop(), &dest_klass);
+         assert(dest == T_OBJECT, "");
+         assert(dest == arg_state->_type, "");
+-        arg_state->_arg = make_conversion(T_OBJECT, dest_klass, Bytecodes::_checkcast, arg_state->_arg, CHECK_NULL);
++        ArgToken arg = arg_state->_arg;
++        ArgToken new_arg = make_conversion(T_OBJECT, dest_klass, Bytecodes::_checkcast, arg, CHECK_(empty));
++        assert(arg.index() == new_arg.index(), "should be the same index");
+         debug_only(dest_klass = (klassOop)badOop);
+         break;
+       }
+@@ -218,17 +288,17 @@
+         if (bc == Bytecodes::_nop) {
+           break;
+         } else if (bc != Bytecodes::_illegal) {
+-          arg = make_conversion(dest, NULL, bc, arg, CHECK_NULL);
++          arg = make_conversion(dest, NULL, bc, arg, CHECK_(empty));
+         } else if (is_subword_type(dest)) {
+           bc = conversion_code(src, T_INT);
+           if (bc != Bytecodes::_illegal) {
+-            arg = make_conversion(dest, NULL, bc, arg, CHECK_NULL);
++            arg = make_conversion(dest, NULL, bc, arg, CHECK_(empty));
+             bc = conversion_code(T_INT, dest);
+-            arg = make_conversion(dest, NULL, bc, arg, CHECK_NULL);
++            arg = make_conversion(dest, NULL, bc, arg, CHECK_(empty));
+           }
+         }
+         if (bc == Bytecodes::_illegal) {
+-          lose("bad primitive conversion", CHECK_NULL);
++          lose("bad primitive conversion", CHECK_(empty));
+         }
+         change_argument(src, arg_slot, dest, arg);
+         break;
+@@ -239,15 +309,15 @@
+         BasicType dest = chain().adapter_conversion_dest_type();
+         ArgToken arg = arg_state->_arg;
+         arg = make_conversion(T_OBJECT, SystemDictionary::box_klass(dest),
+-                              Bytecodes::_checkcast, arg, CHECK_NULL);
++                              Bytecodes::_checkcast, arg, CHECK_(empty));
+         vmIntrinsics::ID unboxer = vmIntrinsics::for_unboxing(dest);
+         if (unboxer == vmIntrinsics::_none) {
+-          lose("no unboxing method", CHECK_NULL);
++          lose("no unboxing method", CHECK_(empty));
+         }
+         ArgToken arglist[2];
+-        arglist[0] = arg;       // outgoing 'this'
+-        arglist[1] = NULL;      // sentinel
+-        arg = make_invoke(NULL, unboxer, Bytecodes::_invokevirtual, false, 1, &arglist[0], CHECK_NULL);
++        arglist[0] = arg;         // outgoing 'this'
++        arglist[1] = ArgToken();  // sentinel
++        arg = make_invoke(NULL, unboxer, Bytecodes::_invokevirtual, false, 1, &arglist[0], CHECK_(empty));
+         change_argument(T_OBJECT, arg_slot, dest, arg);
+         break;
+       }
+@@ -258,12 +328,13 @@
+         ArgToken arg = arg_state->_arg;
+         vmIntrinsics::ID boxer = vmIntrinsics::for_boxing(src);
+         if (boxer == vmIntrinsics::_none) {
+-          lose("no boxing method", CHECK_NULL);
++          lose("no boxing method", CHECK_(empty));
+         }
+         ArgToken arglist[2];
+-        arglist[0] = arg;       // outgoing value
+-        arglist[1] = NULL;      // sentinel
+-        arg = make_invoke(NULL, boxer, Bytecodes::_invokevirtual, false, 1, &arglist[0], CHECK_NULL);
++        arglist[0] = arg;         // outgoing value
++        arglist[1] = ArgToken();  // sentinel
++        assert(false, "I think the argument count must be 1 instead of 0");
++        arg = make_invoke(NULL, boxer, Bytecodes::_invokevirtual, false, 0, &arglist[0], CHECK_(empty));
+         change_argument(src, arg_slot, T_OBJECT, arg);
+         break;
+       }
+@@ -271,7 +342,7 @@
+       case sun_dyn_AdapterMethodHandle::OP_SWAP_ARGS: {
+         int dest_arg_slot = chain().adapter_conversion_vminfo();
+         if (!slot_has_argument(dest_arg_slot)) {
+-          lose("bad swap index", CHECK_NULL);
++          lose("bad swap index", CHECK_(empty));
+         }
+         // a simple swap between two arguments
+         SlotState* dest_arg_state = slot_state(dest_arg_slot);
+@@ -284,7 +355,7 @@
+       case sun_dyn_AdapterMethodHandle::OP_ROT_ARGS: {
+         int dest_arg_slot = chain().adapter_conversion_vminfo();
+         if (!slot_has_argument(dest_arg_slot) || arg_slot == dest_arg_slot) {
+-          lose("bad rotate index", CHECK_NULL);
++          lose("bad rotate index", CHECK_(empty));
+         }
+         SlotState* dest_arg_state = slot_state(dest_arg_slot);
+         // Rotate the source argument (plus following N slots) into the
+@@ -310,7 +381,7 @@
+       case sun_dyn_AdapterMethodHandle::OP_DUP_ARGS: {
+         int dup_slots = chain().adapter_conversion_stack_pushes();
+         if (dup_slots <= 0) {
+-          lose("bad dup count", CHECK_NULL);
++          lose("bad dup count", CHECK_(empty));
+         }
+         for (int i = 0; i < dup_slots; i++) {
+           SlotState* dup = slot_state(arg_slot + 2*i);
+@@ -324,7 +395,7 @@
+       case sun_dyn_AdapterMethodHandle::OP_DROP_ARGS: {
+         int drop_slots = -chain().adapter_conversion_stack_pushes();
+         if (drop_slots <= 0) {
+-          lose("bad drop count", CHECK_NULL);
++          lose("bad drop count", CHECK_(empty));
+         }
+         for (int i = 0; i < drop_slots; i++) {
+           SlotState* drop = slot_state(arg_slot);
+@@ -336,7 +407,7 @@
+       }
+ 
+       case sun_dyn_AdapterMethodHandle::OP_COLLECT_ARGS: { //NYI, may GC
+-        lose("unimplemented", CHECK_NULL);
++        lose("unimplemented", CHECK_(empty));
+         break;
+       }
+ 
+@@ -358,8 +429,8 @@
+         // Fetch the argument, which we will cast to the required array type.
+         assert(arg_state->_type == T_OBJECT, "");
+         ArgToken array_arg = arg_state->_arg;
+-        array_arg = make_conversion(T_OBJECT, array_klass(), Bytecodes::_checkcast, array_arg, CHECK_NULL);
+-        change_argument(T_OBJECT, arg_slot, T_VOID, NULL);
++        array_arg = make_conversion(T_OBJECT, array_klass(), Bytecodes::_checkcast, array_arg, CHECK_(empty));
++        change_argument(T_OBJECT, arg_slot, T_VOID, ArgToken(tt_void));
+ 
+         // Check the required length.
+         int spread_slots = 1 + chain().adapter_conversion_stack_pushes();
+@@ -369,29 +440,29 @@
+           spread_length = spread_slots / 2;
+         }
+         if (spread_slots < 0) {
+-          lose("bad spread length", CHECK_NULL);
++          lose("bad spread length", CHECK_(empty));
+         }
+ 
+         jvalue   length_jvalue;  length_jvalue.i = spread_length;
+-        ArgToken length_arg = make_prim_constant(T_INT, &length_jvalue, CHECK_NULL);
++        ArgToken length_arg = make_prim_constant(T_INT, &length_jvalue, CHECK_(empty));
+         // Call a built-in method known to the JVM to validate the length.
+         ArgToken arglist[3];
+-        arglist[0] = array_arg;  // value to check
+-        arglist[1] = length_arg; // length to check
+-        arglist[2] = NULL;       // sentinel
++        arglist[0] = array_arg;   // value to check
++        arglist[1] = length_arg;  // length to check
++        arglist[2] = ArgToken();  // sentinel
+         make_invoke(NULL, vmIntrinsics::_checkSpreadArgument,
+-                    Bytecodes::_invokestatic, false, 3, &arglist[0], CHECK_NULL);
++                    Bytecodes::_invokestatic, false, 3, &arglist[0], CHECK_(empty));
+ 
+         // Spread out the array elements.
+         Bytecodes::Code aload_op = Bytecodes::_aaload;
+         if (element_type != T_OBJECT) {
+-          lose("primitive array NYI", CHECK_NULL);
++          lose("primitive array NYI", CHECK_(empty));
+         }
+         int ap = arg_slot;
+         for (int i = 0; i < spread_length; i++) {
+           jvalue   offset_jvalue;  offset_jvalue.i = i;
+-          ArgToken offset_arg = make_prim_constant(T_INT, &offset_jvalue, CHECK_NULL);
+-          ArgToken element_arg = make_fetch(element_type, element_klass(), aload_op, array_arg, offset_arg, CHECK_NULL);
++          ArgToken offset_arg = make_prim_constant(T_INT, &offset_jvalue, CHECK_(empty));
++          ArgToken element_arg = make_fetch(element_type, element_klass(), aload_op, array_arg, offset_arg, CHECK_(empty));
+           change_argument(T_VOID, ap, element_type, element_arg);
+           ap += type2size[element_type];
+         }
+@@ -400,11 +471,11 @@
+ 
+       case sun_dyn_AdapterMethodHandle::OP_FLYBY: //NYI, runs Java code
+       case sun_dyn_AdapterMethodHandle::OP_RICOCHET: //NYI, runs Java code
+-        lose("unimplemented", CHECK_NULL);
++        lose("unimplemented", CHECK_(empty));
+         break;
+ 
+       default:
+-        lose("bad adapter conversion", CHECK_NULL);
++        lose("bad adapter conversion", CHECK_(empty));
+         break;
+       }
+     }
+@@ -414,16 +485,16 @@
+       BasicType arg_type  = chain().bound_arg_type();
+       jint      arg_slot  = chain().bound_arg_slot();
+       oop       arg_oop   = chain().bound_arg_oop();
+-      ArgToken  arg       = NULL;
++      ArgToken  arg;
+       if (arg_type == T_OBJECT) {
+-        arg = make_oop_constant(arg_oop, CHECK_NULL);
++        arg = make_oop_constant(arg_oop, CHECK_(empty));
+       } else {
+         jvalue arg_value;
+         BasicType bt = java_lang_boxing_object::get_value(arg_oop, &arg_value);
+         if (bt == arg_type) {
+-          arg = make_prim_constant(arg_type, &arg_value, CHECK_NULL);
++          arg = make_prim_constant(arg_type, &arg_value, CHECK_(empty));
+         } else {
+-          lose("bad bound value", CHECK_NULL);
++          lose("bad bound value", CHECK_(empty));
+         }
+       }
+       debug_only(arg_oop = badOop);
+@@ -432,7 +503,7 @@
+ 
+     // this test must come after the body of the loop
+     if (!chain().is_last()) {
+-      chain().next(CHECK_NULL);
++      chain().next(CHECK_(empty));
+     } else {
+       break;
+     }
+@@ -448,31 +519,36 @@
+     arglist[ap++] = _outgoing.at(i)._arg;
+   }
+   assert(ap == _outgoing_argc, "");
+-  arglist[ap] = NULL; // add a sentinel, for the sake of asserts
++  arglist[ap] = ArgToken();  // add a sentinel, for the sake of asserts
+   return make_invoke(chain().last_method_oop(),
+                      vmIntrinsics::_none,
+                      chain().last_invoke_code(), true,
+                      ap, arglist, THREAD);
+ }
+ 
++
++// -----------------------------------------------------------------------------
++// MethodHandleWalker::walk_incoming_state
++//
+ void MethodHandleWalker::walk_incoming_state(TRAPS) {
+   Handle mtype(THREAD, chain().method_type_oop());
+   int nptypes = java_dyn_MethodType::ptype_count(mtype());
+   _outgoing_argc = nptypes;
+   int argp = nptypes - 1;
+   if (argp >= 0) {
+-    _outgoing.at_grow(argp, make_state(T_VOID, NULL)); // presize
++    _outgoing.at_grow(argp, make_state(T_VOID, ArgToken(tt_void))); // presize
+   }
+   for (int i = 0; i < nptypes; i++) {
+     klassOop  arg_type_klass = NULL;
+     BasicType arg_type = java_lang_Class::as_BasicType(
+                 java_dyn_MethodType::ptype(mtype(), i), &arg_type_klass);
+-    ArgToken  arg = make_parameter(arg_type, arg_type_klass, i, CHECK);
+-    debug_only(arg_type_klass = (klassOop)NULL);
++    int index = new_local_index(arg_type);
++    ArgToken arg = make_parameter(arg_type, arg_type_klass, index, CHECK);
++    debug_only(arg_type_klass = (klassOop) NULL);
+     _outgoing.at_put(argp, make_state(arg_type, arg));
+     if (type2size[arg_type] == 2) {
+       // add the extra slot, so we can model the JVM stack
+-      _outgoing.insert_before(argp+1, make_state(T_VOID, NULL));
++      _outgoing.insert_before(argp+1, make_state(T_VOID, ArgToken(tt_void)));
+     }
+     --argp;
+   }
+@@ -484,17 +560,21 @@
+   // ignore ret; client can catch it if needed
+ }
+ 
+-// this is messy because some kinds of arguments are paired with
+-// companion slots containing an empty value
++
++// -----------------------------------------------------------------------------
++// MethodHandleWalker::change_argument
++//
++// This is messy because some kinds of arguments are paired with
++// companion slots containing an empty value.
+ void MethodHandleWalker::change_argument(BasicType old_type, int slot, BasicType new_type,
+-                                         MethodHandleWalker::ArgToken new_arg) {
++                                         const ArgToken& new_arg) {
+   int old_size = type2size[old_type];
+   int new_size = type2size[new_type];
+   if (old_size == new_size) {
+     // simple case first
+     _outgoing.at_put(slot, make_state(new_type, new_arg));
+   } else if (old_size > new_size) {
+-    for (int i = old_size-1; i >= new_size; i++) {
++    for (int i = old_size - 1; i >= new_size; i--) {
+       assert((i != 0) == (_outgoing.at(slot + i)._type == T_VOID), "");
+       _outgoing.remove_at(slot + i);
+     }
+@@ -504,7 +584,7 @@
+       _outgoing_argc -= 1;      // deleted a real argument
+   } else {
+     for (int i = old_size; i < new_size; i++) {
+-      _outgoing.insert_before(slot+i, make_state(T_VOID, NULL));
++      _outgoing.insert_before(slot + i, make_state(T_VOID, ArgToken(tt_void)));
+     }
+     _outgoing.at_put(slot, make_state(new_type, new_arg));
+     if (old_size == 0)
+@@ -526,72 +606,485 @@
+ #endif
+ 
+ 
+-void MethodHandleCompiler::compile(TRAPS) {
++// -----------------------------------------------------------------------------
++// MethodHandleCompiler
++
++MethodHandleCompiler::MethodHandleCompiler(Handle root, methodHandle callee, bool is_invokedynamic, TRAPS)
++  : MethodHandleWalker(root, is_invokedynamic, THREAD),
++    _callee(callee),
++    _thread(THREAD),
++    _bytecode(THREAD, 50),
++    _constants(THREAD, 10),
++    _cur_stack(0),
++    _max_stack(0),
++    _rtype(T_ILLEGAL)
++{
++
++  // Element zero is always the null constant.
++  (void) _constants.append(NULL);
++
++  // Set name and signature index.
++  _name_index      = cpool_symbol_put(_callee->name());
++  _signature_index = cpool_symbol_put(_callee->signature());
++
++  // Get return type klass.
++  Handle first_mtype(THREAD, chain().method_type_oop());
++  // _rklass is NULL for primitives.
++  _rtype = java_lang_Class::as_BasicType(java_dyn_MethodType::rtype(first_mtype()), &_rklass);
++
++  int params = _callee->size_of_parameters();  // Incoming arguments plus receiver.
++  _num_params = for_invokedynamic() ? params - 1 : params;  // XXX Check if callee is static?
++}
++
++
++// -----------------------------------------------------------------------------
++// MethodHandleCompiler::compile
++//
++// Compile this MethodHandle into a bytecode adapter and return a
++// methodOop.
++methodHandle MethodHandleCompiler::compile(TRAPS) {
+   assert(_thread == THREAD, "must be same thread");
++  methodHandle nullHandle;
++  (void) walk(CHECK_(nullHandle));
++  return get_method_oop(CHECK_(nullHandle));
++}
+ 
+-  _constant_oops.append(Handle());  // element zero is always the null constant
+-  _constant_prims.append(NULL);
+-  {
+-    symbolOop sig
+-      = java_dyn_MethodType::as_signature(chain().method_type_oop(), true, CHECK);
+-    _signature_index = find_oop_constant(sig);
+-    assert(signature() == sig, "");
++
++void MethodHandleCompiler::emit_bc(Bytecodes::Code op, int index) {
++  Bytecodes::check(op);  // Are we legal?
++
++  switch (op) {
++  // b
++  case Bytecodes::_aconst_null:
++  case Bytecodes::_iconst_m1:
++  case Bytecodes::_iconst_0:
++  case Bytecodes::_iconst_1:
++  case Bytecodes::_iconst_2:
++  case Bytecodes::_iconst_3:
++  case Bytecodes::_iconst_4:
++  case Bytecodes::_iconst_5:
++  case Bytecodes::_lconst_0:
++  case Bytecodes::_lconst_1:
++  case Bytecodes::_fconst_0:
++  case Bytecodes::_fconst_1:
++  case Bytecodes::_fconst_2:
++  case Bytecodes::_dconst_0:
++  case Bytecodes::_dconst_1:
++  case Bytecodes::_iload_0:
++  case Bytecodes::_iload_1:
++  case Bytecodes::_iload_2:
++  case Bytecodes::_iload_3:
++  case Bytecodes::_lload_0:
++  case Bytecodes::_lload_1:
++  case Bytecodes::_lload_2:
++  case Bytecodes::_lload_3:
++  case Bytecodes::_fload_0:
++  case Bytecodes::_fload_1:
++  case Bytecodes::_fload_2:
++  case Bytecodes::_fload_3:
++  case Bytecodes::_dload_0:
++  case Bytecodes::_dload_1:
++  case Bytecodes::_dload_2:
++  case Bytecodes::_dload_3:
++  case Bytecodes::_aload_0:
++  case Bytecodes::_aload_1:
++  case Bytecodes::_aload_2:
++  case Bytecodes::_aload_3:
++  case Bytecodes::_istore_0:
++  case Bytecodes::_istore_1:
++  case Bytecodes::_istore_2:
++  case Bytecodes::_istore_3:
++  case Bytecodes::_lstore_0:
++  case Bytecodes::_lstore_1:
++  case Bytecodes::_lstore_2:
++  case Bytecodes::_lstore_3:
++  case Bytecodes::_fstore_0:
++  case Bytecodes::_fstore_1:
++  case Bytecodes::_fstore_2:
++  case Bytecodes::_fstore_3:
++  case Bytecodes::_dstore_0:
++  case Bytecodes::_dstore_1:
++  case Bytecodes::_dstore_2:
++  case Bytecodes::_dstore_3:
++  case Bytecodes::_astore_0:
++  case Bytecodes::_astore_1:
++  case Bytecodes::_astore_2:
++  case Bytecodes::_astore_3:
++  case Bytecodes::_i2l:
++  case Bytecodes::_i2f:
++  case Bytecodes::_i2d:
++  case Bytecodes::_i2b:
++  case Bytecodes::_i2c:
++  case Bytecodes::_i2s:
++  case Bytecodes::_l2i:
++  case Bytecodes::_l2f:
++  case Bytecodes::_l2d:
++  case Bytecodes::_f2i:
++  case Bytecodes::_f2l:
++  case Bytecodes::_f2d:
++  case Bytecodes::_d2i:
++  case Bytecodes::_d2l:
++  case Bytecodes::_d2f:
++  case Bytecodes::_ireturn:
++  case Bytecodes::_lreturn:
++  case Bytecodes::_freturn:
++  case Bytecodes::_dreturn:
++  case Bytecodes::_areturn:
++  case Bytecodes::_return:
++    assert(strcmp(Bytecodes::format(op), "b") == 0, "wrong bytecode format");
++    _bytecode.push(op);
++    break;
++
++  // bi
++  case Bytecodes::_ldc:
++  case Bytecodes::_iload:
++  case Bytecodes::_lload:
++  case Bytecodes::_fload:
++  case Bytecodes::_dload:
++  case Bytecodes::_aload:
++  case Bytecodes::_istore:
++  case Bytecodes::_lstore:
++  case Bytecodes::_fstore:
++  case Bytecodes::_dstore:
++  case Bytecodes::_astore:
++    assert(strcmp(Bytecodes::format(op), "bi") == 0, "wrong bytecode format");
++    assert((char) index == index, "index does not fit in 8-bit");
++    _bytecode.push(op);
++    _bytecode.push(index);
++    break;
++
++  // bii
++  case Bytecodes::_ldc2_w:
++  case Bytecodes::_checkcast:
++    assert(strcmp(Bytecodes::format(op), "bii") == 0, "wrong bytecode format");
++    assert((short) index == index, "index does not fit in 16-bit");
++    _bytecode.push(op);
++    _bytecode.push(index >> 8);
++    _bytecode.push(index);
++    break;
++
++  // bjj
++  case Bytecodes::_invokestatic:
++  case Bytecodes::_invokespecial:
++  case Bytecodes::_invokevirtual:
++    assert(strcmp(Bytecodes::format(op), "bjj") == 0, "wrong bytecode format");
++    assert((short) index == index, "index does not fit in 16-bit");
++    _bytecode.push(op);
++    _bytecode.push(index >> 8);
++    _bytecode.push(index);
++    break;
++
++  default:
++    ShouldNotReachHere();
+   }
++}
+ 
+-  walk(CHECK);
++
++void MethodHandleCompiler::emit_load(BasicType bt, int index) {
++  if (index <= 3) {
++    switch (bt) {
++    case T_BOOLEAN: case T_BYTE: case T_CHAR: case T_SHORT:
++    case T_INT:    emit_bc(Bytecodes::cast(Bytecodes::_iload_0 + index)); break;
++    case T_LONG:   emit_bc(Bytecodes::cast(Bytecodes::_lload_0 + index)); break;
++    case T_FLOAT:  emit_bc(Bytecodes::cast(Bytecodes::_fload_0 + index)); break;
++    case T_DOUBLE: emit_bc(Bytecodes::cast(Bytecodes::_dload_0 + index)); break;
++    case T_OBJECT: emit_bc(Bytecodes::cast(Bytecodes::_aload_0 + index)); break;
++    default:
++      ShouldNotReachHere();
++    }
++  }
++  else {
++    switch (bt) {
++    case T_BOOLEAN: case T_BYTE: case T_CHAR: case T_SHORT:
++    case T_INT:    emit_bc(Bytecodes::_iload, index); break;
++    case T_LONG:   emit_bc(Bytecodes::_lload, index); break;
++    case T_FLOAT:  emit_bc(Bytecodes::_fload, index); break;
++    case T_DOUBLE: emit_bc(Bytecodes::_dload, index); break;
++    case T_OBJECT: emit_bc(Bytecodes::_aload, index); break;
++    default:
++      ShouldNotReachHere();
++    }
++  }
++  stack_push(bt);
+ }
+ 
++void MethodHandleCompiler::emit_store(BasicType bt, int index) {
++  if (index <= 3) {
++    switch (bt) {
++    case T_BOOLEAN: case T_BYTE: case T_CHAR: case T_SHORT:
++    case T_INT:    emit_bc(Bytecodes::cast(Bytecodes::_istore_0 + index)); break;
++    case T_LONG:   emit_bc(Bytecodes::cast(Bytecodes::_lstore_0 + index)); break;
++    case T_FLOAT:  emit_bc(Bytecodes::cast(Bytecodes::_fstore_0 + index)); break;
++    case T_DOUBLE: emit_bc(Bytecodes::cast(Bytecodes::_dstore_0 + index)); break;
++    case T_OBJECT: emit_bc(Bytecodes::cast(Bytecodes::_astore_0 + index)); break;
++    default:
++      ShouldNotReachHere();
++    }
++  }
++  else {
++    switch (bt) {
++    case T_BOOLEAN: case T_BYTE: case T_CHAR: case T_SHORT:
++    case T_INT:    emit_bc(Bytecodes::_istore, index); break;
++    case T_LONG:   emit_bc(Bytecodes::_lstore, index); break;
++    case T_FLOAT:  emit_bc(Bytecodes::_fstore, index); break;
++    case T_DOUBLE: emit_bc(Bytecodes::_dstore, index); break;
++    case T_OBJECT: emit_bc(Bytecodes::_astore, index); break;
++    default:
++      ShouldNotReachHere();
++    }
++  }
++  stack_pop(bt);
++}
++
++
++void MethodHandleCompiler::emit_load_constant(ArgToken arg) {
++  BasicType bt = arg.basic_type();
++  switch (bt) {
++  case T_INT: {
++    jint value = arg.get_jint();
++    if (-1 <= value && value <= 5)
++      emit_bc(Bytecodes::cast(Bytecodes::_iconst_0 + value));
++    else
++      emit_bc(Bytecodes::_ldc, cpool_int_put(value));
++    break;
++  }
++  case T_LONG: {
++    jlong value = arg.get_jlong();
++    if (0 <= value && value <= 1)
++      emit_bc(Bytecodes::cast(Bytecodes::_lconst_0 + (int) value));
++    else
++      emit_bc(Bytecodes::_ldc2_w, cpool_long_put(value));
++    break;
++  }
++  case T_FLOAT: {
++    jfloat value  = arg.get_jfloat();
++    if (value == 0.0 || value == 1.0 || value == 2.0)
++      emit_bc(Bytecodes::cast(Bytecodes::_fconst_0 + (int) value));
++    else
++      emit_bc(Bytecodes::_ldc, cpool_float_put(value));
++    break;
++  }
++  case T_DOUBLE: {
++    jdouble value = arg.get_jdouble();
++    if (value == 0.0 || value == 1.0)
++      emit_bc(Bytecodes::cast(Bytecodes::_dconst_0 + (int) value));
++    else
++      emit_bc(Bytecodes::_ldc2_w, cpool_double_put(value));
++    break;
++  }
++  case T_OBJECT: {
++    Handle value = arg.object();
++    if (value.is_null())
++      emit_bc(Bytecodes::_aconst_null);
++    else
++      emit_bc(Bytecodes::_ldc, cpool_object_put(value));
++    break;
++  }
++  default:
++    ShouldNotReachHere();
++  }
++  stack_push(bt);
++}
++
++
+ MethodHandleWalker::ArgToken
+ MethodHandleCompiler::make_conversion(BasicType type, klassOop tk, Bytecodes::Code op,
+-                                      MethodHandleWalker::ArgToken src, TRAPS) {
+-  Unimplemented();
+-  return NULL;
++                                      const ArgToken& src, TRAPS) {
++
++  BasicType srctype = src.basic_type();
++  int index = src.index();
++
++  switch (op) {
++  case Bytecodes::_i2l:
++  case Bytecodes::_i2f:
++  case Bytecodes::_i2d:
++  case Bytecodes::_i2b:
++  case Bytecodes::_i2c:
++  case Bytecodes::_i2s:
++
++  case Bytecodes::_l2i:
++  case Bytecodes::_l2f:
++  case Bytecodes::_l2d:
++
++  case Bytecodes::_f2i:
++  case Bytecodes::_f2l:
++  case Bytecodes::_f2d:
++
++  case Bytecodes::_d2i:
++  case Bytecodes::_d2l:
++  case Bytecodes::_d2f:
++    emit_load(srctype, index);
++    stack_pop(srctype);  // pop the src type
++    emit_bc(op);
++    stack_push(type);    // push the dest value
++    if (srctype != type)
++      index = new_local_index(type);
++    emit_store(type, index);
++    break;
++
++  case Bytecodes::_checkcast:
++    emit_load(srctype, index);
++    emit_bc(op, cpool_klass_put(tk));
++    emit_store(srctype, index);
++    break;
++
++  default:
++    ShouldNotReachHere();
++  }
++
++  return make_parameter(type, tk, index, THREAD);
+ }
+ 
++
++// -----------------------------------------------------------------------------
++// MethodHandleCompiler
++//
++
++static jvalue zero_jvalue;
++
++// Emit bytecodes for the given invoke instruction.
+ MethodHandleWalker::ArgToken
+ MethodHandleCompiler::make_invoke(methodOop m, vmIntrinsics::ID iid,
+                                   Bytecodes::Code op, bool tailcall,
+                                   int argc, MethodHandleWalker::ArgToken* argv,
+                                   TRAPS) {
+-  // If tailcall, we have walked all the way to a direct method handle.
+-  // Otherwise, make a recursive call to some helper routine.
+-#ifdef ASSERT
++  if (m == NULL) {
++    // Get the intrinsic methodOop.
++    m = vmIntrinsics::method_for(iid);
++  }
++
++  klassOop  klass     = m->method_holder();
++  symbolOop name      = m->name();
++  symbolOop signature = m->signature();
++
++  // This generated adapter method should be in the same class as the
++  // DMH target method (for accessability reasons).
++  if (tailcall) {
++    _target_klass = klass;
++  }
++
++  // instanceKlass* ik = instanceKlass::cast(klass);
++  // tty->print_cr("MethodHandleCompiler::make_invoke: %s %s.%s%s", Bytecodes::name(op), ik->external_name(), name->as_C_string(), signature->as_C_string());
++
++  // Inline the method.
++  InvocationCounter* ic = m->invocation_counter();
++  ic->set_carry();
++
++  for (int i = 0; i < argc; i++) {
++    ArgToken arg = argv[i];
++    TokenType tt = arg.token_type();
++    BasicType bt = arg.basic_type();
++
++    switch (tt) {
++    case tt_parameter:
++    case tt_temporary:
++      emit_load(bt, arg.index());
++      break;
++    case tt_constant:
++      emit_load_constant(arg);
++      break;
++    case tt_illegal:
++      // Sentinel.
++      assert(i == (argc - 1), "sentinel must be last entry");
++      break;
++    case tt_void:
++    default:
++      ShouldNotReachHere();
++    }
++  }
++
++  // Populate constant pool.
++  int name_index          = cpool_symbol_put(name);
++  int signature_index     = cpool_symbol_put(signature);
++  int name_and_type_index = cpool_name_and_type_put(name_index, signature_index);
++  int klass_index         = cpool_klass_put(klass);
++  int methodref_index     = cpool_methodref_put(klass_index, name_and_type_index);
++
++  // Generate invoke.
+   switch (op) {
++  case Bytecodes::_invokestatic:
++  case Bytecodes::_invokespecial:
+   case Bytecodes::_invokevirtual:
+-  case Bytecodes::_invokespecial:
+-  case Bytecodes::_invokestatic:
++    emit_bc(op, methodref_index);
++    break;
+   case Bytecodes::_invokeinterface:
++    Unimplemented();
+     break;
+   default:
+     ShouldNotReachHere();
+   }
+-#endif //ASSERT
+-  _bytes.put((char) op);
+ 
+-  Unimplemented();
+-  return NULL;
++  // If tailcall, we have walked all the way to a direct method handle.
++  // Otherwise, make a recursive call to some helper routine.
++  BasicType rbt = m->result_type();
++  ArgToken ret;
++  if (tailcall) {
++    if (rbt != _rtype) {
++      if (rbt == T_VOID) {
++        // push a zero of the right sort
++        ArgToken zero;
++        if (_rtype == T_OBJECT) {
++          zero = make_oop_constant(NULL, CHECK_(zero));
++        } else {
++          zero = make_prim_constant(_rtype, &zero_jvalue, CHECK_(zero));
++        }
++        emit_load_constant(zero);
++      } else if (_rtype == T_VOID) {
++        // We'll emit a _return with something on the stack.
++        // It's OK to ignore what's on the stack.
++      } else {
++        tty->print_cr("*** rbt=%d != rtype=%d", rbt, _rtype);
++        assert(false, "IMPLEMENT ME");
++      }
++    }
++    switch (_rtype) {
++    case T_BOOLEAN: case T_BYTE: case T_CHAR: case T_SHORT:
++    case T_INT:    emit_bc(Bytecodes::_ireturn); break;
++    case T_LONG:   emit_bc(Bytecodes::_lreturn); break;
++    case T_FLOAT:  emit_bc(Bytecodes::_freturn); break;
++    case T_DOUBLE: emit_bc(Bytecodes::_dreturn); break;
++    case T_VOID:   emit_bc(Bytecodes::_return);  break;
++    case T_OBJECT:
++      if (_rklass.not_null() && _rklass() != SystemDictionary::object_klass())
++        emit_bc(Bytecodes::_checkcast, cpool_klass_put(_rklass()));
++      emit_bc(Bytecodes::_areturn);
++      break;
++    default: ShouldNotReachHere();
++    }
++    ret = ArgToken();  // Dummy return value.
++  }
++  else {
++    stack_push(rbt);  // The return value is already pushed onto the stack.
++    int index = new_local_index(rbt);
++    switch (rbt) {
++    case T_BOOLEAN: case T_BYTE: case T_CHAR:  case T_SHORT:
++    case T_INT:     case T_LONG: case T_FLOAT: case T_DOUBLE:
++    case T_OBJECT:
++      emit_store(rbt, index);
++      ret = ArgToken(tt_temporary, rbt, index);
++      break;
++    case T_VOID:
++      ret = ArgToken(tt_void);
++      break;
++    default:
++      ShouldNotReachHere();
++    }
++  }
++
++  return ret;
+ }
+ 
+ MethodHandleWalker::ArgToken
+ MethodHandleCompiler::make_fetch(BasicType type, klassOop tk, Bytecodes::Code op,
+-                                 MethodHandleWalker::ArgToken base,
+-                                 MethodHandleWalker::ArgToken offset,
++                                 const MethodHandleWalker::ArgToken& base,
++                                 const MethodHandleWalker::ArgToken& offset,
+                                  TRAPS) {
+   Unimplemented();
+-  return NULL;
++  return ArgToken();
+ }
+ 
+-int MethodHandleCompiler::find_oop_constant(oop con) {
+-  if (con == NULL)  return 0;
+-  for (int i = 1, imax = _constant_oops.length(); i < imax; i++) {
+-    if (_constant_oops.at(i) == con)
+-      return i;
+-  }
+-  _constant_prims.append(NULL);
+-  return _constant_oops.append(con);
+-}
+ 
+-int MethodHandleCompiler::find_prim_constant(BasicType bt, jvalue* con) {
++int MethodHandleCompiler::cpool_primitive_put(BasicType bt, jvalue* con) {
+   jvalue con_copy;
+   assert(bt < T_OBJECT, "");
+   if (type2aelembytes(bt) < jintSize) {
+@@ -607,28 +1100,125 @@
+     }
+     bt = T_INT;
+   }
+-  for (int i = 1, imax = _constant_prims.length(); i < imax; i++) {
+-    PrimCon* pcon = _constant_prims.at(i);
+-    if (pcon != NULL && pcon->_type == bt) {
+-      bool match = false;
+-      switch (type2size[bt]) {
+-      case 1:  if (pcon->_value.i == con->i)  match = true;  break;
+-      case 2:  if (pcon->_value.j == con->j)  match = true;  break;
+-      }
+-      if (match)
+-        return i;
++
++//   for (int i = 1, imax = _constants.length(); i < imax; i++) {
++//     ConstantValue* con = _constants.at(i);
++//     if (con != NULL && con->is_primitive() && con->_type == bt) {
++//       bool match = false;
++//       switch (type2size[bt]) {
++//       case 1:  if (pcon->_value.i == con->i)  match = true;  break;
++//       case 2:  if (pcon->_value.j == con->j)  match = true;  break;
++//       }
++//       if (match)
++//         return i;
++//     }
++//   }
++  ConstantValue* cv = new ConstantValue(bt, *con);
++  int index = _constants.append(cv);
++
++  // long and double entries take 2 slots, we add another empty entry.
++  if (type2size[bt] == 2)
++    (void) _constants.append(NULL);
++
++  return index;
++}
++
++
++constantPoolHandle MethodHandleCompiler::get_constant_pool(TRAPS) const {
++  constantPoolHandle nullHandle;
++  bool is_conc_safe = true;
++  constantPoolOop cpool_oop = oopFactory::new_constantPool(_constants.length(), is_conc_safe, CHECK_(nullHandle));
++  constantPoolHandle cpool(THREAD, cpool_oop);
++
++  // Fill the real constant pool skipping the zero element.
++  for (int i = 1; i < _constants.length(); i++) {
++    ConstantValue* cv = _constants.at(i);
++    switch (cv->tag()) {
++    case JVM_CONSTANT_Utf8:        cpool->symbol_at_put(       i, cv->symbol_oop()                     ); break;
++    case JVM_CONSTANT_Integer:     cpool->int_at_put(          i, cv->get_jint()                       ); break;
++    case JVM_CONSTANT_Float:       cpool->float_at_put(        i, cv->get_jfloat()                     ); break;
++    case JVM_CONSTANT_Long:        cpool->long_at_put(         i, cv->get_jlong()                      ); break;
++    case JVM_CONSTANT_Double:      cpool->double_at_put(       i, cv->get_jdouble()                    ); break;
++    case JVM_CONSTANT_Class:       cpool->klass_at_put(        i, cv->klass_oop()                      ); break;
++    case JVM_CONSTANT_Methodref:   cpool->method_at_put(       i, cv->first_index(), cv->second_index()); break;
++    case JVM_CONSTANT_NameAndType: cpool->name_and_type_at_put(i, cv->first_index(), cv->second_index()); break;
++    case JVM_CONSTANT_Object:      cpool->object_at_put(       i, cv->object_oop()                     ); break;
++    default: ShouldNotReachHere();
++    }
++
++    switch (cv->tag()) {
++    case JVM_CONSTANT_Long:
++    case JVM_CONSTANT_Double:
++      i++;  // Skip empty entry.
++      assert(_constants.at(i) == NULL, "empty entry");
++      break;
+     }
+   }
+-  PrimCon* pcon = new PrimCon();
+-  pcon->_type = bt;
+-  pcon->_value = (*con);
+-  _constant_oops.append(Handle());
+-  return _constant_prims.append(pcon);
++
++  // Set the constant pool holder to the target method's class.
++  cpool->set_pool_holder(_target_klass());
++
++  return cpool;
++}
++
++
++methodHandle MethodHandleCompiler::get_method_oop(TRAPS) const {
++  methodHandle nullHandle;
++  // Create a method that holds the generated bytecode.  invokedynamic
++  // has no receiver, normal MH calls do.
++  int flags_bits;
++  if (for_invokedynamic())
++    flags_bits = (/*JVM_MH_INVOKE_BITS |*/ JVM_ACC_PUBLIC | JVM_ACC_FINAL | JVM_ACC_STATIC);
++  else
++    flags_bits = (/*JVM_MH_INVOKE_BITS |*/ JVM_ACC_PUBLIC | JVM_ACC_FINAL);
++
++  bool is_conc_safe = true;
++  methodOop m_oop = oopFactory::new_method(bytecode_length(),
++                                           accessFlags_from(flags_bits),
++                                           0, 0, 0, is_conc_safe, CHECK_(nullHandle));
++  methodHandle m(THREAD, m_oop);
++  m_oop = NULL;  // oop not GC safe
++
++  constantPoolHandle cpool = get_constant_pool(CHECK_(nullHandle));
++  m->set_constants(cpool());
++
++  m->set_name_index(_name_index);
++  m->set_signature_index(_signature_index);
++
++  m->set_code((address) bytecode());
++
++  m->set_max_stack(_max_stack);
++  m->set_max_locals(max_locals());
++  m->set_size_of_parameters(_num_params);
++
++  typeArrayHandle exception_handlers(THREAD, Universe::the_empty_int_array());
++  m->set_exception_table(exception_handlers());
++
++  // Set the carry bit of the invocation counter to force inlining of
++  // the adapter.
++  InvocationCounter* ic = m->invocation_counter();
++  ic->set_carry();
++
++  // Rewrite the method and set up the constant pool cache.
++  objArrayOop m_array = oopFactory::new_system_objArray(1, CHECK_(nullHandle));
++  objArrayHandle methods(THREAD, m_array);
++  methods->obj_at_put(0, m());
++  Rewriter::rewrite(_target_klass(), cpool, methods, CHECK_(nullHandle));  // Use fake class.
++
++#ifndef PRODUCT
++  if (TraceMethodHandles) {
++    m->print();
++    m->print_codes();
++  }
++#endif //PRODUCT
++
++  return m;
+ }
+ 
+ 
+ #ifndef PRODUCT
+ 
++#if 0
+ // MH printer for debugging.
+ 
+ class MethodHandlePrinter : public MethodHandleWalker {
+@@ -791,11 +1381,12 @@
+     out->print("\n");
+   }
+ };
++#endif // 0
+ 
+ extern "C"
+ void print_method_handle(oop mh) {
+   if (java_dyn_MethodHandle::is_instance(mh)) {
+-    MethodHandlePrinter::print(mh);
++    //MethodHandlePrinter::print(mh);
+   } else {
+     tty->print("*** not a method handle: ");
+     mh->print();
+diff --git a/src/share/vm/prims/methodHandleWalk.hpp b/src/share/vm/prims/methodHandleWalk.hpp
+--- a/src/share/vm/prims/methodHandleWalk.hpp
++++ b/src/share/vm/prims/methodHandleWalk.hpp
+@@ -68,6 +68,7 @@
+   Handle method_handle()        { return _method_handle; }
+   oop    method_handle_oop()    { return _method_handle(); }
+   oop    method_type_oop()      { return MethodHandle_type_oop(); }
++  oop    vmtarget_oop()         { return MethodHandle_vmtarget_oop(); }
+ 
+   jint adapter_conversion()     { assert(is_adapter(), ""); return _conversion; }
+   int  adapter_conversion_op()  { return MethodHandles::adapter_conversion_op(adapter_conversion()); }
+@@ -101,8 +102,45 @@
+ // You supply the tokens shuffled by the abstract interpretation.
+ class MethodHandleWalker : StackObj {
+ public:
+-  struct _ArgToken { };  // dummy struct
+-  typedef _ArgToken* ArgToken;
++  // Stack values:
++  enum TokenType {
++    tt_void,
++    tt_parameter,
++    tt_temporary,
++    tt_constant,
++    tt_illegal
++  };
++
++  // Argument token:
++  class ArgToken {
++  private:
++    TokenType _tt;
++    BasicType _bt;
++    jvalue    _value;
++    Handle    _handle;
++
++  public:
++    ArgToken(TokenType tt = tt_illegal) : _tt(tt) {}
++    ArgToken(TokenType tt, BasicType bt, jvalue value) : _tt(tt), _bt(bt), _value(value) {}
++
++    ArgToken(TokenType tt, BasicType bt, int index) : _tt(tt), _bt(bt) {
++      _value.i = index;
++    }
++
++    ArgToken(TokenType tt, BasicType bt, Handle value) : _tt(tt), _bt(bt) {
++      _handle = value;
++    }
++
++    TokenType token_type()  const { return _tt; }
++    BasicType basic_type()  const { return _bt; }
++    int       index()       const { return _value.i; }
++    Handle    object()      const { return _handle; }
++
++    jint      get_jint()    const { return _value.i; }
++    jlong     get_jlong()   const { return _value.j; }
++    jfloat    get_jfloat()  const { return _value.f; }
++    jdouble   get_jdouble() const { return _value.d; }
++  };
+ 
+   // Abstract interpretation state:
+   struct SlotState {
+@@ -118,15 +156,17 @@
+ 
+ private:
+   MethodHandleChain _chain;
++  bool              _for_invokedynamic;
++  int               _local_index;
+ 
+-  GrowableArray<SlotState> _outgoing;  // current outgoing parameter slots
++  GrowableArray<SlotState> _outgoing;       // current outgoing parameter slots
+   int                      _outgoing_argc;  // # non-empty outgoing slots
+ 
+   // Replace a value of type old_type at slot (and maybe slot+1) with the new value.
+   // If old_type != T_VOID, remove the old argument at that point.
+   // If new_type != T_VOID, insert the new argument at that point.
+   // Insert or delete a second empty slot as needed.
+-  void change_argument(BasicType old_type, int slot, BasicType new_type, ArgToken new_arg);
++  void change_argument(BasicType old_type, int slot, BasicType new_type, const ArgToken& new_arg);
+ 
+   SlotState* slot_state(int slot) {
+     if (slot < 0 || slot >= _outgoing.length())
+@@ -153,20 +193,34 @@
+   void walk_incoming_state(TRAPS);
+ 
+ public:
+-  MethodHandleWalker(Handle root, TRAPS)
++  MethodHandleWalker(Handle root, bool for_invokedynamic, TRAPS)
+     : _chain(root, THREAD),
++      _for_invokedynamic(for_invokedynamic),
+       _outgoing(THREAD, 10),
+       _outgoing_argc(0)
+-  { }
++  {
++    _local_index = for_invokedynamic ? 0 : 1;
++  }
+ 
+   MethodHandleChain& chain() { return _chain; }
+ 
++  bool for_invokedynamic() const { return _for_invokedynamic; }
++
++  int new_local_index(BasicType bt) {
++    //int index = _for_invokedynamic ? _local_index : _local_index - 1;
++    int index = _local_index;
++    _local_index += type2size[bt];
++    return index;
++  }
++
++  int max_locals() const { return _local_index; }
++
+   // plug-in abstract interpretation steps:
+   virtual ArgToken make_parameter( BasicType type, klassOop tk, int argnum, TRAPS ) = 0;
+   virtual ArgToken make_prim_constant( BasicType type, jvalue* con, TRAPS ) = 0;
+   virtual ArgToken make_oop_constant( oop con, TRAPS ) = 0;
+-  virtual ArgToken make_conversion( BasicType type, klassOop tk, Bytecodes::Code op, ArgToken src, TRAPS ) = 0;
+-  virtual ArgToken make_fetch( BasicType type, klassOop tk, Bytecodes::Code op, ArgToken base, ArgToken offset, TRAPS ) = 0;
++  virtual ArgToken make_conversion( BasicType type, klassOop tk, Bytecodes::Code op, const ArgToken& src, TRAPS ) = 0;
++  virtual ArgToken make_fetch( BasicType type, klassOop tk, Bytecodes::Code op, const ArgToken& base, const ArgToken& offset, TRAPS ) = 0;
+   virtual ArgToken make_invoke( methodOop m, vmIntrinsics::ID iid, Bytecodes::Code op, bool tailcall, int argc, ArgToken* argv, TRAPS ) = 0;
+ 
+   // For make_invoke, the methodOop can be NULL if the intrinsic ID
+@@ -187,83 +241,167 @@
+ // The IR happens to be JVM bytecodes.
+ class MethodHandleCompiler : public MethodHandleWalker {
+ private:
+-  Thread* _thread;
++  methodHandle _callee;
++  KlassHandle  _rklass;        // Return type for casting.
++  BasicType    _rtype;
++  KlassHandle  _target_klass;
++  Thread*      _thread;
+ 
+-  struct PrimCon {
+-    BasicType _type;
+-    jvalue    _value;
++  // Fake constant pool entry.
++  class ConstantValue {
++  private:
++    int       _tag;   // Constant pool tag type.
++    JavaValue _value;
++    Handle    _handle;
++
++  public:
++    // Constructor for oop types.
++    ConstantValue(int tag, Handle con) : _tag(tag), _handle(con) {
++      assert(tag == JVM_CONSTANT_Utf8   ||
++             tag == JVM_CONSTANT_Class  ||
++             tag == JVM_CONSTANT_String ||
++             tag == JVM_CONSTANT_Object, "must be oop type");
++    }
++
++    // Constructor for oop reference types.
++    ConstantValue(int tag, int index) : _tag(tag) {
++      assert(JVM_CONSTANT_Fieldref <= tag && tag <= JVM_CONSTANT_NameAndType, "must be ref type");
++      _value.set_jint(index);
++    }
++    ConstantValue(int tag, int first_index, int second_index) : _tag(tag) {
++      assert(JVM_CONSTANT_Fieldref <= tag && tag <= JVM_CONSTANT_NameAndType, "must be ref type");
++      _value.set_jint(first_index << 16 | second_index);
++    }
++
++    // Constructor for primitive types.
++    ConstantValue(BasicType bt, jvalue con) {
++      _value.set_type(bt);
++      switch (bt) {
++      case T_INT:    _tag = JVM_CONSTANT_Integer; _value.set_jint(   con.i); break;
++      case T_LONG:   _tag = JVM_CONSTANT_Long;    _value.set_jlong(  con.j); break;
++      case T_FLOAT:  _tag = JVM_CONSTANT_Float;   _value.set_jfloat( con.f); break;
++      case T_DOUBLE: _tag = JVM_CONSTANT_Double;  _value.set_jdouble(con.d); break;
++      default: ShouldNotReachHere();
++      }
++    }
++
++    int       tag()          const { return _tag; }
++    symbolOop symbol_oop()   const { return (symbolOop) _handle(); }
++    klassOop  klass_oop()    const { return (klassOop)  _handle(); }
++    oop       object_oop()   const { return _handle(); }
++    int       index()        const { return _value.get_jint(); }
++    int       first_index()  const { return _value.get_jint() >> 16; }
++    int       second_index() const { return _value.get_jint() & 0x0000FFFF; }
++
++    bool      is_primitive() const { return is_java_primitive(_value.get_type()); }
++    jint      get_jint()     const { return _value.get_jint();    }
++    jlong     get_jlong()    const { return _value.get_jlong();   }
++    jfloat    get_jfloat()   const { return _value.get_jfloat();  }
++    jdouble   get_jdouble()  const { return _value.get_jdouble(); }
+   };
+ 
++  // Fake constant pool.
++  GrowableArray<ConstantValue*> _constants;
++
+   // Accumulated compiler state:
+-  stringStream _bytes;
+-  GrowableArray<Handle>   _constant_oops;
+-  GrowableArray<PrimCon*> _constant_prims;
++  GrowableArray<unsigned char> _bytecode;
++
++  int _cur_stack;
+   int _max_stack;
+   int _num_params;
+-  int _max_locals;
+   int _name_index;
+   int _signature_index;
+ 
+-  // Stack values:
+-  enum TokenType {
+-    tt_void,
+-    tt_parameter,
+-    tt_temporary,
+-    tt_constant
+-  };
+-
+-  ArgToken make_stack_value(TokenType tt, BasicType type, int id) {
+-    return ArgToken( ((intptr_t)id << 8) | ((intptr_t)type << 4) | (intptr_t)tt );
++  void stack_push(BasicType bt) {
++    _cur_stack += type2size[bt];
++    if (_cur_stack > _max_stack) _max_stack = _cur_stack;
++  }
++  void stack_pop(BasicType bt) {
++    _cur_stack -= type2size[bt];
++    assert(_cur_stack >= 0, "sanity");
+   }
+ 
+-public:
++  unsigned char* bytecode()        const { return _bytecode.adr_at(0); }
++  int            bytecode_length() const { return _bytecode.length(); }
++
++  // Fake constant pool.
++  int cpool_oop_put(int tag, Handle con) {
++    if (con.is_null())  return 0;
++    ConstantValue* cv = new ConstantValue(tag, con);
++    return _constants.append(cv);
++  }
++
++  int cpool_oop_reference_put(int tag, int first_index, int second_index) {
++    if (first_index == 0 && second_index == 0)  return 0;
++    assert(first_index != 0 && second_index != 0, "no zero indexes");
++    ConstantValue* cv = new ConstantValue(tag, first_index, second_index);
++    return _constants.append(cv);
++  }
++
++  int cpool_primitive_put(BasicType type, jvalue* con);
++
++  int cpool_int_put(jint value) {
++    jvalue con; con.i = value;
++    return cpool_primitive_put(T_INT, &con);
++  }
++  int cpool_long_put(jlong value) {
++    jvalue con; con.j = value;
++    return cpool_primitive_put(T_LONG, &con);
++  }
++  int cpool_float_put(jfloat value) {
++    jvalue con; con.f = value;
++    return cpool_primitive_put(T_FLOAT, &con);
++  }
++  int cpool_double_put(jdouble value) {
++    jvalue con; con.d = value;
++    return cpool_primitive_put(T_DOUBLE, &con);
++  }
++
++  int cpool_object_put(Handle obj) {
++    return cpool_oop_put(JVM_CONSTANT_Object, obj);
++  }
++  int cpool_symbol_put(symbolOop sym) {
++    return cpool_oop_put(JVM_CONSTANT_Utf8, sym);
++  }
++  int cpool_klass_put(klassOop klass) {
++    return cpool_oop_put(JVM_CONSTANT_Class, klass);
++  }
++  int cpool_methodref_put(int class_index, int name_and_type_index) {
++    return cpool_oop_reference_put(JVM_CONSTANT_Methodref, class_index, name_and_type_index);
++  }
++  int cpool_name_and_type_put(int name_index, int signature_index) {
++    return cpool_oop_reference_put(JVM_CONSTANT_NameAndType, name_index, signature_index);
++  }
++
++  void emit_bc(Bytecodes::Code op, int index = 0);
++  void emit_load(BasicType bt, int index);
++  void emit_store(BasicType bt, int index);
++  void emit_load_constant(ArgToken arg);
++
+   virtual ArgToken make_parameter(BasicType type, klassOop tk, int argnum, TRAPS) {
+-    return make_stack_value(tt_parameter, type, argnum);
++    return ArgToken(tt_parameter, type, argnum);
+   }
+   virtual ArgToken make_oop_constant(oop con, TRAPS) {
+-    return make_stack_value(tt_constant, T_OBJECT, find_oop_constant(con));
++    Handle h(THREAD, con);
++    return ArgToken(tt_constant, T_OBJECT, h);
+   }
+   virtual ArgToken make_prim_constant(BasicType type, jvalue* con, TRAPS) {
+-    return make_stack_value(tt_constant, type, find_prim_constant(type, con));
++    return ArgToken(tt_constant, type, *con);
+   }
+-  virtual ArgToken make_conversion(BasicType type, klassOop tk, Bytecodes::Code op, ArgToken src, TRAPS);
+-  virtual ArgToken make_fetch(BasicType type, klassOop tk, Bytecodes::Code op, ArgToken base, ArgToken offset, TRAPS);
++
++  virtual ArgToken make_conversion(BasicType type, klassOop tk, Bytecodes::Code op, const ArgToken& src, TRAPS);
++  virtual ArgToken make_fetch(BasicType type, klassOop tk, Bytecodes::Code op, const ArgToken& base, const ArgToken& offset, TRAPS);
+   virtual ArgToken make_invoke(methodOop m, vmIntrinsics::ID iid, Bytecodes::Code op, bool tailcall, int argc, ArgToken* argv, TRAPS);
+ 
+-  int find_oop_constant(oop con);
+-  int find_prim_constant(BasicType type, jvalue* con);
++  // Get a real constant pool.
++  constantPoolHandle get_constant_pool(TRAPS) const;
++
++  // Get a real methodOop.
++  methodHandle get_method_oop(TRAPS) const;
+ 
+ public:
+-  MethodHandleCompiler(Handle root, TRAPS)
+-    : MethodHandleWalker(root, THREAD),
+-      _thread(THREAD),
+-      _bytes(50),
+-      _constant_oops(THREAD, 10),
+-      _constant_prims(THREAD, 10),
+-      _max_stack(0), _max_locals(0),
+-      _name_index(0), _signature_index(0)
+-  { }
+-  const char* bytes()         { return _bytes.as_string(); }
+-  int constant_length()       { return _constant_oops.length(); }
+-  int max_stack()             { return _max_stack; }
+-  int max_locals()            { return _max_locals; }
+-  int name_index()            { return _name_index; }
+-  int signature_index()       { return _signature_index; }
+-  symbolHandle name()         { return symbolHandle(_thread, (symbolOop)constant_oop_at(_name_index)()); }
+-  symbolHandle signature()    { return symbolHandle(_thread, (symbolOop)constant_oop_at(_signature_index)()); }
+-
+-  bool constant_is_oop_at(int i) {
+-    return (_constant_prims.at(i) == NULL);
+-  }
+-  Handle constant_oop_at(int i) {
+-    assert(constant_is_oop_at(i), "");
+-    return _constant_oops.at(i);
+-  }
+-  PrimCon* constant_prim_at(int i) {
+-    assert(!constant_is_oop_at(i), "");
+-    return _constant_prims.at(i);
+-  }
++  MethodHandleCompiler(Handle root, methodHandle call_method, bool for_invokedynamic, TRAPS);
+ 
+   // Compile the given MH chain into bytecode.
+-  void compile(TRAPS);
++  methodHandle compile(TRAPS);
+ };
+diff --git a/src/share/vm/prims/methodHandles.cpp b/src/share/vm/prims/methodHandles.cpp
+--- a/src/share/vm/prims/methodHandles.cpp
++++ b/src/share/vm/prims/methodHandles.cpp
+@@ -132,8 +132,9 @@
+     }
+     return m;
+   } else {
++    assert(vmtarget->is_klass(), "must be class or interface");
+     decode_flags_result |= MethodHandles::_dmf_does_dispatch;
+-    assert(vmtarget->is_klass(), "must be class or interface");
++    decode_flags_result |= MethodHandles::_dmf_has_receiver;
+     receiver_limit_result = (klassOop)vmtarget;
+     Klass* tk = Klass::cast((klassOop)vmtarget);
+     if (tk->is_interface()) {
+@@ -179,8 +180,10 @@
+         // short-circuits directly to the methodOop.
+         // (It might be another argument besides a receiver also.)
+         assert(target->is_method(), "must be a simple method");
++        decode_flags_result |= MethodHandles::_dmf_binds_method;
+         methodOop m = (methodOop) target;
+-        decode_flags_result |= MethodHandles::_dmf_binds_method;
++        if (!m->is_static())
++          decode_flags_result |= MethodHandles::_dmf_has_receiver;
+         return m;
+       }
+     }
+@@ -233,8 +236,8 @@
+     BasicType recv_bt = char2type(sig->byte_at(1));
+     // Note: recv_bt might be T_ILLEGAL if byte_at(2) is ')'
+     assert(sig->byte_at(0) == '(', "must be method sig");
+-    if (recv_bt == T_OBJECT || recv_bt == T_ARRAY)
+-      decode_flags_result |= _dmf_has_receiver;
++//     if (recv_bt == T_OBJECT || recv_bt == T_ARRAY)
++//       decode_flags_result |= _dmf_has_receiver;
+   } else {
+     // non-static method
+     decode_flags_result |= _dmf_has_receiver;
+@@ -818,7 +821,7 @@
+   for (int i = 0; ; i++) {
+     const char* test_name = always_null_names[i];
+     if (test_name == NULL)  break;
+-    if (name->equals(test_name, (int) strlen(test_name)))
++    if (name->equals(test_name))
+       return true;
+   }
+   return false;
+@@ -1487,8 +1490,9 @@
+       int target_pushes = decode_MethodHandle_stack_pushes(target());
+       assert(this_pushes == slots_pushed + target_pushes, "BMH stack motion must be correct");
+       // do not blow the stack; use a Java-based adapter if this limit is exceeded
+-      if (slots_pushed + target_pushes > MethodHandlePushLimit)
+-        err = "too many bound parameters";
++      // FIXME
++      // if (slots_pushed + target_pushes > MethodHandlePushLimit)
++      //   err = "too many bound parameters";
+     }
+   }
+ 
+@@ -1518,6 +1522,11 @@
+     verify_vmslots(mh, CHECK);
+   }
+ 
++  // Get bound type and required slots.
++  oop ptype_oop = java_dyn_MethodType::ptype(java_dyn_MethodHandle::type(target()), argnum);
++  BasicType ptype = java_lang_Class::as_BasicType(ptype_oop);
++  int slots_pushed = type2size[ptype];
++
+   // If (a) the target is a direct non-dispatched method handle,
+   // or (b) the target is a dispatched direct method handle and we
+   // are binding the receiver, cut out the middle-man.
+@@ -1529,7 +1538,7 @@
+     int decode_flags = 0; klassOop receiver_limit_oop = NULL;
+     methodHandle m(THREAD, decode_method(target(), receiver_limit_oop, decode_flags));
+     if (m.is_null()) { THROW_MSG(vmSymbols::java_lang_InternalError(), "DMH failed to decode"); }
+-    DEBUG_ONLY(int m_vmslots = m->size_of_parameters() - 1); // pos. of 1st arg.
++    DEBUG_ONLY(int m_vmslots = m->size_of_parameters() - slots_pushed); // pos. of 1st arg.
+     assert(sun_dyn_BoundMethodHandle::vmslots(mh()) == m_vmslots, "type w/ m sig");
+     if (argnum == 0 && (decode_flags & _dmf_has_receiver) != 0) {
+       KlassHandle receiver_limit(THREAD, receiver_limit_oop);
+@@ -1554,10 +1563,6 @@
+   }
+ 
+   // Next question:  Is this a ref, int, or long bound value?
+-  oop ptype_oop = java_dyn_MethodType::ptype(java_dyn_MethodHandle::type(target()), argnum);
+-  BasicType ptype = java_lang_Class::as_BasicType(ptype_oop);
+-  int slots_pushed = type2size[ptype];
+-
+   MethodHandleEntry* me = NULL;
+   if (ptype == T_OBJECT) {
+     if (direct_to_method)  me = MethodHandles::entry(_bound_ref_direct_mh);
+diff --git a/src/share/vm/runtime/frame.cpp b/src/share/vm/runtime/frame.cpp
+--- a/src/share/vm/runtime/frame.cpp
++++ b/src/share/vm/runtime/frame.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -769,9 +769,9 @@
+ 
+ class InterpretedArgumentOopFinder: public SignatureInfo {
+  private:
+-  OopClosure* _f;      // Closure to invoke
+-  int    _offset;      // TOS-relative offset, decremented with each argument
+-  bool   _is_static;   // true if the callee is a static method
++  OopClosure* _f;        // Closure to invoke
++  int    _offset;        // TOS-relative offset, decremented with each argument
++  bool   _has_receiver;  // true if the callee has a receiver
+   frame* _fr;
+ 
+   void set(int size, BasicType type) {
+@@ -786,9 +786,9 @@
+   }
+ 
+  public:
+-  InterpretedArgumentOopFinder(symbolHandle signature, bool is_static, frame* fr, OopClosure* f) : SignatureInfo(signature) {
++  InterpretedArgumentOopFinder(symbolHandle signature, bool has_receiver, frame* fr, OopClosure* f) : SignatureInfo(signature), _has_receiver(has_receiver) {
+     // compute size of arguments
+-    int args_size = ArgumentSizeComputer(signature).size() + (is_static ? 0 : 1);
++    int args_size = ArgumentSizeComputer(signature).size() + (has_receiver ? 1 : 0);
+     assert(!fr->is_interpreted_frame() ||
+            args_size <= fr->interpreter_frame_expression_stack_size(),
+             "args cannot be on stack anymore");
+@@ -796,11 +796,10 @@
+     _f         = f;
+     _fr        = fr;
+     _offset    = args_size;
+-    _is_static = is_static;
+   }
+ 
+   void oops_do() {
+-    if (!_is_static) {
++    if (_has_receiver) {
+       --_offset;
+       oop_offset_do();
+     }
+@@ -912,7 +911,7 @@
+   int max_locals = m->is_native() ? m->size_of_parameters() : m->max_locals();
+ 
+   symbolHandle signature;
+-  bool is_static = false;
++  bool has_receiver = false;
+ 
+   // Process a callee's arguments if we are at a call site
+   // (i.e., if we are at an invoke bytecode)
+@@ -922,7 +921,7 @@
+     Bytecode_invoke *call = Bytecode_invoke_at_check(m, bci);
+     if (call != NULL) {
+       signature = symbolHandle(thread, call->signature());
+-      is_static = call->is_invokestatic();
++      has_receiver = call->has_receiver();
+       if (map->include_argument_oops() &&
+           interpreter_frame_expression_stack_size() > 0) {
+         ResourceMark rm(thread);  // is this right ???
+@@ -936,7 +935,7 @@
+         //       code in the interpreter calls a blocking runtime
+         //       routine which can cause this code to be executed).
+         //       (was bug gri 7/27/98)
+-        oops_interpreted_arguments_do(signature, is_static, f);
++        oops_interpreted_arguments_do(signature, has_receiver, f);
+       }
+     }
+   }
+@@ -950,7 +949,7 @@
+     mask = &oopmap_mask;
+ #endif // ASSERT
+     oops_interpreted_locals_do(f, max_locals, mask);
+-    oops_interpreted_expressions_do(f, signature, is_static,
++    oops_interpreted_expressions_do(f, signature, has_receiver,
+                                     m->max_stack(),
+                                     max_locals, mask);
+   } else {
+@@ -992,7 +991,7 @@
+ 
+ void frame::oops_interpreted_expressions_do(OopClosure *f,
+                                       symbolHandle signature,
+-                                      bool is_static,
++                                      bool has_receiver,
+                                       int max_stack,
+                                       int max_locals,
+                                       InterpreterOopMap *mask) {
+@@ -1005,7 +1004,7 @@
+   // arguments in callee's locals.
+   int args_size = 0;
+   if (!signature.is_null()) {
+-    args_size = ArgumentSizeComputer(signature).size() + (is_static ? 0 : 1);
++    args_size = ArgumentSizeComputer(signature).size() + (has_receiver ? 1 : 0);
+   }
+ 
+   intptr_t *tos_addr = interpreter_frame_tos_at(args_size);
+@@ -1038,8 +1037,8 @@
+   }
+ }
+ 
+-void frame::oops_interpreted_arguments_do(symbolHandle signature, bool is_static, OopClosure* f) {
+-  InterpretedArgumentOopFinder finder(signature, is_static, this, f);
++void frame::oops_interpreted_arguments_do(symbolHandle signature, bool has_receiver, OopClosure* f) {
++  InterpretedArgumentOopFinder finder(signature, has_receiver, this, f);
+   finder.oops_do();
+ }
+ 
+@@ -1066,8 +1065,8 @@
+ class CompiledArgumentOopFinder: public SignatureInfo {
+  protected:
+   OopClosure*     _f;
+-  int             _offset;      // the current offset, incremented with each argument
+-  bool            _is_static;   // true if the callee is a static method
++  int             _offset;        // the current offset, incremented with each argument
++  bool            _has_receiver;  // true if the callee has a receiver
+   frame           _fr;
+   RegisterMap*    _reg_map;
+   int             _arg_size;
+@@ -1087,24 +1086,24 @@
+   }
+ 
+  public:
+-  CompiledArgumentOopFinder(symbolHandle signature, bool is_static, OopClosure* f, frame fr,  const RegisterMap* reg_map)
++  CompiledArgumentOopFinder(symbolHandle signature, bool has_receiver, OopClosure* f, frame fr,  const RegisterMap* reg_map)
+     : SignatureInfo(signature) {
+ 
+     // initialize CompiledArgumentOopFinder
+     _f         = f;
+     _offset    = 0;
+-    _is_static = is_static;
++    _has_receiver = has_receiver;
+     _fr        = fr;
+     _reg_map   = (RegisterMap*)reg_map;
+-    _arg_size  = ArgumentSizeComputer(signature).size() + (is_static ? 0 : 1);
++    _arg_size  = ArgumentSizeComputer(signature).size() + (has_receiver ? 1 : 0);
+ 
+     int arg_size;
+-    _regs = SharedRuntime::find_callee_arguments(signature(), is_static, &arg_size);
++    _regs = SharedRuntime::find_callee_arguments(signature(), has_receiver, &arg_size);
+     assert(arg_size == _arg_size, "wrong arg size");
+   }
+ 
+   void oops_do() {
+-    if (!_is_static) {
++    if (_has_receiver) {
+       handle_oop_offset();
+       _offset++;
+     }
+@@ -1112,9 +1111,9 @@
+   }
+ };
+ 
+-void frame::oops_compiled_arguments_do(symbolHandle signature, bool is_static, const RegisterMap* reg_map, OopClosure* f) {
++void frame::oops_compiled_arguments_do(symbolHandle signature, bool has_receiver, const RegisterMap* reg_map, OopClosure* f) {
+   ResourceMark rm;
+-  CompiledArgumentOopFinder finder(signature, is_static, f, *this, reg_map);
++  CompiledArgumentOopFinder finder(signature, has_receiver, f, *this, reg_map);
+   finder.oops_do();
+ }
+ 
+diff --git a/src/share/vm/runtime/frame.hpp b/src/share/vm/runtime/frame.hpp
+--- a/src/share/vm/runtime/frame.hpp
++++ b/src/share/vm/runtime/frame.hpp
+@@ -371,7 +371,7 @@
+   oop* oopmapreg_to_location(VMReg reg, const RegisterMap* regmap) const;
+ 
+   // Oops-do's
+-  void oops_compiled_arguments_do(symbolHandle signature, bool is_static, const RegisterMap* reg_map, OopClosure* f);
++  void oops_compiled_arguments_do(symbolHandle signature, bool has_receiver, const RegisterMap* reg_map, OopClosure* f);
+   void oops_interpreted_do(OopClosure* f, const RegisterMap* map, bool query_oop_map_cache = true);
+ 
+  private:
+@@ -379,9 +379,9 @@
+                                  int max_locals,
+                                  InterpreterOopMap *mask);
+   void oops_interpreted_expressions_do(OopClosure *f, symbolHandle signature,
+-                                 bool is_static, int max_stack, int max_locals,
++                                 bool has_receiver, int max_stack, int max_locals,
+                                  InterpreterOopMap *mask);
+-  void oops_interpreted_arguments_do(symbolHandle signature, bool is_static, OopClosure* f);
++  void oops_interpreted_arguments_do(symbolHandle signature, bool has_receiver, OopClosure* f);
+ 
+   // Iteration of oops
+   void oops_do_internal(OopClosure* f, CodeBlobClosure* cf, RegisterMap* map, bool use_interpreter_oop_map_cache);
+diff --git a/src/share/vm/runtime/sharedRuntime.cpp b/src/share/vm/runtime/sharedRuntime.cpp
+--- a/src/share/vm/runtime/sharedRuntime.cpp
++++ b/src/share/vm/runtime/sharedRuntime.cpp
+@@ -2145,7 +2145,7 @@
+   return regs.first();
+ }
+ 
+-VMRegPair *SharedRuntime::find_callee_arguments(symbolOop sig, bool is_static, int* arg_size) {
++VMRegPair *SharedRuntime::find_callee_arguments(symbolOop sig, bool has_receiver, int* arg_size) {
+   // This method is returning a data structure allocating as a
+   // ResourceObject, so do not put any ResourceMarks in here.
+   char *s = sig->as_C_string();
+@@ -2157,7 +2157,7 @@
+   BasicType *sig_bt = NEW_RESOURCE_ARRAY( BasicType, 256 );
+   VMRegPair *regs = NEW_RESOURCE_ARRAY( VMRegPair, 256 );
+   int cnt = 0;
+-  if (!is_static) {
++  if (has_receiver) {
+     sig_bt[cnt++] = T_OBJECT; // Receiver is argument 0; not in signature
+   }
+ 
+diff --git a/src/share/vm/runtime/sharedRuntime.hpp b/src/share/vm/runtime/sharedRuntime.hpp
+--- a/src/share/vm/runtime/sharedRuntime.hpp
++++ b/src/share/vm/runtime/sharedRuntime.hpp
+@@ -357,7 +357,7 @@
+ 
+   // Convert a sig into a calling convention register layout
+   // and find interesting things about it.
+-  static VMRegPair* find_callee_arguments(symbolOop sig, bool is_static, int *arg_size);
++  static VMRegPair* find_callee_arguments(symbolOop sig, bool has_receiver, int *arg_size);
+   static VMReg     name_for_receiver();
+ 
+   // "Top of Stack" slots that may be unused by the calling convention but must
+diff --git a/src/share/vm/utilities/constantTag.hpp b/src/share/vm/utilities/constantTag.hpp
+--- a/src/share/vm/utilities/constantTag.hpp
++++ b/src/share/vm/utilities/constantTag.hpp
+@@ -36,7 +36,8 @@
+   JVM_CONSTANT_UnresolvedString         = 102,  // Temporary tag until actual use
+   JVM_CONSTANT_StringIndex              = 103,  // Temporary tag while constructing constant pool
+   JVM_CONSTANT_UnresolvedClassInError   = 104,  // Error tag due to resolution error
+-  JVM_CONSTANT_InternalMax              = 104   // Last implementation tag
++  JVM_CONSTANT_Object                   = 105,  // Required for BoundMethodHandle arguments.
++  JVM_CONSTANT_InternalMax              = 105   // Last implementation tag
+ };
+ 
+ 
+@@ -70,6 +71,8 @@
+   bool is_unresolved_string() const { return _tag == JVM_CONSTANT_UnresolvedString; }
+   bool is_string_index() const      { return _tag == JVM_CONSTANT_StringIndex; }
+ 
++  bool is_object() const            { return _tag == JVM_CONSTANT_Object; }
++
+   bool is_klass_reference() const   { return is_klass_index() || is_unresolved_klass(); }
+   bool is_klass_or_reference() const{ return is_klass() || is_klass_reference(); }
+   bool is_field_or_method() const   { return is_field() || is_method() || is_interface_method(); }

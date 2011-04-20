@@ -1,0 +1,1225 @@
+Make asm compatible with the bytecodes defined by this JVM change:
+  http://hg.openjdk.java.net/jdk7/jdk7/hotspot/rev/136b78722a08
+  http://hg.openjdk.java.net/mlvm/mlvm/hotspot/file/tip/meth-ldc-6939203.patch
+
+Change comment:
+  6939203: JSR 292 needs method handle constants
+  Summary: Add new CP types CONSTANT_MethodHandle, CONSTANT_MethodType; extend 'ldc' bytecode.
+
+Apply this patch before asm-jsr292-bsm.patch.
+
+diff --git a/src/org/objectweb/asm/ClassReader.java b/src/org/objectweb/asm/ClassReader.java
+--- a/src/org/objectweb/asm/ClassReader.java
++++ b/src/org/objectweb/asm/ClassReader.java
+@@ -31,6 +31,7 @@
+ 
+ import java.io.InputStream;
+ import java.io.IOException;
++import java.util.Arrays;
+ 
+ /**
+  * A Java class parser to make a {@link ClassVisitor} visit an existing class.
+@@ -191,7 +192,11 @@
+                         max = size;
+                     }
+                     break;
++                case ClassWriter.MHANDLE:
++                    size = 4;
++                    break;
+                 // case ClassWriter.CLASS:
++                // case ClassWriter.MTYPE:
+                 // case ClassWriter.STR:
+                 default:
+                     size = 3;
+@@ -283,6 +288,10 @@
+             Item item = new Item(i);
+             int nameType;
+             switch (tag) {
++                case ClassWriter.MHANDLE:
++                    tag = Member.methodHandleTag(readByte(index));
++                    index = items[readUnsignedShort(index + 1)];
++                    // fall through:
+                 case ClassWriter.FIELD:
+                 case ClassWriter.METH:
+                 case ClassWriter.IMETH:
+@@ -292,7 +301,6 @@
+                             readUTF8(nameType, buf),
+                             readUTF8(nameType + 2, buf));
+                     break;
+-
+                 case ClassWriter.INT:
+                     item.set(readInt(index));
+                     break;
+@@ -332,6 +340,7 @@
+ 
+                 // case ClassWriter.STR:
+                 // case ClassWriter.CLASS:
++                // case ClassWriter.MTYPE:
+                 default:
+                     item.set(tag, readUTF8(index, buf), null, null);
+                     break;
+@@ -1496,6 +1505,40 @@
+     }
+ 
+     /**
++     * Makes the given visitor visit the Java constant pool of this {@link ClassReader}.
++     *
++     * @param poolVisitor the visitor that must visit this class.
++     */
++    public void acceptPoolVisitor(final ConstantPoolVisitor poolVisitor) {
++        acceptPoolVisitor(poolVisitor, -1);
++    }
++
++    /**
++     * Makes the given visitor visit the Java constant pool of this {@link ClassReader}.
++     *
++     * @param poolVisitor the visitor that must visit this class.
++     * @param tagFilter bit-encoded set of constant types to visit (-1 means all, 0 means none, 2 means UTF8 only, etc.)
++     */
++    public void acceptPoolVisitor(final ConstantPoolVisitor poolVisitor, final int tagFilter) {
++        char[] buf = new char[maxStringLength];
++        int len = getItemLength();
++        poolVisitor.visitPool(len);
++        if (tagFilter != 0) {
++            for (int i = 0; i < len; i++) {
++                int pos = getItem(i);
++                if (pos == 0)  continue;
++                int tag = b[pos-1];
++                int bitpos = tag;
++                if (bitpos > 31)  bitpos = 31;  // sign bit
++                if (((tagFilter >> bitpos) & 1) == 0)  continue;
++                Object value = readConst(i, buf);
++                poolVisitor.visitPoolConstant(i, tag, value);
++            }
++        }
++        poolVisitor.visitPoolEnd();
++    }
++
++    /**
+      * Reads parameter annotations and makes the given visitor visit them.
+      * 
+      * @param v start offset in {@link #b b} of the annotations to be read.
+@@ -1864,6 +1907,16 @@
+         return items[item];
+     }
+ 
++    /** Limit to the parameter of {@link #getItem}. */
++    public int getItemLength() {
++        return items.length;
++    }
++
++    /** How long should buffers be? */
++    public int getBufLength() {
++        return maxStringLength;
++    }
++
+     /**
+      * Reads a byte value in {@link #b b}. <i>This method is intended for
+      * {@link Attribute} sub classes, and is normally not needed by class
+@@ -1943,11 +1996,15 @@
+      */
+     public String readUTF8(int index, final char[] buf) {
+         int item = readUnsignedShort(index);
++        return getUTF8(item, buf);
++    }
++
++    private String getUTF8(int item, final char[] buf) {
+         String s = strings[item];
+         if (s != null) {
+             return s;
+         }
+-        index = items[item];
++        int index = items[item];
+         return strings[item] = readUTF(index + 2, readUnsignedShort(index), buf);
+     }
+ 
+@@ -2029,7 +2086,9 @@
+      */
+     public Object readConst(final int item, final char[] buf) {
+         int index = items[item];
+-        switch (b[index - 1]) {
++        if (index == 0)  return null;
++        int tag = b[index - 1];
++        switch (tag) {
+             case ClassWriter.INT:
+                 return new Integer(readInt(index));
+             case ClassWriter.FLOAT:
+@@ -2040,9 +2099,41 @@
+                 return new Double(Double.longBitsToDouble(readLong(index)));
+             case ClassWriter.CLASS:
+                 return Type.getObjectType(readUTF8(index, buf));
+-                // case ClassWriter.STR:
++            case ClassWriter.MTYPE:
++                return Type.getType(readUTF8(index, buf));
++            case ClassWriter.STR:
++                return readUTF8(index, buf);
++            case ClassWriter.UTF8:
++                return getUTF8(item, buf);
++            case ClassWriter.FIELD:
++            case ClassWriter.METH:
++                return getMemberConst(tag, index, buf);
++            case ClassWriter.IMETH:
++                return getMemberConst(ClassWriter.METH, index, buf);
++            case ClassWriter.NAME_TYPE:
++                return new Member(null,
++                                  readUTF8(index + 0, buf),
++                                  readUTF8(index + 2, buf));
++            case ClassWriter.MHANDLE:
++                return getMethodHandle(index, buf);
+             default:
+-                return readUTF8(index, buf);
++                return "<Unknown Item>";
+         }
+     }
++
++    private Object getMethodHandle(int index, char[] buf) {
++        return getMemberConst(Member.methodHandleTag(readByte(index)),
++                              items[readUnsignedShort(index + 1)],
++                              buf);
++    }
++
++    private Object getMemberConst(int tag, int index, char[] buf) {
++        String owner = readClass(index + 0, buf);
++        int nameTypeIndex = items[readUnsignedShort(index + 2)];
++        return new Member(owner,
++                          readUTF8(nameTypeIndex + 0, buf),
++                          readUTF8(nameTypeIndex + 2, buf),
++                          tag);
++
++    }
+ }
+diff --git a/src/org/objectweb/asm/ClassWriter.java b/src/org/objectweb/asm/ClassWriter.java
+--- a/src/org/objectweb/asm/ClassWriter.java
++++ b/src/org/objectweb/asm/ClassWriter.java
+@@ -164,64 +164,74 @@
+     /**
+      * The type of CONSTANT_Class constant pool items.
+      */
+-    static final int CLASS = 7;
++    static final int CLASS = Opcodes.CONSTANT_Class;
+ 
+     /**
+      * The type of CONSTANT_Fieldref constant pool items.
+      */
+-    static final int FIELD = 9;
++    static final int FIELD = Opcodes.CONSTANT_Fieldref;
+ 
+     /**
+      * The type of CONSTANT_Methodref constant pool items.
+      */
+-    static final int METH = 10;
++    static final int METH = Opcodes.CONSTANT_Methodref;
+ 
+     /**
+      * The type of CONSTANT_InterfaceMethodref constant pool items.
+      */
+-    static final int IMETH = 11;
++    static final int IMETH = Opcodes.CONSTANT_InterfaceMethodref;
+ 
+     /**
+      * The type of CONSTANT_String constant pool items.
+      */
+-    static final int STR = 8;
++    static final int STR = Opcodes.CONSTANT_String;
+ 
+     /**
+      * The type of CONSTANT_Integer constant pool items.
+      */
+-    static final int INT = 3;
++    static final int INT = Opcodes.CONSTANT_Integer;
+ 
+     /**
+      * The type of CONSTANT_Float constant pool items.
+      */
+-    static final int FLOAT = 4;
++    static final int FLOAT = Opcodes.CONSTANT_Float;
+ 
+     /**
+      * The type of CONSTANT_Long constant pool items.
+      */
+-    static final int LONG = 5;
++    static final int LONG = Opcodes.CONSTANT_Long;
+ 
+     /**
+      * The type of CONSTANT_Double constant pool items.
+      */
+-    static final int DOUBLE = 6;
++    static final int DOUBLE = Opcodes.CONSTANT_Double;
+ 
+     /**
+      * The type of CONSTANT_NameAndType constant pool items.
+      */
+-    static final int NAME_TYPE = 12;
++    static final int NAME_TYPE = Opcodes.CONSTANT_NameAndType;
+ 
+     /**
+      * The type of CONSTANT_Utf8 constant pool items.
+      */
+-    static final int UTF8 = 1;
++    static final int UTF8 = Opcodes.CONSTANT_Utf8;
+ 
+     /**
++     * The type of CONSTANT_MethodHandle constant pool items.
++     */
++    static final int MHANDLE = Opcodes.CONSTANT_MethodHandle;
++
++    /**
++     * The type of CONSTANT_MethodType constant pool items.
++     */
++    static final int MTYPE = Opcodes.CONSTANT_MethodType;
++ 
++    /**
+      * Normal type Item stored in the ClassWriter {@link ClassWriter#typeTable},
+      * instead of the constant pool, in order to avoid clashes with normal
+      * constant pool items in the ClassWriter constant pool's hash table.
+      */
+-    static final int TYPE_NORMAL = 13;
++    static final int TYPE_NORMAL = 23;
+ 
+     /**
+      * Uninitialized type Item stored in the ClassWriter
+@@ -229,14 +239,14 @@
+      * avoid clashes with normal constant pool items in the ClassWriter constant
+      * pool's hash table.
+      */
+-    static final int TYPE_UNINIT = 14;
++    static final int TYPE_UNINIT = 24;
+ 
+     /**
+      * Merged type Item stored in the ClassWriter {@link ClassWriter#typeTable},
+      * instead of the constant pool, in order to avoid clashes with normal
+      * constant pool items in the ClassWriter constant pool's hash table.
+      */
+-    static final int TYPE_MERGED = 15;
++    static final int TYPE_MERGED = 25;
+ 
+     /**
+      * The class reader from which this class writer was constructed, if any.
+@@ -284,6 +294,11 @@
+     final Item key3;
+ 
+     /**
++     * A reusable key used to look for items in the {@link #items} hash table.
++     */
++    final Item key4;
++
++    /**
+      * A type table used to temporarily store internal names that will not
+      * necessarily be stored in the constant pool. This type table is used by
+      * the control flow and data flow analysis algorithm used to compute stack
+@@ -546,6 +561,7 @@
+         key = new Item();
+         key2 = new Item();
+         key3 = new Item();
++        key4 = new Item();
+         this.computeMaxs = (flags & COMPUTE_MAXS) != 0;
+         this.computeFrames = (flags & COMPUTE_FRAMES) != 0;
+     }
+@@ -903,7 +919,7 @@
+                     ? t.getInternalName()
+                     : t.getDescriptor());
+         } else {
+-            throw new IllegalArgumentException("value " + cst);
++            throw badArg(cst);
+         }
+     }
+ 
+@@ -977,6 +993,39 @@
+     }
+ 
+     /**
++     * Adds a method type reference to the constant pool of the class being build.
++     * Does nothing if the constant pool already contains a similar item.
++     * <i>This method is intended for {@link Attribute} sub classes, and is
++     * normally not needed by class generators or adapters.</i>
++     *
++     * @param value the internal name of the MethodType.
++     * @return a new or already existing MethodType reference item.
++     */
++    Item newMethodTypeItem(final String value) {
++        key2.set(MTYPE, value, null, null);
++        Item result = get(key2);
++        if (result == null) {
++            pool.put12(MTYPE, newUTF8(value));
++            result = new Item(index++, key2);
++            put(result);
++        }
++        return result;
++    }
++
++    /**
++     * Adds a method type reference to the constant pool of the class being build.
++     * Does nothing if the constant pool already contains a similar item.
++     * <i>This method is intended for {@link Attribute} sub classes, and is
++     * normally not needed by class generators or adapters.</i>
++     *
++     * @param value the internal name of the method type.
++     * @return the index of a new or already existing method type reference item.
++     */
++    public int newMethodType(final String value) {
++        return newMethodTypeItem(value).index;
++    }
++
++    /**
+      * Adds a field reference to the constant pool of the class being build.
+      * Does nothing if the constant pool already contains a similar item.
+      *
+@@ -1062,6 +1111,60 @@
+     }
+ 
+     /**
++     * Adds a member reference to the constant pool of the class being build.
++     * Does nothing if the constant pool already contains a similar item.
++     *
++     * @param owner the internal name of the member's owner class.
++     * @param name the member's name.
++     * @param desc the member's descriptor.
++     * @param refKind the type of reference
++     * @return a new or already existing method reference item.
++     */
++    Item newMethodHandleItem(
++        final String owner,
++        final String name,
++        final String desc,
++        final int refKind)
++    {
++        int type = Member.methodHandleTag(refKind);
++        key4.set(type, owner, name, desc);
++        Item result = get(key4);
++        if (result == null) {
++            int ref;
++            if (refKind <= Opcodes.REF_putStatic) {
++                ref = newField(owner, name, desc);
++            } else {
++                ref = newMethod(owner, name, desc, refKind == Opcodes.REF_invokeInterface);
++            }
++            put112(type, ref);
++            result = new Item(index++, key4);
++            put(result);
++        }
++        return result;
++    }
++
++    /**
++     * Adds a member reference to the constant pool of the class being build.
++     * Does nothing if the constant pool already contains a similar item.
++     * <i>This method is intended for {@link Attribute} sub classes, and is
++     * normally not needed by class generators or adapters.</i>
++     *
++     * @param owner the internal name of the member's owner class.
++     * @param name the member's name.
++     * @param desc the member's descriptor.
++     * @param refKind the type of reference
++     * @return the index of a new or already existing method handle reference item.
++     */
++    public int newMethodHandle(
++        final String owner,
++        final String name,
++        final String desc,
++        final int refKind)
++    {
++        return newMethodHandleItem(owner, name, desc, refKind).index;
++    }
++
++    /**
+      * Adds an integer to the constant pool of the class being build. Does
+      * nothing if the constant pool already contains a similar item.
+      *
+@@ -1356,6 +1459,10 @@
+         items[index] = i;
+     }
+ 
++    static private IllegalArgumentException badArg(Object value) {
++        return new IllegalArgumentException("value " + value);
++    }
++
+     /**
+      * Puts one byte and two shorts into the constant pool.
+      *
+@@ -1364,6 +1471,20 @@
+      * @param s2 another short.
+      */
+     private void put122(final int b, final int s1, final int s2) {
++        if (b != (b & 0xFF))  throw badArg(Integer.valueOf(b));
+         pool.put12(b, s1).putShort(s2);
+     }
++
++    /**
++     * Puts two bytes and two shorts into the constant pool.
++     *
++     * @param b1b2 two bytes, packed into an int as b1 + b2*256.
++     * @param s1 a short.
++     * @param s2 another short.
++     */
++    private void put112(final int b1b2, final int s1) {
++        if (b1b2 != (b1b2 & 0xFFFF) || (b1b2 & 0x00FF) == 0 || (b1b2 & 0xFF00) == 0)
++            throw badArg(Integer.valueOf(b1b2));
++        pool.putByte(b1b2 & 0xFF).put12(b1b2 >> 8, s1);
++    }
+ }
+diff --git a/src/org/objectweb/asm/ConstantPoolVisitor.java b/src/org/objectweb/asm/ConstantPoolVisitor.java
+new file mode 100644
+--- /dev/null
++++ b/src/org/objectweb/asm/ConstantPoolVisitor.java
+@@ -0,0 +1,63 @@
++/***
++ * ASM: a very small and fast Java bytecode manipulation framework
++ * Copyright (c) 2000-2007 INRIA, France Telecom
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. Neither the name of the copyright holders nor the names of its
++ *    contributors may be used to endorse or promote products derived from
++ *    this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
++ * THE POSSIBILITY OF SUCH DAMAGE.
++ */
++package org.objectweb.asm;
++
++/**
++ * A visitor to visit a Java class constant pool.
++ * The methods of this interface must be called
++ * in the following order: <tt>visitPool</tt>
++ * ( <tt>visitPoolConstant</tt> )* <tt>visitPoolEnd</tt>.
++ * 
++ * @author John R. Rose
++ */
++public interface ConstantPoolVisitor {
++
++    /**
++     * Visits the header of the constant pool.
++     * 
++     * @param length the number of items of the constant pool, including holes (at least one)
++     */
++    void visitPool(int length);
++
++    /**
++     * Visits a constant item
++     *
++     * @param item the number of the item being visited
++     * @param tag the tag of this constant pool item, e.g., {@link Opcodes#CONSTANT_Class}.
++     * @param value the constant value, in the form of an Integer, String, Type, Member, etc.
++     */
++    void visitPoolConstant(int item, int tag, Object value);
++
++    /**
++     * Visits the end of the constant pool. This method, which is the last one to be
++     * called, is used to inform the visitor that all the constants have been visited.
++     */
++    void visitPoolEnd();
++}
+diff --git a/src/org/objectweb/asm/Item.java b/src/org/objectweb/asm/Item.java
+--- a/src/org/objectweb/asm/Item.java
++++ b/src/org/objectweb/asm/Item.java
+@@ -50,7 +50,8 @@
+      * {@link ClassWriter#DOUBLE}, {@link ClassWriter#UTF8},
+      * {@link ClassWriter#STR}, {@link ClassWriter#CLASS},
+      * {@link ClassWriter#NAME_TYPE}, {@link ClassWriter#FIELD},
+-     * {@link ClassWriter#METH}, {@link ClassWriter#IMETH}.
++     * {@link ClassWriter#METH}, {@link ClassWriter#IMETH},
++     * {@link ClassWriter#MTYPE}, or a result of {@link ClassWriter#methodHandleTag(int)}
+      * 
+      * Special Item types are used for Items that are stored in the ClassWriter
+      * {@link ClassWriter#typeTable}, instead of the constant pool, in order to
+@@ -199,6 +200,7 @@
+             case ClassWriter.UTF8:
+             case ClassWriter.STR:
+             case ClassWriter.CLASS:
++            case ClassWriter.MTYPE:
+             case ClassWriter.TYPE_NORMAL:
+                 hashCode = 0x7FFFFFFF & (type + strVal1.hashCode());
+                 return;
+@@ -209,6 +211,7 @@
+                 // ClassWriter.FIELD:
+                 // ClassWriter.METH:
+                 // ClassWriter.IMETH:
++                // ClassWriter.MHANDLE:
+             default:
+                 hashCode = 0x7FFFFFFF & (type + strVal1.hashCode()
+                         * strVal2.hashCode() * strVal3.hashCode());
+@@ -229,6 +232,7 @@
+             case ClassWriter.UTF8:
+             case ClassWriter.STR:
+             case ClassWriter.CLASS:
++            case ClassWriter.MTYPE:
+             case ClassWriter.TYPE_NORMAL:
+                 return i.strVal1.equals(strVal1);
+             case ClassWriter.TYPE_MERGED:
+@@ -245,6 +249,7 @@
+             // case ClassWriter.FIELD:
+             // case ClassWriter.METH:
+             // case ClassWriter.IMETH:
++            // case ClassWriter.MHANDLE:
+             default:    
+                 return i.strVal1.equals(strVal1) && i.strVal2.equals(strVal2)
+                         && i.strVal3.equals(strVal3);
+diff --git a/src/org/objectweb/asm/Member.java b/src/org/objectweb/asm/Member.java
+new file mode 100644
+--- /dev/null
++++ b/src/org/objectweb/asm/Member.java
+@@ -0,0 +1,303 @@
++/***
++ * ASM: a very small and fast Java bytecode manipulation framework
++ * Copyright (c) 2000-2007 INRIA, France Telecom
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. Neither the name of the copyright holders nor the names of its
++ *    contributors may be used to endorse or promote products derived from
++ *    this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
++ * THE POSSIBILITY OF SUCH DAMAGE.
++ */
++package org.objectweb.asm;
++
++import java.lang.reflect.Constructor;
++import java.lang.reflect.Method;
++
++/**
++ * A Java class member. This class can be used to make it easier to manipulate
++ * fields, methods, and method handles.
++ * 
++ * @author John R. Rose
++ */
++public class Member {
++
++    // ------------------------------------------------------------------------
++    // Fields
++    // ------------------------------------------------------------------------
++
++    /**
++     * The containing type.
++     */
++    private final Type owner;
++
++    /**
++     * The name of the member.
++     */
++    private final String name;
++
++    /**
++     * The type of the member (METHOD, OBJECT, etc.)
++     */
++    private final Type type;
++
++    /**
++     * A constant pool tag, one of FIELD, METH (not IMETH), NAME_TYPE, or (MHANDLE + refKind*256).
++     */
++    private final int tag;
++
++    /**
++     * Cached unique string encoding for this member.
++     */
++    private String encoding;
++
++    // ------------------------------------------------------------------------
++    // Constructors
++    // ------------------------------------------------------------------------
++
++    /**
++     * Constructs a member description.
++     * @param owner the type in which this member occurs
++     * @param name  the name of the member
++     * @param type  the type of the member (method or field)
++     */
++    public Member(Type owner, String name, Type type) {
++        this(owner, name, type, 0);
++    }
++
++    /**
++     * Constructs a member description.
++     * @param owner the type in which this member occurs
++     * @param name  the name of the member
++     * @param type  the type of the member (method or field)
++     * @param tag  the optional constant pool tag
++     */
++    public Member(Type owner, String name, Type type, int tag) {
++        if (tag == 0) {
++            // default tag depends on type:
++            tag = (type.getSort() == Type.METHOD ? ClassWriter.METH : ClassWriter.FIELD);
++        }
++        this.owner = owner;
++        this.name = name;
++        this.type = type;
++        this.tag = tag;
++    }
++
++    public Member(String owner, String name, String type) {
++        this(owner, name, type, 0);
++    }
++
++    public Member(String owner, String name, String type, int tag) {
++        this(owner == null ? null : Type.getObjectType(owner),
++             name,
++             type == null ? null : Type.getType(type),
++             tag);
++    }
++
++    // ------------------------------------------------------------------------
++    // Accessors
++    // ------------------------------------------------------------------------
++
++    /**
++     * Returns the owner of this member, or null if there is none.
++     */
++    public Type getOwner() {
++        return owner;
++    }
++
++    /**
++     * Returns the name of this member, or null if there is none.
++     */
++    public String getName() {
++        return name;
++    }
++
++    /**
++     * Returns the type of this member, or null if there is none.
++     */
++    public Type getType() {
++        return type;
++    }
++
++    /**
++     * Returns the tag of this member.
++     */
++    public int getTag() {
++        return tag;
++    }
++
++    // ------------------------------------------------------------------------
++    // Equals, hashCode and toString
++    // ------------------------------------------------------------------------
++
++    /**
++     * Tests if the given object is equal to this member.
++     * 
++     * @param o the object to be compared to this member.
++     * @return <tt>true</tt> if the given object is equal to this member.
++     */
++    public boolean equals(final Object o) {
++        if (this == o) {
++            return true;
++        }
++        if (!(o instanceof Member)) {
++            return false;
++        }
++        Member that = (Member) o;
++        return eq(this.owner, that.owner) &&
++               eq(this.name, that.name) &&
++               eq(this.type, that.type) &&
++               this.tag == that.tag;
++    }
++
++    private static boolean eq(Object x, Object y) {
++        return (x == y) || (x != null && x.equals(y));
++    }
++
++    /**
++     * Returns a hash code value for this type.
++     * 
++     * @return a hash code value for this type.
++     */
++    public int hashCode() {
++        int hc = tag;
++        hc = hc*31 + (owner == null ? 0 : owner.hashCode());
++        hc = hc*31 + (name == null ? 0 : name.hashCode());
++        hc = hc*31 + (type == null ? 0 : type.hashCode());
++        return hc;
++    }
++
++    /**
++     * Returns a string representation of this member.
++     * The string will be of the form owner.name (descriptor) for a method
++     * or owner.name : descriptor for a field.
++     * If it is a method handle reference, the mode will be appended.
++     * 
++     * @return a string representation
++     */
++    public String toString() {
++        return encode(new StringBuffer(), true).toString();
++    }
++
++    /* @return a string representation which is unique to this member */
++    public String encoding() {
++        String s = encoding;
++        if (s == null) {
++            encoding = s = encode(new StringBuffer(), false).toString();
++        }
++        return s;
++    }
++
++    /**
++     * Write a string representation of this member to buf.
++     * If pretty it will be the toString representation.
++     * Otherwise, it will be a structured string that is
++     * unique to this member, of the form "MODE.OWNER.NAME.TYPE".
++     * The "MODE." prefix is present only for a method handle reference.
++     * The "OWNER." prefix is not present for a bare NameAndType & type.
++     * None of the strings contains the dot '.' character.
++     * Qualified names are qualified with '/' slash.
++     * The tag is not an explicit part of the encoding,
++     * but could be deduced if necessary.
++     */
++    StringBuffer encode(StringBuffer buf, boolean pretty) {
++        int mode = (tag >> 8);
++        if (mode != 0) {
++            if (!pretty)
++                buf.append(modeName(mode)).append('.');
++            else
++                buf.append("<").append(modeName(mode)).append("> ");
++        }
++        if (owner != null) {
++            owner.getInternalName(buf);
++            buf.append('.');
++        }
++        buf.append(name);
++        if (!pretty) {
++            buf.append(".");
++        } else if (type.getSort() == Type.METHOD) {
++            buf.append(" ");
++        } else {
++            buf.append(" : ");
++        }
++        type.getDescriptor(buf);
++        return buf;
++    }
++
++    /** Create a composite tag for a CONSTANT_MethodHandle item. */
++    static int methodHandleTag(int refKind) {
++        if (refKind >= Opcodes.REF_getField
++            && refKind <= Opcodes.REF_invokeInterface)
++            return Opcodes.CONSTANT_MethodHandle + (refKind << 8);
++        throw badArg(refKind);
++    }
++    /** Extract a subtype tag from a composite tag for a CONSTANT_MethodHandle item. */
++    static int methodHandleTagKind(int tag) {
++        if ((tag & 0xFF) == Opcodes.CONSTANT_MethodHandle
++                && ((tag-0x100) >>> 8) < Opcodes.REF_invokeInterface)
++            return (tag >> 8);
++        throw badArg(tag);
++    }
++
++    static private IllegalArgumentException badArg(int value) {
++        return new IllegalArgumentException("value " + value);
++    }
++
++    /** String value of a constant pool tag. */
++    public static String tagName(int tag) {
++        switch (tag) {
++            case 0: return "None";
++            case Opcodes.CONSTANT_Utf8:       return "Utf8";
++            case Opcodes.CONSTANT_Integer:    return "Integer";
++            case Opcodes.CONSTANT_Float:      return "Float";
++            case Opcodes.CONSTANT_Long:       return "Long";
++            case Opcodes.CONSTANT_Double:     return "Double";
++            case Opcodes.CONSTANT_Class:      return "Class";
++            case Opcodes.CONSTANT_String:     return "String";
++            case Opcodes.CONSTANT_Fieldref:   return "Fieldref";
++            case Opcodes.CONSTANT_Methodref:  return "Methodref";
++            case Opcodes.CONSTANT_InterfaceMethodref:  return "InterfaceMethodref";
++            case Opcodes.CONSTANT_NameAndType:   return "NameAndType";
++            case Opcodes.CONSTANT_MethodHandle:  return "MethodHandle";
++            case Opcodes.CONSTANT_MethodType:    return "MethodType";
++        }
++        if ((tag & 0xFF) == Opcodes.CONSTANT_MethodHandle) {
++            return "MethodHandle/"+modeName(methodHandleTagKind(tag));
++        }
++        return "BadTag#"+tag;
++    }
++    /** String value ofa MethodHandle submode. */
++    public static String modeName(int mode) {
++        switch (mode) {
++            case 0: return "NoMode";
++            case Opcodes.REF_getField: return "getField";
++            case Opcodes.REF_getStatic: return "getStatic";
++            case Opcodes.REF_putField: return "putField";
++            case Opcodes.REF_putStatic: return "putStatic";
++            case Opcodes.REF_invokeVirtual: return "invokeVirtual";
++            case Opcodes.REF_invokeStatic: return "invokeStatic";
++            case Opcodes.REF_invokeSpecial: return "invokeSpecial";
++            case Opcodes.REF_newInvokeSpecial: return "newInvokeSpecial";
++            case Opcodes.REF_invokeInterface: return "invokeInterface";
++        }
++        return "BadMode#"+mode;
++    }
++}
+diff --git a/src/org/objectweb/asm/Opcodes.java b/src/org/objectweb/asm/Opcodes.java
+--- a/src/org/objectweb/asm/Opcodes.java
++++ b/src/org/objectweb/asm/Opcodes.java
+@@ -89,6 +89,32 @@
+     int T_INT = 10;
+     int T_LONG = 11;
+ 
++    // constant pool tags
++    int CONSTANT_Utf8 = 1;
++    int CONSTANT_Integer = 3;
++    int CONSTANT_Float = 4;
++    int CONSTANT_Long = 5;
++    int CONSTANT_Double = 6;
++    int CONSTANT_Class = 7;
++    int CONSTANT_String = 8;
++    int CONSTANT_Fieldref = 9;
++    int CONSTANT_Methodref = 10;
++    int CONSTANT_InterfaceMethodref = 11;
++    int CONSTANT_NameAndType = 12;
++    int CONSTANT_MethodHandle = 15;  // JSR 292
++    int CONSTANT_MethodType = 16;  // JSR 292
++
++    // CONSTANT_MethodHandle constant pool items have a subtype tag
++    int REF_getField = 1;
++    int REF_getStatic = 2;
++    int REF_putField = 3;
++    int REF_putStatic = 4;
++    int REF_invokeVirtual = 5;
++    int REF_invokeStatic = 6;
++    int REF_invokeSpecial = 7;
++    int REF_newInvokeSpecial = 8;
++    int REF_invokeInterface = 9;
++
+     // stack map frame types
+ 
+     /**
+@@ -138,7 +164,7 @@
+     /** 
+      * Represents a owner of an invokedynamic call.
+      */
+-    String INVOKEDYNAMIC_OWNER = "java/lang/dyn/Dynamic";
++    String INVOKEDYNAMIC_OWNER = "java/dyn/InvokeDynamic";
+     
+     // opcodes // visit method (- = idem)
+ 
+diff --git a/src/org/objectweb/asm/Type.java b/src/org/objectweb/asm/Type.java
+--- a/src/org/objectweb/asm/Type.java
++++ b/src/org/objectweb/asm/Type.java
+@@ -97,6 +97,11 @@
+     public static final int OBJECT = 10;
+ 
+     /**
++     * The sort of method reference type. See {@link #getSort getSort}.
++     */
++    public static final int METHOD = 11;
++
++    /**
+      * The <tt>void</tt> type.
+      */
+     public static final Type VOID_TYPE = new Type(VOID, null, ('V' << 24)
+@@ -394,18 +399,21 @@
+                 return LONG_TYPE;
+             case 'D':
+                 return DOUBLE_TYPE;
++            case '(':
++                len = 1;
++                while (buf[off + len] != ')') {
++                    len += computeLen(buf, off + len);
++                }
++                len += 1;
++                len += computeLen(buf, off + len);
++                return new Type(METHOD, buf, off, len);
+             case '[':
+                 len = 1;
+                 while (buf[off + len] == '[') {
+                     ++len;
+                 }
+-                if (buf[off + len] == 'L') {
+-                    ++len;
+-                    while (buf[off + len] != ';') {
+-                        ++len;
+-                    }
+-                }
+-                return new Type(ARRAY, buf, off, len + 1);
++                len += computeLen(buf, off + len);
++                return new Type(ARRAY, buf, off, len);
+                 // case 'L':
+             default:
+                 len = 1;
+@@ -416,6 +424,17 @@
+         }
+     }
+ 
++    private static int computeLen(char[] buf, int off) {
++        if (buf[off] != 'L')  return 1;
++        int len = 1;  // skip 'L'
++        while (buf[off + len] != ';') {
++            ++len;
++        }
++        ++len;  // skip semi also
++        return len;
++    }
++
++
+     // ------------------------------------------------------------------------
+     // Accessors
+     // ------------------------------------------------------------------------
+@@ -499,10 +518,12 @@
+      * array type. The internal name of a class is its fully qualified name (as
+      * returned by Class.getName(), where '.' are replaced by '/'. This method
+      * should only be used for an object or array type.
+-     * 
++     *
+      * @return the internal name of the class corresponding to this object type.
+      */
+     public String getInternalName() {
++        if (buf == null)
++            return "<" + getDescriptorChar() + ">";
+         return new String(buf, off, len);
+     }
+ 
+@@ -516,6 +537,7 @@
+      * @return the descriptor corresponding to this Java type.
+      */
+     public String getDescriptor() {
++        if (sort == METHOD)  return getInternalName();
+         StringBuffer buf = new StringBuffer();
+         getDescriptor(buf);
+         return buf.toString();
+@@ -545,21 +567,45 @@
+     }
+ 
+     /**
++     * Appends the internal name of this Java type to the given
++     * string buffer.
++     * 
++     * For primitives, it is a single letter in angle brackets, such as '&lt;I&gt;'.
++     *
++     * @param buf the string buffer to which the descriptor must be appended.
++     */
++    public void getInternalName(final StringBuffer buf) {
++        if (this.buf == null)
++            buf.append('<').append(getDescriptorChar()).append('>');
++        else
++            buf.append(this.buf, off, len);
++    }
++
++    public char getDescriptorChar() {
++        if (buf == null)
++            return (char) ((off & 0xFF000000) >>> 24);
++        else if (sort == OBJECT)
++            return 'L';
++        else
++            return buf[0];
++    }
++
++    /**
+      * Appends the descriptor corresponding to this Java type to the given
+      * string buffer.
+      * 
+      * @param buf the string buffer to which the descriptor must be appended.
+      */
+-    private void getDescriptor(final StringBuffer buf) {
++    void getDescriptor(final StringBuffer buf) {
+         if (this.buf == null) {
+             // descriptor is in byte 3 of 'off' for primitive types (buf == null)
+-            buf.append((char) ((off & 0xFF000000) >>> 24));
+-        } else if (sort == ARRAY) {
+-            buf.append(this.buf, off, len);
+-        } else { // sort == OBJECT
++            buf.append(getDescriptorChar());
++        } else if (sort == OBJECT) {
+             buf.append('L');
+             buf.append(this.buf, off, len);
+             buf.append(';');
++        } else { // sort == ARRAY, METHOD
++            buf.append(this.buf, off, len);
+         }
+     }
+ 
+@@ -582,7 +628,7 @@
+ 
+     /**
+      * Returns the descriptor corresponding to the given Java type.
+-     * 
++     *
+      * @param c an object class, a primitive class or an array class.
+      * @return the descriptor corresponding to the given class.
+      */
+@@ -593,6 +639,23 @@
+     }
+ 
+     /**
++     * Returns the descriptor corresponding to the given Java method type.
++     * 
++     * @param c an array of types, with the return type first
++     * @return the descriptor corresponding to the given type.
++     */
++    public static String getDescriptor(final Class ret, final Class[] params) {
++        StringBuffer buf = new StringBuffer();
++        buf.append('(');
++        for (int i = 0; i < params.length; i++) {
++            getDescriptor(buf, params[i]);
++        }
++        buf.append(')');
++        getDescriptor(buf, ret);
++        return buf.toString();
++    }
++
++    /**
+      * Returns the descriptor corresponding to the given constructor.
+      * 
+      * @param c a {@link Constructor Constructor} object.
+@@ -733,7 +796,7 @@
+         if (sort != t.sort) {
+             return false;
+         }
+-        if (sort == OBJECT || sort == ARRAY) {
++        if (buf != null) {
+             if (len != t.len) {
+                 return false;
+             }
+@@ -753,7 +816,7 @@
+      */
+     public int hashCode() {
+         int hc = 13 * sort;
+-        if (sort == OBJECT || sort == ARRAY) {
++        if (buf != null) {
+             for (int i = off, end = i + len; i < end; i++) {
+                 hc = 17 * (hc + buf[i]);
+             }
+@@ -764,9 +827,9 @@
+     /**
+      * Returns a string representation of this type.
+      * 
+-     * @return the descriptor of this type.
++     * @return the internal name of this type.
+      */
+     public String toString() {
+-        return getDescriptor();
++        return getInternalName();
+     }
+ }
+diff --git a/src/org/objectweb/asm/util/TraceClassVisitor.java b/src/org/objectweb/asm/util/TraceClassVisitor.java
+--- a/src/org/objectweb/asm/util/TraceClassVisitor.java
++++ b/src/org/objectweb/asm/util/TraceClassVisitor.java
+@@ -36,9 +36,11 @@
+ import org.objectweb.asm.Attribute;
+ import org.objectweb.asm.ClassReader;
+ import org.objectweb.asm.ClassVisitor;
++import org.objectweb.asm.ConstantPoolVisitor;
+ import org.objectweb.asm.MethodVisitor;
+ import org.objectweb.asm.Opcodes;
+ import org.objectweb.asm.FieldVisitor;
++import org.objectweb.asm.Member;
+ import org.objectweb.asm.signature.SignatureReader;
+ 
+ /**
+@@ -92,7 +94,7 @@
+  * @author Eugene Kuleshov
+  */
+ public class TraceClassVisitor extends TraceAbstractVisitor implements
+-        ClassVisitor
++        ClassVisitor, ConstantPoolVisitor
+ {
+ 
+     /**
+@@ -145,7 +147,9 @@
+         } else {
+             cr = new ClassReader(args[i]);
+         }
+-        cr.accept(new TraceClassVisitor(new PrintWriter(System.out)),
++        TraceClassVisitor visitor = new TraceClassVisitor(new PrintWriter(System.out));
++        cr.acceptPoolVisitor(visitor);
++        cr.accept(visitor,
+                 getDefaultAttributes(),
+                 flags);
+     }
+@@ -468,6 +472,50 @@
+     }
+ 
+     // ------------------------------------------------------------------------
++    // Implementation of the ConstantPoolVisitor interface
++    // ------------------------------------------------------------------------
++
++    public void visitPool(int length) {
++        buf.setLength(0);
++        buf.append("CONSTANTS {  // length=").append(length).append('\n');
++        text.add(buf.toString());
++        if (cv instanceof ConstantPoolVisitor)
++            ((ConstantPoolVisitor)cv).visitPool(length);
++    }
++    
++    public void visitPoolConstant(int item, int tag, Object value) {
++        buf.setLength(0);
++        buf.append("  ").append(item).append(" ");
++        buf.append(Member.tagName(tag)).append(" : ");
++        boolean done = false;
++        if (value instanceof String) {
++            String s = (String) value;
++            for (int k = s.length() - 1; k >= 0; k--) {
++                char c = s.charAt(k);
++                if (!(Character.isJavaIdentifierPart(c)
++                        || "/".indexOf(c) >= 0)) {
++                    appendString(buf, (String) value);
++                    done = true;
++                    break;
++                }
++            }
++        }
++        if (!done)
++            buf.append(value);
++        buf.append('\n');
++        text.add(buf.toString());
++        if (cv instanceof ConstantPoolVisitor)
++            ((ConstantPoolVisitor)cv).visitPoolConstant(item, tag, value);
++    }
++
++    public void visitPoolEnd() {
++        text.add("} //CONSTANTS\n");
++        text.add("\n");
++        if (cv instanceof ConstantPoolVisitor)
++            ((ConstantPoolVisitor)cv).visitPoolEnd();
++    }
++
++    // ------------------------------------------------------------------------
+     // Utility methods
+     // ------------------------------------------------------------------------
+ 
+diff --git a/src/org/objectweb/asm/util/TraceMethodVisitor.java b/src/org/objectweb/asm/util/TraceMethodVisitor.java
+--- a/src/org/objectweb/asm/util/TraceMethodVisitor.java
++++ b/src/org/objectweb/asm/util/TraceMethodVisitor.java
+@@ -327,7 +327,11 @@
+         if (cst instanceof String) {
+             AbstractVisitor.appendString(buf, (String) cst);
+         } else if (cst instanceof Type) {
+-            buf.append(((Type) cst).getDescriptor()).append(".class");
++            Type t = (Type) cst;
++            if (t.getSort() == Type.OBJECT || t.getSort() == Type.ARRAY)
++                buf.append(t.getInternalName()).append(".class");
++            else
++                buf.append(t.getDescriptor());
+         } else {
+             buf.append(cst);
+         }

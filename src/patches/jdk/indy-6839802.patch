@@ -1,0 +1,324 @@
+6839802: java.dyn needs to be on the CORE_PKGS list
+Summary: fix makefile to expose the new APIs in the core list; edit some javadocs for correctness
+Reviewed-by: mr
+
+diff --git a/make/common/Release.gmk b/make/common/Release.gmk
+--- a/make/common/Release.gmk
++++ b/make/common/Release.gmk
+@@ -51,6 +51,9 @@
+                         com.sun.java.swing.plaf.windows  \
+                         com.sun.java.swing.plaf.motif    \
+                         com.sun.java.swing.plaf.gtk
++
++# This is a stopgap until 6839872 is fixed.
++EXCLUDE_PROPWARN_PKGS += sun.dyn
+ 
+ # 64-bit solaris has a few special cases. We define the variable
+ # SOLARIS64 for use in this Makefile to easily test those cases
+diff --git a/make/docs/CORE_PKGS.gmk b/make/docs/CORE_PKGS.gmk
+--- a/make/docs/CORE_PKGS.gmk
++++ b/make/docs/CORE_PKGS.gmk
+@@ -97,6 +97,7 @@
+   java.awt.print                                 \
+   java.beans                                     \
+   java.beans.beancontext                         \
++  java.dyn                                       \
+   java.io                                        \
+   java.lang                                      \
+   java.lang.annotation                           \
+diff --git a/src/share/classes/java/dyn/CallSite.java b/src/share/classes/java/dyn/CallSite.java
+--- a/src/share/classes/java/dyn/CallSite.java
++++ b/src/share/classes/java/dyn/CallSite.java
+@@ -28,18 +28,28 @@
+ import sun.dyn.util.BytecodeName;
+ 
+ /**
+- * An <code>invokedynamic</code> call site, as reified to the bootstrap method.
+- * Every instance of a call site corresponds to a distinct instance
+- * of the <code>invokedynamic</code> instruction.
+- * Call sites have state, one reference word, called the <code>target</code>,
+- * and typed as a {@link MethodHandle}.  When this state is null (as it is
+- * initially) the call site is in the unlinked state.  Otherwise, it is said
+- * to be linked to its target.
++ * An {@code invokedynamic} call site, as reified by the
++ * containing class's bootstrap method.
++ * Every call site object corresponds to a distinct instance
++ * of the <code>invokedynamic</code> instruction, and vice versa.
++ * Every call site has one state variable, called the {@code target}.
++ * It is typed as a {@link MethodHandle}.  This state is never null, and
++ * it is the responsibility of the bootstrap method to produce call sites
++ * which have been pre-linked to an initial target method.
+  * <p>
+- * When an unlinked call site is executed, a bootstrap routine is called
+- * to finish the execution of the call site, and optionally to link
+- * the call site.
++ * (Note:  The bootstrap method may elect to produce call sites of a
++ * language-specific subclass of {@code CallSite}.  In such a case,
++ * the subclass may claim responsibility for initializing its target to
++ * a non-null value, by overriding {@link #initialTarget}.)
+  * <p>
++ * An {@code invokedynamic} instruction which has not yet been executed
++ * is said to be <em>unlinked</em>.  When an unlinked call site is executed,
++ * the containing class's bootstrap method is called to manufacture a call site,
++ * for the instruction.  If the bootstrap method does not assign a non-null
++ * value to the new call site's target variable, the method {@link #initialTarget}
++ * is called to produce the new call site's first target method.
++ * <p>
++ * @see Linkage#registerBootstrapMethod(java.lang.Class, java.dyn.MethodHandle)
+  * @author John Rose, JSR 292 EG
+  */
+ public class CallSite {
+@@ -52,6 +62,15 @@
+     final String name;
+     final MethodType type;
+ 
++    /**
++     * Make a call site given the parameters from a call to the bootstrap method.
++     * The resulting call site is in an unlinked state, which means that before
++     * it is returned from a bootstrap method call it must be provided with
++     * a target method via a call to {@link CallSite#setTarget}.
++     * @param caller the class in which the relevant {@code invokedynamic} instruction occurs
++     * @param name the name specified by the {@code invokedynamic} instruction
++     * @param type the method handle type derived from descriptor of the {@code invokedynamic} instruction
++     */
+     public CallSite(Object caller, String name, MethodType type) {
+         this.caller = caller;
+         this.name = name;
+@@ -73,7 +92,9 @@
+      * <p>
+      * If the bootstrap method itself does not initialize the call site,
+      * this method must be overridden, because it just raises an
+-     * {@code InvokeDynamicBootstrapError}.
++     * {@code InvokeDynamicBootstrapError}, which in turn causes the
++     * linkage of the {@code invokedynamic} instruction to terminate
++     * abnormally.
+      */
+     protected MethodHandle initialTarget() {
+         throw new InvokeDynamicBootstrapError("target must be initialized before call site is linked: "+this);
+@@ -81,7 +102,7 @@
+ 
+     /**
+      * Report the current linkage state of the call site.  (This is mutable.)
+-     * The value is null if and only if the call site is currently unlinked.
++     * The value maybe null only if the call site is currently unlinked.
+      * When a linked call site is invoked, the target method is used directly.
+      * When an unlinked call site is invoked, its bootstrap method receives
+      * the call, as if via {@link Linkage#bootstrapInvokeDynamic}.
+@@ -113,8 +134,9 @@
+      * into the bootstrap method and/or the target methods used
+      * at any given call site.
+      * @param target the new target, or null if it is to be unlinked
+-     * @throws WrongMethodTypeException if the new target is not null
+-     *         and has a method type that differs from the call site's {@link #type}
++     * @throws NullPointerException if the proposed new target is null
++     * @throws WrongMethodTypeException if the proposed new target
++     *         has a method type that differs from the call site's {@link #type()}
+      */
+     public void setTarget(MethodHandle target) {
+         checkTarget(target);
+@@ -122,6 +144,7 @@
+     }
+ 
+     protected void checkTarget(MethodHandle target) {
++        target.type();  // provoke NPE
+         if (!canSetTarget(target))
+             throw new WrongMethodTypeException(String.valueOf(target));
+     }
+@@ -132,7 +155,7 @@
+ 
+     /**
+      * Report the class containing the call site.
+-     * This is immutable static context.
++     * This is an immutable property of the call site, set from the first argument to the constructor.
+      * @return class containing the call site
+      */
+     public Class<?> callerClass() {
+@@ -141,7 +164,7 @@
+ 
+     /**
+      * Report the method name specified in the {@code invokedynamic} instruction.
+-     * This is immutable static context.
++     * This is an immutable property of the call site, set from the second argument to the constructor.
+      * <p>
+      * Note that the name is a JVM bytecode name, and as such can be any
+      * non-empty string, as long as it does not contain certain "dangerous"
+@@ -187,7 +210,7 @@
+      * which are derived from its bytecode-level invocation descriptor.
+      * The types are packaged into a {@link MethodType}.
+      * Any linked target of this call site must be exactly this method type.
+-     * This is immutable static context.
++     * This is an immutable property of the call site, set from the third argument to the constructor.
+      * @return method type specified by the call site
+      */
+     public MethodType type() {
+diff --git a/src/share/classes/java/dyn/InvokeDynamic.java b/src/share/classes/java/dyn/InvokeDynamic.java
+--- a/src/share/classes/java/dyn/InvokeDynamic.java
++++ b/src/share/classes/java/dyn/InvokeDynamic.java
+@@ -26,10 +26,25 @@
+ package java.dyn;
+ 
+ /**
+- * Syntactic marker interface to request javac to emit an {@code invokedynamic} instruction.
++ * Syntactic marker to request javac to emit an {@code invokedynamic} instruction.
++ * An {@code invokedynamic} instruction is a 5-byte bytecoded instruction
++ * which begins with an opcode byte of value 186 ({@code 0xBA}),
++ * and is followed by a two-byte index of a {@code NameAndType} constant
++ * pool entry, then by two zero bytes.  The constant pool reference gives
++ * the method name and argument and return types of the call site; there
++ * is no other information provided at the call site.
+  * <p>
+- * This type has no particular meaning as a class or interface supertype, and can never be instantiated.
++ * The {@code invokedynamic} instruction is incomplete without a target method.
++ * The target method is a property of the reified call site object
++ * (of type {@link CallSite}) which is in a one-to-one association with each
++ * corresponding {@code invokedynamic} instruction.  The call site object
++ * is initially produced by a <em>bootstrap method</em> associated with
++ * the call site, via the various overloadings of {@link Linkage#registerBootstrapMethod}.
++ * <p>
++ * The type {@code InvokeDynamic} has no particular meaning as a
++ * class or interface supertype, or an object type; it can never be instantiated.
+  * Logically, it denotes a source of all dynamically typed methods.
++ * It may be viewed as a pure syntactic marker (an importable one) of static calls.
+  * @author John Rose, JSR 292 EG
+  */
+ public final class InvokeDynamic {
+diff --git a/src/share/classes/java/dyn/Linkage.java b/src/share/classes/java/dyn/Linkage.java
+--- a/src/share/classes/java/dyn/Linkage.java
++++ b/src/share/classes/java/dyn/Linkage.java
+@@ -37,16 +37,19 @@
+     private Linkage() {}  // do not instantiate
+ 
+     /**
+-     * Register a bootstrap method for use for a given caller class.
+-     * The method handle must be of a type equivalent to {@link Linkage#makeCallSite}.
++     * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
++     * Register a <em>bootstrap method</em> to use when linking a given caller class.
++     * It must be a method handle of a type equivalent to {@link CallSite#CallSite}.
++     * In other words, it must act as a factory method which accepts the arguments
++     * to {@code CallSite}'s constructor (a class, a string, and a method type),
++     * and returns a {@code CallSite} object (possibly of a subclass of {@code CallSite}).
+      * <p>
+-     * The operation will fail with an exception if any of the following conditions hold:
++     * The registration will fail with an {@code IllegalStateException} if any of the following conditions hold:
+      * <ul>
+      * <li>The caller of this method is in a different package than the {@code callerClass},
+      *     and there is a security manager, and its {@code checkPermission} call throws
+      *     when passed {@link LinkagePermission}("registerBootstrapMethod",callerClass).
+-     * <li>The given class already has a bootstrap method, either from an embedded
+-     *     {@code BootstrapInvokeDynamic} classfile attribute, or from a previous
++     * <li>The given class already has a bootstrap method from a previous
+      *     call to this method.
+      * <li>The given class is already fully initialized.
+      * <li>The given class is in the process of initialization, in another thread.
+@@ -75,9 +78,10 @@
+     }
+ 
+     /**
++     * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+      * Simplified version of registerBootstrapMethod for self-registration,
+      * to be called from a static initializer.
+-     * Finds a static method of type (CallSite, Object[]) -> Object in the
++     * Finds a static method of the required type in the
+      * given class, and installs it on the caller.
+      * @throws IllegalArgumentException if there is no such method
+      */
+@@ -92,9 +96,10 @@
+     }
+ 
+     /**
++     * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+      * Simplified version of registerBootstrapMethod for self-registration,
+      * to be called from a static initializer.
+-     * Finds a static method of type (CallSite, Object[]) -> Object in the
++     * Finds a static method of the required type in the
+      * caller's class, and installs it on the caller.
+      * @throws IllegalArgumentException if there is no such method
+      */
+@@ -109,6 +114,7 @@
+     }
+ 
+     /**
++     * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+      * Report the bootstrap method registered for a given class.
+      * Returns null if the class has never yet registered a bootstrap method,
+      * or if the class has explicitly registered a null bootstrap method.
+@@ -125,8 +131,10 @@
+         }
+     }
+ 
+-    /** The type of any bootstrap method is a three-argument method
+-     * {@code (Class<?>, String, MethodType)} returning a {@code CallSite}.
++    /**
++     * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
++     * The type of any bootstrap method is a three-argument method
++     * {@code (Class, String, MethodType)} returning a {@code CallSite}.
+      */
+     public static final MethodType BOOTSTRAP_METHOD_TYPE
+             = MethodType.make(CallSite.class,
+@@ -140,6 +148,7 @@
+             new WeakHashMap<Class, MethodHandle>();
+ 
+     /**
++     * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+      * Invalidate all <code>invokedynamic</code> call sites everywhere.
+      * <p>
+      * When this method returns, every <code>invokedynamic</code> instruction
+@@ -163,6 +172,7 @@
+     }
+ 
+     /**
++     * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+      * Invalidate all <code>invokedynamic</code> call sites associated
+      * with the given class.
+      * (These are exactly those sites which report the given class
+diff --git a/src/share/classes/java/dyn/MethodHandles.java b/src/share/classes/java/dyn/MethodHandles.java
+--- a/src/share/classes/java/dyn/MethodHandles.java
++++ b/src/share/classes/java/dyn/MethodHandles.java
+@@ -73,6 +73,7 @@
+     }
+ 
+     /**
++     * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+      * A factory object for creating method handles, when the creation
+      * requires access checking.  Method handles do not perform
+      * access checks when they are called; this is a major difference
+@@ -108,8 +109,10 @@
+      * access.  In any of these cases, an exception will be
+      * thrown from the attempted lookup.
+      * In general, the conditions under which a method handle may be
+-     * created for a method M are exactly as restrictive as the conditions
+-     * under which the lookup class could have compiled a call to M.
++     * created for a method {@code M} are exactly as restrictive as the conditions
++     * under which the lookup class could have compiled a call to {@code M}.
++     * At least some of these error conditions are likely to be
++     * represented by checked exceptions in the final version of this API.
+      */
+     public static final
+     class Lookup {
+@@ -222,11 +225,11 @@
+ 
+         /**
+          * Produce an early-bound method handle for a virtual method,
+-         * or a handle for a constructor, as if called from an {@code invokespecial}
++         * as if called from an {@code invokespecial}
+          * instruction from {@code caller}.
+-         * The type of the method handle will be that of the method or constructor,
++         * The type of the method handle will be that of the method,
+          * with a suitably restricted receiver type (such as {@code caller}) prepended.
+-         * The method or constructor and all its argument types must be accessible
++         * The method and all its argument types must be accessible
+          * to the caller.
+          * <p>
+          * When called, the handle will treat the first argument as a receiver,
+diff --git a/src/share/classes/java/dyn/MethodType.java b/src/share/classes/java/dyn/MethodType.java
+--- a/src/share/classes/java/dyn/MethodType.java
++++ b/src/share/classes/java/dyn/MethodType.java
+@@ -333,7 +333,7 @@
+ 
+     /** Convenience method for {@link #make(java.lang.Class, java.lang.Class[])}.
+      * Convert all wrapper types to their corresponding primitive types.
+-     * A return type of {@java.lang.Void} is changed to {@code void}.
++     * A return type of {@code java.lang.Void} is changed to {@code void}.
+      * @return a version of the original type with all wrapper types replaced
+      */
+     public MethodType unwrap() {

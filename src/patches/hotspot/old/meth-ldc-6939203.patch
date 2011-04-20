@@ -1,0 +1,3390 @@
+6939203: JSR 292 needs method handle constants
+Summary: Add new CP types CONSTANT_MethodHandle, CONSTANT_MethodType; extend 'ldc' bytecode.
+Reviewed-by: twisti, never
+
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/interpreter/BytecodeDisassembler.java b/agent/src/share/classes/sun/jvm/hotspot/interpreter/BytecodeDisassembler.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/interpreter/BytecodeDisassembler.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/interpreter/BytecodeDisassembler.java
+@@ -72,6 +72,7 @@
+       addBytecodeClass(Bytecodes._invokestatic, BytecodeInvoke.class);
+       addBytecodeClass(Bytecodes._invokespecial, BytecodeInvoke.class);
+       addBytecodeClass(Bytecodes._invokeinterface, BytecodeInvoke.class);
++      addBytecodeClass(Bytecodes._invokedynamic, BytecodeInvoke.class);
+       addBytecodeClass(Bytecodes._jsr, BytecodeJsr.class);
+       addBytecodeClass(Bytecodes._jsr_w, BytecodeJsrW.class);
+       addBytecodeClass(Bytecodes._iload, BytecodeLoad.class);
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/interpreter/BytecodeInvoke.java b/agent/src/share/classes/sun/jvm/hotspot/interpreter/BytecodeInvoke.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/interpreter/BytecodeInvoke.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/interpreter/BytecodeInvoke.java
+@@ -54,15 +54,31 @@
+   // returns the name of the invoked method
+   public Symbol name() {
+     ConstantPool cp = method().getConstants();
++    if (isInvokedynamic()) {
++       int[] nt = cp.getNameAndTypeAt(indexForFieldOrMethod());
++       return cp.getSymbolAt(nt[0]);
++    }
+     return cp.getNameRefAt(index());
+   }
+ 
+   // returns the signature of the invoked method
+   public Symbol signature() {
+     ConstantPool cp = method().getConstants();
++    if (isInvokedynamic()) {
++       int[] nt = cp.getNameAndTypeAt(indexForFieldOrMethod());
++       return cp.getSymbolAt(nt[1]);
++    }
+     return cp.getSignatureRefAt(index());
+   }
+ 
++  public int getSecondaryIndex() {
++    if (isInvokedynamic()) {
++      // change byte-ordering of 4-byte integer
++      return VM.getVM().getBytes().swapInt(javaSignedWordAt(1));
++    }
++    return super.getSecondaryIndex();  // throw an error
++  }
++
+   public Method getInvokedMethod() {
+     return method().getConstants().getMethodRefAt(index());
+   }
+@@ -87,6 +103,7 @@
+   public boolean isInvokevirtual()   { return adjustedInvokeCode() == Bytecodes._invokevirtual;   }
+   public boolean isInvokestatic()    { return adjustedInvokeCode() == Bytecodes._invokestatic;    }
+   public boolean isInvokespecial()   { return adjustedInvokeCode() == Bytecodes._invokespecial;   }
++  public boolean isInvokedynamic()   { return adjustedInvokeCode() == Bytecodes._invokedynamic; }
+ 
+   public boolean isValid()           { return isInvokeinterface() ||
+                                               isInvokevirtual()   ||
+@@ -104,6 +121,11 @@
+     buf.append(spaces);
+     buf.append('#');
+     buf.append(Integer.toString(indexForFieldOrMethod()));
++    if (isInvokedynamic()) {
++       buf.append('(');
++       buf.append(Integer.toString(getSecondaryIndex()));
++       buf.append(')');
++    }
+     buf.append(" [Method ");
+     StringBuffer sigBuf = new StringBuffer();
+     new SignatureConverter(signature(), sigBuf).iterateReturntype();
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/interpreter/BytecodeLoadConstant.java b/agent/src/share/classes/sun/jvm/hotspot/interpreter/BytecodeLoadConstant.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/interpreter/BytecodeLoadConstant.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/interpreter/BytecodeLoadConstant.java
+@@ -25,6 +25,7 @@
+ package sun.jvm.hotspot.interpreter;
+ 
+ import sun.jvm.hotspot.oops.*;
++import sun.jvm.hotspot.runtime.*;
+ import sun.jvm.hotspot.utilities.*;
+ 
+ public class BytecodeLoadConstant extends BytecodeWithCPIndex {
+@@ -32,10 +33,47 @@
+     super(method, bci);
+   }
+ 
++  public boolean hasCacheIndex() {
++    // normal ldc uses CP index, but fast_aldc uses swapped CP cache index
++    return javaCode() != code();
++  }
++
+   public int index() {
+-    return javaCode() == Bytecodes._ldc ?
++    int i = javaCode() == Bytecodes._ldc ?
+                  (int) (0xFF & javaByteAt(1))
+                : (int) (0xFFFF & javaShortAt(1));
++    if (hasCacheIndex()) {
++      return (0xFFFF & VM.getVM().getBytes().swapShort((short) i));
++    } else {
++      return i;
++    }
++  }
++
++  public int poolIndex() {
++    int i = index();
++    if (hasCacheIndex()) {
++      ConstantPoolCache cpCache = method().getConstants().getCache();
++      return cpCache.getEntryAt(i).getConstantPoolIndex();
++    } else {
++      return i;
++    }
++  }
++
++  public int cacheIndex() {
++    if (hasCacheIndex()) {
++      return index();
++    } else {
++      return -1;  // no cache index
++    }
++  }
++
++  private Oop getCachedConstant() {
++    int i = cacheIndex();
++    if (i >= 0) {
++      ConstantPoolCache cpCache = method().getConstants().getCache();
++      return cpCache.getEntryAt(i).getF1();
++    }
++    return null;
+   }
+ 
+   public void verify() {
+@@ -58,6 +96,7 @@
+        // has to be int or float or String or Klass
+        return (ctag.isUnresolvedString() || ctag.isString()
+                || ctag.isUnresolvedKlass() || ctag.isKlass()
++               || ctag.isMethodHandle() || ctag.isMethodType()
+                || ctag.isInt() || ctag.isFloat())? true: false;
+     }
+   }
+@@ -112,7 +151,7 @@
+ 
+   public String getConstantValue() {
+     ConstantPool cpool = method().getConstants();
+-    int cpIndex = index();
++    int cpIndex = poolIndex();
+     ConstantTag ctag = cpool.getTagAt(cpIndex);
+     if (ctag.isInt()) {
+        return "<int " + Integer.toString(cpool.getIntAt(cpIndex)) +">";
+@@ -149,6 +188,18 @@
+        } else {
+           throw new RuntimeException("should not reach here");
+        }
++    } else if (ctag.isMethodHandle() || ctag.isMethodType()) {
++       Oop x = getCachedConstant();
++       int refidx = cpool.getMethodHandleIndexAt(cpIndex);
++       int refkind = cpool.getMethodHandleRefKindAt(cpIndex);
++       return "<MethodHandle kind=" + Integer.toString(refkind) +
++           " ref=" + Integer.toString(refidx)
++           + (x == null ? "" : " @" + x.getHandle()) + ">";
++    } else if (ctag.isMethodType()) {
++       Oop x = getCachedConstant();
++       int refidx = cpool.getMethodTypeIndexAt(cpIndex);
++       return "<MethodType " + cpool.getSymbolAt(refidx).asString()
++           + (x == null ? "" : " @" + x.getHandle()) + ">";
+     } else {
+        if (Assert.ASSERTS_ENABLED) {
+          Assert.that(false, "invalid load constant type");
+@@ -162,7 +213,12 @@
+     buf.append(getJavaBytecodeName());
+     buf.append(spaces);
+     buf.append('#');
+-    buf.append(Integer.toString(index()));
++    buf.append(Integer.toString(poolIndex()));
++    if (hasCacheIndex()) {
++       buf.append('(');
++       buf.append(Integer.toString(cacheIndex()));
++       buf.append(')');
++    }
+     buf.append(spaces);
+     buf.append(getConstantValue());
+     if (code() != javaCode()) {
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/interpreter/BytecodeWithCPIndex.java b/agent/src/share/classes/sun/jvm/hotspot/interpreter/BytecodeWithCPIndex.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/interpreter/BytecodeWithCPIndex.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/interpreter/BytecodeWithCPIndex.java
+@@ -37,12 +37,19 @@
+   // the constant pool index for this bytecode
+   public int index() { return 0xFFFF & javaShortAt(1); }
+ 
++  public int getSecondaryIndex() {
++     throw new IllegalArgumentException("must be invokedynamic");
++  }
++
+   protected int indexForFieldOrMethod() {
+      ConstantPoolCache cpCache = method().getConstants().getCache();
+      // get ConstantPool index from ConstantPoolCacheIndex at given bci
+      int cpCacheIndex = index();
+      if (cpCache == null) {
+         return cpCacheIndex;
++     } else if (code() == Bytecodes._invokedynamic) {
++        int secondaryIndex = getSecondaryIndex();
++        return cpCache.getMainEntryAt(secondaryIndex).getConstantPoolIndex();
+      } else {
+         // change byte-ordering and go via cache
+         return cpCache.getEntryAt((int) (0xFFFF & VM.getVM().getBytes().swapShort((short) cpCacheIndex))).getConstantPoolIndex();
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/interpreter/Bytecodes.java b/agent/src/share/classes/sun/jvm/hotspot/interpreter/Bytecodes.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/interpreter/Bytecodes.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/interpreter/Bytecodes.java
+@@ -222,7 +222,7 @@
+   public static final int _invokespecial        = 183; // 0xb7
+   public static final int _invokestatic         = 184; // 0xb8
+   public static final int _invokeinterface      = 185; // 0xb9
+-  public static final int _xxxunusedxxx         = 186; // 0xba
++  public static final int _invokedynamic        = 186; // 0xba
+   public static final int _new                  = 187; // 0xbb
+   public static final int _newarray             = 188; // 0xbc
+   public static final int _anewarray            = 189; // 0xbd
+@@ -269,9 +269,12 @@
+   public static final int _fast_invokevfinal    = 226;
+   public static final int _fast_linearswitch    = 227;
+   public static final int _fast_binaryswitch    = 228;
+-  public static final int _shouldnotreachhere   = 229; // For debugging
++  public static final int _fast_aldc            = 229;
++  public static final int _fast_aldc_w          = 230;
++  public static final int _return_register_finalizer = 231;
++  public static final int _shouldnotreachhere   = 232; // For debugging
+ 
+-  public static final int number_of_codes       = 230;
++  public static final int number_of_codes       = 233;
+ 
+   public static int specialLengthAt(Method method, int bci) {
+     int code = codeAt(method, bci);
+@@ -458,9 +461,9 @@
+     def(_dconst_1            , "dconst_1"            , "b"    , null    , BasicType.getTDouble() ,  2, false);
+     def(_bipush              , "bipush"              , "bc"   , null    , BasicType.getTInt()    ,  1, false);
+     def(_sipush              , "sipush"              , "bcc"  , null    , BasicType.getTInt()    ,  1, false);
+-    def(_ldc                 , "ldc"                 , "bi"   , null    , BasicType.getTIllegal(),  1, true );
+-    def(_ldc_w               , "ldc_w"               , "bii"  , null    , BasicType.getTIllegal(),  1, true );
+-    def(_ldc2_w              , "ldc2_w"              , "bii"  , null    , BasicType.getTIllegal(),  2, true );
++    def(_ldc                 , "ldc"                 , "bk"   , null    , BasicType.getTIllegal(),  1, true );
++    def(_ldc_w               , "ldc_w"               , "bkk"  , null    , BasicType.getTIllegal(),  1, true );
++    def(_ldc2_w              , "ldc2_w"              , "bkk"  , null    , BasicType.getTIllegal(),  2, true );
+     def(_iload               , "iload"               , "bi"   , "wbii"  , BasicType.getTInt()    ,  1, false);
+     def(_lload               , "lload"               , "bi"   , "wbii"  , BasicType.getTLong()   ,  2, false);
+     def(_fload               , "fload"               , "bi"   , "wbii"  , BasicType.getTFloat()  ,  1, false);
+@@ -618,26 +621,26 @@
+     def(_dreturn             , "dreturn"             , "b"    , null    , BasicType.getTDouble() , -2, true );
+     def(_areturn             , "areturn"             , "b"    , null    , BasicType.getTObject() , -1, true );
+     def(_return              , "return"              , "b"    , null    , BasicType.getTVoid()   ,  0, true );
+-    def(_getstatic           , "getstatic"           , "bjj"  , null    , BasicType.getTIllegal(),  1, true );
+-    def(_putstatic           , "putstatic"           , "bjj"  , null    , BasicType.getTIllegal(), -1, true );
+-    def(_getfield            , "getfield"            , "bjj"  , null    , BasicType.getTIllegal(),  0, true );
+-    def(_putfield            , "putfield"            , "bjj"  , null    , BasicType.getTIllegal(), -2, true );
+-    def(_invokevirtual       , "invokevirtual"       , "bjj"  , null    , BasicType.getTIllegal(), -1, true );
+-    def(_invokespecial       , "invokespecial"       , "bjj"  , null    , BasicType.getTIllegal(), -1, true );
+-    def(_invokestatic        , "invokestatic"        , "bjj"  , null    , BasicType.getTIllegal(),  0, true );
+-    def(_invokeinterface     , "invokeinterface"     , "bjj__", null    , BasicType.getTIllegal(), -1, true );
+-    def(_xxxunusedxxx        , "xxxunusedxxx"        , null   , null    , BasicType.getTVoid()   ,  0, false);
+-    def(_new                 , "new"                 , "bii"  , null    , BasicType.getTObject() ,  1, true );
++    def(_getstatic           , "getstatic"           , "bJJ"  , null    , BasicType.getTIllegal(),  1, true );
++    def(_putstatic           , "putstatic"           , "bJJ"  , null    , BasicType.getTIllegal(), -1, true );
++    def(_getfield            , "getfield"            , "bJJ"  , null    , BasicType.getTIllegal(),  0, true );
++    def(_putfield            , "putfield"            , "bJJ"  , null    , BasicType.getTIllegal(), -2, true );
++    def(_invokevirtual       , "invokevirtual"       , "bJJ"  , null    , BasicType.getTIllegal(), -1, true );
++    def(_invokespecial       , "invokespecial"       , "bJJ"  , null    , BasicType.getTIllegal(), -1, true );
++    def(_invokestatic        , "invokestatic"        , "bJJ"  , null    , BasicType.getTIllegal(),  0, true );
++    def(_invokeinterface     , "invokeinterface"     , "bJJ__", null    , BasicType.getTIllegal(), -1, true );
++    def(_invokedynamic       , "invokedynamic"       , "bJJJJ", null    , BasicType.getTIllegal(), -1, true );
++    def(_new                 , "new"                 , "bkk"  , null    , BasicType.getTObject() ,  1, true );
+     def(_newarray            , "newarray"            , "bc"   , null    , BasicType.getTObject() ,  0, true );
+-    def(_anewarray           , "anewarray"           , "bii"  , null    , BasicType.getTObject() ,  0, true );
++    def(_anewarray           , "anewarray"           , "bkk"  , null    , BasicType.getTObject() ,  0, true );
+     def(_arraylength         , "arraylength"         , "b"    , null    , BasicType.getTVoid()   ,  0, true );
+     def(_athrow              , "athrow"              , "b"    , null    , BasicType.getTVoid()   , -1, true );
+-    def(_checkcast           , "checkcast"           , "bii"  , null    , BasicType.getTObject() ,  0, true );
+-    def(_instanceof          , "instanceof"          , "bii"  , null    , BasicType.getTInt()    ,  0, true );
++    def(_checkcast           , "checkcast"           , "bkk"  , null    , BasicType.getTObject() ,  0, true );
++    def(_instanceof          , "instanceof"          , "bkk"  , null    , BasicType.getTInt()    ,  0, true );
+     def(_monitorenter        , "monitorenter"        , "b"    , null    , BasicType.getTVoid()   , -1, true );
+     def(_monitorexit         , "monitorexit"         , "b"    , null    , BasicType.getTVoid()   , -1, true );
+     def(_wide                , "wide"                , ""     , null    , BasicType.getTVoid()   ,  0, false);
+-    def(_multianewarray      , "multianewarray"      , "biic" , null    , BasicType.getTObject() ,  1, true );
++    def(_multianewarray      , "multianewarray"      , "bkkc" , null    , BasicType.getTObject() ,  1, true );
+     def(_ifnull              , "ifnull"              , "boo"  , null    , BasicType.getTVoid()   , -1, false);
+     def(_ifnonnull           , "ifnonnull"           , "boo"  , null    , BasicType.getTVoid()   , -1, false);
+     def(_goto_w              , "goto_w"              , "boooo", null    , BasicType.getTVoid()   ,  0, false);
+@@ -646,38 +649,44 @@
+ 
+     //  JVM bytecodes
+     //  bytecode               bytecode name           format   wide f.   result tp               stk traps  std code
+-    def(_fast_agetfield      , "fast_agetfield"      , "bjj"  , null    , BasicType.getTObject() ,  0, true , _getfield       );
+-    def(_fast_bgetfield      , "fast_bgetfield"      , "bjj"  , null    , BasicType.getTInt()    ,  0, true , _getfield       );
+-    def(_fast_cgetfield      , "fast_cgetfield"      , "bjj"  , null    , BasicType.getTChar()   ,  0, true , _getfield       );
+-    def(_fast_dgetfield      , "fast_dgetfield"      , "bjj"  , null    , BasicType.getTDouble() ,  0, true , _getfield       );
+-    def(_fast_fgetfield      , "fast_fgetfield"      , "bjj"  , null    , BasicType.getTFloat()  ,  0, true , _getfield       );
+-    def(_fast_igetfield      , "fast_igetfield"      , "bjj"  , null    , BasicType.getTInt()    ,  0, true , _getfield       );
+-    def(_fast_lgetfield      , "fast_lgetfield"      , "bjj"  , null    , BasicType.getTLong()   ,  0, true , _getfield       );
+-    def(_fast_sgetfield      , "fast_sgetfield"      , "bjj"  , null    , BasicType.getTShort()  ,  0, true , _getfield       );
++    def(_fast_agetfield      , "fast_agetfield"      , "bJJ"  , null    , BasicType.getTObject() ,  0, true , _getfield       );
++    def(_fast_bgetfield      , "fast_bgetfield"      , "bJJ"  , null    , BasicType.getTInt()    ,  0, true , _getfield       );
++    def(_fast_cgetfield      , "fast_cgetfield"      , "bJJ"  , null    , BasicType.getTChar()   ,  0, true , _getfield       );
++    def(_fast_dgetfield      , "fast_dgetfield"      , "bJJ"  , null    , BasicType.getTDouble() ,  0, true , _getfield       );
++    def(_fast_fgetfield      , "fast_fgetfield"      , "bJJ"  , null    , BasicType.getTFloat()  ,  0, true , _getfield       );
++    def(_fast_igetfield      , "fast_igetfield"      , "bJJ"  , null    , BasicType.getTInt()    ,  0, true , _getfield       );
++    def(_fast_lgetfield      , "fast_lgetfield"      , "bJJ"  , null    , BasicType.getTLong()   ,  0, true , _getfield       );
++    def(_fast_sgetfield      , "fast_sgetfield"      , "bJJ"  , null    , BasicType.getTShort()  ,  0, true , _getfield       );
+ 
+-    def(_fast_aputfield      , "fast_aputfield"      , "bjj"  , null    , BasicType.getTObject() ,  0, true , _putfield       );
+-    def(_fast_bputfield      , "fast_bputfield"      , "bjj"  , null    , BasicType.getTInt()    ,  0, true , _putfield       );
+-    def(_fast_cputfield      , "fast_cputfield"      , "bjj"  , null    , BasicType.getTChar()   ,  0, true , _putfield       );
+-    def(_fast_dputfield      , "fast_dputfield"      , "bjj"  , null    , BasicType.getTDouble() ,  0, true , _putfield       );
+-    def(_fast_fputfield      , "fast_fputfield"      , "bjj"  , null    , BasicType.getTFloat()  ,  0, true , _putfield       );
+-    def(_fast_iputfield      , "fast_iputfield"      , "bjj"  , null    , BasicType.getTInt()    ,  0, true , _putfield       );
+-    def(_fast_lputfield      , "fast_lputfield"      , "bjj"  , null    , BasicType.getTLong()   ,  0, true , _putfield       );
+-    def(_fast_sputfield      , "fast_sputfield"      , "bjj"  , null    , BasicType.getTShort()  ,  0, true , _putfield       );
++    def(_fast_aputfield      , "fast_aputfield"      , "bJJ"  , null    , BasicType.getTObject() ,  0, true , _putfield       );
++    def(_fast_bputfield      , "fast_bputfield"      , "bJJ"  , null    , BasicType.getTInt()    ,  0, true , _putfield       );
++    def(_fast_cputfield      , "fast_cputfield"      , "bJJ"  , null    , BasicType.getTChar()   ,  0, true , _putfield       );
++    def(_fast_dputfield      , "fast_dputfield"      , "bJJ"  , null    , BasicType.getTDouble() ,  0, true , _putfield       );
++    def(_fast_fputfield      , "fast_fputfield"      , "bJJ"  , null    , BasicType.getTFloat()  ,  0, true , _putfield       );
++    def(_fast_iputfield      , "fast_iputfield"      , "bJJ"  , null    , BasicType.getTInt()    ,  0, true , _putfield       );
++    def(_fast_lputfield      , "fast_lputfield"      , "bJJ"  , null    , BasicType.getTLong()   ,  0, true , _putfield       );
++    def(_fast_sputfield      , "fast_sputfield"      , "bJJ"  , null    , BasicType.getTShort()  ,  0, true , _putfield       );
+ 
+     def(_fast_aload_0        , "fast_aload_0"        , "b"    , null    , BasicType.getTObject() ,  1, true , _aload_0        );
+-    def(_fast_iaccess_0      , "fast_iaccess_0"      , "b_jj" , null    , BasicType.getTInt()    ,  1, true , _aload_0        );
+-    def(_fast_aaccess_0      , "fast_aaccess_0"      , "b_jj" , null    , BasicType.getTObject() ,  1, true , _aload_0        );
+-    def(_fast_faccess_0      , "fast_faccess_0"      , "b_jj" , null    , BasicType.getTObject() ,  1, true , _aload_0        );
++    def(_fast_iaccess_0      , "fast_iaccess_0"      , "b_JJ" , null    , BasicType.getTInt()    ,  1, true , _aload_0        );
++    def(_fast_aaccess_0      , "fast_aaccess_0"      , "b_JJ" , null    , BasicType.getTObject() ,  1, true , _aload_0        );
++    def(_fast_faccess_0      , "fast_faccess_0"      , "b_JJ" , null    , BasicType.getTObject() ,  1, true , _aload_0        );
+ 
+     def(_fast_iload          , "fast_iload"          , "bi"   , null    , BasicType.getTInt()    ,  1, false, _iload);
+     def(_fast_iload2         , "fast_iload2"         , "bi_i" , null    , BasicType.getTInt()    ,  2, false, _iload);
+     def(_fast_icaload        , "fast_icaload"        , "bi_"  , null    , BasicType.getTInt()    ,  0, false, _iload);
+ 
+     // Faster method invocation.
+-    def(_fast_invokevfinal   , "fast_invokevfinal"   , "bjj"  , null    , BasicType.getTIllegal(), -1, true, _invokevirtual);
++    def(_fast_invokevfinal   , "fast_invokevfinal"   , "bJJ"  , null    , BasicType.getTIllegal(), -1, true, _invokevirtual);
+ 
+     def(_fast_linearswitch   , "fast_linearswitch"   , ""     , null    , BasicType.getTVoid()   , -1, false, _lookupswitch   );
+     def(_fast_binaryswitch   , "fast_binaryswitch"   , ""     , null    , BasicType.getTVoid()   , -1, false, _lookupswitch   );
++
++    def(_return_register_finalizer, "return_register_finalizer", "b"    , null    , BasicType.getTVoid()   , 0, true, _return );
++
++    def(_fast_aldc           , "fast_aldc"           , "bj"   , null    , BasicType.getTObject(),   1, true,  _ldc   );
++    def(_fast_aldc_w         , "fast_aldc_w"         , "bJJ"  , null    , BasicType.getTObject(),   1, true,  _ldc_w );
++
+     def(_shouldnotreachhere  , "_shouldnotreachhere" , "b"    , null    , BasicType.getTVoid()   ,  0, false);
+ 
+     if (Assert.ASSERTS_ENABLED) {
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/oops/ConstantPool.java b/agent/src/share/classes/sun/jvm/hotspot/oops/ConstantPool.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/oops/ConstantPool.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/oops/ConstantPool.java
+@@ -152,7 +152,7 @@
+     return res;
+   }
+ 
+-  public int getNameAndTypeAt(int which) {
++  public int[] getNameAndTypeAt(int which) {
+     if (Assert.ASSERTS_ENABLED) {
+       Assert.that(getTagAt(which).isNameAndType(), "Corrupted constant pool");
+     }
+@@ -160,18 +160,16 @@
+     if (DEBUG) {
+       System.err.println("ConstantPool.getNameAndTypeAt(" + which + "): result = " + i);
+     }
+-    return i;
++    return new int[] { extractLowShortFromInt(i), extractHighShortFromInt(i) };
+   }
+ 
+   public Symbol getNameRefAt(int which) {
+-    int refIndex = getNameAndTypeAt(getNameAndTypeRefIndexAt(which));
+-    int nameIndex = extractLowShortFromInt(refIndex);
++    int nameIndex = getNameAndTypeAt(getNameAndTypeRefIndexAt(which))[0];
+     return getSymbolAt(nameIndex);
+   }
+ 
+   public Symbol getSignatureRefAt(int which) {
+-    int refIndex = getNameAndTypeAt(getNameAndTypeRefIndexAt(which));
+-    int sigIndex = extractHighShortFromInt(refIndex);
++    int sigIndex = getNameAndTypeAt(getNameAndTypeRefIndexAt(which))[1];
+     return getSymbolAt(sigIndex);
+   }
+ 
+@@ -220,11 +218,11 @@
+ 
+   /** Lookup for entries consisting of (name_index, signature_index) */
+   public int getNameRefIndexAt(int index) {
+-    int refIndex = getNameAndTypeAt(index);
++    int[] refIndex = getNameAndTypeAt(index);
+     if (DEBUG) {
+-      System.err.println("ConstantPool.getNameRefIndexAt(" + index + "): refIndex = " + refIndex);
++      System.err.println("ConstantPool.getNameRefIndexAt(" + index + "): refIndex = " + refIndex[0]+"/"+refIndex[1]);
+     }
+-    int i = extractLowShortFromInt(refIndex);
++    int i = refIndex[0];
+     if (DEBUG) {
+       System.err.println("ConstantPool.getNameRefIndexAt(" + index + "): result = " + i);
+     }
+@@ -233,17 +231,53 @@
+ 
+   /** Lookup for entries consisting of (name_index, signature_index) */
+   public int getSignatureRefIndexAt(int index) {
+-    int refIndex = getNameAndTypeAt(index);
++    int[] refIndex = getNameAndTypeAt(index);
+     if (DEBUG) {
+-      System.err.println("ConstantPool.getSignatureRefIndexAt(" + index + "): refIndex = " + refIndex);
++      System.err.println("ConstantPool.getSignatureRefIndexAt(" + index + "): refIndex = " + refIndex[0]+"/"+refIndex[1]);
+     }
+-    int i = extractHighShortFromInt(refIndex);
++    int i = refIndex[1];
+     if (DEBUG) {
+       System.err.println("ConstantPool.getSignatureRefIndexAt(" + index + "): result = " + i);
+     }
+     return i;
+   }
+ 
++  /** Lookup for MethodHandle entries. */
++  public int getMethodHandleIndexAt(int i) {
++    if (Assert.ASSERTS_ENABLED) {
++      Assert.that(getTagAt(i).isMethodHandle(), "Corrupted constant pool");
++    }
++    int res = extractHighShortFromInt(getIntAt(i));
++    if (DEBUG) {
++      System.err.println("ConstantPool.getMethodHandleIndexAt(" + i + "): result = " + res);
++    }
++    return res;
++  }
++
++  /** Lookup for MethodHandle entries. */
++  public int getMethodHandleRefKindAt(int i) {
++    if (Assert.ASSERTS_ENABLED) {
++      Assert.that(getTagAt(i).isMethodHandle(), "Corrupted constant pool");
++    }
++    int res = extractLowShortFromInt(getIntAt(i));
++    if (DEBUG) {
++      System.err.println("ConstantPool.getMethodHandleRefKindAt(" + i + "): result = " + res);
++    }
++    return res;
++  }
++
++  /** Lookup for MethodType entries. */
++  public int getMethodTypeIndexAt(int i) {
++    if (Assert.ASSERTS_ENABLED) {
++      Assert.that(getTagAt(i).isMethodType(), "Corrupted constant pool");
++    }
++    int res = getIntAt(i);
++    if (DEBUG) {
++      System.err.println("ConstantPool.getMethodHandleTypeAt(" + i + "): result = " + res);
++    }
++    return res;
++  }
++
+   final private static String[] nameForTag = new String[] {
+   };
+ 
+@@ -261,6 +295,8 @@
+     case JVM_CONSTANT_Methodref:          return "JVM_CONSTANT_Methodref";
+     case JVM_CONSTANT_InterfaceMethodref: return "JVM_CONSTANT_InterfaceMethodref";
+     case JVM_CONSTANT_NameAndType:        return "JVM_CONSTANT_NameAndType";
++    case JVM_CONSTANT_MethodHandle:       return "JVM_CONSTANT_MethodHandle";
++    case JVM_CONSTANT_MethodType:         return "JVM_CONSTANT_MethodType";
+     case JVM_CONSTANT_Invalid:            return "JVM_CONSTANT_Invalid";
+     case JVM_CONSTANT_UnresolvedClass:    return "JVM_CONSTANT_UnresolvedClass";
+     case JVM_CONSTANT_UnresolvedClassInError:    return "JVM_CONSTANT_UnresolvedClassInError";
+@@ -317,6 +353,8 @@
+         case JVM_CONSTANT_Methodref:
+         case JVM_CONSTANT_InterfaceMethodref:
+         case JVM_CONSTANT_NameAndType:
++        case JVM_CONSTANT_MethodHandle:
++        case JVM_CONSTANT_MethodType:
+           visitor.doInt(new IntField(new NamedFieldIdentifier(nameForTag(ctag)), indexOffset(index), true), true);
+           break;
+         }
+@@ -467,6 +505,18 @@
+                                           + ", type = " + signatureIndex);
+                   break;
+               }
++
++              case JVM_CONSTANT_MethodHandle: {
++                  dos.writeByte(cpConstType);
++                  int value = getIntAt(ci);
++                  short nameIndex = (short) extractLowShortFromInt(value);
++                  short signatureIndex = (short) extractHighShortFromInt(value);
++                  dos.writeShort(nameIndex);
++                  dos.writeShort(signatureIndex);
++                  if (DEBUG) debugMessage("CP[" + ci + "] = N&T name = " + nameIndex
++                                          + ", type = " + signatureIndex);
++                  break;
++              }
+               default:
+                   throw new InternalError("unknown tag: " + cpConstType);
+           } // switch
+@@ -488,10 +538,12 @@
+   //
+ 
+   private static int extractHighShortFromInt(int val) {
++    // must stay in sync with constantPoolOopDesc::name_and_type_at_put, method_at_put, etc.
+     return (val >> 16) & 0xFFFF;
+   }
+ 
+   private static int extractLowShortFromInt(int val) {
++    // must stay in sync with constantPoolOopDesc::name_and_type_at_put, method_at_put, etc.
+     return val & 0xFFFF;
+   }
+ }
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/oops/ConstantPoolCache.java b/agent/src/share/classes/sun/jvm/hotspot/oops/ConstantPoolCache.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/oops/ConstantPoolCache.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/oops/ConstantPoolCache.java
+@@ -78,6 +78,31 @@
+     return new ConstantPoolCacheEntry(this, i);
+   }
+ 
++  public static boolean isSecondaryIndex(int i)     { return (i < 0); }
++  public static int     decodeSecondaryIndex(int i) { return  isSecondaryIndex(i) ? ~i : i; }
++  public static int     encodeSecondaryIndex(int i) { return !isSecondaryIndex(i) ? ~i : i; }
++
++  // secondary entries hold invokedynamic call site bindings
++  public ConstantPoolCacheEntry getSecondaryEntryAt(int i) {
++    ConstantPoolCacheEntry e = new ConstantPoolCacheEntry(this, decodeSecondaryIndex(i));
++    if (Assert.ASSERTS_ENABLED) {
++      Assert.that(e.isSecondaryEntry(), "must be a secondary entry");
++    }
++    return e;
++  }
++
++  public ConstantPoolCacheEntry getMainEntryAt(int i) {
++    if (isSecondaryIndex(i)) {
++      // run through an extra level of indirection:
++      i = getSecondaryEntryAt(i).getMainEntryIndex();
++    }
++    ConstantPoolCacheEntry e = new ConstantPoolCacheEntry(this, i);
++    if (Assert.ASSERTS_ENABLED) {
++      Assert.that(!e.isSecondaryEntry(), "must not be a secondary entry");
++    }
++    return e;
++  }
++
+   public int getIntAt(int entry, int fld) {
+     //alignObjectSize ?
+     long offset = baseOffset + /*alignObjectSize*/entry * elementSize + fld* getHeap().getIntSize();
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/oops/ConstantPoolCacheEntry.java b/agent/src/share/classes/sun/jvm/hotspot/oops/ConstantPoolCacheEntry.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/oops/ConstantPoolCacheEntry.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/oops/ConstantPoolCacheEntry.java
+@@ -28,6 +28,7 @@
+ import sun.jvm.hotspot.debugger.*;
+ import sun.jvm.hotspot.runtime.*;
+ import sun.jvm.hotspot.types.*;
++import sun.jvm.hotspot.utilities.*;
+ 
+ public class ConstantPoolCacheEntry {
+   private static long          size;
+@@ -67,9 +68,23 @@
+   }
+ 
+   public int getConstantPoolIndex() {
++    if (Assert.ASSERTS_ENABLED) {
++      Assert.that(!isSecondaryEntry(), "must not be a secondary CP entry");
++    }
+     return (int) (getIndices() & 0xFFFF);
+   }
+ 
++  public boolean isSecondaryEntry() {
++    return (getIndices() & 0xFFFF) == 0;
++  }
++
++  public int getMainEntryIndex() {
++    if (Assert.ASSERTS_ENABLED) {
++      Assert.that(isSecondaryEntry(), "must be a secondary CP entry");
++    }
++    return (int) (getIndices() >>> 16);
++  }
++
+   private long getIndices() {
+       return cp.getHandle().getCIntegerAt(indices.getOffset() + offset, indices.getSize(), indices.isUnsigned());
+   }
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/oops/GenerateOopMap.java b/agent/src/share/classes/sun/jvm/hotspot/oops/GenerateOopMap.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/oops/GenerateOopMap.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/oops/GenerateOopMap.java
+@@ -566,6 +566,7 @@
+       case Bytecodes._invokespecial:
+       case Bytecodes._invokestatic:
+       case Bytecodes._invokeinterface:
++      case Bytecodes._invokedynamic:
+         // FIXME: print signature of referenced method (need more
+         // accessors in ConstantPool and ConstantPoolCache)
+         int idx = currentBC.getIndexBig();
+@@ -605,6 +606,7 @@
+       case Bytecodes._invokespecial:
+       case Bytecodes._invokestatic:
+       case Bytecodes._invokeinterface:
++      case Bytecodes._invokedynamic:
+         // FIXME: print signature of referenced method (need more
+         // accessors in ConstantPool and ConstantPoolCache)
+         int idx = currentBC.getIndexBig();
+@@ -1134,6 +1136,7 @@
+       case Bytecodes._invokespecial:
+       case Bytecodes._invokestatic:
+       case Bytecodes._invokeinterface:
++      case Bytecodes._invokedynamic:
+         _itr_send = itr;
+         _report_result_for_send = true;
+         break;
+@@ -1379,6 +1382,7 @@
+     case Bytecodes._invokevirtual:
+     case Bytecodes._invokespecial:     doMethod(false, false, itr.getIndexBig(), itr.bci()); break;
+     case Bytecodes._invokestatic:      doMethod(true,  false, itr.getIndexBig(), itr.bci()); break;
++    case Bytecodes._invokedynamic:     doMethod(false, true,  itr.getIndexBig(), itr.bci()); break;
+     case Bytecodes._invokeinterface:   doMethod(false, true,  itr.getIndexBig(), itr.bci()); break;
+     case Bytecodes._newarray:
+     case Bytecodes._anewarray:         ppNewRef(vCTS, itr.bci()); break;
+@@ -1725,7 +1729,7 @@
+   void  doMethod                            (boolean is_static, boolean is_interface, int idx, int bci) {
+     // Dig up signature for field in constant pool
+     ConstantPool cp       = _method.getConstants();
+-    int nameAndTypeIdx    = cp.getNameAndTypeRefIndexAt(idx);
++    int nameAndTypeIdx    = cp.getTagAt(idx).isNameAndType() ? idx : cp.getNameAndTypeRefIndexAt(idx);
+     int signatureIdx      = cp.getSignatureRefIndexAt(nameAndTypeIdx);
+     Symbol signature      = cp.getSymbolAt(signatureIdx);
+ 
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/runtime/ClassConstants.java b/agent/src/share/classes/sun/jvm/hotspot/runtime/ClassConstants.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/runtime/ClassConstants.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/runtime/ClassConstants.java
+@@ -40,6 +40,19 @@
+     public static final int JVM_CONSTANT_Methodref          = 10;
+     public static final int JVM_CONSTANT_InterfaceMethodref = 11;
+     public static final int JVM_CONSTANT_NameAndType        = 12;
++    public static final int JVM_CONSTANT_MethodHandle       = 15;
++    public static final int JVM_CONSTANT_MethodType         = 16;
++
++    // JVM_CONSTANT_MethodHandle subtypes
++    public static final int JVM_REF_getField                = 1;
++    public static final int JVM_REF_getStatic               = 2;
++    public static final int JVM_REF_putField                = 3;
++    public static final int JVM_REF_putStatic               = 4;
++    public static final int JVM_REF_invokeVirtual           = 5;
++    public static final int JVM_REF_invokeStatic            = 6;
++    public static final int JVM_REF_invokeSpecial           = 7;
++    public static final int JVM_REF_newInvokeSpecial        = 8;
++    public static final int JVM_REF_invokeInterface         = 9;
+ 
+     // HotSpot specific constant pool constant types.
+ 
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/tools/jcore/ByteCodeRewriter.java b/agent/src/share/classes/sun/jvm/hotspot/tools/jcore/ByteCodeRewriter.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/tools/jcore/ByteCodeRewriter.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/tools/jcore/ByteCodeRewriter.java
+@@ -54,14 +54,34 @@
+ 
+     }
+ 
+-    protected short getConstantPoolIndex(int bci) {
++    protected short getConstantPoolIndex(int rawcode, int bci) {
+        // get ConstantPool index from ConstantPoolCacheIndex at given bci
+-       short cpCacheIndex = method.getBytecodeShortArg(bci);
++       String fmt = Bytecodes.format(rawcode);
++       int cpCacheIndex;
++       switch (fmt.length()) {
++       case 2: cpCacheIndex = method.getBytecodeByteArg(bci); break;
++       case 3: cpCacheIndex = method.getBytecodeShortArg(bci); break;
++       case 5:
++           if (fmt.indexOf("__") >= 0)
++               cpCacheIndex = method.getBytecodeShortArg(bci);
++           else
++               cpCacheIndex = method.getBytecodeIntArg(bci);
++           break;
++       default: throw new IllegalArgumentException();
++       }
+        if (cpCache == null) {
+-          return cpCacheIndex;
++          return (short) cpCacheIndex;
++       } else if (fmt.indexOf("JJJJ") >= 0) {
++          // change byte-ordering and go via secondary cache entry
++          return (short) cpCache.getMainEntryAt(bytes.swapInt(cpCacheIndex)).getConstantPoolIndex();
++       } else if (fmt.indexOf("JJ") >= 0) {
++          // change byte-ordering and go via cache
++          return (short) cpCache.getEntryAt((int) (0xFFFF & bytes.swapShort((short)cpCacheIndex))).getConstantPoolIndex();
++       } else if (fmt.indexOf("j") >= 0) {
++          // go via cache
++          return (short) cpCache.getEntryAt((int) (0xFF & cpCacheIndex)).getConstantPoolIndex();
+        } else {
+-          // change byte-ordering and go via cache
+-          return (short) cpCache.getEntryAt((int) (0xFFFF & bytes.swapShort(cpCacheIndex))).getConstantPoolIndex();
++          return (short) cpCacheIndex;
+        }
+     }
+ 
+@@ -100,10 +120,31 @@
+                 case Bytecodes._invokespecial:
+                 case Bytecodes._invokestatic:
+                 case Bytecodes._invokeinterface: {
+-                    cpoolIndex = getConstantPoolIndex(bci + 1);
++                    cpoolIndex = getConstantPoolIndex(hotspotcode, bci + 1);
+                     writeShort(code, bci + 1, cpoolIndex);
+                     break;
+                 }
++
++                case Bytecodes._invokedynamic:
++                    cpoolIndex = getConstantPoolIndex(hotspotcode, bci + 1);
++                    writeShort(code, bci + 1, cpoolIndex);
++                    writeShort(code, bci + 3, (short)0);  // clear out trailing bytes
++                    break;
++
++                case Bytecodes._ldc_w:
++                    if (hotspotcode != bytecode) {
++                        // fast_aldc_w puts constant in CP cache
++                        cpoolIndex = getConstantPoolIndex(hotspotcode, bci + 1);
++                        writeShort(code, bci + 1, cpoolIndex);
++                    }
++                    break;
++                case Bytecodes._ldc:
++                    if (hotspotcode != bytecode) {
++                        // fast_aldc puts constant in CP cache
++                        cpoolIndex = getConstantPoolIndex(hotspotcode, bci + 1);
++                        code[bci + 1] = (byte)(cpoolIndex);
++                    }
++                    break;
+             }
+ 
+             len = Bytecodes.lengthFor(bytecode);
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/tools/jcore/ClassWriter.java b/agent/src/share/classes/sun/jvm/hotspot/tools/jcore/ClassWriter.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/tools/jcore/ClassWriter.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/tools/jcore/ClassWriter.java
+@@ -61,10 +61,12 @@
+     protected short  _signatureIndex;
+ 
+     protected static int extractHighShortFromInt(int val) {
++        // must stay in sync with constantPoolOopDesc::name_and_type_at_put, method_at_put, etc.
+         return (val >> 16) & 0xFFFF;
+     }
+ 
+     protected static int extractLowShortFromInt(int val) {
++        // must stay in sync with constantPoolOopDesc::name_and_type_at_put, method_at_put, etc.
+         return val & 0xFFFF;
+     }
+ 
+@@ -297,6 +299,28 @@
+                                         + ", type = " + signatureIndex);
+                      break;
+                 }
++
++                case JVM_CONSTANT_MethodHandle: {
++                     dos.writeByte(cpConstType);
++                     int value = cpool.getIntAt(ci);
++                     short refIndex = (short) extractHighShortFromInt(value);
++                     byte  refKind  = (byte)  extractLowShortFromInt(value);
++                     dos.writeByte(refKind);
++                     dos.writeShort(refIndex);
++                     if (DEBUG) debugMessage("CP[" + ci + "] = MH index = " + refIndex
++                                        + ", kind = " + refKind);
++                     break;
++                }
++
++                case JVM_CONSTANT_MethodType: {
++                     dos.writeByte(cpConstType);
++                     int value = cpool.getIntAt(ci);
++                     short refIndex = (short) value;
++                     dos.writeShort(refIndex);
++                     if (DEBUG) debugMessage("CP[" + ci + "] = MT index = " + refIndex);
++                     break;
++                }
++
+                 default:
+                   throw new InternalError("Unknown tag: " + cpConstType);
+             } // switch
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/ui/classbrowser/HTMLGenerator.java b/agent/src/share/classes/sun/jvm/hotspot/ui/classbrowser/HTMLGenerator.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/ui/classbrowser/HTMLGenerator.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/ui/classbrowser/HTMLGenerator.java
+@@ -572,6 +572,16 @@
+                buf.cell(Integer.toString(cpool.getIntAt(index)));
+                break;
+ 
++            case JVM_CONSTANT_MethodHandle:
++               buf.cell("JVM_CONSTANT_MethodHandle");
++               buf.cell(genLowHighShort(cpool.getIntAt(index)));
++               break;
++
++            case JVM_CONSTANT_MethodType:
++               buf.cell("JVM_CONSTANT_MethodType");
++               buf.cell(Integer.toString(cpool.getIntAt(index)));
++               break;
++
+             default:
+                throw new InternalError("unknown tag: " + ctag);
+          }
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/utilities/ConstantTag.java b/agent/src/share/classes/sun/jvm/hotspot/utilities/ConstantTag.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/utilities/ConstantTag.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/utilities/ConstantTag.java
+@@ -38,12 +38,26 @@
+   private static int JVM_CONSTANT_Methodref               = 10;
+   private static int JVM_CONSTANT_InterfaceMethodref      = 11;
+   private static int JVM_CONSTANT_NameAndType             = 12;
++  private static int JVM_CONSTANT_MethodHandle            = 15;  // JSR 292
++  private static int JVM_CONSTANT_MethodType              = 16;  // JSR 292
+   private static int JVM_CONSTANT_Invalid                 = 0;   // For bad value initialization
+   private static int JVM_CONSTANT_UnresolvedClass         = 100; // Temporary tag until actual use
+   private static int JVM_CONSTANT_ClassIndex              = 101; // Temporary tag while constructing constant pool
+   private static int JVM_CONSTANT_UnresolvedString        = 102; // Temporary tag until actual use
+   private static int JVM_CONSTANT_StringIndex             = 103; // Temporary tag while constructing constant pool
+   private static int JVM_CONSTANT_UnresolvedClassInError  = 104; // Resolution failed
++  private static int JVM_CONSTANT_Object                  = 105; // Required for BoundMethodHandle arguments.
++
++  // JVM_CONSTANT_MethodHandle subtypes //FIXME: connect these to data structure
++  private static int JVM_REF_getField                = 1;
++  private static int JVM_REF_getStatic               = 2;
++  private static int JVM_REF_putField                = 3;
++  private static int JVM_REF_putStatic               = 4;
++  private static int JVM_REF_invokeVirtual           = 5;
++  private static int JVM_REF_invokeStatic            = 6;
++  private static int JVM_REF_invokeSpecial           = 7;
++  private static int JVM_REF_newInvokeSpecial        = 8;
++  private static int JVM_REF_invokeInterface         = 9;
+ 
+   private byte tag;
+ 
+@@ -62,6 +76,8 @@
+   public boolean isDouble()           { return tag == JVM_CONSTANT_Double; }
+   public boolean isNameAndType()      { return tag == JVM_CONSTANT_NameAndType; }
+   public boolean isUtf8()             { return tag == JVM_CONSTANT_Utf8; }
++  public boolean isMethodHandle()     { return tag == JVM_CONSTANT_MethodHandle; }
++  public boolean isMethodType()       { return tag == JVM_CONSTANT_MethodType; }
+ 
+   public boolean isInvalid()          { return tag == JVM_CONSTANT_Invalid; }
+ 
+@@ -73,6 +89,8 @@
+   public boolean isUnresolvedString()       { return tag == JVM_CONSTANT_UnresolvedString; }
+   public boolean isStringIndex()            { return tag == JVM_CONSTANT_StringIndex; }
+ 
++  public boolean isObject()                 { return tag == JVM_CONSTANT_Object; }
++
+   public boolean isKlassReference()   { return isKlassIndex() || isUnresolvedKlass(); }
+   public boolean isFieldOrMethod()    { return isField() || isMethod() || isInterfaceMethod(); }
+   public boolean isSymbol()           { return isUtf8(); }
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/utilities/soql/sa.js b/agent/src/share/classes/sun/jvm/hotspot/utilities/soql/sa.js
+--- a/agent/src/share/classes/sun/jvm/hotspot/utilities/soql/sa.js
++++ b/agent/src/share/classes/sun/jvm/hotspot/utilities/soql/sa.js
+@@ -825,6 +825,8 @@
+    }
+    writeln("");
+    disAsm.decode(new sapkg.interpreter.BytecodeVisitor() {
++                    prologue: function(method) { },
++                    epilogue: function() { },
+                     visit: function(bytecode) {
+                        if (hasLines) {
+                           var line = method.getLineNumberFromBCI(bci);
+diff --git a/src/cpu/sparc/vm/templateTable_sparc.cpp b/src/cpu/sparc/vm/templateTable_sparc.cpp
+--- a/src/cpu/sparc/vm/templateTable_sparc.cpp
++++ b/src/cpu/sparc/vm/templateTable_sparc.cpp
+@@ -318,6 +318,31 @@
+   __ bind(exit);
+ }
+ 
++// Fast path for caching oop constants.
++// %%% We should use this to handle Class and String constants also.
++// %%% It will simplify the ldc/primitive path considerably.
++void TemplateTable::fast_aldc(bool wide) {
++  transition(vtos, atos);
++
++  if (!EnableMethodHandles) {
++    // We should not encounter this bytecode if !EnableMethodHandles.
++    // The verifier will stop it.  However, if we get past the verifier,
++    // this will stop the thread in a reasonable way, without crashing the JVM.
++    __ call_VM(noreg, CAST_FROM_FN_PTR(address,
++                     InterpreterRuntime::throw_IncompatibleClassChangeError));
++    // the call_VM checks for exception, so we should never return here.
++    __ should_not_reach_here();
++    return;
++  }
++
++  Register Rcache = G3_scratch;
++  Register Rscratch = G4_scratch;
++
++  resolve_cache_and_index(f1_oop, Otos_i, Rcache, Rscratch, wide ? sizeof(u2) : sizeof(u1));
++
++  __ verify_oop(Otos_i);
++}
++
+ void TemplateTable::ldc2_w() {
+   transition(vtos, vtos);
+   Label retry, resolved, Long, exit;
+@@ -2006,6 +2031,8 @@
+     case Bytecodes::_invokestatic   : // fall through
+     case Bytecodes::_invokeinterface: entry = CAST_FROM_FN_PTR(address, InterpreterRuntime::resolve_invoke);  break;
+     case Bytecodes::_invokedynamic  : entry = CAST_FROM_FN_PTR(address, InterpreterRuntime::resolve_invokedynamic);  break;
++    case Bytecodes::_fast_aldc      : entry = CAST_FROM_FN_PTR(address, InterpreterRuntime::resolve_ldc);     break;
++    case Bytecodes::_fast_aldc_w    : entry = CAST_FROM_FN_PTR(address, InterpreterRuntime::resolve_ldc);     break;
+     default                         : ShouldNotReachHere();                                 break;
+   }
+   // first time invocation - must resolve first
+diff --git a/src/cpu/x86/vm/templateTable_x86_32.cpp b/src/cpu/x86/vm/templateTable_x86_32.cpp
+--- a/src/cpu/x86/vm/templateTable_x86_32.cpp
++++ b/src/cpu/x86/vm/templateTable_x86_32.cpp
+@@ -378,6 +378,32 @@
+   __ bind(Done);
+ }
+ 
++// Fast path for caching oop constants.
++// %%% We should use this to handle Class and String constants also.
++// %%% It will simplify the ldc/primitive path considerably.
++void TemplateTable::fast_aldc(bool wide) {
++  transition(vtos, atos);
++
++  if (!EnableMethodHandles) {
++    // We should not encounter this bytecode if !EnableMethodHandles.
++    // The verifier will stop it.  However, if we get past the verifier,
++    // this will stop the thread in a reasonable way, without crashing the JVM.
++    __ call_VM(noreg, CAST_FROM_FN_PTR(address,
++                     InterpreterRuntime::throw_IncompatibleClassChangeError));
++    // the call_VM checks for exception, so we should never return here.
++    __ should_not_reach_here();
++    return;
++  }
++
++  const Register cache = rcx;
++  const Register index = rdx;
++
++  resolve_cache_and_index(f1_oop, rax, cache, index, wide ? sizeof(u2) : sizeof(u1));
++  if (VerifyOops) {
++    __ verify_oop(rax);
++  }
++}
++
+ void TemplateTable::ldc2_w() {
+   transition(vtos, vtos);
+   Label Long, Done;
+@@ -2146,6 +2172,8 @@
+     case Bytecodes::_invokestatic   : // fall through
+     case Bytecodes::_invokeinterface: entry = CAST_FROM_FN_PTR(address, InterpreterRuntime::resolve_invoke);  break;
+     case Bytecodes::_invokedynamic  : entry = CAST_FROM_FN_PTR(address, InterpreterRuntime::resolve_invokedynamic); break;
++    case Bytecodes::_fast_aldc      : entry = CAST_FROM_FN_PTR(address, InterpreterRuntime::resolve_ldc);     break;
++    case Bytecodes::_fast_aldc_w    : entry = CAST_FROM_FN_PTR(address, InterpreterRuntime::resolve_ldc);     break;
+     default                         : ShouldNotReachHere();                                 break;
+   }
+   __ movl(temp, (int)bytecode());
+diff --git a/src/cpu/x86/vm/templateTable_x86_64.cpp b/src/cpu/x86/vm/templateTable_x86_64.cpp
+--- a/src/cpu/x86/vm/templateTable_x86_64.cpp
++++ b/src/cpu/x86/vm/templateTable_x86_64.cpp
+@@ -389,6 +389,32 @@
+   __ bind(Done);
+ }
+ 
++// Fast path for caching oop constants.
++// %%% We should use this to handle Class and String constants also.
++// %%% It will simplify the ldc/primitive path considerably.
++void TemplateTable::fast_aldc(bool wide) {
++  transition(vtos, atos);
++
++  if (!EnableMethodHandles) {
++    // We should not encounter this bytecode if !EnableMethodHandles.
++    // The verifier will stop it.  However, if we get past the verifier,
++    // this will stop the thread in a reasonable way, without crashing the JVM.
++    __ call_VM(noreg, CAST_FROM_FN_PTR(address,
++                     InterpreterRuntime::throw_IncompatibleClassChangeError));
++    // the call_VM checks for exception, so we should never return here.
++    __ should_not_reach_here();
++    return;
++  }
++
++  const Register cache = rcx;
++  const Register index = rdx;
++
++  resolve_cache_and_index(f1_oop, rax, cache, index, wide ? sizeof(u2) : sizeof(u1));
++  if (VerifyOops) {
++    __ verify_oop(rax);
++  }
++}
++
+ void TemplateTable::ldc2_w() {
+   transition(vtos, vtos);
+   Label Long, Done;
+@@ -2099,6 +2125,12 @@
+   case Bytecodes::_invokedynamic:
+     entry = CAST_FROM_FN_PTR(address, InterpreterRuntime::resolve_invokedynamic);
+     break;
++  case Bytecodes::_fast_aldc:
++    entry = CAST_FROM_FN_PTR(address, InterpreterRuntime::resolve_ldc);
++    break;
++  case Bytecodes::_fast_aldc_w:
++    entry = CAST_FROM_FN_PTR(address, InterpreterRuntime::resolve_ldc);
++    break;
+   default:
+     ShouldNotReachHere();
+     break;
+diff --git a/src/share/vm/c1/c1_GraphBuilder.cpp b/src/share/vm/c1/c1_GraphBuilder.cpp
+--- a/src/share/vm/c1/c1_GraphBuilder.cpp
++++ b/src/share/vm/c1/c1_GraphBuilder.cpp
+@@ -878,15 +878,12 @@
+       case T_OBJECT :
+        {
+         ciObject* obj = con.as_object();
+-        if (obj->is_klass()) {
+-          ciKlass* klass = obj->as_klass();
+-          if (!klass->is_loaded() || PatchALot) {
+-            patch_state = state()->copy();
+-            t = new ObjectConstant(obj);
+-          } else {
+-            t = new InstanceConstant(klass->java_mirror());
+-          }
++        if (!obj->is_loaded()
++            || (PatchALot && obj->klass() != ciEnv::current()->String_klass())) {
++          patch_state = state()->copy();
++          t = new ObjectConstant(obj);
+         } else {
++          assert(!obj->is_klass(), "must be java_mirror of klass");
+           t = new InstanceConstant(obj->as_instance());
+         }
+         break;
+diff --git a/src/share/vm/c1/c1_Runtime1.cpp b/src/share/vm/c1/c1_Runtime1.cpp
+--- a/src/share/vm/c1/c1_Runtime1.cpp
++++ b/src/share/vm/c1/c1_Runtime1.cpp
+@@ -640,7 +640,7 @@
+ 
+ 
+ static klassOop resolve_field_return_klass(methodHandle caller, int bci, TRAPS) {
+-  Bytecode_field* field_access = Bytecode_field_at(caller(), caller->bcp_from(bci));
++  Bytecode_field* field_access = Bytecode_field_at(caller, bci);
+   // This can be static or non-static field access
+   Bytecodes::Code code       = field_access->code();
+ 
+@@ -760,7 +760,7 @@
+   Handle load_klass(THREAD, NULL);                // oop needed by load_klass_patching code
+   if (stub_id == Runtime1::access_field_patching_id) {
+ 
+-    Bytecode_field* field_access = Bytecode_field_at(caller_method(), caller_method->bcp_from(bci));
++    Bytecode_field* field_access = Bytecode_field_at(caller_method, bci);
+     FieldAccessInfo result; // initialize class if needed
+     Bytecodes::Code code = field_access->code();
+     constantPoolHandle constants(THREAD, caller_method->constants());
+@@ -820,11 +820,9 @@
+       case Bytecodes::_ldc:
+       case Bytecodes::_ldc_w:
+         {
+-          Bytecode_loadconstant* cc = Bytecode_loadconstant_at(caller_method(),
+-                                                               caller_method->bcp_from(bci));
+-          klassOop resolved = caller_method->constants()->klass_at(cc->index(), CHECK);
+-          // ldc wants the java mirror.
+-          k = resolved->klass_part()->java_mirror();
++          Bytecode_loadconstant* cc = Bytecode_loadconstant_at(caller_method, bci);
++          k = cc->resolve_constant(CHECK);
++          assert(k != NULL && !k->is_klass(), "must be class mirror or other Java constant");
+         }
+         break;
+       default: Unimplemented();
+@@ -855,6 +853,15 @@
+     // Return to the now deoptimized frame.
+   }
+ 
++  // If we are patching in a non-perm oop, make sure the nmethod
++  // is on the right list.
++  if (ScavengeRootsInCode && load_klass.not_null() && load_klass->is_scavengable()) {
++    MutexLockerEx ml_code (CodeCache_lock, Mutex::_no_safepoint_check_flag);
++    nmethod* nm = CodeCache::find_nmethod(caller_frame.pc());
++    guarantee(nm != NULL, "only nmethods can contain non-perm oops");
++    if (!nm->on_scavenge_root_list())
++      CodeCache::add_scavenge_root_nmethod(nm);
++  }
+ 
+   // Now copy code back
+ 
+diff --git a/src/share/vm/ci/ciCPCache.cpp b/src/share/vm/ci/ciCPCache.cpp
+--- a/src/share/vm/ci/ciCPCache.cpp
++++ b/src/share/vm/ci/ciCPCache.cpp
+@@ -44,13 +44,23 @@
+ // ciCPCache::is_f1_null_at
+ bool ciCPCache::is_f1_null_at(int index) {
+   VM_ENTRY_MARK;
+-  constantPoolCacheOop cpcache = (constantPoolCacheOop) get_oop();
+-  oop f1 = cpcache->secondary_entry_at(index)->f1();
++  oop f1 = entry_at(index)->f1();
+   return (f1 == NULL);
+ }
+ 
+ 
+ // ------------------------------------------------------------------
++// ciCPCache::get_pool_index
++int ciCPCache::get_pool_index(int index) {
++  VM_ENTRY_MARK;
++  ConstantPoolCacheEntry* e = entry_at(index);
++  if (e->is_secondary_entry())
++    e = entry_at(e->main_entry_index());
++  return e->constant_pool_index();
++}
++
++
++// ------------------------------------------------------------------
+ // ciCPCache::print
+ //
+ // Print debugging information about the cache.
+diff --git a/src/share/vm/ci/ciCPCache.hpp b/src/share/vm/ci/ciCPCache.hpp
+--- a/src/share/vm/ci/ciCPCache.hpp
++++ b/src/share/vm/ci/ciCPCache.hpp
+@@ -29,6 +29,18 @@
+ // Note: This class is called ciCPCache as ciConstantPoolCache is used
+ // for something different.
+ class ciCPCache : public ciObject {
++private:
++  constantPoolCacheOop get_cpCacheOop() {   // must be called inside a VM_ENTRY_MARK
++    return (constantPoolCacheOop) get_oop();
++  }
++
++  ConstantPoolCacheEntry* entry_at(int i) {
++    int raw_index = i;
++    if (constantPoolCacheOopDesc::is_secondary_index(i))
++      raw_index = constantPoolCacheOopDesc::decode_secondary_index(i);
++    return get_cpCacheOop()->entry_at(raw_index);
++  }
++
+ public:
+   ciCPCache(constantPoolCacheHandle cpcache) : ciObject(cpcache) {}
+ 
+@@ -41,5 +53,7 @@
+ 
+   bool is_f1_null_at(int index);
+ 
++  int get_pool_index(int index);
++
+   void print();
+ };
+diff --git a/src/share/vm/ci/ciClassList.hpp b/src/share/vm/ci/ciClassList.hpp
+--- a/src/share/vm/ci/ciClassList.hpp
++++ b/src/share/vm/ci/ciClassList.hpp
+@@ -85,6 +85,7 @@
+ friend class ciConstantPoolCache;      \
+ friend class ciField;                  \
+ friend class ciConstant;               \
++friend class ciCPCache;                \
+ friend class ciFlags;                  \
+ friend class ciExceptionHandler;       \
+ friend class ciCallProfile;            \
+diff --git a/src/share/vm/ci/ciEnv.cpp b/src/share/vm/ci/ciEnv.cpp
+--- a/src/share/vm/ci/ciEnv.cpp
++++ b/src/share/vm/ci/ciEnv.cpp
+@@ -511,9 +511,22 @@
+ //
+ // Implementation of get_constant_by_index().
+ ciConstant ciEnv::get_constant_by_index_impl(constantPoolHandle cpool,
+-                                             int index,
++                                             int pool_index, int cache_index,
+                                              ciInstanceKlass* accessor) {
++  bool ignore_will_link;
+   EXCEPTION_CONTEXT;
++  int index = pool_index;
++  if (cache_index >= 0) {
++    assert(index < 0, "only one kind of index at a time");
++    ConstantPoolCacheEntry* cpc_entry = cpool->cache()->entry_at(cache_index);
++    index = cpc_entry->constant_pool_index();
++    oop obj = cpc_entry->f1();
++    if (obj != NULL) {
++      assert(obj->is_instance(), "must be an instance");
++      ciObject* ciobj = get_object(obj);
++      return ciConstant(T_OBJECT, ciobj);
++    }
++  }
+   constantTag tag = cpool->tag_at(index);
+   if (tag.is_int()) {
+     return ciConstant(T_INT, (jint)cpool->int_at(index));
+@@ -540,8 +553,7 @@
+     return ciConstant(T_OBJECT, constant);
+   } else if (tag.is_klass() || tag.is_unresolved_klass()) {
+     // 4881222: allow ldc to take a class type
+-    bool ignore;
+-    ciKlass* klass = get_klass_by_index_impl(cpool, index, ignore, accessor);
++    ciKlass* klass = get_klass_by_index_impl(cpool, index, ignore_will_link, accessor);
+     if (HAS_PENDING_EXCEPTION) {
+       CLEAR_PENDING_EXCEPTION;
+       record_out_of_memory_failure();
+@@ -549,12 +561,26 @@
+     }
+     assert (klass->is_instance_klass() || klass->is_array_klass(),
+             "must be an instance or array klass ");
+-    return ciConstant(T_OBJECT, klass);
++    return ciConstant(T_OBJECT, klass->java_mirror());
+   } else if (tag.is_object()) {
+     oop obj = cpool->object_at(index);
+     assert(obj->is_instance(), "must be an instance");
+     ciObject* ciobj = get_object(obj);
+     return ciConstant(T_OBJECT, ciobj);
++  } else if (tag.is_method_type()) {
++    // must execute Java code to link this CP entry into cache[i].f1
++    ciSymbol* signature = get_object(cpool->method_type_signature_at(index))->as_symbol();
++    ciObject* ciobj = get_unloaded_method_type_constant(signature);
++    return ciConstant(T_OBJECT, ciobj);
++  } else if (tag.is_method_handle()) {
++    // must execute Java code to link this CP entry into cache[i].f1
++    int ref_kind        = cpool->method_handle_ref_kind_at(index);
++    int callee_index    = cpool->method_handle_klass_index_at(index);
++    ciKlass* callee     = get_klass_by_index_impl(cpool, callee_index, ignore_will_link, accessor);
++    ciSymbol* name      = get_object(cpool->method_handle_name_ref_at(index))->as_symbol();
++    ciSymbol* signature = get_object(cpool->method_handle_signature_ref_at(index))->as_symbol();
++    ciObject* ciobj     = get_unloaded_method_handle_constant(callee, name, signature, ref_kind);
++    return ciConstant(T_OBJECT, ciobj);
+   } else {
+     ShouldNotReachHere();
+     return ciConstant();
+@@ -562,61 +588,15 @@
+ }
+ 
+ // ------------------------------------------------------------------
+-// ciEnv::is_unresolved_string_impl
+-//
+-// Implementation of is_unresolved_string().
+-bool ciEnv::is_unresolved_string_impl(instanceKlass* accessor, int index) const {
+-  EXCEPTION_CONTEXT;
+-  assert(accessor->is_linked(), "must be linked before accessing constant pool");
+-  constantPoolOop cpool = accessor->constants();
+-  constantTag tag = cpool->tag_at(index);
+-  return tag.is_unresolved_string();
+-}
+-
+-// ------------------------------------------------------------------
+-// ciEnv::is_unresolved_klass_impl
+-//
+-// Implementation of is_unresolved_klass().
+-bool ciEnv::is_unresolved_klass_impl(instanceKlass* accessor, int index) const {
+-  EXCEPTION_CONTEXT;
+-  assert(accessor->is_linked(), "must be linked before accessing constant pool");
+-  constantPoolOop cpool = accessor->constants();
+-  constantTag tag = cpool->tag_at(index);
+-  return tag.is_unresolved_klass();
+-}
+-
+-// ------------------------------------------------------------------
+ // ciEnv::get_constant_by_index
+ //
+ // Pull a constant out of the constant pool.  How appropriate.
+ //
+ // Implementation note: this query is currently in no way cached.
+ ciConstant ciEnv::get_constant_by_index(constantPoolHandle cpool,
+-                                        int index,
++                                        int pool_index, int cache_index,
+                                         ciInstanceKlass* accessor) {
+-  GUARDED_VM_ENTRY(return get_constant_by_index_impl(cpool, index, accessor);)
+-}
+-
+-// ------------------------------------------------------------------
+-// ciEnv::is_unresolved_string
+-//
+-// Check constant pool
+-//
+-// Implementation note: this query is currently in no way cached.
+-bool ciEnv::is_unresolved_string(ciInstanceKlass* accessor,
+-                                 int index) const {
+-  GUARDED_VM_ENTRY(return is_unresolved_string_impl(accessor->get_instanceKlass(), index); )
+-}
+-
+-// ------------------------------------------------------------------
+-// ciEnv::is_unresolved_klass
+-//
+-// Check constant pool
+-//
+-// Implementation note: this query is currently in no way cached.
+-bool ciEnv::is_unresolved_klass(ciInstanceKlass* accessor,
+-                                int index) const {
+-  GUARDED_VM_ENTRY(return is_unresolved_klass_impl(accessor->get_instanceKlass(), index); )
++  GUARDED_VM_ENTRY(return get_constant_by_index_impl(cpool, pool_index, cache_index, accessor);)
+ }
+ 
+ // ------------------------------------------------------------------
+diff --git a/src/share/vm/ci/ciEnv.hpp b/src/share/vm/ci/ciEnv.hpp
+--- a/src/share/vm/ci/ciEnv.hpp
++++ b/src/share/vm/ci/ciEnv.hpp
+@@ -116,12 +116,8 @@
+                                 bool& is_accessible,
+                                 ciInstanceKlass* loading_klass);
+   ciConstant get_constant_by_index(constantPoolHandle cpool,
+-                                   int constant_index,
++                                   int pool_index, int cache_index,
+                                    ciInstanceKlass* accessor);
+-  bool       is_unresolved_string(ciInstanceKlass* loading_klass,
+-                                   int constant_index) const;
+-  bool       is_unresolved_klass(ciInstanceKlass* loading_klass,
+-                                   int constant_index) const;
+   ciField*   get_field_by_index(ciInstanceKlass* loading_klass,
+                                 int field_index);
+   ciMethod*  get_method_by_index(constantPoolHandle cpool,
+@@ -137,12 +133,8 @@
+                                      bool& is_accessible,
+                                      ciInstanceKlass* loading_klass);
+   ciConstant get_constant_by_index_impl(constantPoolHandle cpool,
+-                                        int constant_index,
++                                        int pool_index, int cache_index,
+                                         ciInstanceKlass* loading_klass);
+-  bool       is_unresolved_string_impl (instanceKlass* loading_klass,
+-                                        int constant_index) const;
+-  bool       is_unresolved_klass_impl (instanceKlass* loading_klass,
+-                                        int constant_index) const;
+   ciField*   get_field_by_index_impl(ciInstanceKlass* loading_klass,
+                                      int field_index);
+   ciMethod*  get_method_by_index_impl(constantPoolHandle cpool,
+@@ -190,6 +182,25 @@
+     return _factory->get_unloaded_klass(accessing_klass, name, true);
+   }
+ 
++  // Get a ciKlass representing an unloaded klass mirror.
++  // Result is not necessarily unique, but will be unloaded.
++  ciInstance* get_unloaded_klass_mirror(ciKlass* type) {
++    return _factory->get_unloaded_klass_mirror(type);
++  }
++
++  // Get a ciInstance representing an unresolved method handle constant.
++  ciInstance* get_unloaded_method_handle_constant(ciKlass*  holder,
++                                                  ciSymbol* name,
++                                                  ciSymbol* signature,
++                                                  int       ref_kind) {
++    return _factory->get_unloaded_method_handle_constant(holder, name, signature, ref_kind);
++  }
++
++  // Get a ciInstance representing an unresolved method type constant.
++  ciInstance* get_unloaded_method_type_constant(ciSymbol* signature) {
++    return _factory->get_unloaded_method_type_constant(signature);
++  }
++
+   // See if we already have an unloaded klass for the given name
+   // or return NULL if not.
+   ciKlass *check_get_unloaded_klass(ciKlass* accessing_klass, ciSymbol* name) {
+diff --git a/src/share/vm/ci/ciInstanceKlass.cpp b/src/share/vm/ci/ciInstanceKlass.cpp
+--- a/src/share/vm/ci/ciInstanceKlass.cpp
++++ b/src/share/vm/ci/ciInstanceKlass.cpp
+@@ -324,9 +324,11 @@
+ //
+ // Get the instance of java.lang.Class corresponding to this klass.
+ ciInstance* ciInstanceKlass::java_mirror() {
+-  assert(is_loaded(), "must be loaded");
+   if (_java_mirror == NULL) {
+-    _java_mirror = ciKlass::java_mirror();
++    if (!is_loaded())
++      _java_mirror = ciEnv::current()->get_unloaded_klass_mirror(this);
++    else
++      _java_mirror = ciKlass::java_mirror();
+   }
+   return _java_mirror;
+ }
+diff --git a/src/share/vm/ci/ciObjectFactory.cpp b/src/share/vm/ci/ciObjectFactory.cpp
+--- a/src/share/vm/ci/ciObjectFactory.cpp
++++ b/src/share/vm/ci/ciObjectFactory.cpp
+@@ -70,6 +70,7 @@
+ 
+   _unloaded_methods = new (arena) GrowableArray<ciMethod*>(arena, 4, 0, NULL);
+   _unloaded_klasses = new (arena) GrowableArray<ciKlass*>(arena, 8, 0, NULL);
++  _unloaded_instances = new (arena) GrowableArray<ciInstance*>(arena, 4, 0, NULL);
+   _return_addresses =
+     new (arena) GrowableArray<ciReturnAddress*>(arena, 8, 0, NULL);
+ }
+@@ -443,6 +444,74 @@
+   return new_klass;
+ }
+ 
++
++//------------------------------------------------------------------
++// ciObjectFactory::get_unloaded_instance
++//
++// Get a ciInstance representing an as-yet undetermined instance of a given class.
++//
++ciInstance* ciObjectFactory::get_unloaded_instance(ciInstanceKlass* instance_klass) {
++  for (int i=0; i<_unloaded_instances->length(); i++) {
++    ciInstance* entry = _unloaded_instances->at(i);
++    if (entry->klass()->equals(instance_klass)) {
++      // We've found a match.
++      return entry;
++    }
++  }
++
++  // This is a new unloaded instance.  Create it and stick it in
++  // the cache.
++  ciInstance* new_instance = new (arena()) ciInstance(instance_klass);
++
++  init_ident_of(new_instance);
++  _unloaded_instances->append(new_instance);
++
++  // make sure it looks the way we want:
++  assert(!new_instance->is_loaded(), "");
++  assert(new_instance->klass() == instance_klass, "");
++
++  return new_instance;
++}
++
++
++//------------------------------------------------------------------
++// ciObjectFactory::get_unloaded_klass_mirror
++//
++// Get a ciInstance representing an unresolved klass mirror.
++//
++// Currently, this ignores the parameters and returns a unique unloaded instance.
++ciInstance* ciObjectFactory::get_unloaded_klass_mirror(ciKlass*  type) {
++  assert(ciEnv::_Class_klass != NULL, "");
++  return get_unloaded_instance(ciEnv::_Class_klass->as_instance_klass());
++}
++
++//------------------------------------------------------------------
++// ciObjectFactory::get_unloaded_method_handle_constant
++//
++// Get a ciInstance representing an unresolved method handle constant.
++//
++// Currently, this ignores the parameters and returns a unique unloaded instance.
++ciInstance* ciObjectFactory::get_unloaded_method_handle_constant(ciKlass*  holder,
++                                                                 ciSymbol* name,
++                                                                 ciSymbol* signature,
++                                                                 int       ref_kind) {
++  if (ciEnv::_MethodHandle_klass == NULL)  return NULL;
++  return get_unloaded_instance(ciEnv::_MethodHandle_klass->as_instance_klass());
++}
++
++//------------------------------------------------------------------
++// ciObjectFactory::get_unloaded_method_type_constant
++//
++// Get a ciInstance representing an unresolved method type constant.
++//
++// Currently, this ignores the parameters and returns a unique unloaded instance.
++ciInstance* ciObjectFactory::get_unloaded_method_type_constant(ciSymbol* signature) {
++  if (ciEnv::_MethodType_klass == NULL)  return NULL;
++  return get_unloaded_instance(ciEnv::_MethodType_klass->as_instance_klass());
++}
++
++
++
+ //------------------------------------------------------------------
+ // ciObjectFactory::get_empty_methodData
+ //
+@@ -637,7 +706,8 @@
+ //
+ // Print debugging information about the object factory
+ void ciObjectFactory::print() {
+-  tty->print("<ciObjectFactory oops=%d unloaded_methods=%d unloaded_klasses=%d>",
++  tty->print("<ciObjectFactory oops=%d unloaded_methods=%d unloaded_instances=%d unloaded_klasses=%d>",
+              _ci_objects->length(), _unloaded_methods->length(),
++             _unloaded_instances->length(),
+              _unloaded_klasses->length());
+ }
+diff --git a/src/share/vm/ci/ciObjectFactory.hpp b/src/share/vm/ci/ciObjectFactory.hpp
+--- a/src/share/vm/ci/ciObjectFactory.hpp
++++ b/src/share/vm/ci/ciObjectFactory.hpp
+@@ -39,6 +39,7 @@
+   GrowableArray<ciObject*>* _ci_objects;
+   GrowableArray<ciMethod*>* _unloaded_methods;
+   GrowableArray<ciKlass*>* _unloaded_klasses;
++  GrowableArray<ciInstance*>* _unloaded_instances;
+   GrowableArray<ciReturnAddress*>* _return_addresses;
+   int                       _next_ident;
+ 
+@@ -73,6 +74,8 @@
+ 
+   void print_contents_impl();
+ 
++  ciInstance* get_unloaded_instance(ciInstanceKlass* klass);
++
+ public:
+   static bool is_initialized() { return _initialized; }
+ 
+@@ -98,6 +101,18 @@
+                               ciSymbol* name,
+                               bool create_if_not_found);
+ 
++  // Get a ciInstance representing an unresolved klass mirror.
++  ciInstance* get_unloaded_klass_mirror(ciKlass* type);
++
++  // Get a ciInstance representing an unresolved method handle constant.
++  ciInstance* get_unloaded_method_handle_constant(ciKlass*  holder,
++                                                  ciSymbol* name,
++                                                  ciSymbol* signature,
++                                                  int       ref_kind);
++
++  // Get a ciInstance representing an unresolved method type constant.
++  ciInstance* get_unloaded_method_type_constant(ciSymbol* signature);
++
+ 
+   // Get the ciMethodData representing the methodData for a method
+   // with none.
+diff --git a/src/share/vm/ci/ciStreams.cpp b/src/share/vm/ci/ciStreams.cpp
+--- a/src/share/vm/ci/ciStreams.cpp
++++ b/src/share/vm/ci/ciStreams.cpp
+@@ -186,12 +186,13 @@
+ }
+ 
+ // ------------------------------------------------------------------
+-// ciBytecodeStream::get_constant_index
++// ciBytecodeStream::get_constant_raw_index
+ //
+ // If this bytecode is one of the ldc variants, get the index of the
+ // referenced constant.
+-int ciBytecodeStream::get_constant_index() const {
+-  switch(cur_bc()) {
++int ciBytecodeStream::get_constant_raw_index() const {
++  // work-alike for Bytecode_loadconstant::raw_index()
++  switch (cur_bc()) {
+   case Bytecodes::_ldc:
+     return get_index_u1();
+   case Bytecodes::_ldc_w:
+@@ -202,25 +203,52 @@
+     return 0;
+   }
+ }
++
++// ------------------------------------------------------------------
++// ciBytecodeStream::get_constant_pool_index
++// Decode any CP cache index into a regular pool index.
++int ciBytecodeStream::get_constant_pool_index() const {
++  // work-alike for Bytecode_loadconstant::pool_index()
++  int index = get_constant_raw_index();
++  if (has_cache_index()) {
++    return get_cpcache()->get_pool_index(index);
++  }
++  return index;
++}
++
++// ------------------------------------------------------------------
++// ciBytecodeStream::get_constant_cache_index
++// Return the CP cache index, or -1 if there isn't any.
++int ciBytecodeStream::get_constant_cache_index() const {
++  // work-alike for Bytecode_loadconstant::cache_index()
++  return has_cache_index() ? get_constant_raw_index() : -1;
++}
++
+ // ------------------------------------------------------------------
+ // ciBytecodeStream::get_constant
+ //
+ // If this bytecode is one of the ldc variants, get the referenced
+ // constant.
+ ciConstant ciBytecodeStream::get_constant() {
++  int pool_index = get_constant_raw_index();
++  int cache_index = -1;
++  if (has_cache_index()) {
++    cache_index = pool_index;
++    pool_index = -1;
++  }
+   VM_ENTRY_MARK;
+   constantPoolHandle cpool(_method->get_methodOop()->constants());
+-  return CURRENT_ENV->get_constant_by_index(cpool, get_constant_index(), _holder);
++  return CURRENT_ENV->get_constant_by_index(cpool, pool_index, cache_index, _holder);
+ }
+ 
+ // ------------------------------------------------------------------
+-bool ciBytecodeStream::is_unresolved_string() const {
+-  return CURRENT_ENV->is_unresolved_string(_holder, get_constant_index());
+-}
+-
+-// ------------------------------------------------------------------
+-bool ciBytecodeStream::is_unresolved_klass() const {
+-  return CURRENT_ENV->is_unresolved_klass(_holder, get_klass_index());
++// ciBytecodeStream::get_constant_pool_tag
++//
++// If this bytecode is one of the ldc variants, get the referenced
++// constant.
++constantTag ciBytecodeStream::get_constant_pool_tag(int index) const {
++  VM_ENTRY_MARK;
++  return _method->get_methodOop()->constants()->tag_at(index);
+ }
+ 
+ // ------------------------------------------------------------------
+@@ -378,13 +406,16 @@
+ 
+ // ------------------------------------------------------------------
+ // ciBytecodeStream::get_cpcache
+-ciCPCache* ciBytecodeStream::get_cpcache() {
+-  VM_ENTRY_MARK;
+-  // Get the constant pool.
+-  constantPoolOop      cpool   = _holder->get_instanceKlass()->constants();
+-  constantPoolCacheOop cpcache = cpool->cache();
++ciCPCache* ciBytecodeStream::get_cpcache() const {
++  if (_cpcache == NULL) {
++    VM_ENTRY_MARK;
++    // Get the constant pool.
++    constantPoolOop      cpool   = _holder->get_instanceKlass()->constants();
++    constantPoolCacheOop cpcache = cpool->cache();
+ 
+-  return CURRENT_ENV->get_object(cpcache)->as_cpcache();
++    *(ciCPCache**)&_cpcache = CURRENT_ENV->get_object(cpcache)->as_cpcache();
++  }
++  return _cpcache;
+ }
+ 
+ // ------------------------------------------------------------------
+diff --git a/src/share/vm/ci/ciStreams.hpp b/src/share/vm/ci/ciStreams.hpp
+--- a/src/share/vm/ci/ciStreams.hpp
++++ b/src/share/vm/ci/ciStreams.hpp
+@@ -46,6 +46,7 @@
+ 
+   ciMethod* _method;           // the method
+   ciInstanceKlass* _holder;
++  ciCPCache* _cpcache;
+   address _bc_start;            // Start of current bytecode for table
+   address _was_wide;            // Address past last wide bytecode
+   jint* _table_base;            // Aligned start of last table or switch
+@@ -58,7 +59,9 @@
+ 
+   void reset( address base, unsigned int size ) {
+     _bc_start =_was_wide = 0;
+-    _start = _pc = base; _end = base + size; }
++    _start = _pc = base; _end = base + size;
++    _cpcache = NULL;
++  }
+ 
+   void assert_wide(bool require_wide) const {
+     if (require_wide)
+@@ -136,15 +139,20 @@
+   bool is_wide() const { return ( _pc == _was_wide ); }
+ 
+   // Does this instruction contain an index which refes into the CP cache?
+-  bool uses_cp_cache() const { return Bytecodes::uses_cp_cache(cur_bc_raw()); }
++  bool has_cache_index() const { return Bytecodes::uses_cp_cache(cur_bc_raw()); }
+ 
+   int get_index_u1() const {
+     return bytecode()->get_index_u1(cur_bc_raw());
+   }
+ 
++  int get_index_u1_cpcache() const {
++    return bytecode()->get_index_u1_cpcache(cur_bc_raw());
++  }
++
+   // Get a byte index following this bytecode.
+   // If prefixed with a wide bytecode, get a wide index.
+   int get_index() const {
++    assert(!has_cache_index(), "else use cpcache variant");
+     return (_pc == _was_wide)   // was widened?
+       ? get_index_u2(true)      // yes, return wide index
+       : get_index_u1();         // no, return narrow index
+@@ -207,7 +215,9 @@
+     return cur_bci() + get_int_table(index); }
+ 
+   // --- Constant pool access ---
+-  int get_constant_index() const;
++  int get_constant_raw_index() const;
++  int get_constant_pool_index() const;
++  int get_constant_cache_index() const;
+   int get_field_index();
+   int get_method_index();
+ 
+@@ -217,12 +227,17 @@
+   int get_klass_index() const;
+ 
+   // If this bytecode is one of the ldc variants, get the referenced
+-  // constant
++  // constant.  Do not attempt to resolve it, since that would require
++  // execution of Java code.  If it is not resolved, return an unloaded
++  // object (ciConstant.as_object()->is_loaded() == false).
+   ciConstant get_constant();
+-  // True if the ldc variant points to an unresolved string
+-  bool is_unresolved_string() const;
+-  // True if the ldc variant points to an unresolved klass
+-  bool is_unresolved_klass() const;
++  constantTag get_constant_pool_tag(int index) const;
++
++  // True if the klass-using bytecode points to an unresolved klass
++  bool is_unresolved_klass() const {
++    constantTag tag = get_constant_pool_tag(get_klass_index());
++    return tag.is_unresolved_klass();
++  }
+ 
+   // If this bytecode is one of get_field, get_static, put_field,
+   // or put_static, get the referenced field.
+@@ -238,7 +253,7 @@
+   int       get_method_holder_index();
+   int       get_method_signature_index();
+ 
+-  ciCPCache*  get_cpcache();
++  ciCPCache*  get_cpcache() const;
+   ciCallSite* get_call_site();
+ };
+ 
+diff --git a/src/share/vm/classfile/classFileParser.cpp b/src/share/vm/classfile/classFileParser.cpp
+--- a/src/share/vm/classfile/classFileParser.cpp
++++ b/src/share/vm/classfile/classFileParser.cpp
+@@ -113,6 +113,29 @@
+           cp->string_index_at_put(index, string_index);
+         }
+         break;
++      case JVM_CONSTANT_MethodHandle :
++      case JVM_CONSTANT_MethodType :
++        if (!EnableMethodHandles ||
++            _major_version < Verifier::INVOKEDYNAMIC_MAJOR_VERSION) {
++          classfile_parse_error(
++            (!EnableInvokeDynamic ?
++             "This JVM does not support constant tag %u in class file %s" :
++             "Class file version does not support constant tag %u in class file %s"),
++            tag, CHECK);
++        }
++        if (tag == JVM_CONSTANT_MethodHandle) {
++          cfs->guarantee_more(4, CHECK);  // ref_kind, method_index, tag/access_flags
++          u1 ref_kind = cfs->get_u1_fast();
++          u2 method_index = cfs->get_u2_fast();
++          cp->method_handle_index_at_put(index, ref_kind, method_index);
++        } else if (tag == JVM_CONSTANT_MethodType) {
++          cfs->guarantee_more(3, CHECK);  // signature_index, tag/access_flags
++          u2 signature_index = cfs->get_u2_fast();
++          cp->method_type_index_at_put(index, signature_index);
++        } else {
++          ShouldNotReachHere();
++        }
++        break;
+       case JVM_CONSTANT_Integer :
+         {
+           cfs->guarantee_more(5, CHECK);  // bytes, tag/access_flags
+@@ -333,6 +356,60 @@
+           cp->unresolved_string_at_put(index, sym);
+         }
+         break;
++      case JVM_CONSTANT_MethodHandle :
++        {
++          int ref_index = cp->method_handle_index_at(index);
++          check_property(
++            valid_cp_range(ref_index, length) &&
++                EnableMethodHandles,
++              "Invalid constant pool index %u in class file %s",
++              ref_index, CHECK_(nullHandle));
++          constantTag tag = cp->tag_at(ref_index);
++          int ref_kind  = cp->method_handle_ref_kind_at(index);
++          switch (ref_kind) {
++          case JVM_REF_getField:
++          case JVM_REF_getStatic:
++          case JVM_REF_putField:
++          case JVM_REF_putStatic:
++            check_property(
++              tag.is_field(),
++              "Invalid constant pool index %u in class file %s (not a field)",
++              ref_index, CHECK_(nullHandle));
++            break;
++          case JVM_REF_invokeVirtual:
++          case JVM_REF_invokeStatic:
++          case JVM_REF_invokeSpecial:
++          case JVM_REF_newInvokeSpecial:
++            check_property(
++              tag.is_method(),
++              "Invalid constant pool index %u in class file %s (not a method)",
++              ref_index, CHECK_(nullHandle));
++            break;
++          case JVM_REF_invokeInterface:
++            check_property(
++              tag.is_interface_method(),
++              "Invalid constant pool index %u in class file %s (not an interface method)",
++              ref_index, CHECK_(nullHandle));
++            break;
++          default:
++            classfile_parse_error(
++              "Bad method handle kind at constant pool index %u in class file %s",
++              index, CHECK_(nullHandle));
++          }
++          // Keep the ref_index unchanged.  It will be indirected at link-time.
++        }
++        break;
++      case JVM_CONSTANT_MethodType :
++        {
++          int ref_index = cp->method_type_index_at(index);
++          check_property(
++            valid_cp_range(ref_index, length) &&
++                cp->tag_at(ref_index).is_utf8() &&
++                EnableMethodHandles,
++              "Invalid constant pool index %u in class file %s",
++              ref_index, CHECK_(nullHandle));
++        }
++        break;
+       default:
+         fatal(err_msg("bad constant pool tag value %u",
+                       cp->tag_at(index).value()));
+@@ -415,6 +492,43 @@
+         }
+         break;
+       }
++      case JVM_CONSTANT_MethodHandle: {
++        int ref_index = cp->method_handle_index_at(index);
++        int ref_kind  = cp->method_handle_ref_kind_at(index);
++        switch (ref_kind) {
++        case JVM_REF_invokeVirtual:
++        case JVM_REF_invokeStatic:
++        case JVM_REF_invokeSpecial:
++        case JVM_REF_newInvokeSpecial:
++          {
++            int name_and_type_ref_index = cp->name_and_type_ref_index_at(ref_index);
++            int name_ref_index = cp->name_ref_index_at(name_and_type_ref_index);
++            symbolHandle name(THREAD, cp->symbol_at(name_ref_index));
++            if (ref_kind == JVM_REF_newInvokeSpecial) {
++              if (name() != vmSymbols::object_initializer_name()) {
++                classfile_parse_error(
++                  "Bad constructor name at constant pool index %u in class file %s",
++                  name_ref_index, CHECK_(nullHandle));
++              }
++            } else {
++              if (name() == vmSymbols::object_initializer_name()) {
++                classfile_parse_error(
++                  "Bad method name at constant pool index %u in class file %s",
++                  name_ref_index, CHECK_(nullHandle));
++              }
++            }
++          }
++          break;
++          // Other ref_kinds are already fully checked in previous pass.
++        }
++        break;
++      }
++      case JVM_CONSTANT_MethodType: {
++        symbolHandle no_name = vmSymbolHandles::type_name(); // place holder
++        symbolHandle signature(THREAD, cp->method_type_signature_at(index));
++        verify_legal_method_signature(no_name, signature, CHECK_(nullHandle));
++        break;
++      }
+     }  // end of switch
+   }  // end of for
+ 
+@@ -430,7 +544,7 @@
+   case JVM_CONSTANT_UnresolvedClass :
+     // Patching a class means pre-resolving it.
+     // The name in the constant pool is ignored.
+-    if (patch->klass() == SystemDictionary::Class_klass()) { // %%% java_lang_Class::is_instance
++    if (java_lang_Class::is_instance(patch())) {
+       guarantee_property(!java_lang_Class::is_primitive(patch()),
+                          "Illegal class patch at %d in class file %s",
+                          index, CHECK);
+diff --git a/src/share/vm/classfile/systemDictionary.cpp b/src/share/vm/classfile/systemDictionary.cpp
+--- a/src/share/vm/classfile/systemDictionary.cpp
++++ b/src/share/vm/classfile/systemDictionary.cpp
+@@ -2454,6 +2454,48 @@
+   return Handle(THREAD, (oop) result.get_jobject());
+ }
+ 
++// Ask Java code to find or construct a method handle constant.
++Handle SystemDictionary::link_method_handle_constant(KlassHandle caller,
++                                                     int ref_kind, //e.g., JVM_REF_invokeVirtual
++                                                     KlassHandle callee,
++                                                     symbolHandle name_sym,
++                                                     symbolHandle signature,
++                                                     TRAPS) {
++  Handle empty;
++  Handle name = java_lang_String::create_from_symbol(name_sym(), CHECK_(empty));
++  Handle type;
++  if (signature->utf8_length() > 0 && signature->byte_at(0) == '(') {
++    bool ignore_is_on_bcp = false;
++    type = find_method_handle_type(signature, caller, ignore_is_on_bcp, CHECK_(empty));
++  } else {
++    SignatureStream ss(signature(), false);
++    if (!ss.is_done()) {
++      oop mirror = ss.as_java_mirror(caller->class_loader(), caller->protection_domain(),
++                                     SignatureStream::NCDFError, CHECK_(empty));
++      type = Handle(THREAD, mirror);
++      ss.next();
++      if (!ss.is_done())  type = Handle();  // error!
++    }
++  }
++  if (type.is_null()) {
++    THROW_MSG_(vmSymbols::java_lang_LinkageError(), "bad signature", empty);
++  }
++
++  // call sun.dyn.MethodHandleNatives::linkMethodHandleConstant(Class caller, int refKind, Class callee, String name, Object type) -> MethodHandle
++  JavaCallArguments args;
++  args.push_oop(caller->java_mirror());  // the referring class
++  args.push_int(ref_kind);
++  args.push_oop(callee->java_mirror());  // the target class
++  args.push_oop(name());
++  args.push_oop(type());
++  JavaValue result(T_OBJECT);
++  JavaCalls::call_static(&result,
++                         SystemDictionary::MethodHandleNatives_klass(),
++                         vmSymbols::linkMethodHandleConstant_name(),
++                         vmSymbols::linkMethodHandleConstant_signature(),
++                         &args, CHECK_(empty));
++  return Handle(THREAD, (oop) result.get_jobject());
++}
+ 
+ // Ask Java code to find or construct a java.dyn.CallSite for the given
+ // name and signature, as interpreted relative to the given class loader.
+diff --git a/src/share/vm/classfile/systemDictionary.hpp b/src/share/vm/classfile/systemDictionary.hpp
+--- a/src/share/vm/classfile/systemDictionary.hpp
++++ b/src/share/vm/classfile/systemDictionary.hpp
+@@ -473,6 +473,13 @@
+                                            KlassHandle accessing_klass,
+                                            bool& return_bcp_flag,
+                                            TRAPS);
++  // ask Java to compute a java.dyn.MethodHandle object for a given CP entry
++  static Handle    link_method_handle_constant(KlassHandle caller,
++                                               int ref_kind, //e.g., JVM_REF_invokeVirtual
++                                               KlassHandle callee,
++                                               symbolHandle name,
++                                               symbolHandle signature,
++                                               TRAPS);
+   // ask Java to create a dynamic call site, while linking an invokedynamic op
+   static Handle    make_dynamic_call_site(Handle bootstrap_method,
+                                           // Callee information:
+diff --git a/src/share/vm/classfile/verifier.cpp b/src/share/vm/classfile/verifier.cpp
+--- a/src/share/vm/classfile/verifier.cpp
++++ b/src/share/vm/classfile/verifier.cpp
+@@ -1595,7 +1595,10 @@
+   if (opcode == Bytecodes::_ldc || opcode == Bytecodes::_ldc_w) {
+     if (!tag.is_unresolved_string() && !tag.is_unresolved_klass()) {
+       types = (1 << JVM_CONSTANT_Integer) | (1 << JVM_CONSTANT_Float)
+-            | (1 << JVM_CONSTANT_String)  | (1 << JVM_CONSTANT_Class);
++            | (1 << JVM_CONSTANT_String)  | (1 << JVM_CONSTANT_Class)
++            | (1 << JVM_CONSTANT_MethodHandle) | (1 << JVM_CONSTANT_MethodType);
++      // Note:  The class file parser already verified the legality of
++      // MethodHandle and MethodType constants.
+       verify_cp_type(index, cp, types, CHECK_VERIFY(this));
+     }
+   } else {
+@@ -1629,6 +1632,14 @@
+     current_frame->push_stack_2(
+       VerificationType::long_type(),
+       VerificationType::long2_type(), CHECK_VERIFY(this));
++  } else if (tag.is_method_handle()) {
++    current_frame->push_stack(
++      VerificationType::reference_type(
++        vmSymbols::java_dyn_MethodHandle()), CHECK_VERIFY(this));
++  } else if (tag.is_method_type()) {
++    current_frame->push_stack(
++      VerificationType::reference_type(
++        vmSymbols::java_dyn_MethodType()), CHECK_VERIFY(this));
+   } else {
+     verify_error(bci, "Invalid index in ldc");
+     return;
+@@ -1917,9 +1928,12 @@
+   // Get referenced class type
+   VerificationType ref_class_type;
+   if (opcode == Bytecodes::_invokedynamic) {
+-    if (!EnableInvokeDynamic) {
++    if (!EnableInvokeDynamic ||
++        _klass->major_version() < Verifier::INVOKEDYNAMIC_MAJOR_VERSION) {
+       class_format_error(
+-        "invokedynamic instructions not enabled on this JVM",
++        (!EnableInvokeDynamic ?
++         "invokedynamic instructions not enabled in this JVM" :
++         "invokedynamic instructions not supported by this class file version"),
+         _klass->external_name());
+       return;
+     }
+diff --git a/src/share/vm/classfile/verifier.hpp b/src/share/vm/classfile/verifier.hpp
+--- a/src/share/vm/classfile/verifier.hpp
++++ b/src/share/vm/classfile/verifier.hpp
+@@ -25,7 +25,10 @@
+ // The verifier class
+ class Verifier : AllStatic {
+  public:
+-  enum { STACKMAP_ATTRIBUTE_MAJOR_VERSION = 50 };
++  enum {
++    STACKMAP_ATTRIBUTE_MAJOR_VERSION    = 50,
++    INVOKEDYNAMIC_MAJOR_VERSION         = 51
++  };
+   typedef enum { ThrowException, NoException } Mode;
+ 
+   /**
+diff --git a/src/share/vm/classfile/vmSymbols.hpp b/src/share/vm/classfile/vmSymbols.hpp
+--- a/src/share/vm/classfile/vmSymbols.hpp
++++ b/src/share/vm/classfile/vmSymbols.hpp
+@@ -246,6 +246,8 @@
+   /* internal up-calls made only by the JVM, via class sun.dyn.MethodHandleNatives: */            \
+   template(findMethodHandleType_name,                 "findMethodHandleType")                     \
+   template(findMethodHandleType_signature, "(Ljava/lang/Class;[Ljava/lang/Class;)Ljava/dyn/MethodType;") \
++  template(linkMethodHandleConstant_name,             "linkMethodHandleConstant")                 \
++  template(linkMethodHandleConstant_signature, "(Ljava/lang/Class;ILjava/lang/Class;Ljava/lang/String;Ljava/lang/Object;)Ljava/dyn/MethodHandle;") \
+   template(makeDynamicCallSite_name,                  "makeDynamicCallSite")                      \
+   template(makeDynamicCallSite_signature, "(Ljava/dyn/MethodHandle;Ljava/lang/String;Ljava/dyn/MethodType;Ljava/lang/Object;Lsun/dyn/MemberName;I)Ljava/dyn/CallSite;") \
+   NOT_LP64(  do_alias(machine_word_signature,         int_signature)  )                           \
+diff --git a/src/share/vm/code/nmethod.cpp b/src/share/vm/code/nmethod.cpp
+--- a/src/share/vm/code/nmethod.cpp
++++ b/src/share/vm/code/nmethod.cpp
+@@ -2596,13 +2596,10 @@
+         case Bytecodes::_getstatic:
+         case Bytecodes::_putstatic:
+           {
+-            methodHandle sdm = sd->method();
+-            Bytecode_field* field = Bytecode_field_at(sdm(), sdm->bcp_from(sd->bci()));
+-            constantPoolOop sdmc = sdm->constants();
+-            symbolOop name = sdmc->name_ref_at(field->index());
++            Bytecode_field* field = Bytecode_field_at(sd->method(), sd->bci());
+             st->print(" ");
+-            if (name != NULL)
+-              name->print_symbol_on(st);
++            if (field->name() != NULL)
++              field->name()->print_symbol_on(st);
+             else
+               st->print("<UNKNOWN>");
+           }
+diff --git a/src/share/vm/includeDB_core b/src/share/vm/includeDB_core
+--- a/src/share/vm/includeDB_core
++++ b/src/share/vm/includeDB_core
+@@ -545,6 +545,7 @@
+ 
+ ciCPCache.hpp                           ciClassList.hpp
+ ciCPCache.hpp                           ciObject.hpp
++ciCPCache.hpp                           cpCacheOop.hpp
+ 
+ ciEnv.cpp                               allocation.inline.hpp
+ ciEnv.cpp                               ciConstant.hpp
+@@ -823,6 +824,7 @@
+ 
+ ciStreams.cpp                           ciCallSite.hpp
+ ciStreams.cpp                           ciConstant.hpp
++ciStreams.cpp                           ciCPCache.hpp
+ ciStreams.cpp                           ciField.hpp
+ ciStreams.cpp                           ciStreams.hpp
+ ciStreams.cpp                           ciUtilities.hpp
+diff --git a/src/share/vm/interpreter/bytecode.cpp b/src/share/vm/interpreter/bytecode.cpp
+--- a/src/share/vm/interpreter/bytecode.cpp
++++ b/src/share/vm/interpreter/bytecode.cpp
+@@ -136,25 +136,24 @@
+ // Implementation of Bytecode_invoke
+ 
+ void Bytecode_invoke::verify() const {
+-  Bytecodes::Code bc = adjusted_invoke_code();
+   assert(is_valid(), "check invoke");
+   assert(method()->constants()->cache() != NULL, "do not call this from verifier or rewriter");
+ }
+ 
+ 
+-symbolOop Bytecode_invoke::signature() const {
++symbolOop Bytecode_member_ref::signature() const {
+   constantPoolOop constants = method()->constants();
+   return constants->signature_ref_at(index());
+ }
+ 
+ 
+-symbolOop Bytecode_invoke::name() const {
++symbolOop Bytecode_member_ref::name() const {
+   constantPoolOop constants = method()->constants();
+   return constants->name_ref_at(index());
+ }
+ 
+ 
+-BasicType Bytecode_invoke::result_type(Thread *thread) const {
++BasicType Bytecode_member_ref::result_type(Thread *thread) const {
+   symbolHandle sh(thread, signature());
+   ResultTypeFinder rts(sh);
+   rts.iterate();
+@@ -167,9 +166,9 @@
+   KlassHandle resolved_klass;
+   constantPoolHandle constants(THREAD, _method->constants());
+ 
+-  if (adjusted_invoke_code() == Bytecodes::_invokedynamic) {
++  if (java_code() == Bytecodes::_invokedynamic) {
+     LinkResolver::resolve_dynamic_method(m, resolved_klass, constants, index(), CHECK_(methodHandle()));
+-  } else if (adjusted_invoke_code() != Bytecodes::_invokeinterface) {
++  } else if (java_code() != Bytecodes::_invokeinterface) {
+     LinkResolver::resolve_method(m, resolved_klass, constants, index(), CHECK_(methodHandle()));
+   } else {
+     LinkResolver::resolve_interface_method(m, resolved_klass, constants, index(), CHECK_(methodHandle()));
+@@ -178,51 +177,68 @@
+ }
+ 
+ 
+-int Bytecode_invoke::index() const {
++int Bytecode_member_ref::index() const {
+   // Note:  Rewriter::rewrite changes the Java_u2 of an invokedynamic to a native_u4,
+   // at the same time it allocates per-call-site CP cache entries.
+-  Bytecodes::Code stdc = Bytecodes::java_code(code());
+-  Bytecode* invoke = Bytecode_at(bcp());
+-  if (invoke->has_index_u4(stdc))
+-    return invoke->get_index_u4(stdc);
++  Bytecodes::Code rawc = code();
++  Bytecode* invoke = bytecode();
++  if (invoke->has_index_u4(rawc))
++    return invoke->get_index_u4(rawc);
+   else
+-    return invoke->get_index_u2_cpcache(stdc);
++    return invoke->get_index_u2_cpcache(rawc);
+ }
+ 
++int Bytecode_member_ref::pool_index() const {
++  int index = this->index();
++  DEBUG_ONLY({
++      if (!bytecode()->has_index_u4(code()))
++        index -= constantPoolOopDesc::CPCACHE_INDEX_TAG;
++    });
++  return _method->constants()->cache()->entry_at(index)->constant_pool_index();
++}
+ 
+ // Implementation of Bytecode_field
+ 
+ void Bytecode_field::verify() const {
+-  Bytecodes::Code stdc = Bytecodes::java_code(code());
+-  assert(stdc == Bytecodes::_putstatic || stdc == Bytecodes::_getstatic ||
+-         stdc == Bytecodes::_putfield  || stdc == Bytecodes::_getfield, "check field");
++  assert(is_valid(), "check field");
+ }
+ 
+ 
+-bool Bytecode_field::is_static() const {
+-  Bytecodes::Code stdc = Bytecodes::java_code(code());
+-  return stdc == Bytecodes::_putstatic || stdc == Bytecodes::_getstatic;
++// Implementation of Bytecode_loadconstant
++
++int Bytecode_loadconstant::raw_index() const {
++  Bytecode* bcp = bytecode();
++  Bytecodes::Code rawc = bcp->code();
++  assert(rawc != Bytecodes::_wide, "verifier prevents this");
++  if (Bytecodes::java_code(rawc) == Bytecodes::_ldc)
++    return bcp->get_index_u1(rawc);
++  else
++    return bcp->get_index_u2(rawc, false);
+ }
+ 
+-
+-int Bytecode_field::index() const {
+-  Bytecode* invoke = Bytecode_at(bcp());
+-  return invoke->get_index_u2_cpcache(Bytecodes::_getfield);
++int Bytecode_loadconstant::pool_index() const {
++  int index = raw_index();
++  if (has_cache_index()) {
++    return _method->constants()->cache()->entry_at(index)->constant_pool_index();
++  }
++  return index;
+ }
+ 
++BasicType Bytecode_loadconstant::result_type() const {
++  int index = pool_index();
++  constantTag tag = _method->constants()->tag_at(index);
++  return tag.basic_type();
++}
+ 
+-// Implementation of Bytecodes loac constant
+-
+-int Bytecode_loadconstant::index() const {
+-  Bytecodes::Code stdc = Bytecodes::java_code(code());
+-  if (stdc != Bytecodes::_wide) {
+-    if (Bytecodes::java_code(stdc) == Bytecodes::_ldc)
+-      return get_index_u1(stdc);
+-    else
+-      return get_index_u2(stdc, false);
++oop Bytecode_loadconstant::resolve_constant(TRAPS) const {
++  assert(_method.not_null(), "must supply method to resolve constant");
++  int index = raw_index();
++  constantPoolOop constants = _method->constants();
++  if (has_cache_index()) {
++    return constants->resolve_cached_constant_at(index, THREAD);
++  } else {
++    return constants->resolve_constant_at(index, THREAD);
+   }
+-  stdc = Bytecodes::code_at(addr_at(1));
+-  return get_index_u2(stdc, true);
+ }
+ 
+ //------------------------------------------------------------------------------
+diff --git a/src/share/vm/interpreter/bytecode.hpp b/src/share/vm/interpreter/bytecode.hpp
+--- a/src/share/vm/interpreter/bytecode.hpp
++++ b/src/share/vm/interpreter/bytecode.hpp
+@@ -76,9 +76,13 @@
+           return Bytes::get_native_u2(p);
+     else  return Bytes::get_Java_u2(p);
+   }
++  int get_index_u1_cpcache(Bytecodes::Code bc) const {
++    assert_same_format_as(bc); assert_index_size(1, bc);
++    return *(jubyte*)addr_at(1) + constantPoolOopDesc::CPCACHE_INDEX_TAG;
++  }
+   int get_index_u2_cpcache(Bytecodes::Code bc) const {
+     assert_same_format_as(bc); assert_index_size(2, bc); assert_native_index(bc);
+-    return Bytes::get_native_u2(addr_at(1)) DEBUG_ONLY(+ constantPoolOopDesc::CPCACHE_INDEX_TAG);
++    return Bytes::get_native_u2(addr_at(1)) + constantPoolOopDesc::CPCACHE_INDEX_TAG;
+   }
+   int get_index_u4(Bytecodes::Code bc) const {
+     assert_same_format_as(bc); assert_index_size(4, bc);
+@@ -152,7 +156,7 @@
+ 
+ inline Bytecode_lookupswitch* Bytecode_lookupswitch_at(address bcp) {
+   Bytecode_lookupswitch* b = (Bytecode_lookupswitch*)bcp;
+-  debug_only(b->verify());
++  DEBUG_ONLY(b->verify());
+   return b;
+ }
+ 
+@@ -174,44 +178,56 @@
+ 
+ inline Bytecode_tableswitch* Bytecode_tableswitch_at(address bcp) {
+   Bytecode_tableswitch* b = (Bytecode_tableswitch*)bcp;
+-  debug_only(b->verify());
++  DEBUG_ONLY(b->verify());
+   return b;
+ }
+ 
+ 
+-// Abstraction for invoke_{virtual, static, interface, special}
++// Common code for decoding invokes and field references.
+ 
+-class Bytecode_invoke: public ResourceObj {
++class Bytecode_member_ref: public ResourceObj {
+  protected:
+   methodHandle _method;                          // method containing the bytecode
+   int          _bci;                             // position of the bytecode
+ 
+-  Bytecode_invoke(methodHandle method, int bci)  : _method(method), _bci(bci) {}
++  Bytecode_member_ref(methodHandle method, int bci)  : _method(method), _bci(bci) {}
++
++ public:
++  // Attributes
++  methodHandle method() const                    { return _method; }
++  int          bci() const                       { return _bci; }
++  address      bcp() const                       { return _method->bcp_from(bci()); }
++  Bytecode*    bytecode() const                  { return Bytecode_at(bcp()); }
++
++  int          index() const;                    // cache index (loaded from instruction)
++  int          pool_index() const;               // constant pool index
++  symbolOop    name() const;                     // returns the name of the method or field
++  symbolOop    signature() const;                // returns the signature of the method or field
++
++  BasicType    result_type(Thread* thread) const; // returns the result type of the getfield or invoke
++
++  Bytecodes::Code code() const                   { return Bytecodes::code_at(bcp(), _method()); }
++  Bytecodes::Code java_code() const              { return Bytecodes::java_code(code()); }
++};
++
++// Abstraction for invoke_{virtual, static, interface, special}
++
++class Bytecode_invoke: public Bytecode_member_ref {
++ protected:
++  Bytecode_invoke(methodHandle method, int bci)  : Bytecode_member_ref(method, bci) {}
+ 
+  public:
+   void verify() const;
+ 
+   // Attributes
+-  methodHandle method() const                    { return _method; }
+-  int          bci() const                       { return _bci; }
+-  address      bcp() const                       { return _method->bcp_from(bci()); }
+-
+-  int          index() const;                    // the constant pool index for the invoke
+-  symbolOop    name() const;                     // returns the name of the invoked method
+-  symbolOop    signature() const;                // returns the signature of the invoked method
+-  BasicType    result_type(Thread *thread) const; // returns the result type of the invoke
+-
+-  Bytecodes::Code code() const                   { return Bytecodes::code_at(bcp(), _method()); }
+-  Bytecodes::Code adjusted_invoke_code() const   { return Bytecodes::java_code(code()); }
+-
+   methodHandle static_target(TRAPS);             // "specified" method   (from constant pool)
+ 
+   // Testers
+-  bool is_invokeinterface() const                { return adjusted_invoke_code() == Bytecodes::_invokeinterface; }
+-  bool is_invokevirtual() const                  { return adjusted_invoke_code() == Bytecodes::_invokevirtual; }
+-  bool is_invokestatic() const                   { return adjusted_invoke_code() == Bytecodes::_invokestatic; }
+-  bool is_invokespecial() const                  { return adjusted_invoke_code() == Bytecodes::_invokespecial; }
+-  bool is_invokedynamic() const                  { return adjusted_invoke_code() == Bytecodes::_invokedynamic; }
++  bool is_invokeinterface() const                { return java_code() == Bytecodes::_invokeinterface; }
++  bool is_invokevirtual() const                  { return java_code() == Bytecodes::_invokevirtual; }
++  bool is_invokestatic() const                   { return java_code() == Bytecodes::_invokestatic; }
++  bool is_invokespecial() const                  { return java_code() == Bytecodes::_invokespecial; }
++  bool is_invokedynamic() const                  { return java_code() == Bytecodes::_invokedynamic; }
+ 
+   bool has_receiver() const                      { return !is_invokestatic() && !is_invokedynamic(); }
+ 
+@@ -230,7 +246,7 @@
+ 
+ inline Bytecode_invoke* Bytecode_invoke_at(methodHandle method, int bci) {
+   Bytecode_invoke* b = new Bytecode_invoke(method, bci);
+-  debug_only(b->verify());
++  DEBUG_ONLY(b->verify());
+   return b;
+ }
+ 
+@@ -240,21 +256,34 @@
+ }
+ 
+ 
+-// Abstraction for all field accesses (put/get field/static_
+-class Bytecode_field: public Bytecode {
+-public:
++// Abstraction for all field accesses (put/get field/static)
++class Bytecode_field: public Bytecode_member_ref {
++ protected:
++  Bytecode_field(methodHandle method, int bci)  : Bytecode_member_ref(method, bci) {}
++
++ public:
++  // Testers
++  bool is_getfield() const                       { return java_code() == Bytecodes::_getfield; }
++  bool is_putfield() const                       { return java_code() == Bytecodes::_putfield; }
++  bool is_getstatic() const                      { return java_code() == Bytecodes::_getstatic; }
++  bool is_putstatic() const                      { return java_code() == Bytecodes::_putstatic; }
++
++  bool is_getter() const                         { return is_getfield()  || is_getstatic(); }
++  bool is_static() const                         { return is_getstatic() || is_putstatic(); }
++
++  bool is_valid() const                          { return is_getfield()   ||
++                                                          is_putfield()   ||
++                                                          is_getstatic()  ||
++                                                          is_putstatic(); }
+   void verify() const;
+ 
+-  int  index() const;
+-  bool is_static() const;
+-
+   // Creation
+-  inline friend Bytecode_field* Bytecode_field_at(const methodOop method, address bcp);
++  inline friend Bytecode_field* Bytecode_field_at(methodHandle method, int bci);
+ };
+ 
+-inline Bytecode_field* Bytecode_field_at(const methodOop method, address bcp) {
+-  Bytecode_field* b = (Bytecode_field*)bcp;
+-  debug_only(b->verify());
++inline Bytecode_field* Bytecode_field_at(methodHandle method, int bci) {
++  Bytecode_field* b = new Bytecode_field(method, bci);
++  DEBUG_ONLY(b->verify());
+   return b;
+ }
+ 
+@@ -274,7 +303,7 @@
+ 
+ inline Bytecode_checkcast* Bytecode_checkcast_at(address bcp) {
+   Bytecode_checkcast* b = (Bytecode_checkcast*)bcp;
+-  debug_only(b->verify());
++  DEBUG_ONLY(b->verify());
+   return b;
+ }
+ 
+@@ -294,7 +323,7 @@
+ 
+ inline Bytecode_instanceof* Bytecode_instanceof_at(address bcp) {
+   Bytecode_instanceof* b = (Bytecode_instanceof*)bcp;
+-  debug_only(b->verify());
++  DEBUG_ONLY(b->verify());
+   return b;
+ }
+ 
+@@ -312,7 +341,7 @@
+ 
+ inline Bytecode_new* Bytecode_new_at(address bcp) {
+   Bytecode_new* b = (Bytecode_new*)bcp;
+-  debug_only(b->verify());
++  DEBUG_ONLY(b->verify());
+   return b;
+ }
+ 
+@@ -330,7 +359,7 @@
+ 
+ inline Bytecode_multianewarray* Bytecode_multianewarray_at(address bcp) {
+   Bytecode_multianewarray* b = (Bytecode_multianewarray*)bcp;
+-  debug_only(b->verify());
++  DEBUG_ONLY(b->verify());
+   return b;
+ }
+ 
+@@ -348,29 +377,57 @@
+ 
+ inline Bytecode_anewarray* Bytecode_anewarray_at(address bcp) {
+   Bytecode_anewarray* b = (Bytecode_anewarray*)bcp;
+-  debug_only(b->verify());
++  DEBUG_ONLY(b->verify());
+   return b;
+ }
+ 
+ 
+ // Abstraction for ldc, ldc_w and ldc2_w
+ 
+-class Bytecode_loadconstant: public Bytecode {
++class Bytecode_loadconstant: public ResourceObj {
++ private:
++  int          _bci;
++  methodHandle _method;
++
++  Bytecodes::Code code() const                   { return bytecode()->code(); }
++
++  int raw_index() const;
++
++  Bytecode_loadconstant(methodHandle method, int bci) : _method(method), _bci(bci) {}
++
+  public:
++  // Attributes
++  methodHandle method() const                    { return _method; }
++  int          bci() const                       { return _bci; }
++  address      bcp() const                       { return _method->bcp_from(bci()); }
++  Bytecode*    bytecode() const                  { return Bytecode_at(bcp()); }
++
+   void verify() const {
++    assert(_method.not_null(), "must supply method");
+     Bytecodes::Code stdc = Bytecodes::java_code(code());
+     assert(stdc == Bytecodes::_ldc ||
+            stdc == Bytecodes::_ldc_w ||
+            stdc == Bytecodes::_ldc2_w, "load constant");
+   }
+ 
+-  int index() const;
++  // Only non-standard bytecodes (fast_aldc) have CP cache indexes.
++  bool has_cache_index() const { return code() >= Bytecodes::number_of_java_codes; }
+ 
+-  inline friend Bytecode_loadconstant* Bytecode_loadconstant_at(const methodOop method, address bcp);
++  int pool_index() const;               // index into constant pool
++  int cache_index() const {             // index into CP cache (or -1 if none)
++    return has_cache_index() ? raw_index() : -1;
++  }
++
++  BasicType result_type() const;        // returns the result type of the ldc
++
++  oop resolve_constant(TRAPS) const;
++
++  // Creation
++  inline friend Bytecode_loadconstant* Bytecode_loadconstant_at(methodHandle method, int bci);
+ };
+ 
+-inline Bytecode_loadconstant* Bytecode_loadconstant_at(const methodOop method, address bcp) {
+-  Bytecode_loadconstant* b = (Bytecode_loadconstant*)bcp;
+-  debug_only(b->verify());
++inline Bytecode_loadconstant* Bytecode_loadconstant_at(methodHandle method, int bci) {
++  Bytecode_loadconstant* b = new Bytecode_loadconstant(method, bci);
++  DEBUG_ONLY(b->verify());
+   return b;
+ }
+diff --git a/src/share/vm/interpreter/bytecodeTracer.cpp b/src/share/vm/interpreter/bytecodeTracer.cpp
+--- a/src/share/vm/interpreter/bytecodeTracer.cpp
++++ b/src/share/vm/interpreter/bytecodeTracer.cpp
+@@ -49,6 +49,7 @@
+ 
+   int       get_index_u1()           { return *(address)_next_pc++; }
+   int       get_index_u2()           { int i=Bytes::get_Java_u2(_next_pc); _next_pc+=2; return i; }
++  int       get_index_u1_cpcache()   { return get_index_u1() + constantPoolOopDesc::CPCACHE_INDEX_TAG; }
+   int       get_index_u2_cpcache()   { int i=Bytes::get_native_u2(_next_pc); _next_pc+=2; return i + constantPoolOopDesc::CPCACHE_INDEX_TAG; }
+   int       get_index_u4()           { int i=Bytes::get_native_u4(_next_pc); _next_pc+=4; return i; }
+   int       get_index_special()      { return (is_wide()) ? get_index_u2() : get_index_u1(); }
+@@ -60,6 +61,7 @@
+   bool      check_index(int i, int& cp_index, outputStream* st = tty);
+   void      print_constant(int i, outputStream* st = tty);
+   void      print_field_or_method(int i, outputStream* st = tty);
++  void      print_field_or_method(int orig_i, int i, outputStream* st = tty);
+   void      print_attributes(int bci, outputStream* st = tty);
+   void      bytecode_epilog(int bci, outputStream* st = tty);
+ 
+@@ -177,18 +179,29 @@
+   _closure->trace(method, bcp, st);
+ }
+ 
++void print_symbol(symbolOop sym, outputStream* st) {
++  char buf[40];
++  int len = sym->utf8_length();
++  if (len >= (int)sizeof(buf)) {
++    st->print_cr(" %s...[%d]", sym->as_C_string(buf, sizeof(buf)), len);
++  } else {
++    st->print(" ");
++    sym->print_on(st); st->cr();
++  }
++}
++
+ void print_oop(oop value, outputStream* st) {
+   if (value == NULL) {
+     st->print_cr(" NULL");
+-  } else {
++  } else if (java_lang_String::is_instance(value)) {
+     EXCEPTION_MARK;
+     Handle h_value (THREAD, value);
+     symbolHandle sym = java_lang_String::as_symbol(h_value, CATCH);
+-    if (sym->utf8_length() > 32) {
+-      st->print_cr(" ....");
+-    } else {
+-      sym->print_on(st); st->cr();
+-    }
++    print_symbol(sym(), st);
++  } else if (value->is_symbol()) {
++    print_symbol(symbolOop(value), st);
++  } else {
++    st->print_cr(" " PTR_FORMAT, (intptr_t) value);
+   }
+ }
+ 
+@@ -279,16 +292,27 @@
+   } else if (tag.is_double()) {
+     st->print_cr(" %f", constants->double_at(i));
+   } else if (tag.is_string()) {
+-    oop string = constants->resolved_string_at(i);
++    oop string = constants->pseudo_string_at(i);
+     print_oop(string, st);
+   } else if (tag.is_unresolved_string()) {
+-    st->print_cr(" <unresolved string at %d>", i);
++    const char* string = constants->string_at_noresolve(i);
++    st->print_cr(" %s", string);
+   } else if (tag.is_klass()) {
+     st->print_cr(" %s", constants->resolved_klass_at(i)->klass_part()->external_name());
+   } else if (tag.is_unresolved_klass()) {
+     st->print_cr(" <unresolved klass at %d>", i);
+   } else if (tag.is_object()) {
+-    st->print_cr(" " PTR_FORMAT, constants->object_at(i));
++    st->print(" <Object>");
++    print_oop(constants->object_at(i), st);
++  } else if (tag.is_method_type()) {
++    int i2 = constants->method_type_index_at(i);
++    st->print(" <MethodType> %d", i2);
++    print_oop(constants->symbol_at(i2), st);
++  } else if (tag.is_method_handle()) {
++    int kind = constants->method_handle_ref_kind_at(i);
++    int i2 = constants->method_handle_index_at(i);
++    st->print(" <MethodHandle of kind %d>", kind, i2);
++    print_field_or_method(-i, i2, st);
+   } else {
+     st->print_cr(" bad tag=%d at %d", tag.value(), i);
+   }
+@@ -297,7 +321,10 @@
+ void BytecodePrinter::print_field_or_method(int i, outputStream* st) {
+   int orig_i = i;
+   if (!check_index(orig_i, i, st))  return;
++  print_field_or_method(orig_i, i, st);
++}
+ 
++void BytecodePrinter::print_field_or_method(int orig_i, int i, outputStream* st) {
+   constantPoolOop constants = method()->constants();
+   constantTag tag = constants->tag_at(i);
+ 
+@@ -314,9 +341,11 @@
+     return;
+   }
+ 
++  symbolOop klass = constants->klass_name_at(constants->uncached_klass_ref_index_at(i));
+   symbolOop name = constants->uncached_name_ref_at(i);
+   symbolOop signature = constants->uncached_signature_ref_at(i);
+-  st->print_cr(" %d <%s> <%s> ", i, name->as_C_string(), signature->as_C_string());
++  const char* sep = (tag.is_field() ? "/" : "");
++  st->print_cr(" %d <%s.%s%s%s> ", i, klass->as_C_string(), name->as_C_string(), sep, signature->as_C_string());
+ }
+ 
+ 
+@@ -340,12 +369,20 @@
+       st->print_cr(" " INT32_FORMAT, get_short());
+       break;
+     case Bytecodes::_ldc:
+-      print_constant(get_index_u1(), st);
++      if (Bytecodes::uses_cp_cache(raw_code())) {
++        print_constant(get_index_u1_cpcache(), st);
++      } else {
++        print_constant(get_index_u1(), st);
++      }
+       break;
+ 
+     case Bytecodes::_ldc_w:
+     case Bytecodes::_ldc2_w:
+-      print_constant(get_index_u2(), st);
++      if (Bytecodes::uses_cp_cache(raw_code())) {
++        print_constant(get_index_u2_cpcache(), st);
++      } else {
++        print_constant(get_index_u2(), st);
++      }
+       break;
+ 
+     case Bytecodes::_iload:
+diff --git a/src/share/vm/interpreter/bytecodes.cpp b/src/share/vm/interpreter/bytecodes.cpp
+--- a/src/share/vm/interpreter/bytecodes.cpp
++++ b/src/share/vm/interpreter/bytecodes.cpp
+@@ -487,6 +487,9 @@
+ 
+   def(_return_register_finalizer , "return_register_finalizer" , "b"    , NULL    , T_VOID   ,  0, true, _return);
+ 
++  def(_fast_aldc           , "fast_aldc"           , "bj"   , NULL    , T_OBJECT,   1, true,  _ldc   );
++  def(_fast_aldc_w         , "fast_aldc_w"         , "bJJ"  , NULL    , T_OBJECT,   1, true,  _ldc_w );
++
+   def(_shouldnotreachhere  , "_shouldnotreachhere" , "b"    , NULL    , T_VOID   ,  0, false);
+ 
+   // platform specific JVM bytecodes
+diff --git a/src/share/vm/interpreter/bytecodes.hpp b/src/share/vm/interpreter/bytecodes.hpp
+--- a/src/share/vm/interpreter/bytecodes.hpp
++++ b/src/share/vm/interpreter/bytecodes.hpp
+@@ -270,6 +270,10 @@
+     _fast_linearswitch    ,
+     _fast_binaryswitch    ,
+ 
++    // special handling of oop constants:
++    _fast_aldc            ,
++    _fast_aldc_w          ,
++
+     _return_register_finalizer    ,
+ 
+     _shouldnotreachhere,      // For debugging
+diff --git a/src/share/vm/interpreter/interpreter.cpp b/src/share/vm/interpreter/interpreter.cpp
+--- a/src/share/vm/interpreter/interpreter.cpp
++++ b/src/share/vm/interpreter/interpreter.cpp
+@@ -267,20 +267,6 @@
+ }
+ #endif // PRODUCT
+ 
+-static BasicType constant_pool_type(methodOop method, int index) {
+-  constantTag tag = method->constants()->tag_at(index);
+-       if (tag.is_int              ()) return T_INT;
+-  else if (tag.is_float            ()) return T_FLOAT;
+-  else if (tag.is_long             ()) return T_LONG;
+-  else if (tag.is_double           ()) return T_DOUBLE;
+-  else if (tag.is_string           ()) return T_OBJECT;
+-  else if (tag.is_unresolved_string()) return T_OBJECT;
+-  else if (tag.is_klass            ()) return T_OBJECT;
+-  else if (tag.is_unresolved_klass ()) return T_OBJECT;
+-  ShouldNotReachHere();
+-  return T_ILLEGAL;
+-}
+-
+ 
+ //------------------------------------------------------------------------------------------------------------------------
+ // Deoptimization support
+@@ -330,13 +316,15 @@
+     }
+ 
+     case Bytecodes::_ldc   :
+-      type = constant_pool_type( method, *(bcp+1) );
+-      break;
+-
+     case Bytecodes::_ldc_w : // fall through
+     case Bytecodes::_ldc2_w:
+-      type = constant_pool_type( method, Bytes::get_Java_u2(bcp+1) );
+-      break;
++      {
++        Thread *thread = Thread::current();
++        ResourceMark rm(thread);
++        methodHandle mh(thread, method);
++        type = Bytecode_loadconstant_at(mh, bci)->result_type();
++        break;
++      }
+ 
+     default:
+       type = Bytecodes::result_type(code);
+diff --git a/src/share/vm/interpreter/interpreterRuntime.cpp b/src/share/vm/interpreter/interpreterRuntime.cpp
+--- a/src/share/vm/interpreter/interpreterRuntime.cpp
++++ b/src/share/vm/interpreter/interpreterRuntime.cpp
+@@ -83,6 +83,18 @@
+   }
+ IRT_END
+ 
++IRT_ENTRY(void, InterpreterRuntime::resolve_ldc(JavaThread* thread, Bytecodes::Code bytecode)) {
++  assert(bytecode == Bytecodes::_fast_aldc ||
++         bytecode == Bytecodes::_fast_aldc_w, "wrong bc");
++  ResourceMark rm(thread);
++  methodHandle m (thread, method(thread));
++  Bytecode_loadconstant* ldc = Bytecode_loadconstant_at(m, bci(thread));
++  oop result = ldc->resolve_constant(THREAD);
++  DEBUG_ONLY(ConstantPoolCacheEntry* cpce = m->constants()->cache()->entry_at(ldc->cache_index()));
++  assert(result == cpce->f1(), "expected result for assembly code");
++}
++IRT_END
++
+ 
+ //------------------------------------------------------------------------------------------------------------------------
+ // Allocation
+@@ -328,7 +340,7 @@
+   typeArrayHandle    h_extable  (thread, h_method->exception_table());
+   bool               should_repeat;
+   int                handler_bci;
+-  int                current_bci = bcp(thread) - h_method->code_base();
++  int                current_bci = bci(thread);
+ 
+   // Need to do this check first since when _do_not_unlock_if_synchronized
+   // is set, we don't want to trigger any classloading which may make calls
+@@ -615,8 +627,7 @@
+   if (bytecode == Bytecodes::_invokevirtual || bytecode == Bytecodes::_invokeinterface) {
+     ResourceMark rm(thread);
+     methodHandle m (thread, method(thread));
+-    int bci = m->bci_from(bcp(thread));
+-    Bytecode_invoke* call = Bytecode_invoke_at(m, bci);
++    Bytecode_invoke* call = Bytecode_invoke_at(m, bci(thread));
+     symbolHandle signature (thread, call->signature());
+     receiver = Handle(thread,
+                   thread->last_frame().interpreter_callee_receiver(signature));
+diff --git a/src/share/vm/interpreter/interpreterRuntime.hpp b/src/share/vm/interpreter/interpreterRuntime.hpp
+--- a/src/share/vm/interpreter/interpreterRuntime.hpp
++++ b/src/share/vm/interpreter/interpreterRuntime.hpp
+@@ -34,6 +34,7 @@
+   static frame     last_frame(JavaThread *thread)    { return thread->last_frame(); }
+   static methodOop method(JavaThread *thread)        { return last_frame(thread).interpreter_frame_method(); }
+   static address   bcp(JavaThread *thread)           { return last_frame(thread).interpreter_frame_bcp(); }
++  static int       bci(JavaThread *thread)           { return last_frame(thread).interpreter_frame_bci(); }
+   static void      set_bcp_and_mdp(address bcp, JavaThread*thread);
+   static Bytecodes::Code code(JavaThread *thread)    {
+     // pass method to avoid calling unsafe bcp_to_method (partial fix 4926272)
+@@ -59,6 +60,7 @@
+  public:
+   // Constants
+   static void    ldc           (JavaThread* thread, bool wide);
++  static void    resolve_ldc   (JavaThread* thread, Bytecodes::Code bytecode);
+ 
+   // Allocation
+   static void    _new          (JavaThread* thread, constantPoolOopDesc* pool, int index);
+diff --git a/src/share/vm/interpreter/rewriter.cpp b/src/share/vm/interpreter/rewriter.cpp
+--- a/src/share/vm/interpreter/rewriter.cpp
++++ b/src/share/vm/interpreter/rewriter.cpp
+@@ -38,6 +38,8 @@
+       case JVM_CONSTANT_InterfaceMethodref:
+       case JVM_CONSTANT_Fieldref          : // fall through
+       case JVM_CONSTANT_Methodref         : // fall through
++      case JVM_CONSTANT_MethodHandle      : // fall through
++      case JVM_CONSTANT_MethodType        : // fall through
+         add_cp_cache_entry(i);
+         break;
+     }
+@@ -131,6 +133,27 @@
+ }
+ 
+ 
++// Rewrite some ldc bytecodes to _fast_aldc
++void Rewriter::maybe_rewrite_ldc(address bcp, int offset, bool is_wide) {
++  assert((*bcp) == (is_wide ? Bytecodes::_ldc_w : Bytecodes::_ldc), "");
++  address p = bcp + offset;
++  int cp_index = is_wide ? Bytes::get_Java_u2(p) : (u1)(*p);
++  constantTag tag = _pool->tag_at(cp_index).value();
++  if (tag.is_method_handle() || tag.is_method_type()) {
++    int cache_index = cp_entry_to_cp_cache(cp_index);
++    if (is_wide) {
++      (*bcp) = Bytecodes::_fast_aldc_w;
++      assert(cache_index == (u2)cache_index, "");
++      Bytes::put_native_u2(p, cache_index);
++    } else {
++      (*bcp) = Bytecodes::_fast_aldc;
++      assert(cache_index == (u1)cache_index, "");
++      (*p) = (u1)cache_index;
++    }
++  }
++}
++
++
+ // Rewrites a method given the index_map information
+ void Rewriter::scan_method(methodOop method) {
+ 
+@@ -198,6 +221,12 @@
+         case Bytecodes::_invokedynamic:
+           rewrite_invokedynamic(bcp, prefix_length+1);
+           break;
++        case Bytecodes::_ldc:
++          maybe_rewrite_ldc(bcp, prefix_length+1, false);
++          break;
++        case Bytecodes::_ldc_w:
++          maybe_rewrite_ldc(bcp, prefix_length+1, true);
++          break;
+         case Bytecodes::_jsr            : // fall through
+         case Bytecodes::_jsr_w          : nof_jsrs++;                   break;
+         case Bytecodes::_monitorenter   : // fall through
+diff --git a/src/share/vm/interpreter/rewriter.hpp b/src/share/vm/interpreter/rewriter.hpp
+--- a/src/share/vm/interpreter/rewriter.hpp
++++ b/src/share/vm/interpreter/rewriter.hpp
+@@ -66,6 +66,7 @@
+   void rewrite_Object_init(methodHandle m, TRAPS);
+   void rewrite_member_reference(address bcp, int offset);
+   void rewrite_invokedynamic(address bcp, int offset);
++  void maybe_rewrite_ldc(address bcp, int offset, bool is_wide);
+ 
+  public:
+   // Driver routine:
+diff --git a/src/share/vm/interpreter/templateTable.cpp b/src/share/vm/interpreter/templateTable.cpp
+--- a/src/share/vm/interpreter/templateTable.cpp
++++ b/src/share/vm/interpreter/templateTable.cpp
+@@ -507,6 +507,9 @@
+   def(Bytecodes::_fast_linearswitch   , ubcp|disp|____|____, itos, vtos, fast_linearswitch   ,  _           );
+   def(Bytecodes::_fast_binaryswitch   , ubcp|disp|____|____, itos, vtos, fast_binaryswitch   ,  _           );
+ 
++  def(Bytecodes::_fast_aldc           , ubcp|____|clvm|____, vtos, atos, fast_aldc           ,  false       );
++  def(Bytecodes::_fast_aldc_w         , ubcp|____|clvm|____, vtos, atos, fast_aldc           ,  true        );
++
+   def(Bytecodes::_return_register_finalizer , ____|disp|clvm|____, vtos, vtos, _return       ,  vtos        );
+ 
+   def(Bytecodes::_shouldnotreachhere   , ____|____|____|____, vtos, vtos, shouldnotreachhere ,  _           );
+diff --git a/src/share/vm/interpreter/templateTable.hpp b/src/share/vm/interpreter/templateTable.hpp
+--- a/src/share/vm/interpreter/templateTable.hpp
++++ b/src/share/vm/interpreter/templateTable.hpp
+@@ -123,6 +123,7 @@
+   static void sipush();
+   static void ldc(bool wide);
+   static void ldc2_w();
++  static void fast_aldc(bool wide);
+ 
+   static void locals_index(Register reg, int offset = 1);
+   static void iload();
+diff --git a/src/share/vm/oops/constantPoolKlass.cpp b/src/share/vm/oops/constantPoolKlass.cpp
+--- a/src/share/vm/oops/constantPoolKlass.cpp
++++ b/src/share/vm/oops/constantPoolKlass.cpp
+@@ -372,6 +372,13 @@
+         entry->print_value_on(st);
+         }
+         break;
++      case JVM_CONSTANT_MethodHandle :
++        st->print("ref_kind=%d", cp->method_handle_ref_kind_at(index));
++        st->print(" ref_index=%d", cp->method_handle_index_at(index));
++        break;
++      case JVM_CONSTANT_MethodType :
++        st->print("signature_index=%d", cp->method_type_index_at(index));
++        break;
+       default:
+         ShouldNotReachHere();
+         break;
+@@ -437,6 +444,7 @@
+           // can be non-perm, can be non-instance (array)
+         }
+       }
++      // FIXME: verify JSR 292 tags JVM_CONSTANT_MethodHandle, etc.
+       base++;
+     }
+     guarantee(cp->tags()->is_perm(),         "should be in permspace");
+diff --git a/src/share/vm/oops/constantPoolOop.cpp b/src/share/vm/oops/constantPoolOop.cpp
+--- a/src/share/vm/oops/constantPoolOop.cpp
++++ b/src/share/vm/oops/constantPoolOop.cpp
+@@ -358,6 +358,11 @@
+   return klass_at_noresolve(ref_index);
+ }
+ 
++symbolOop constantPoolOopDesc::uncached_klass_ref_at_noresolve(int which) {
++  jint ref_index = uncached_klass_ref_index_at(which);
++  return klass_at_noresolve(ref_index);
++}
++
+ char* constantPoolOopDesc::string_at_noresolve(int which) {
+   // Test entry type in case string is resolved while in here.
+   oop entry = *(obj_at_addr(which));
+@@ -384,6 +389,119 @@
+   }
+ }
+ 
++oop constantPoolOopDesc::resolve_constant_at_impl(constantPoolHandle this_oop, int index, int cache_index, TRAPS) {
++  oop result_oop = NULL;
++  if (cache_index >= 0) {
++    assert(index < 0, "only one kind of index at a time");
++    ConstantPoolCacheEntry* cpc_entry = this_oop->cache()->entry_at(cache_index);
++    result_oop = cpc_entry->f1();
++    if (result_oop != NULL) {
++      return result_oop;  // that was easy...
++    }
++    index = cpc_entry->constant_pool_index();
++  }
++
++  int tag_value = this_oop->tag_at(index).value();
++  switch (tag_value) {
++
++  case JVM_CONSTANT_UnresolvedClass:
++  case JVM_CONSTANT_UnresolvedClassInError:
++  case JVM_CONSTANT_Class:
++    {
++      klassOop resolved = klass_at_impl(this_oop, index, CHECK_NULL);
++      // ldc wants the java mirror.
++      result_oop = resolved->klass_part()->java_mirror();
++      break;
++    }
++
++  case JVM_CONSTANT_String:
++  case JVM_CONSTANT_UnresolvedString:
++    if (this_oop->is_pseudo_string_at(index)) {
++      result_oop = this_oop->pseudo_string_at(index);
++      break;
++    }
++    result_oop = string_at_impl(this_oop, index, CHECK_NULL);
++    break;
++
++  case JVM_CONSTANT_Object:
++    result_oop = this_oop->object_at(index);
++    break;
++
++  case JVM_CONSTANT_MethodHandle:
++    {
++      int ref_kind                 = this_oop->method_handle_ref_kind_at(index);
++      int callee_index             = this_oop->method_handle_klass_index_at(index);
++      symbolHandle name(THREAD,      this_oop->method_handle_name_ref_at(index));
++      symbolHandle signature(THREAD, this_oop->method_handle_signature_ref_at(index));
++      if (PrintMiscellaneous)
++        tty->print_cr("resolve JVM_CONSTANT_MethodHandle:%d [%d/%d/%d] %s.%s",
++                      ref_kind, index, this_oop->method_handle_index_at(index),
++                      callee_index, name->as_C_string(), signature->as_C_string());
++      KlassHandle callee;
++      { klassOop k = klass_at_impl(this_oop, callee_index, CHECK_NULL);
++        callee = KlassHandle(THREAD, k);
++      }
++      KlassHandle klass(THREAD, this_oop->pool_holder());
++      Handle value = SystemDictionary::link_method_handle_constant(klass, ref_kind,
++                                                                   callee, name, signature,
++                                                                   CHECK_NULL);
++      result_oop = value();
++      // FIXME: Uniquify errors, using SystemDictionary::find_resolution_error.
++      break;
++    }
++
++  case JVM_CONSTANT_MethodType:
++    {
++      symbolHandle signature(THREAD, this_oop->method_type_signature_at(index));
++      if (PrintMiscellaneous)
++        tty->print_cr("resolve JVM_CONSTANT_MethodType [%d/%d] %s",
++                      index, this_oop->method_type_index_at(index),
++                      signature->as_C_string());
++      KlassHandle klass(THREAD, this_oop->pool_holder());
++      bool ignore_is_on_bcp = false;
++      Handle value = SystemDictionary::find_method_handle_type(signature,
++                                                               klass,
++                                                               ignore_is_on_bcp,
++                                                               CHECK_NULL);
++      result_oop = value();
++      // FIXME: Uniquify errors, using SystemDictionary::find_resolution_error.
++      break;
++    }
++
++    /* maybe some day
++  case JVM_CONSTANT_Integer:
++  case JVM_CONSTANT_Float:
++  case JVM_CONSTANT_Long:
++  case JVM_CONSTANT_Double:
++    result_oop = java_lang_boxing_object::create(...);
++    break;
++    */
++
++  default:
++    DEBUG_ONLY( tty->print_cr("*** %p: tag at CP[%d/%d] = %d",
++                              this_oop(), index, cache_index, tag_value) );
++    assert(false, "unexpected constant tag");
++    break;
++  }
++
++  if (cache_index >= 0) {
++    // Cache the oop here also.
++    Handle result(THREAD, result_oop);
++    result_oop = NULL;  // safety
++    ObjectLocker ol(this_oop, THREAD);
++    ConstantPoolCacheEntry* cpc_entry = this_oop->cache()->entry_at(cache_index);
++    oop result_oop2 = cpc_entry->f1();
++    if (result_oop2 != NULL) {
++      // Race condition:  May already be filled in while we were trying to lock.
++      return result_oop2;
++    }
++    cpc_entry->set_f1(result());
++    return result();
++  } else {
++    return result_oop;
++  }
++}
++
+ oop constantPoolOopDesc::string_at_impl(constantPoolHandle this_oop, int which, TRAPS) {
+   oop entry = *(this_oop->obj_at_addr(which));
+   if (entry->is_symbol()) {
+@@ -690,6 +808,28 @@
+     }
+   } break;
+ 
++  case JVM_CONSTANT_MethodType:
++  {
++    int k1 = method_type_index_at(index1);
++    int k2 = cp2->method_type_index_at(index2);
++    if (k1 == k2) {
++      return true;
++    }
++  } break;
++
++  case JVM_CONSTANT_MethodHandle:
++  {
++    int k1 = method_handle_ref_kind_at(index1);
++    int k2 = cp2->method_handle_ref_kind_at(index2);
++    if (k1 == k2) {
++      int i1 = method_handle_index_at(index1);
++      int i2 = cp2->method_handle_index_at(index2);
++      if (i1 == i2) {
++        return true;
++      }
++    }
++  } break;
++
+   case JVM_CONSTANT_UnresolvedString:
+   {
+     symbolOop s1 = unresolved_string_at(index1);
+@@ -863,6 +1003,19 @@
+     to_cp->symbol_at_put(to_i, s);
+   } break;
+ 
++  case JVM_CONSTANT_MethodType:
++  {
++    jint k = method_type_index_at(from_i);
++    to_cp->method_type_index_at_put(to_i, k);
++  } break;
++
++  case JVM_CONSTANT_MethodHandle:
++  {
++    int k1 = method_handle_ref_kind_at(from_i);
++    int k2 = method_handle_index_at(from_i);
++    to_cp->method_handle_index_at_put(to_i, k1, k2);
++  } break;
++
+   // Invalid is used as the tag for the second constant pool entry
+   // occupied by JVM_CONSTANT_Double or JVM_CONSTANT_Long. It should
+   // not be seen by itself.
+@@ -1066,8 +1219,12 @@
+     case JVM_CONSTANT_UnresolvedClassInError:
+     case JVM_CONSTANT_StringIndex:
+     case JVM_CONSTANT_UnresolvedString:
++    case JVM_CONSTANT_MethodType:
+       return 3;
+ 
++    case JVM_CONSTANT_MethodHandle:
++      return 4; //tag, ref_kind, ref_index
++
+     case JVM_CONSTANT_Integer:
+     case JVM_CONSTANT_Float:
+     case JVM_CONSTANT_Fieldref:
+@@ -1271,6 +1428,22 @@
+         DBG(printf("JVM_CONSTANT_StringIndex: %hd", idx1));
+         break;
+       }
++      case JVM_CONSTANT_MethodHandle: {
++        *bytes = JVM_CONSTANT_MethodHandle;
++        int kind = method_handle_ref_kind_at(idx);
++        idx1 = method_handle_index_at(idx);
++        *(bytes+1) = (unsigned char) kind;
++        Bytes::put_Java_u2((address) (bytes+2), idx1);
++        DBG(printf("JVM_CONSTANT_MethodHandle: %d %hd", kind, idx1));
++        break;
++      }
++      case JVM_CONSTANT_MethodType: {
++        *bytes = JVM_CONSTANT_MethodType;
++        idx1 = method_type_index_at(idx);
++        Bytes::put_Java_u2((address) (bytes+1), idx1);
++        DBG(printf("JVM_CONSTANT_MethodType: %hd", idx1));
++        break;
++      }
+     }
+     DBG(printf("\n"));
+     bytes += ent_size;
+diff --git a/src/share/vm/oops/constantPoolOop.hpp b/src/share/vm/oops/constantPoolOop.hpp
+--- a/src/share/vm/oops/constantPoolOop.hpp
++++ b/src/share/vm/oops/constantPoolOop.hpp
+@@ -146,6 +146,16 @@
+     oop_store_without_check(obj_at_addr(which), oop(s));
+   }
+ 
++  void method_handle_index_at_put(int which, int ref_kind, int ref_index) {
++    tag_at_put(which, JVM_CONSTANT_MethodHandle);
++    *int_at_addr(which) = ((jint) ref_index<<16) | ref_kind;
++  }
++
++  void method_type_index_at_put(int which, int ref_index) {
++    tag_at_put(which, JVM_CONSTANT_MethodType);
++    *int_at_addr(which) = ref_index;
++  }
++
+   // Temporary until actual use
+   void unresolved_string_at_put(int which, symbolOop s) {
+     *obj_at_addr(which) = NULL;
+@@ -357,6 +367,36 @@
+     return *int_at_addr(which);
+   }
+ 
++  int method_handle_ref_kind_at(int which) {
++    assert(tag_at(which).is_method_handle(), "Corrupted constant pool");
++    return extract_low_short_from_int(*int_at_addr(which));  // mask out unwanted ref_index bits
++  }
++  int method_handle_index_at(int which) {
++    assert(tag_at(which).is_method_handle(), "Corrupted constant pool");
++    return extract_high_short_from_int(*int_at_addr(which));  // shift out unwanted ref_kind bits
++  }
++  int method_type_index_at(int which) {
++    assert(tag_at(which).is_method_type(), "Corrupted constant pool");
++    return *int_at_addr(which);
++  }
++  // Derived queries:
++  symbolOop method_handle_name_ref_at(int which) {
++    int member = method_handle_index_at(which);
++    return impl_name_ref_at(member, true);
++  }
++  symbolOop method_handle_signature_ref_at(int which) {
++    int member = method_handle_index_at(which);
++    return impl_signature_ref_at(member, true);
++  }
++  int method_handle_klass_index_at(int which) {
++    int member = method_handle_index_at(which);
++    return impl_klass_ref_index_at(member, true);
++  }
++  symbolOop method_type_signature_at(int which) {
++    int sym = method_type_index_at(which);
++    return symbol_at(sym);
++  }
++
+   // The following methods (name/signature/klass_ref_at, klass_ref_at_noresolve,
+   // name_and_type_ref_index_at) all expect to be passed indices obtained
+   // directly from the bytecode, and extracted according to java byte order.
+@@ -388,6 +428,17 @@
+     resolve_string_constants_impl(h_this, CHECK);
+   }
+ 
++  // Resolve late bound constants.
++  oop resolve_constant_at(int index, TRAPS) {
++    constantPoolHandle h_this(THREAD, this);
++    return resolve_constant_at_impl(h_this, index, -1, THREAD);
++  }
++
++  oop resolve_cached_constant_at(int cache_index, TRAPS) {
++    constantPoolHandle h_this(THREAD, this);
++    return resolve_constant_at_impl(h_this, -1, cache_index, THREAD);
++  }
++
+   // Klass name matches name at offset
+   bool klass_name_at_matches(instanceKlassHandle k, int which);
+ 
+@@ -420,6 +471,7 @@
+   // Routines currently used for annotations (only called by jvm.cpp) but which might be used in the
+   // future by other Java code. These take constant pool indices rather than possibly-byte-swapped
+   // constant pool cache indices as do the peer methods above.
++  symbolOop uncached_klass_ref_at_noresolve(int which);
+   symbolOop uncached_name_ref_at(int which)                 { return impl_name_ref_at(which, true); }
+   symbolOop uncached_signature_ref_at(int which)            { return impl_signature_ref_at(which, true); }
+   int       uncached_klass_ref_index_at(int which)          { return impl_klass_ref_index_at(which, true); }
+@@ -436,6 +488,8 @@
+ 
+ #ifdef ASSERT
+   enum { CPCACHE_INDEX_TAG = 0x10000 };  // helps keep CP cache indices distinct from CP indices
++#else
++  enum { CPCACHE_INDEX_TAG = 0 };        // in product mode, this zero value is a no-op
+ #endif //ASSERT
+ 
+  private:
+@@ -469,6 +523,8 @@
+   // Resolve string constants (to prevent allocation during compilation)
+   static void resolve_string_constants_impl(constantPoolHandle this_oop, TRAPS);
+ 
++  static oop resolve_constant_at_impl(constantPoolHandle this_oop, int index, int cache_index, TRAPS);
++
+  public:
+   // Merging constantPoolOop support:
+   bool compare_entry_to(int index1, constantPoolHandle cp2, int index2, TRAPS);
+diff --git a/src/share/vm/oops/cpCacheOop.hpp b/src/share/vm/oops/cpCacheOop.hpp
+--- a/src/share/vm/oops/cpCacheOop.hpp
++++ b/src/share/vm/oops/cpCacheOop.hpp
+@@ -110,6 +110,7 @@
+ class ConstantPoolCacheEntry VALUE_OBJ_CLASS_SPEC {
+   friend class VMStructs;
+   friend class constantPoolCacheKlass;
++  friend class constantPoolOopDesc;  //resolve_constant_at_impl => set_f1
+ 
+  private:
+   volatile intx     _indices;  // constant pool index & rewrite bytecodes
+diff --git a/src/share/vm/opto/parse2.cpp b/src/share/vm/opto/parse2.cpp
+--- a/src/share/vm/opto/parse2.cpp
++++ b/src/share/vm/opto/parse2.cpp
+@@ -1324,33 +1324,21 @@
+   case Bytecodes::_ldc_w:
+   case Bytecodes::_ldc2_w:
+     // If the constant is unresolved, run this BC once in the interpreter.
+-    if (iter().is_unresolved_string()) {
+-      uncommon_trap(Deoptimization::make_trap_request
+-                    (Deoptimization::Reason_unloaded,
+-                     Deoptimization::Action_reinterpret,
+-                     iter().get_constant_index()),
+-                    NULL, "unresolved_string");
+-      break;
+-    } else {
++    {
+       ciConstant constant = iter().get_constant();
+-      if (constant.basic_type() == T_OBJECT) {
+-        ciObject* c = constant.as_object();
+-        if (c->is_klass()) {
+-          // The constant returned for a klass is the ciKlass for the
+-          // entry.  We want the java_mirror so get it.
+-          ciKlass* klass = c->as_klass();
+-          if (klass->is_loaded()) {
+-            constant = ciConstant(T_OBJECT, klass->java_mirror());
+-          } else {
+-            uncommon_trap(Deoptimization::make_trap_request
+-                          (Deoptimization::Reason_unloaded,
+-                           Deoptimization::Action_reinterpret,
+-                           iter().get_constant_index()),
+-                          NULL, "unresolved_klass");
+-            break;
+-          }
+-        }
++      if (constant.basic_type() == T_OBJECT &&
++          !constant.as_object()->is_loaded()) {
++        int index = iter().get_constant_pool_index();
++        constantTag tag = iter().get_constant_pool_tag(index);
++        uncommon_trap(Deoptimization::make_trap_request
++                      (Deoptimization::Reason_unloaded,
++                       Deoptimization::Action_reinterpret,
++                       index),
++                      NULL, tag.internal_name());
++        break;
+       }
++      assert(constant.basic_type() != T_OBJECT || !constant.as_object()->is_klass(),
++             "must be java_mirror of klass");
+       bool pushed = push_constant(constant, true);
+       guarantee(pushed, "must be possible to push this constant");
+     }
+diff --git a/src/share/vm/prims/jvm.h b/src/share/vm/prims/jvm.h
+--- a/src/share/vm/prims/jvm.h
++++ b/src/share/vm/prims/jvm.h
+@@ -1044,7 +1044,22 @@
+     JVM_CONSTANT_Fieldref,
+     JVM_CONSTANT_Methodref,
+     JVM_CONSTANT_InterfaceMethodref,
+-    JVM_CONSTANT_NameAndType
++    JVM_CONSTANT_NameAndType,
++    JVM_CONSTANT_MethodHandle           = 15,  // JSR 292
++    JVM_CONSTANT_MethodType             = 16   // JSR 292
++};
++
++/* JVM_CONSTANT_MethodHandle subtypes */
++enum {
++    JVM_REF_getField                = 1,
++    JVM_REF_getStatic               = 2,
++    JVM_REF_putField                = 3,
++    JVM_REF_putStatic               = 4,
++    JVM_REF_invokeVirtual           = 5,
++    JVM_REF_invokeStatic            = 6,
++    JVM_REF_invokeSpecial           = 7,
++    JVM_REF_newInvokeSpecial        = 8,
++    JVM_REF_invokeInterface         = 9
+ };
+ 
+ /* Used in the newarray instruction. */
+diff --git a/src/share/vm/prims/methodComparator.cpp b/src/share/vm/prims/methodComparator.cpp
+--- a/src/share/vm/prims/methodComparator.cpp
++++ b/src/share/vm/prims/methodComparator.cpp
+@@ -163,10 +163,10 @@
+ 
+   case Bytecodes::_ldc   : // fall through
+   case Bytecodes::_ldc_w : {
+-    Bytecode_loadconstant* ldc_old = Bytecode_loadconstant_at(_s_old->method()(), _s_old->bcp());
+-    Bytecode_loadconstant* ldc_new = Bytecode_loadconstant_at(_s_new->method()(), _s_new->bcp());
+-    int cpi_old = ldc_old->index();
+-    int cpi_new = ldc_new->index();
++    Bytecode_loadconstant* ldc_old = Bytecode_loadconstant_at(_s_old->method(), _s_old->bci());
++    Bytecode_loadconstant* ldc_new = Bytecode_loadconstant_at(_s_new->method(), _s_new->bci());
++    int cpi_old = ldc_old->pool_index();
++    int cpi_new = ldc_new->pool_index();
+     constantTag tag_old = _old_cp->tag_at(cpi_old);
+     constantTag tag_new = _new_cp->tag_at(cpi_new);
+     if (tag_old.is_int() || tag_old.is_float()) {
+@@ -187,12 +187,30 @@
+       if (strcmp(_old_cp->string_at_noresolve(cpi_old),
+                  _new_cp->string_at_noresolve(cpi_new)) != 0)
+         return false;
+-    } else { // tag_old should be klass - 4881222
++    } else if (tag_old.is_klass() || tag_old.is_unresolved_klass()) {
++      // tag_old should be klass - 4881222
+       if (! (tag_new.is_unresolved_klass() || tag_new.is_klass()))
+         return false;
+       if (_old_cp->klass_at_noresolve(cpi_old) !=
+           _new_cp->klass_at_noresolve(cpi_new))
+         return false;
++    } else if (tag_old.is_method_type() && tag_new.is_method_type()) {
++      int mti_old = _old_cp->method_type_index_at(cpi_old);
++      int mti_new = _new_cp->method_type_index_at(cpi_new);
++      if ((_old_cp->symbol_at(mti_old) != _new_cp->symbol_at(mti_new)))
++        return false;
++    } else if (tag_old.is_method_handle() && tag_new.is_method_handle()) {
++      if (_old_cp->method_handle_ref_kind_at(cpi_old) !=
++          _new_cp->method_handle_ref_kind_at(cpi_new))
++        return false;
++      int mhi_old = _old_cp->method_handle_index_at(cpi_old);
++      int mhi_new = _new_cp->method_handle_index_at(cpi_new);
++      if ((_old_cp->uncached_klass_ref_at_noresolve(mhi_old) != _new_cp->uncached_klass_ref_at_noresolve(mhi_new)) ||
++          (_old_cp->uncached_name_ref_at(mhi_old) != _new_cp->uncached_name_ref_at(mhi_new)) ||
++          (_old_cp->uncached_signature_ref_at(mhi_old) != _new_cp->uncached_signature_ref_at(mhi_new)))
++        return false;
++    } else {
++      return false;  // unknown tag
+     }
+     break;
+   }
+diff --git a/src/share/vm/runtime/sharedRuntime.cpp b/src/share/vm/runtime/sharedRuntime.cpp
+--- a/src/share/vm/runtime/sharedRuntime.cpp
++++ b/src/share/vm/runtime/sharedRuntime.cpp
+@@ -779,7 +779,7 @@
+ 
+   // Find bytecode
+   Bytecode_invoke* bytecode = Bytecode_invoke_at(caller, bci);
+-  bc = bytecode->adjusted_invoke_code();
++  bc = bytecode->java_code();
+   int bytecode_index = bytecode->index();
+ 
+   // Find receiver for non-static call
+diff --git a/src/share/vm/utilities/constantTag.cpp b/src/share/vm/utilities/constantTag.cpp
+--- a/src/share/vm/utilities/constantTag.cpp
++++ b/src/share/vm/utilities/constantTag.cpp
+@@ -28,56 +28,85 @@
+ #ifndef PRODUCT
+ 
+ void constantTag::print_on(outputStream* st) const {
++  st->print(internal_name());
++}
++
++#endif // PRODUCT
++
++BasicType constantTag::basic_type() const {
+   switch (_tag) {
++    case JVM_CONSTANT_Integer :
++      return T_INT;
++    case JVM_CONSTANT_Float :
++      return T_FLOAT;
++    case JVM_CONSTANT_Long :
++      return T_LONG;
++    case JVM_CONSTANT_Double :
++      return T_DOUBLE;
++
+     case JVM_CONSTANT_Class :
+-      st->print("Class");
+-      break;
+-    case JVM_CONSTANT_Fieldref :
+-      st->print("Field");
+-      break;
+-    case JVM_CONSTANT_Methodref :
+-      st->print("Method");
+-      break;
+-    case JVM_CONSTANT_InterfaceMethodref :
+-      st->print("InterfaceMethod");
+-      break;
+     case JVM_CONSTANT_String :
+-      st->print("String");
+-      break;
+-    case JVM_CONSTANT_Integer :
+-      st->print("Integer");
+-      break;
+-    case JVM_CONSTANT_Float :
+-      st->print("Float");
+-      break;
+-    case JVM_CONSTANT_Long :
+-      st->print("Long");
+-      break;
+-    case JVM_CONSTANT_Double :
+-      st->print("Double");
+-      break;
+-    case JVM_CONSTANT_NameAndType :
+-      st->print("NameAndType");
+-      break;
+-    case JVM_CONSTANT_Utf8 :
+-      st->print("Utf8");
+-      break;
+     case JVM_CONSTANT_UnresolvedClass :
+-      st->print("Unresolved class");
+-      break;
++    case JVM_CONSTANT_UnresolvedClassInError :
+     case JVM_CONSTANT_ClassIndex :
+-      st->print("Unresolved class index");
+-      break;
+     case JVM_CONSTANT_UnresolvedString :
+-      st->print("Unresolved string");
+-      break;
+     case JVM_CONSTANT_StringIndex :
+-      st->print("Unresolved string index");
+-      break;
++    case JVM_CONSTANT_MethodHandle :
++    case JVM_CONSTANT_MethodType :
++    case JVM_CONSTANT_Object :
++      return T_OBJECT;
+     default:
+       ShouldNotReachHere();
+-      break;
++      return T_ILLEGAL;
+   }
+ }
+ 
+-#endif // PRODUCT
++
++
++const char* constantTag::internal_name() const {
++  switch (_tag) {
++    case JVM_CONSTANT_Invalid :
++      return "Invalid index";
++    case JVM_CONSTANT_Class :
++      return "Class";
++    case JVM_CONSTANT_Fieldref :
++      return "Field";
++    case JVM_CONSTANT_Methodref :
++      return "Method";
++    case JVM_CONSTANT_InterfaceMethodref :
++      return "InterfaceMethod";
++    case JVM_CONSTANT_String :
++      return "String";
++    case JVM_CONSTANT_Integer :
++      return "Integer";
++    case JVM_CONSTANT_Float :
++      return "Float";
++    case JVM_CONSTANT_Long :
++      return "Long";
++    case JVM_CONSTANT_Double :
++      return "Double";
++    case JVM_CONSTANT_NameAndType :
++      return "NameAndType";
++    case JVM_CONSTANT_MethodHandle :
++      return "MethodHandle";
++    case JVM_CONSTANT_MethodType :
++      return "MethodType";
++    case JVM_CONSTANT_Object :
++      return "Object";
++    case JVM_CONSTANT_Utf8 :
++      return "Utf8";
++    case JVM_CONSTANT_UnresolvedClass :
++      return "Unresolved Class";
++    case JVM_CONSTANT_UnresolvedClassInError :
++      return "Unresolved Class Error";
++    case JVM_CONSTANT_ClassIndex :
++      return "Unresolved Class Index";
++    case JVM_CONSTANT_UnresolvedString :
++      return "Unresolved String";
++    case JVM_CONSTANT_StringIndex :
++      return "Unresolved String Index";
++    default:
++      ShouldNotReachHere();
++      return "Illegal";
++  }
++}
+diff --git a/src/share/vm/utilities/constantTag.hpp b/src/share/vm/utilities/constantTag.hpp
+--- a/src/share/vm/utilities/constantTag.hpp
++++ b/src/share/vm/utilities/constantTag.hpp
+@@ -78,13 +78,24 @@
+   bool is_field_or_method() const   { return is_field() || is_method() || is_interface_method(); }
+   bool is_symbol() const            { return is_utf8(); }
+ 
++  bool is_method_type() const              { return _tag == JVM_CONSTANT_MethodType; }
++  bool is_method_handle() const            { return _tag == JVM_CONSTANT_MethodHandle; }
++
++  constantTag() {
++    _tag = JVM_CONSTANT_Invalid;
++  }
+   constantTag(jbyte tag) {
+     assert((tag >= 0 && tag <= JVM_CONSTANT_NameAndType) ||
++           (tag >= JVM_CONSTANT_MethodHandle && tag <= JVM_CONSTANT_MethodType) ||
+            (tag >= JVM_CONSTANT_InternalMin && tag <= JVM_CONSTANT_InternalMax), "Invalid constant tag");
+     _tag = tag;
+   }
+ 
+   jbyte value()                      { return _tag; }
+ 
++  BasicType basic_type() const;        // if used with ldc, what kind of value gets pushed?
++
++  const char* internal_name() const;  // for error reporting
++
+   void print_on(outputStream* st) const PRODUCT_RETURN;
+ };

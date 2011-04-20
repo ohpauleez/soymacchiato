@@ -1,0 +1,1250 @@
+6981791: remove experimental code for JSR 292
+Reviewed-by: twisti
+
+grep -n AllowTransitionalJSR292 $(hg loc -I src) \
+  && echo "*** ERROR: There is still code for transitional modes! "
+
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/oops/ConstantPool.java b/agent/src/share/classes/sun/jvm/hotspot/oops/ConstantPool.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/oops/ConstantPool.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/oops/ConstantPool.java
+@@ -331,8 +331,6 @@
+     if (Assert.ASSERTS_ENABLED) {
+       Assert.that(getTagAt(i).isInvokeDynamic(), "Corrupted constant pool");
+     }
+-    if (getTagAt(i).value() == JVM_CONSTANT_InvokeDynamicTrans)
+-        return null;
+     int bsmSpec = extractLowShortFromInt(this.getIntAt(i));
+     TypeArray operands = getOperands();
+     if (operands == null)  return null;  // safety first
+@@ -368,7 +366,6 @@
+     case JVM_CONSTANT_MethodHandle:       return "JVM_CONSTANT_MethodHandle";
+     case JVM_CONSTANT_MethodType:         return "JVM_CONSTANT_MethodType";
+     case JVM_CONSTANT_InvokeDynamic:      return "JVM_CONSTANT_InvokeDynamic";
+-    case JVM_CONSTANT_InvokeDynamicTrans: return "JVM_CONSTANT_InvokeDynamic/transitional";
+     case JVM_CONSTANT_Invalid:            return "JVM_CONSTANT_Invalid";
+     case JVM_CONSTANT_UnresolvedClass:    return "JVM_CONSTANT_UnresolvedClass";
+     case JVM_CONSTANT_UnresolvedClassInError:    return "JVM_CONSTANT_UnresolvedClassInError";
+@@ -428,7 +425,6 @@
+         case JVM_CONSTANT_MethodHandle:
+         case JVM_CONSTANT_MethodType:
+         case JVM_CONSTANT_InvokeDynamic:
+-        case JVM_CONSTANT_InvokeDynamicTrans:
+           visitor.doInt(new IntField(new NamedFieldIdentifier(nameForTag(ctag)), indexOffset(index), true), true);
+           break;
+         }
+@@ -592,7 +588,6 @@
+                   break;
+               }
+ 
+-              case JVM_CONSTANT_InvokeDynamicTrans:
+               case JVM_CONSTANT_InvokeDynamic: {
+                   dos.writeByte(cpConstType);
+                   int value = getIntAt(ci);
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/runtime/ClassConstants.java b/agent/src/share/classes/sun/jvm/hotspot/runtime/ClassConstants.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/runtime/ClassConstants.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/runtime/ClassConstants.java
+@@ -42,7 +42,7 @@
+     public static final int JVM_CONSTANT_NameAndType        = 12;
+     public static final int JVM_CONSTANT_MethodHandle       = 15;
+     public static final int JVM_CONSTANT_MethodType         = 16;
+-    public static final int JVM_CONSTANT_InvokeDynamicTrans = 17;  // only occurs in old class files
++    //     static final int JVM_CONSTANT_(unused)           = 17;
+     public static final int JVM_CONSTANT_InvokeDynamic      = 18;
+ 
+     // JVM_CONSTANT_MethodHandle subtypes
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/tools/jcore/ClassWriter.java b/agent/src/share/classes/sun/jvm/hotspot/tools/jcore/ClassWriter.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/tools/jcore/ClassWriter.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/tools/jcore/ClassWriter.java
+@@ -321,7 +321,6 @@
+                      break;
+                 }
+ 
+-                case JVM_CONSTANT_InvokeDynamicTrans:
+                 case JVM_CONSTANT_InvokeDynamic: {
+                      dos.writeByte(cpConstType);
+                      int value = cpool.getIntAt(ci);
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/ui/classbrowser/HTMLGenerator.java b/agent/src/share/classes/sun/jvm/hotspot/ui/classbrowser/HTMLGenerator.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/ui/classbrowser/HTMLGenerator.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/ui/classbrowser/HTMLGenerator.java
+@@ -598,7 +598,6 @@
+                buf.cell(Integer.toString(cpool.getIntAt(index)));
+                break;
+ 
+-            case JVM_CONSTANT_InvokeDynamicTrans:
+             case JVM_CONSTANT_InvokeDynamic:
+                buf.cell("JVM_CONSTANT_InvokeDynamic");
+                buf.cell(genLowHighShort(cpool.getIntAt(index)) +
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/utilities/ConstantTag.java b/agent/src/share/classes/sun/jvm/hotspot/utilities/ConstantTag.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/utilities/ConstantTag.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/utilities/ConstantTag.java
+@@ -40,7 +40,7 @@
+   private static int JVM_CONSTANT_NameAndType             = 12;
+   private static int JVM_CONSTANT_MethodHandle            = 15;  // JSR 292
+   private static int JVM_CONSTANT_MethodType              = 16;  // JSR 292
+-  private static int JVM_CONSTANT_InvokeDynamicTrans      = 17;  // JSR 292, only occurs in old class files
++  //      static int JVM_CONSTANT_(unused)                = 17;  // JSR 292 early drafts only
+   private static int JVM_CONSTANT_InvokeDynamic           = 18;  // JSR 292
+   private static int JVM_CONSTANT_Invalid                 = 0;   // For bad value initialization
+   private static int JVM_CONSTANT_UnresolvedClass         = 100; // Temporary tag until actual use
+@@ -83,7 +83,6 @@
+   public boolean isMethodHandle()     { return tag == JVM_CONSTANT_MethodHandle; }
+   public boolean isMethodType()       { return tag == JVM_CONSTANT_MethodType; }
+   public boolean isInvokeDynamic()    { return tag == JVM_CONSTANT_InvokeDynamic; }
+-  public boolean isInvokeDynamicTrans() { return tag == JVM_CONSTANT_InvokeDynamicTrans; }
+ 
+   public boolean isInvalid()          { return tag == JVM_CONSTANT_Invalid; }
+ 
+diff --git a/src/share/vm/classfile/classFileParser.cpp b/src/share/vm/classfile/classFileParser.cpp
+--- a/src/share/vm/classfile/classFileParser.cpp
++++ b/src/share/vm/classfile/classFileParser.cpp
+@@ -169,7 +169,6 @@
+           ShouldNotReachHere();
+         }
+         break;
+-      case JVM_CONSTANT_InvokeDynamicTrans :  // this tag appears only in old classfiles
+       case JVM_CONSTANT_InvokeDynamic :
+         {
+           if (_major_version < Verifier::INVOKEDYNAMIC_MAJOR_VERSION) {
+@@ -185,14 +184,6 @@
+           cfs->guarantee_more(5, CHECK);  // bsm_index, nt, tag/access_flags
+           u2 bootstrap_specifier_index = cfs->get_u2_fast();
+           u2 name_and_type_index = cfs->get_u2_fast();
+-          if (tag == JVM_CONSTANT_InvokeDynamicTrans) {
+-            if (!AllowTransitionalJSR292)
+-              classfile_parse_error(
+-                "This JVM does not support transitional InvokeDynamic tag %u in class file %s",
+-                tag, CHECK);
+-            cp->invoke_dynamic_trans_at_put(index, bootstrap_specifier_index, name_and_type_index);
+-            break;
+-          }
+           if (_max_bootstrap_specifier_index < (int) bootstrap_specifier_index)
+             _max_bootstrap_specifier_index = (int) bootstrap_specifier_index;  // collect for later
+           cp->invoke_dynamic_at_put(index, bootstrap_specifier_index, name_and_type_index);
+@@ -491,7 +482,6 @@
+               ref_index, CHECK_(nullHandle));
+         }
+         break;
+-      case JVM_CONSTANT_InvokeDynamicTrans :
+       case JVM_CONSTANT_InvokeDynamic :
+         {
+           int name_and_type_ref_index = cp->invoke_dynamic_name_and_type_ref_index_at(index);
+@@ -500,14 +490,6 @@
+                          "Invalid constant pool index %u in class file %s",
+                          name_and_type_ref_index,
+                          CHECK_(nullHandle));
+-          if (tag == JVM_CONSTANT_InvokeDynamicTrans) {
+-            int bootstrap_method_ref_index = cp->invoke_dynamic_bootstrap_method_ref_index_at(index);
+-            check_property(valid_cp_range(bootstrap_method_ref_index, length) &&
+-                           cp->tag_at(bootstrap_method_ref_index).is_method_handle(),
+-                           "Invalid constant pool index %u in class file %s",
+-                           bootstrap_method_ref_index,
+-                           CHECK_(nullHandle));
+-          }
+           // bootstrap specifier index must be checked later, when BootstrapMethods attr is available
+           break;
+         }
+@@ -2822,7 +2804,6 @@
+     }
+   }
+ 
+-  if (AllowTransitionalJSR292 && word_sig_index == 0)  return;
+   if (word_sig_index == 0)
+     THROW_MSG(vmSymbols::java_lang_VirtualMachineError(),
+               "missing I or J signature (for vmentry) in java.lang.invoke.MethodHandle");
+@@ -2862,7 +2843,6 @@
+     }
+   }
+ 
+-  if (AllowTransitionalJSR292 && !found_vmentry)  return;
+   if (!found_vmentry)
+     THROW_MSG(vmSymbols::java_lang_VirtualMachineError(),
+               "missing vmentry byte field in java.lang.invoke.MethodHandle");
+@@ -3234,15 +3214,6 @@
+     if (EnableInvokeDynamic && class_name == vmSymbols::java_lang_invoke_MethodHandle() && class_loader.is_null()) {
+       java_lang_invoke_MethodHandle_fix_pre(cp, fields, &fac, CHECK_(nullHandle));
+     }
+-    if (AllowTransitionalJSR292 &&
+-        EnableInvokeDynamic && class_name == vmSymbols::java_dyn_MethodHandle() && class_loader.is_null()) {
+-      java_lang_invoke_MethodHandle_fix_pre(cp, fields, &fac, CHECK_(nullHandle));
+-    }
+-    if (AllowTransitionalJSR292 &&
+-        EnableInvokeDynamic && class_name == vmSymbols::sun_dyn_MethodHandleImpl() && class_loader.is_null()) {
+-      // allow vmentry field in MethodHandleImpl also
+-      java_lang_invoke_MethodHandle_fix_pre(cp, fields, &fac, CHECK_(nullHandle));
+-    }
+ 
+     // Add a fake "discovered" field if it is not present
+     // for compatibility with earlier jdk's.
+diff --git a/src/share/vm/classfile/javaClasses.cpp b/src/share/vm/classfile/javaClasses.cpp
+--- a/src/share/vm/classfile/javaClasses.cpp
++++ b/src/share/vm/classfile/javaClasses.cpp
+@@ -69,28 +69,6 @@
+     return ik->find_local_field(name_symbol, signature_symbol, fd);
+ }
+ 
+-static bool find_hacked_field(instanceKlass* ik,
+-                              Symbol* name_symbol, Symbol* signature_symbol,
+-                              fieldDescriptor* fd,
+-                              bool allow_super = false) {
+-  bool found = find_field(ik, name_symbol, signature_symbol, fd, allow_super);
+-  if (!found && AllowTransitionalJSR292) {
+-    Symbol* backup_sig = SystemDictionary::find_backup_signature(signature_symbol);
+-    if (backup_sig != NULL) {
+-      found = find_field(ik, name_symbol, backup_sig, fd, allow_super);
+-      if (TraceMethodHandles) {
+-        ResourceMark rm;
+-        tty->print_cr("MethodHandles: %s.%s: backup for %s => %s%s",
+-                      ik->name()->as_C_string(), name_symbol->as_C_string(),
+-                      signature_symbol->as_C_string(), backup_sig->as_C_string(),
+-                      (found ? "" : " (NOT FOUND)"));
+-      }
+-    }
+-  }
+-  return found;
+-}
+-#define find_field find_hacked_field  /* remove after AllowTransitionalJSR292 */
+-
+ // Helpful routine for computing field offsets at run time rather than hardcoding them
+ static void
+ compute_offset(int &dest_offset,
+@@ -2226,7 +2204,6 @@
+   klassOop k = SystemDictionary::MethodHandle_klass();
+   if (k != NULL && EnableInvokeDynamic) {
+     bool allow_super = false;
+-    if (AllowTransitionalJSR292)  allow_super = true;  // temporary, to access java.dyn.MethodHandleImpl
+     compute_offset(_type_offset,      k, vmSymbols::type_name(),      vmSymbols::java_lang_invoke_MethodType_signature(), allow_super);
+     compute_offset(_vmtarget_offset,  k, vmSymbols::vmtarget_name(),  vmSymbols::object_signature(),                      allow_super);
+     compute_offset(_vmentry_offset,   k, vmSymbols::vmentry_name(),   vmSymbols::machine_word_signature(),                allow_super);
+diff --git a/src/share/vm/classfile/systemDictionary.cpp b/src/share/vm/classfile/systemDictionary.cpp
+--- a/src/share/vm/classfile/systemDictionary.cpp
++++ b/src/share/vm/classfile/systemDictionary.cpp
+@@ -1887,99 +1887,27 @@
+   0
+ };
+ 
+-Symbol* SystemDictionary::find_backup_symbol(Symbol* symbol,
+-                                             const char* from_prefix,
+-                                             const char* to_prefix) {
+-  assert(AllowTransitionalJSR292, "");  // delete this subroutine
+-  Symbol* backup_symbol = NULL;
+-  size_t from_len = strlen(from_prefix);
+-  if (strncmp((const char*) symbol->base(), from_prefix, from_len) != 0)
+-    return NULL;
+-  char buf[100];
+-  size_t to_len = strlen(to_prefix);
+-  size_t tail_len = symbol->utf8_length() - from_len;
+-  size_t new_len = to_len + tail_len;
+-  guarantee(new_len < sizeof(buf), "buf too small");
+-  memcpy(buf, to_prefix, to_len);
+-  memcpy(buf + to_len, symbol->base() + from_len, tail_len);
+-  buf[new_len] = '\0';
+-  vmSymbols::SID backup_sid = vmSymbols::find_sid(buf);
+-  if (backup_sid != vmSymbols::NO_SID) {
+-    backup_symbol = vmSymbols::symbol_at(backup_sid);
+-  }
+-  return backup_symbol;
+-}
+-
+-Symbol* SystemDictionary::find_backup_class_name(Symbol* symbol) {
+-  assert(AllowTransitionalJSR292, "");  // delete this subroutine
+-  if (symbol == NULL)  return NULL;
+-  Symbol* backup_symbol = find_backup_symbol(symbol, "java/lang/invoke/", "java/dyn/");  // AllowTransitionalJSR292 ONLY
+-  if (backup_symbol == NULL)
+-    backup_symbol = find_backup_symbol(symbol, "java/dyn/", "sun/dyn/");  // AllowTransitionalJSR292 ONLY
+-  return backup_symbol;
+-}
+-
+-Symbol* SystemDictionary::find_backup_signature(Symbol* symbol) {
+-  assert(AllowTransitionalJSR292, "");  // delete this subroutine
+-  if (symbol == NULL)  return NULL;
+-  return find_backup_symbol(symbol, "Ljava/lang/invoke/", "Ljava/dyn/");
+-}
+-
+ bool SystemDictionary::initialize_wk_klass(WKID id, int init_opt, TRAPS) {
+   assert(id >= (int)FIRST_WKID && id < (int)WKID_LIMIT, "oob");
+   int  info = wk_init_info[id - FIRST_WKID];
+   int  sid  = (info >> CEIL_LG_OPTION_LIMIT);
+   Symbol* symbol = vmSymbols::symbol_at((vmSymbols::SID)sid);
+   klassOop*    klassp = &_well_known_klasses[id];
+-  bool pre_load = (init_opt < SystemDictionary::Opt);
+-  bool try_load = true;
++  bool must_load = (init_opt < SystemDictionary::Opt);
++  bool try_load  = true;
+   if (init_opt == SystemDictionary::Opt_Kernel) {
+ #ifndef KERNEL
+     try_load = false;
+ #endif //KERNEL
+   }
+-  Symbol* backup_symbol = NULL;  // symbol to try if the current symbol fails
+-  if (init_opt == SystemDictionary::Pre_JSR292) {
+-    if (!EnableInvokeDynamic)  try_load = false;  // do not bother to load such classes
+-    if (AllowTransitionalJSR292) {
+-      backup_symbol = find_backup_class_name(symbol);
+-      if (try_load && PreferTransitionalJSR292) {
+-        while (backup_symbol != NULL) {
+-          (*klassp) = resolve_or_null(backup_symbol, CHECK_0); // try backup early
+-          if (TraceMethodHandles) {
+-            ResourceMark rm;
+-            tty->print_cr("MethodHandles: try backup first for %s => %s (%s)",
+-                          symbol->as_C_string(), backup_symbol->as_C_string(),
+-                          ((*klassp) == NULL) ? "no such class" : "backup load succeeded");
+-          }
+-          if ((*klassp) != NULL)  return true;
+-          backup_symbol = find_backup_class_name(backup_symbol);  // find next backup
+-        }
+-      }
+-    }
+-  }
+-  if ((*klassp) != NULL)  return true;
+-  if (!try_load)          return false;
+-  while (symbol != NULL) {
+-    bool must_load = (pre_load && (backup_symbol == NULL));
++  if ((*klassp) == NULL && try_load) {
+     if (must_load) {
+       (*klassp) = resolve_or_fail(symbol, true, CHECK_0); // load required class
+     } else {
+       (*klassp) = resolve_or_null(symbol,       CHECK_0); // load optional klass
+     }
+-    if ((*klassp) != NULL)  return true;
+-    // Go around again.  Example of long backup sequence:
+-    // java.lang.invoke.MemberName, java.dyn.MemberName, sun.dyn.MemberName, ONLY if AllowTransitionalJSR292
+-    if (TraceMethodHandles && (backup_symbol != NULL)) {
+-      ResourceMark rm;
+-      tty->print_cr("MethodHandles: backup for %s => %s",
+-                    symbol->as_C_string(), backup_symbol->as_C_string());
+-    }
+-    symbol = backup_symbol;
+-    if (AllowTransitionalJSR292)
+-      backup_symbol = find_backup_class_name(symbol);
+   }
+-  return false;
++  return ((*klassp) != NULL);
+ }
+ 
+ void SystemDictionary::initialize_wk_klasses_until(WKID limit_id, WKID &start_id, TRAPS) {
+@@ -2409,9 +2337,7 @@
+     // Must create lots of stuff here, but outside of the SystemDictionary lock.
+     if (THREAD->is_Compiler_thread())
+       return NULL;              // do not attempt from within compiler
+-    bool for_invokeGeneric = (name_id == vmSymbols::VM_SYMBOL_ENUM_NAME(invokeGeneric_name));
+-    if (AllowInvokeForInvokeGeneric && name_id == vmSymbols::VM_SYMBOL_ENUM_NAME(invoke_name))
+-      for_invokeGeneric = true;
++    bool for_invokeGeneric = (name_id != vmSymbols::VM_SYMBOL_ENUM_NAME(invokeExact_name));
+     bool found_on_bcp = false;
+     Handle mt = find_method_handle_type(signature, accessing_klass,
+                                         for_invokeGeneric,
+@@ -2498,14 +2424,10 @@
+   JavaCallArguments args(Handle(THREAD, rt()));
+   args.push_oop(pts());
+   JavaValue result(T_OBJECT);
+-  Symbol* findMethodHandleType_signature = vmSymbols::findMethodHandleType_signature();
+-  if (AllowTransitionalJSR292 && SystemDictionaryHandles::MethodType_klass()->name() == vmSymbols::java_dyn_MethodType()) {
+-    findMethodHandleType_signature = vmSymbols::findMethodHandleType_TRANS_signature();
+-  }
+   JavaCalls::call_static(&result,
+                          SystemDictionary::MethodHandleNatives_klass(),
+                          vmSymbols::findMethodHandleType_name(),
+-                         findMethodHandleType_signature,
++                         vmSymbols::findMethodHandleType_signature(),
+                          &args, CHECK_(empty));
+   Handle method_type(THREAD, (oop) result.get_jobject());
+ 
+@@ -2513,14 +2435,10 @@
+     // call java.lang.invoke.MethodHandleNatives::notifyGenericMethodType(MethodType) -> void
+     JavaCallArguments args(Handle(THREAD, method_type()));
+     JavaValue no_result(T_VOID);
+-    Symbol* notifyGenericMethodType_signature = vmSymbols::notifyGenericMethodType_signature();
+-    if (AllowTransitionalJSR292 && SystemDictionaryHandles::MethodType_klass()->name() == vmSymbols::java_dyn_MethodType()) {
+-      notifyGenericMethodType_signature = vmSymbols::notifyGenericMethodType_TRANS_signature();
+-    }
+     JavaCalls::call_static(&no_result,
+                            SystemDictionary::MethodHandleNatives_klass(),
+                            vmSymbols::notifyGenericMethodType_name(),
+-                           notifyGenericMethodType_signature,
++                           vmSymbols::notifyGenericMethodType_signature(),
+                            &args, THREAD);
+     if (HAS_PENDING_EXCEPTION) {
+       // If the notification fails, just kill it.
+@@ -2569,14 +2487,10 @@
+   args.push_oop(name());
+   args.push_oop(type());
+   JavaValue result(T_OBJECT);
+-  Symbol* linkMethodHandleConstant_signature = vmSymbols::linkMethodHandleConstant_signature();
+-  if (AllowTransitionalJSR292 && SystemDictionaryHandles::MethodHandle_klass()->name() == vmSymbols::java_dyn_MethodHandle()) {
+-    linkMethodHandleConstant_signature = vmSymbols::linkMethodHandleConstant_TRANS_signature();
+-  }
+   JavaCalls::call_static(&result,
+                          SystemDictionary::MethodHandleNatives_klass(),
+                          vmSymbols::linkMethodHandleConstant_name(),
+-                         linkMethodHandleConstant_signature,
++                         vmSymbols::linkMethodHandleConstant_signature(),
+                          &args, CHECK_(empty));
+   return Handle(THREAD, (oop) result.get_jobject());
+ }
+@@ -2607,17 +2521,10 @@
+   args.push_oop(caller_mname());
+   args.push_int(caller_bci);
+   JavaValue result(T_OBJECT);
+-  Symbol* makeDynamicCallSite_signature = vmSymbols::makeDynamicCallSite_signature();
+-  if (AllowTransitionalJSR292 && SystemDictionaryHandles::MethodHandleNatives_klass()->name() == vmSymbols::sun_dyn_MethodHandleNatives()) {
+-    makeDynamicCallSite_signature = vmSymbols::makeDynamicCallSite_TRANS_signature();
+-  }
+-  if (AllowTransitionalJSR292 && SystemDictionaryHandles::MethodHandleNatives_klass()->name() == vmSymbols::java_dyn_MethodHandleNatives()) {
+-    makeDynamicCallSite_signature = vmSymbols::makeDynamicCallSite_TRANS2_signature();
+-  }
+   JavaCalls::call_static(&result,
+                          SystemDictionary::MethodHandleNatives_klass(),
+                          vmSymbols::makeDynamicCallSite_name(),
+-                         makeDynamicCallSite_signature,
++                         vmSymbols::makeDynamicCallSite_signature(),
+                          &args, CHECK_(empty));
+   oop call_site_oop = (oop) result.get_jobject();
+   assert(call_site_oop->is_oop()
+@@ -2698,28 +2605,10 @@
+       argument_info_result = argument_info;  // return argument_info to caller
+       return bsm;
+     }
+-    // else null BSM; fall through
+-  } else if (tag.is_name_and_type()) {
+-    // JSR 292 EDR does not have JVM_CONSTANT_InvokeDynamic
+-    // a bare name&type defaults its BSM to null, so fall through...
+   } else {
+     ShouldNotReachHere();  // verifier does not allow this
+   }
+ 
+-  // Fall through to pick up the per-class bootstrap method.
+-  // This mechanism may go away in the PFD.
+-  assert(AllowTransitionalJSR292, "else the verifier should have stopped us already");
+-  argument_info_result = empty;  // return no argument_info to caller
+-  oop bsm_oop = instanceKlass::cast(caller_method->method_holder())->bootstrap_method();
+-  if (bsm_oop != NULL) {
+-    if (TraceMethodHandles) {
+-      tty->print_cr("bootstrap method for "PTR_FORMAT" registered as "PTR_FORMAT":",
+-                    (intptr_t) caller_method(), (intptr_t) bsm_oop);
+-    }
+-    assert(bsm_oop->is_oop(), "must be sane");
+-    return Handle(THREAD, bsm_oop);
+-  }
+-
+   return empty;
+ }
+ 
+diff --git a/src/share/vm/classfile/systemDictionary.hpp b/src/share/vm/classfile/systemDictionary.hpp
+--- a/src/share/vm/classfile/systemDictionary.hpp
++++ b/src/share/vm/classfile/systemDictionary.hpp
+@@ -146,7 +146,6 @@
+   /* support for dynamic typing; it's OK if these are NULL in earlier JDKs */ \
+   template(MethodHandle_klass,           java_lang_invoke_MethodHandle,     Pre_JSR292) \
+   template(MemberName_klass,             java_lang_invoke_MemberName,       Pre_JSR292) \
+-  template(MethodHandleImpl_klass,       sun_dyn_MethodHandleImpl,          Opt) /* AllowTransitionalJSR292 ONLY */ \
+   template(MethodHandleNatives_klass,    java_lang_invoke_MethodHandleNatives, Pre_JSR292) \
+   template(AdapterMethodHandle_klass,    java_lang_invoke_AdapterMethodHandle, Pre_JSR292) \
+   template(BoundMethodHandle_klass,      java_lang_invoke_BoundMethodHandle, Pre_JSR292) \
+@@ -154,7 +153,6 @@
+   template(MethodType_klass,             java_lang_invoke_MethodType,       Pre_JSR292) \
+   template(MethodTypeForm_klass,         java_lang_invoke_MethodTypeForm,   Pre_JSR292) \
+   template(WrongMethodTypeException_klass, java_lang_invoke_WrongMethodTypeException, Pre_JSR292) \
+-  template(Linkage_klass,                java_lang_invoke_Linkage,          Opt) /* AllowTransitionalJSR292 ONLY */ \
+   template(CallSite_klass,               java_lang_invoke_CallSite,         Pre_JSR292) \
+   /* Note: MethodHandle must be first, and CallSite last in group */          \
+                                                                               \
+@@ -422,8 +420,6 @@
+     initialize_wk_klasses_until((WKID) limit, start_id, THREAD);
+   }
+ 
+-  static Symbol* find_backup_symbol(Symbol* symbol, const char* from_prefix, const char* to_prefix);
+-
+ public:
+   #define WK_KLASS_DECLARE(name, ignore_symbol, option) \
+     static klassOop name() { return check_klass_##option(_well_known_klasses[WK_KLASS_ENUM_NAME(name)]); }
+@@ -445,9 +441,6 @@
+ 
+   static void load_abstract_ownable_synchronizer_klass(TRAPS);
+ 
+-  static Symbol* find_backup_class_name(Symbol* class_name_symbol);
+-  static Symbol* find_backup_signature(Symbol* signature_symbol);
+-
+ private:
+   // Tells whether ClassLoader.loadClassInternal is present
+   static bool has_loadClassInternal()       { return _has_loadClassInternal; }
+diff --git a/src/share/vm/classfile/verifier.cpp b/src/share/vm/classfile/verifier.cpp
+--- a/src/share/vm/classfile/verifier.cpp
++++ b/src/share/vm/classfile/verifier.cpp
+@@ -1671,19 +1671,13 @@
+       VerificationType::long_type(),
+       VerificationType::long2_type(), CHECK_VERIFY(this));
+   } else if (tag.is_method_handle()) {
+-    Symbol* methodHandle_name = vmSymbols::java_lang_invoke_MethodHandle();
+-    if (AllowTransitionalJSR292 && !Universe::is_bootstrapping())
+-      methodHandle_name = SystemDictionaryHandles::MethodHandle_klass()->name();
+     current_frame->push_stack(
+       VerificationType::reference_type(
+-        methodHandle_name), CHECK_VERIFY(this));
++        vmSymbols::java_lang_invoke_MethodHandle()), CHECK_VERIFY(this));
+   } else if (tag.is_method_type()) {
+-    Symbol* methodType_name = vmSymbols::java_lang_invoke_MethodType();
+-    if (AllowTransitionalJSR292 && !Universe::is_bootstrapping())
+-      methodType_name = SystemDictionaryHandles::MethodType_klass()->name();
+     current_frame->push_stack(
+       VerificationType::reference_type(
+-        methodType_name), CHECK_VERIFY(this));
++        vmSymbols::java_lang_invoke_MethodType()), CHECK_VERIFY(this));
+   } else {
+     verify_error(bci, "Invalid index in ldc");
+     return;
+@@ -1950,8 +1944,7 @@
+   unsigned int types = (opcode == Bytecodes::_invokeinterface
+                                 ? 1 << JVM_CONSTANT_InterfaceMethodref
+                       : opcode == Bytecodes::_invokedynamic
+-                                ? ((AllowTransitionalJSR292 ? 1 << JVM_CONSTANT_NameAndType : 0)
+-                                  |1 << JVM_CONSTANT_InvokeDynamic)
++                                ? 1 << JVM_CONSTANT_InvokeDynamic
+                                 : 1 << JVM_CONSTANT_Methodref);
+   verify_cp_type(index, cp, types, CHECK_VERIFY(this));
+ 
+diff --git a/src/share/vm/classfile/vmSymbols.hpp b/src/share/vm/classfile/vmSymbols.hpp
+--- a/src/share/vm/classfile/vmSymbols.hpp
++++ b/src/share/vm/classfile/vmSymbols.hpp
+@@ -245,44 +245,15 @@
+   template(java_lang_invoke_AdapterMethodHandle,      "java/lang/invoke/AdapterMethodHandle")     \
+   template(java_lang_invoke_BoundMethodHandle,        "java/lang/invoke/BoundMethodHandle")       \
+   template(java_lang_invoke_DirectMethodHandle,       "java/lang/invoke/DirectMethodHandle")      \
+-  /* temporary transitional public names from 6839872: */                                         \
+-  template(java_dyn_InvokeDynamic,                    "java/dyn/InvokeDynamic")         /* AllowTransitionalJSR292 ONLY */ \
+-  template(java_dyn_Linkage,                          "java/dyn/Linkage")               /* AllowTransitionalJSR292 ONLY */ \
+-  template(java_dyn_CallSite,                         "java/dyn/CallSite")              /* AllowTransitionalJSR292 ONLY */ \
+-  template(java_dyn_MethodHandle,                     "java/dyn/MethodHandle")          /* AllowTransitionalJSR292 ONLY */ \
+-  template(java_dyn_MethodType,                       "java/dyn/MethodType")            /* AllowTransitionalJSR292 ONLY */ \
+-  template(java_dyn_WrongMethodTypeException,         "java/dyn/WrongMethodTypeException") /* AllowTransitionalJSR292 ONLY */ \
+-  template(java_dyn_MethodType_signature,             "Ljava/dyn/MethodType;")          /* AllowTransitionalJSR292 ONLY */ \
+-  template(java_dyn_MethodHandle_signature,           "Ljava/dyn/MethodHandle;")        /* AllowTransitionalJSR292 ONLY */ \
+-  /* temporary transitional internal names from 6839872: */                                       \
+-  template(java_dyn_MethodTypeForm,                   "java/dyn/MethodTypeForm")        /* AllowTransitionalJSR292 ONLY */ \
+-  template(java_dyn_MethodTypeForm_signature,         "Ljava/dyn/MethodTypeForm;")      /* AllowTransitionalJSR292 ONLY */ \
+-  template(java_dyn_MemberName,                       "java/dyn/MemberName")            /* AllowTransitionalJSR292 ONLY */ \
+-  template(java_dyn_MethodHandleNatives,              "java/dyn/MethodHandleNatives")   /* AllowTransitionalJSR292 ONLY */ \
+-  template(java_dyn_AdapterMethodHandle,              "java/dyn/AdapterMethodHandle")   /* AllowTransitionalJSR292 ONLY */ \
+-  template(java_dyn_BoundMethodHandle,                "java/dyn/BoundMethodHandle")     /* AllowTransitionalJSR292 ONLY */ \
+-  template(java_dyn_DirectMethodHandle,               "java/dyn/DirectMethodHandle")    /* AllowTransitionalJSR292 ONLY */ \
+-  /* temporary transitional internal names from EDR: */                                           \
+-  template(sun_dyn_MemberName,                        "sun/dyn/MemberName")             /* AllowTransitionalJSR292 ONLY */ \
+-  template(sun_dyn_MethodHandleImpl,                  "sun/dyn/MethodHandleImpl")       /* AllowTransitionalJSR292 ONLY */ \
+-  template(sun_dyn_MethodHandleNatives,               "sun/dyn/MethodHandleNatives")    /* AllowTransitionalJSR292 ONLY */ \
+-  template(sun_dyn_AdapterMethodHandle,               "sun/dyn/AdapterMethodHandle")    /* AllowTransitionalJSR292 ONLY */ \
+-  template(sun_dyn_BoundMethodHandle,                 "sun/dyn/BoundMethodHandle")      /* AllowTransitionalJSR292 ONLY */ \
+-  template(sun_dyn_DirectMethodHandle,                "sun/dyn/DirectMethodHandle")     /* AllowTransitionalJSR292 ONLY */ \
+   /* internal up-calls made only by the JVM, via class sun.invoke.MethodHandleNatives: */         \
+   template(findMethodHandleType_name,                 "findMethodHandleType")                     \
+   template(findMethodHandleType_signature,       "(Ljava/lang/Class;[Ljava/lang/Class;)Ljava/lang/invoke/MethodType;") \
+-  template(findMethodHandleType_TRANS_signature, "(Ljava/lang/Class;[Ljava/lang/Class;)Ljava/dyn/MethodType;") /* AllowTransitionalJSR292 ONLY */ \
+   template(notifyGenericMethodType_name,              "notifyGenericMethodType")                  \
+   template(notifyGenericMethodType_signature,         "(Ljava/lang/invoke/MethodType;)V")         \
+-  template(notifyGenericMethodType_TRANS_signature,   "(Ljava/dyn/MethodType;)V")       /* AllowTransitionalJSR292 ONLY */ \
+   template(linkMethodHandleConstant_name,             "linkMethodHandleConstant")                 \
+   template(linkMethodHandleConstant_signature, "(Ljava/lang/Class;ILjava/lang/Class;Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;") \
+-  template(linkMethodHandleConstant_TRANS_signature, "(Ljava/lang/Class;ILjava/lang/Class;Ljava/lang/String;Ljava/lang/Object;)Ljava/dyn/MethodHandle;") /* AllowTransitionalJSR292 ONLY */ \
+   template(makeDynamicCallSite_name,                  "makeDynamicCallSite")                      \
+   template(makeDynamicCallSite_signature, "(Ljava/lang/invoke/MethodHandle;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/Object;Ljava/lang/invoke/MemberName;I)Ljava/lang/invoke/CallSite;") \
+-  template(makeDynamicCallSite_TRANS_signature, "(Ljava/dyn/MethodHandle;Ljava/lang/String;Ljava/dyn/MethodType;Ljava/lang/Object;Lsun/dyn/MemberName;I)Ljava/dyn/CallSite;") /* AllowTransitionalJSR292 ONLY */ \
+-  template(makeDynamicCallSite_TRANS2_signature, "(Ljava/dyn/MethodHandle;Ljava/lang/String;Ljava/dyn/MethodType;Ljava/lang/Object;Ljava/dyn/MemberName;I)Ljava/dyn/CallSite;") /* AllowTransitionalJSR292 ONLY */ \
+   NOT_LP64(  do_alias(machine_word_signature,         int_signature)  )                           \
+   LP64_ONLY( do_alias(machine_word_signature,         long_signature) )                           \
+                                                                                                   \
+@@ -910,8 +881,6 @@
+   do_intrinsic(_invoke,                   java_lang_reflect_Method, invoke_name, object_object_array_object_signature, F_R) \
+   /*   (symbols invoke_name and invoke_signature defined above) */                                                      \
+   do_intrinsic(_checkSpreadArgument,      java_lang_invoke_MethodHandleNatives, checkSpreadArgument_name, checkSpreadArgument_signature, F_S) \
+-  do_intrinsic(_checkSpreadArgument_TRANS,sun_dyn_MethodHandleImpl, checkSpreadArgument_name, checkSpreadArgument_signature, F_S) /* AllowTransitionalJSR292 ONLY */ \
+-  do_intrinsic(_checkSpreadArgument_TRANS2,java_dyn_MethodHandleNatives, checkSpreadArgument_name, checkSpreadArgument_signature, F_S) /* AllowTransitionalJSR292 ONLY */ \
+    do_name(    checkSpreadArgument_name,       "checkSpreadArgument")                                                   \
+    do_name(    checkSpreadArgument_signature,  "(Ljava/lang/Object;I)V")                                                \
+   do_intrinsic(_invokeExact,              java_lang_invoke_MethodHandle, invokeExact_name,   object_array_object_signature, F_RN) \
+diff --git a/src/share/vm/interpreter/bytecodeTracer.cpp b/src/share/vm/interpreter/bytecodeTracer.cpp
+--- a/src/share/vm/interpreter/bytecodeTracer.cpp
++++ b/src/share/vm/interpreter/bytecodeTracer.cpp
+@@ -345,7 +345,6 @@
+     break;
+   case JVM_CONSTANT_NameAndType:
+   case JVM_CONSTANT_InvokeDynamic:
+-  case JVM_CONSTANT_InvokeDynamicTrans:
+     has_klass = false;
+     break;
+   default:
+diff --git a/src/share/vm/interpreter/interpreterRuntime.cpp b/src/share/vm/interpreter/interpreterRuntime.cpp
+--- a/src/share/vm/interpreter/interpreterRuntime.cpp
++++ b/src/share/vm/interpreter/interpreterRuntime.cpp
+@@ -369,10 +369,7 @@
+   }
+ 
+   // create exception
+-  Symbol* java_lang_invoke_WrongMethodTypeException = vmSymbols::java_lang_invoke_WrongMethodTypeException();
+-  if (AllowTransitionalJSR292)
+-    java_lang_invoke_WrongMethodTypeException = SystemDictionaryHandles::WrongMethodTypeException_klass()->name();
+-  THROW_MSG(java_lang_invoke_WrongMethodTypeException, message);
++  THROW_MSG(vmSymbols::java_lang_invoke_WrongMethodTypeException(), message);
+ }
+ IRT_END
+ 
+diff --git a/src/share/vm/interpreter/linkResolver.cpp b/src/share/vm/interpreter/linkResolver.cpp
+--- a/src/share/vm/interpreter/linkResolver.cpp
++++ b/src/share/vm/interpreter/linkResolver.cpp
+@@ -224,9 +224,7 @@
+       // Make sure the Java part of the runtime has been booted up.
+       klassOop natives = SystemDictionary::MethodHandleNatives_klass();
+       if (natives == NULL || instanceKlass::cast(natives)->is_not_initialized()) {
+-        Symbol* natives_name = vmSymbols::java_lang_invoke_MethodHandleNatives();
+-        if (natives != NULL && AllowTransitionalJSR292)  natives_name = Klass::cast(natives)->name();
+-        SystemDictionary::resolve_or_fail(natives_name,
++        SystemDictionary::resolve_or_fail(vmSymbols::java_lang_invoke_MethodHandleNatives(),
+                                           Handle(),
+                                           Handle(),
+                                           true,
+diff --git a/src/share/vm/interpreter/rewriter.cpp b/src/share/vm/interpreter/rewriter.cpp
+--- a/src/share/vm/interpreter/rewriter.cpp
++++ b/src/share/vm/interpreter/rewriter.cpp
+@@ -52,7 +52,6 @@
+       case JVM_CONSTANT_MethodHandle      : // fall through
+       case JVM_CONSTANT_MethodType        : // fall through
+       case JVM_CONSTANT_InvokeDynamic     : // fall through
+-      case JVM_CONSTANT_InvokeDynamicTrans: // fall through
+         add_cp_cache_entry(i);
+         break;
+     }
+@@ -62,7 +61,6 @@
+             "all cp cache indexes fit in a u2");
+ 
+   _have_invoke_dynamic = ((tag_mask & (1 << JVM_CONSTANT_InvokeDynamic)) != 0);
+-  _have_invoke_dynamic |= ((tag_mask & (1 << JVM_CONSTANT_InvokeDynamicTrans)) != 0);
+ }
+ 
+ 
+@@ -81,16 +79,10 @@
+       if (pool_index >= 0 &&
+           _pool->tag_at(pool_index).is_invoke_dynamic()) {
+         int bsm_index = _pool->invoke_dynamic_bootstrap_method_ref_index_at(pool_index);
+-        if (bsm_index != 0) {
+-          assert(_pool->tag_at(bsm_index).is_method_handle(), "must be a MH constant");
+-          // There is a CP cache entry holding the BSM for these calls.
+-          int bsm_cache_index = cp_entry_to_cp_cache(bsm_index);
+-          cache->entry_at(i)->initialize_bootstrap_method_index_in_cache(bsm_cache_index);
+-        } else {
+-          // There is no CP cache entry holding the BSM for these calls.
+-          // We will need to look for a class-global BSM, later.
+-          guarantee(AllowTransitionalJSR292, "");
+-        }
++        assert(_pool->tag_at(bsm_index).is_method_handle(), "must be a MH constant");
++        // There is a CP cache entry holding the BSM for these calls.
++        int bsm_cache_index = cp_entry_to_cp_cache(bsm_index);
++        cache->entry_at(i)->initialize_bootstrap_method_index_in_cache(bsm_cache_index);
+       }
+     }
+   }
+diff --git a/src/share/vm/oops/constantPoolKlass.cpp b/src/share/vm/oops/constantPoolKlass.cpp
+--- a/src/share/vm/oops/constantPoolKlass.cpp
++++ b/src/share/vm/oops/constantPoolKlass.cpp
+@@ -383,7 +383,6 @@
+       case JVM_CONSTANT_MethodType :
+         st->print("signature_index=%d", cp->method_type_index_at(index));
+         break;
+-      case JVM_CONSTANT_InvokeDynamicTrans :
+       case JVM_CONSTANT_InvokeDynamic :
+         {
+           st->print("bootstrap_method_index=%d", cp->invoke_dynamic_bootstrap_method_ref_index_at(index));
+diff --git a/src/share/vm/oops/constantPoolOop.cpp b/src/share/vm/oops/constantPoolOop.cpp
+--- a/src/share/vm/oops/constantPoolOop.cpp
++++ b/src/share/vm/oops/constantPoolOop.cpp
+@@ -284,17 +284,13 @@
+     if (constantPoolCacheOopDesc::is_secondary_index(which)) {
+       // Invokedynamic index.
+       int pool_index = cache()->main_entry_at(which)->constant_pool_index();
+-      if (!AllowTransitionalJSR292 || tag_at(pool_index).is_invoke_dynamic())
+-        pool_index = invoke_dynamic_name_and_type_ref_index_at(pool_index);
++      pool_index = invoke_dynamic_name_and_type_ref_index_at(pool_index);
+       assert(tag_at(pool_index).is_name_and_type(), "");
+       return pool_index;
+     }
+     // change byte-ordering and go via cache
+     i = remap_instruction_operand_from_cache(which);
+   } else {
+-    if (AllowTransitionalJSR292 && tag_at(which).is_name_and_type())
+-      // invokedynamic index is a simple name-and-type
+-      return which;
+     if (tag_at(which).is_invoke_dynamic()) {
+       int pool_index = invoke_dynamic_name_and_type_ref_index_at(which);
+       assert(tag_at(pool_index).is_name_and_type(), "");
+@@ -953,7 +949,6 @@
+   } break;
+ 
+   case JVM_CONSTANT_InvokeDynamic:
+-  case JVM_CONSTANT_InvokeDynamicTrans:
+   {
+     int k1 = invoke_dynamic_bootstrap_method_ref_index_at(index1);
+     int k2 = cp2->invoke_dynamic_bootstrap_method_ref_index_at(index2);
+@@ -1214,13 +1209,6 @@
+     to_cp->method_handle_index_at_put(to_i, k1, k2);
+   } break;
+ 
+-  case JVM_CONSTANT_InvokeDynamicTrans:
+-  {
+-    int k1 = from_cp->invoke_dynamic_bootstrap_method_ref_index_at(from_i);
+-    int k2 = from_cp->invoke_dynamic_name_and_type_ref_index_at(from_i);
+-    to_cp->invoke_dynamic_trans_at_put(to_i, k1, k2);
+-  } break;
+-
+   case JVM_CONSTANT_InvokeDynamic:
+   {
+     int k1 = from_cp->invoke_dynamic_bootstrap_specifier_index(from_i);
+@@ -1446,7 +1434,6 @@
+       return 5;
+ 
+     case JVM_CONSTANT_InvokeDynamic:
+-    case JVM_CONSTANT_InvokeDynamicTrans:
+       // u1 tag, u2 bsm, u2 nt
+       return 5;
+ 
+@@ -1661,7 +1648,6 @@
+         DBG(printf("JVM_CONSTANT_MethodType: %hd", idx1));
+         break;
+       }
+-      case JVM_CONSTANT_InvokeDynamicTrans:
+       case JVM_CONSTANT_InvokeDynamic: {
+         *bytes = tag;
+         idx1 = extract_low_short_from_int(*int_at_addr(idx));
+diff --git a/src/share/vm/oops/constantPoolOop.hpp b/src/share/vm/oops/constantPoolOop.hpp
+--- a/src/share/vm/oops/constantPoolOop.hpp
++++ b/src/share/vm/oops/constantPoolOop.hpp
+@@ -244,12 +244,6 @@
+     *int_at_addr(which) = ((jint) name_and_type_index<<16) | bootstrap_specifier_index;
+   }
+ 
+-  void invoke_dynamic_trans_at_put(int which, int bootstrap_method_index, int name_and_type_index) {
+-    tag_at_put(which, JVM_CONSTANT_InvokeDynamicTrans);
+-    *int_at_addr(which) = ((jint) name_and_type_index<<16) | bootstrap_method_index;
+-    assert(AllowTransitionalJSR292, "");
+-  }
+-
+   // Temporary until actual use
+   void unresolved_string_at_put(int which, Symbol* s) {
+     release_tag_at_put(which, JVM_CONSTANT_UnresolvedString);
+@@ -570,15 +564,11 @@
+   };
+   int invoke_dynamic_bootstrap_method_ref_index_at(int which) {
+     assert(tag_at(which).is_invoke_dynamic(), "Corrupted constant pool");
+-    if (tag_at(which).value() == JVM_CONSTANT_InvokeDynamicTrans)
+-      return extract_low_short_from_int(*int_at_addr(which));
+     int op_base = invoke_dynamic_operand_base(which);
+     return operands()->short_at(op_base + _indy_bsm_offset);
+   }
+   int invoke_dynamic_argument_count_at(int which) {
+     assert(tag_at(which).is_invoke_dynamic(), "Corrupted constant pool");
+-    if (tag_at(which).value() == JVM_CONSTANT_InvokeDynamicTrans)
+-      return 0;
+     int op_base = invoke_dynamic_operand_base(which);
+     int argc = operands()->short_at(op_base + _indy_argc_offset);
+     DEBUG_ONLY(int end_offset = op_base + _indy_argv_offset + argc;
+diff --git a/src/share/vm/oops/cpCacheOop.cpp b/src/share/vm/oops/cpCacheOop.cpp
+--- a/src/share/vm/oops/cpCacheOop.cpp
++++ b/src/share/vm/oops/cpCacheOop.cpp
+@@ -185,7 +185,7 @@
+         this->print(tty, 0);
+       }
+       assert(method->can_be_statically_bound(), "must be a MH invoker method");
+-      assert(AllowTransitionalJSR292 || _f2 >= constantPoolOopDesc::CPCACHE_INDEX_TAG, "BSM index initialized");
++      assert(_f2 >= constantPoolOopDesc::CPCACHE_INDEX_TAG, "BSM index initialized");
+       // SystemDictionary::find_method_handle_invoke only caches
+       // methods which signature classes are on the boot classpath,
+       // otherwise the newly created method is returned.  To avoid
+diff --git a/src/share/vm/oops/instanceKlass.hpp b/src/share/vm/oops/instanceKlass.hpp
+--- a/src/share/vm/oops/instanceKlass.hpp
++++ b/src/share/vm/oops/instanceKlass.hpp
+@@ -193,8 +193,6 @@
+   typeArrayOop    _inner_classes;
+   // Implementors of this interface (not valid if it overflows)
+   klassOop        _implementors[implementors_limit];
+-  // invokedynamic bootstrap method (a java.lang.invoke.MethodHandle)
+-  oop             _bootstrap_method;  // AllowTransitionalJSR292 ONLY
+   // Annotations for this class, or null if none.
+   typeArrayOop    _class_annotations;
+   // Annotation objects (byte arrays) for fields, or null if no annotations.
+@@ -528,10 +526,6 @@
+                                     u2 method_index)  { _enclosing_method_class_index  = class_index;
+                                                         _enclosing_method_method_index = method_index; }
+ 
+-  // JSR 292 support
+-  oop bootstrap_method() const                        { return _bootstrap_method; }  // AllowTransitionalJSR292 ONLY
+-  void set_bootstrap_method(oop mh)                   { oop_store(&_bootstrap_method, mh); }
+-
+   // jmethodID support
+   static jmethodID get_jmethod_id(instanceKlassHandle ik_h,
+                      methodHandle method_h);
+@@ -817,7 +811,6 @@
+   oop* adr_signers() const           { return (oop*)&this->_signers;}
+   oop* adr_inner_classes() const     { return (oop*)&this->_inner_classes;}
+   oop* adr_implementors() const      { return (oop*)&this->_implementors[0];}
+-  oop* adr_bootstrap_method() const  { return (oop*)&this->_bootstrap_method;}  // AllowTransitionalJSR292 ONLY
+   oop* adr_methods_jmethod_ids() const             { return (oop*)&this->_methods_jmethod_ids;}
+   oop* adr_methods_cached_itable_indices() const   { return (oop*)&this->_methods_cached_itable_indices;}
+   oop* adr_class_annotations() const   { return (oop*)&this->_class_annotations;}
+diff --git a/src/share/vm/oops/instanceKlassKlass.cpp b/src/share/vm/oops/instanceKlassKlass.cpp
+--- a/src/share/vm/oops/instanceKlassKlass.cpp
++++ b/src/share/vm/oops/instanceKlassKlass.cpp
+@@ -105,7 +105,6 @@
+   MarkSweep::mark_and_push(ik->adr_protection_domain());
+   MarkSweep::mark_and_push(ik->adr_host_klass());
+   MarkSweep::mark_and_push(ik->adr_signers());
+-  MarkSweep::mark_and_push(ik->adr_bootstrap_method());
+   MarkSweep::mark_and_push(ik->adr_class_annotations());
+   MarkSweep::mark_and_push(ik->adr_fields_annotations());
+   MarkSweep::mark_and_push(ik->adr_methods_annotations());
+@@ -143,7 +142,6 @@
+   PSParallelCompact::mark_and_push(cm, ik->adr_protection_domain());
+   PSParallelCompact::mark_and_push(cm, ik->adr_host_klass());
+   PSParallelCompact::mark_and_push(cm, ik->adr_signers());
+-  PSParallelCompact::mark_and_push(cm, ik->adr_bootstrap_method());
+   PSParallelCompact::mark_and_push(cm, ik->adr_class_annotations());
+   PSParallelCompact::mark_and_push(cm, ik->adr_fields_annotations());
+   PSParallelCompact::mark_and_push(cm, ik->adr_methods_annotations());
+@@ -187,7 +185,6 @@
+   for (int i = 0; i < instanceKlass::implementors_limit; i++) {
+     blk->do_oop(&ik->adr_implementors()[i]);
+   }
+-  blk->do_oop(ik->adr_bootstrap_method());
+   blk->do_oop(ik->adr_class_annotations());
+   blk->do_oop(ik->adr_fields_annotations());
+   blk->do_oop(ik->adr_methods_annotations());
+@@ -242,8 +239,6 @@
+   for (int i = 0; i < instanceKlass::implementors_limit; i++) {
+     if (mr.contains(&adr[i])) blk->do_oop(&adr[i]);
+   }
+-  adr = ik->adr_bootstrap_method();
+-  if (mr.contains(adr)) blk->do_oop(adr);
+   adr = ik->adr_class_annotations();
+   if (mr.contains(adr)) blk->do_oop(adr);
+   adr = ik->adr_fields_annotations();
+@@ -285,7 +280,6 @@
+   for (int i = 0; i < instanceKlass::implementors_limit; i++) {
+     MarkSweep::adjust_pointer(&ik->adr_implementors()[i]);
+   }
+-  MarkSweep::adjust_pointer(ik->adr_bootstrap_method());
+   MarkSweep::adjust_pointer(ik->adr_class_annotations());
+   MarkSweep::adjust_pointer(ik->adr_fields_annotations());
+   MarkSweep::adjust_pointer(ik->adr_methods_annotations());
+@@ -322,11 +316,6 @@
+     pm->claim_or_forward_depth(sg_addr);
+   }
+ 
+-  oop* bsm_addr = ik->adr_bootstrap_method();
+-  if (PSScavenge::should_scavenge(bsm_addr)) {
+-    pm->claim_or_forward_depth(bsm_addr);
+-  }
+-
+   klassKlass::oop_push_contents(pm, obj);
+ }
+ 
+@@ -420,7 +409,6 @@
+     ik->set_breakpoints(NULL);
+     ik->init_previous_versions();
+     ik->set_generic_signature(NULL);
+-    ik->set_bootstrap_method(NULL);
+     ik->release_set_methods_jmethod_ids(NULL);
+     ik->release_set_methods_cached_itable_indices(NULL);
+     ik->set_class_annotations(NULL);
+@@ -545,11 +533,6 @@
+     } // pvw is cleaned up
+   } // rm is cleaned up
+ 
+-  if (ik->bootstrap_method() != NULL) {
+-    st->print(BULLET"bootstrap method:  ");
+-    ik->bootstrap_method()->print_value_on(st);
+-    st->cr();
+-  }
+   if (ik->generic_signature() != NULL) {
+     st->print(BULLET"generic signature: ");
+     ik->generic_signature()->print_value_on(st);
+diff --git a/src/share/vm/oops/methodOop.cpp b/src/share/vm/oops/methodOop.cpp
+--- a/src/share/vm/oops/methodOop.cpp
++++ b/src/share/vm/oops/methodOop.cpp
+@@ -839,11 +839,11 @@
+ bool methodOopDesc::is_method_handle_invoke_name(vmSymbols::SID name_sid) {
+   switch (name_sid) {
+   case vmSymbols::VM_SYMBOL_ENUM_NAME(invokeExact_name):
+-  case vmSymbols::VM_SYMBOL_ENUM_NAME(invokeGeneric_name):
++  case vmSymbols::VM_SYMBOL_ENUM_NAME(invoke_name):
+     return true;
+   }
+-  if ((AllowTransitionalJSR292 || AllowInvokeForInvokeGeneric)
+-      && name_sid == vmSymbols::VM_SYMBOL_ENUM_NAME(invoke_name))
++  if (AllowInvokeGeneric
++      && name_sid == vmSymbols::VM_SYMBOL_ENUM_NAME(invokeGeneric_name))
+     return true;
+   return false;
+ }
+@@ -1079,7 +1079,6 @@
+   if (name_id == vmSymbols::NO_SID)  return;
+   vmSymbols::SID   sig_id = vmSymbols::find_sid(signature());
+   if (klass_id != vmSymbols::VM_SYMBOL_ENUM_NAME(java_lang_invoke_MethodHandle)
+-      && !(klass_id == vmSymbols::VM_SYMBOL_ENUM_NAME(java_dyn_MethodHandle) && AllowTransitionalJSR292)
+       && sig_id == vmSymbols::NO_SID)  return;
+   jshort flags = access_flags().as_short();
+ 
+@@ -1105,20 +1104,17 @@
+     break;
+ 
+   // Signature-polymorphic methods: MethodHandle.invoke*, InvokeDynamic.*.
+-  case vmSymbols::VM_SYMBOL_ENUM_NAME(java_dyn_MethodHandle):  // AllowTransitionalJSR292 ONLY
+   case vmSymbols::VM_SYMBOL_ENUM_NAME(java_lang_invoke_MethodHandle):
+     if (is_static() || !is_native())  break;
+     switch (name_id) {
+     case vmSymbols::VM_SYMBOL_ENUM_NAME(invokeGeneric_name):
++      if (!AllowInvokeGeneric)  break;
++    case vmSymbols::VM_SYMBOL_ENUM_NAME(invoke_name):
+       id = vmIntrinsics::_invokeGeneric;
+       break;
+     case vmSymbols::VM_SYMBOL_ENUM_NAME(invokeExact_name):
+       id = vmIntrinsics::_invokeExact;
+       break;
+-    case vmSymbols::VM_SYMBOL_ENUM_NAME(invoke_name):
+-      if (AllowInvokeForInvokeGeneric)   id = vmIntrinsics::_invokeGeneric;
+-      else if (AllowTransitionalJSR292)  id = vmIntrinsics::_invokeExact;
+-      break;
+     }
+     break;
+   case vmSymbols::VM_SYMBOL_ENUM_NAME(java_lang_invoke_InvokeDynamic):
+diff --git a/src/share/vm/prims/jvm.h b/src/share/vm/prims/jvm.h
+--- a/src/share/vm/prims/jvm.h
++++ b/src/share/vm/prims/jvm.h
+@@ -1065,7 +1065,7 @@
+     JVM_CONSTANT_NameAndType,
+     JVM_CONSTANT_MethodHandle           = 15,  // JSR 292
+     JVM_CONSTANT_MethodType             = 16,  // JSR 292
+-    JVM_CONSTANT_InvokeDynamicTrans     = 17,  // JSR 292, only occurs in old class files
++    //JVM_CONSTANT_(unused)             = 17,  // JSR 292 early drafts only
+     JVM_CONSTANT_InvokeDynamic          = 18,  // JSR 292
+     JVM_CONSTANT_ExternalMax            = 18   // Last tag found in classfiles
+ };
+diff --git a/src/share/vm/prims/methodHandleWalk.cpp b/src/share/vm/prims/methodHandleWalk.cpp
+--- a/src/share/vm/prims/methodHandleWalk.cpp
++++ b/src/share/vm/prims/methodHandleWalk.cpp
+@@ -959,12 +959,6 @@
+   if (m == NULL) {
+     // Get the intrinsic methodOop.
+     m = vmIntrinsics::method_for(iid);
+-    if (m == NULL && iid == vmIntrinsics::_checkSpreadArgument && AllowTransitionalJSR292) {
+-      m = vmIntrinsics::method_for(vmIntrinsics::_checkSpreadArgument_TRANS);
+-      if (m == NULL)
+-        // sun.dyn.MethodHandleImpl not found, look for java.dyn.MethodHandleNatives:
+-        m = vmIntrinsics::method_for(vmIntrinsics::_checkSpreadArgument_TRANS2);
+-    }
+     if (m == NULL) {
+       ArgToken zero;
+       lose(vmIntrinsics::name_at(iid), CHECK_(zero));
+diff --git a/src/share/vm/prims/methodHandles.cpp b/src/share/vm/prims/methodHandles.cpp
+--- a/src/share/vm/prims/methodHandles.cpp
++++ b/src/share/vm/prims/methodHandles.cpp
+@@ -2488,74 +2488,21 @@
+ }
+ JVM_END
+ 
+-JVM_ENTRY(void, MHN_registerBootstrap(JNIEnv *env, jobject igcls, jclass caller_jh, jobject bsm_jh)) {
+-  instanceKlassHandle ik = MethodHandles::resolve_instance_klass(caller_jh, THREAD);
+-  if (!AllowTransitionalJSR292) {
+-    THROW_MSG(vmSymbols::java_lang_IllegalArgumentException(),
+-              "registerBootstrapMethod is only supported in JSR 292 EDR");
+-  }
+-  ik->link_class(CHECK);
+-  if (!java_lang_invoke_MethodHandle::is_instance(JNIHandles::resolve(bsm_jh))) {
+-    THROW_MSG(vmSymbols::java_lang_IllegalArgumentException(), "method handle");
+-  }
+-  const char* err = NULL;
+-  if (ik->is_initialized() || ik->is_in_error_state()) {
+-    err = "too late: class is already initialized";
+-  } else {
+-    ObjectLocker ol(ik, THREAD);  // note:  this should be a recursive lock
+-    if (ik->is_not_initialized() ||
+-        (ik->is_being_initialized() && ik->is_reentrant_initialization(THREAD))) {
+-      if (ik->bootstrap_method() != NULL) {
+-        err = "class is already equipped with a bootstrap method";
+-      } else {
+-        ik->set_bootstrap_method(JNIHandles::resolve_non_null(bsm_jh));
+-        err = NULL;
+-      }
+-    } else {
+-      err = "class is already initialized";
+-      if (ik->is_being_initialized())
+-        err = "class is already being initialized in a different thread";
+-    }
+-  }
+-  if (err != NULL) {
+-    THROW_MSG(vmSymbols::java_lang_IllegalStateException(), err);
+-  }
+-}
+-JVM_END
+-
+-JVM_ENTRY(jobject, MHN_getBootstrap(JNIEnv *env, jobject igcls, jclass caller_jh)) {
+-  if (!AllowTransitionalJSR292)
+-    THROW_MSG_NULL(vmSymbols::java_lang_IllegalArgumentException(), "getBootstrap: transitional only");
+-  instanceKlassHandle ik = MethodHandles::resolve_instance_klass(caller_jh, THREAD);
+-  return JNIHandles::make_local(THREAD, ik->bootstrap_method());
+-}
+-JVM_END
+-
+-JVM_ENTRY(void, MHN_setCallSiteTarget(JNIEnv *env, jobject igcls, jobject site_jh, jobject target_jh)) {
+-  if (!AllowTransitionalJSR292)
+-    THROW_MSG(vmSymbols::java_lang_IllegalArgumentException(), "setCallSite: transitional only");
+-}
+-JVM_END
+-
+ 
+ /// JVM_RegisterMethodHandleMethods
+ 
+ #define LANG "Ljava/lang/"
+-#define JLINV "Ljava/lang/invoke/" /* standard package */
+-#define JDYN "Ljava/dyn/" /* alternative package to JLINV if AllowTransitionalJSR292 */
+-#define IDYN "Lsun/dyn/"  /* alternative package to JDYN if AllowTransitionalJSR292 */
+-// FIXME: After AllowTransitionalJSR292 is removed, replace JDYN and IDYN by JLINV.
++#define JLINV "Ljava/lang/invoke/"
+ 
+ #define OBJ   LANG"Object;"
+ #define CLS   LANG"Class;"
+ #define STRG  LANG"String;"
+-#define CST   JDYN"CallSite;"
+-#define MT    JDYN"MethodType;"
+-#define MH    JDYN"MethodHandle;"
+-#define MEM   IDYN"MemberName;"
+-#define AMH   IDYN"AdapterMethodHandle;"
+-#define BMH   IDYN"BoundMethodHandle;"
+-#define DMH   IDYN"DirectMethodHandle;"
++#define MT    JLINV"MethodType;"
++#define MH    JLINV"MethodHandle;"
++#define MEM   JLINV"MemberName;"
++#define AMH   JLINV"AdapterMethodHandle;"
++#define BMH   JLINV"BoundMethodHandle;"
++#define DMH   JLINV"DirectMethodHandle;"
+ 
+ #define CC (char*)  /*cast a literal from (const char*)*/
+ #define FN_PTR(f) CAST_FROM_FN_PTR(void*, &f)
+@@ -2579,39 +2526,6 @@
+   {CC"getMembers",              CC"("CLS""STRG""STRG"I"CLS"I["MEM")I",  FN_PTR(MHN_getMembers)}
+ };
+ 
+-// FIXME: Remove methods2 after AllowTransitionalJSR292 is removed.
+-static JNINativeMethod methods2[] = {
+-  {CC"registerBootstrap",       CC"("CLS MH")V",                FN_PTR(MHN_registerBootstrap)},
+-  {CC"getBootstrap",            CC"("CLS")"MH,                  FN_PTR(MHN_getBootstrap)},
+-  {CC"setCallSiteTarget",       CC"("CST MH")V",                FN_PTR(MHN_setCallSiteTarget)}
+-};
+-
+-static void hack_signatures(JNINativeMethod* methods, jint num_methods, const char* from_sig, const char* to_sig) {
+-  for (int i = 0; i < num_methods; i++) {
+-    const char* sig = methods[i].signature;
+-    if (!strstr(sig, from_sig))  continue;
+-    size_t buflen = strlen(sig) + 100;
+-    char* buf = NEW_C_HEAP_ARRAY(char, buflen);
+-    char* bufp = buf;
+-    const char* sigp = sig;
+-    size_t from_len = strlen(from_sig), to_len = strlen(to_sig);
+-    while (*sigp != '\0') {
+-      assert(bufp < buf + buflen - to_len - 1, "oob");
+-      if (strncmp(sigp, from_sig, from_len) != 0) {
+-        *bufp++ = *sigp++;
+-      } else {
+-        strcpy(bufp, to_sig);
+-        bufp += to_len;
+-        sigp += from_len;
+-      }
+-    }
+-    *bufp = '\0';
+-    methods[i].signature = buf;  // replace with new signature
+-    if (TraceMethodHandles)
+-      tty->print_cr("MethodHandleNatives: %s: change signature %s => %s", methods[i].name, sig, buf);
+-  }
+-}
+-
+ // This one function is exported, used by NativeLookup.
+ 
+ JVM_ENTRY(void, JVM_RegisterMethodHandleMethods(JNIEnv *env, jclass MHN_class)) {
+@@ -2622,92 +2536,41 @@
+     return;  // bind nothing
+   }
+ 
+-  if (SystemDictionary::MethodHandleNatives_klass() != NULL &&
+-      SystemDictionary::MethodHandleNatives_klass() != java_lang_Class::as_klassOop(JNIHandles::resolve(MHN_class))) {
+-    warning("multiple versions of MethodHandleNatives in boot classpath; consider using -XX:+PreferTransitionalJSR292");
+-    THROW_MSG(vmSymbols::java_lang_InternalError(), "multiple versions of MethodHandleNatives in boot classpath; consider using -XX:+PreferTransitionalJSR292");
+-  }
+-
+   bool enable_MH = true;
+ 
+-  // Loop control.  FIXME: Replace by dead reckoning after AllowTransitionalJSR292 is removed.
+-  bool registered_natives = false;
+-  bool try_plain = true, try_JDYN = true, try_IDYN = true;
+-  for (;;) {
++  {
+     ThreadToNativeFromVM ttnfv(thread);
+ 
+-    if      (try_plain) { try_plain = false; }
+-    else if (try_JDYN)  { try_JDYN  = false; hack_signatures(methods, sizeof(methods)/sizeof(JNINativeMethod), IDYN, JDYN); }
+-    else if (try_IDYN)  { try_IDYN  = false; hack_signatures(methods, sizeof(methods)/sizeof(JNINativeMethod), JDYN, JLINV); }
+-    else                { break; }
+     int status = env->RegisterNatives(MHN_class, methods, sizeof(methods)/sizeof(JNINativeMethod));
+     if (env->ExceptionOccurred()) {
++      MethodHandles::set_enabled(false);
++      warning("JSR 292 method handle code is mismatched to this JVM.  Disabling support.");
++      enable_MH = false;
+       env->ExceptionClear();
+-      // and try again...
+-    } else {
+-      registered_natives = true;
+-      break;
+     }
+   }
+-  if (!registered_natives) {
+-    MethodHandles::set_enabled(false);
+-    warning("JSR 292 method handle code is mismatched to this JVM.  Disabling support.");
+-    enable_MH = false;
+-  }
+ 
+   if (enable_MH) {
+-    bool found_raise_exception = false;
+     KlassHandle MHN_klass = SystemDictionaryHandles::MethodHandleNatives_klass();
+-    KlassHandle MHI_klass = SystemDictionaryHandles::MethodHandleImpl_klass();
+-    // Loop control.  FIXME: Replace by dead reckoning after AllowTransitionalJSR292 is removed.
+-    bool try_MHN = true, try_MHI = AllowTransitionalJSR292;
+-    for (;;) {
+-      KlassHandle try_klass;
+-      if      (try_MHN) { try_MHN = false; try_klass = MHN_klass; }
+-      else if (try_MHI) { try_MHI = false; try_klass = MHI_klass; }
+-      else              { break; }
+-      if (try_klass.is_null())  continue;
++    if (MHN_klass.not_null()) {
+       TempNewSymbol raiseException_name = SymbolTable::new_symbol("raiseException", CHECK);
+       TempNewSymbol raiseException_sig = SymbolTable::new_symbol("(ILjava/lang/Object;Ljava/lang/Object;)V", CHECK);
+-      methodOop raiseException_method  = instanceKlass::cast(try_klass->as_klassOop())
++      methodOop raiseException_method  = instanceKlass::cast(MHN_klass->as_klassOop())
+                     ->find_method(raiseException_name, raiseException_sig);
+       if (raiseException_method != NULL && raiseException_method->is_static()) {
+         MethodHandles::set_raise_exception_method(raiseException_method);
+-        found_raise_exception = true;
+-        break;
++      } else {
++        warning("JSR 292 method handle code is mismatched to this JVM.  Disabling support.");
++        enable_MH = false;
+       }
+-    }
+-    if (!found_raise_exception) {
+-      warning("JSR 292 method handle code is mismatched to this JVM.  Disabling support.");
++    } else {
+       enable_MH = false;
+     }
+   }
+ 
+   if (enable_MH) {
+-    if (AllowTransitionalJSR292) {
+-      // We need to link the MethodHandleImpl klass before we generate
+-      // the method handle adapters as the _raise_exception adapter uses
+-      // one of its methods (and its c2i-adapter).
+-      klassOop k = SystemDictionary::MethodHandleImpl_klass();
+-      if (k != NULL) {
+-        instanceKlass* ik = instanceKlass::cast(k);
+-        ik->link_class(CHECK);
+-      }
+-    }
+-
+     MethodHandles::generate_adapters();
+     MethodHandles::set_enabled(true);
+   }
+-
+-  if (AllowTransitionalJSR292) {
+-    ThreadToNativeFromVM ttnfv(thread);
+-
+-    int status = env->RegisterNatives(MHN_class, methods2, sizeof(methods2)/sizeof(JNINativeMethod));
+-    if (env->ExceptionOccurred()) {
+-      // Don't do this, since it's too late:
+-      //   MethodHandles::set_enabled(false)
+-      env->ExceptionClear();
+-    }
+-  }
+ }
+ JVM_END
+diff --git a/src/share/vm/prims/nativeLookup.cpp b/src/share/vm/prims/nativeLookup.cpp
+--- a/src/share/vm/prims/nativeLookup.cpp
++++ b/src/share/vm/prims/nativeLookup.cpp
+@@ -120,8 +120,6 @@
+ 
+   { CC"Java_sun_misc_Unsafe_registerNatives",                      NULL, FN_PTR(JVM_RegisterUnsafeMethods)       },
+   { CC"Java_java_lang_invoke_MethodHandleNatives_registerNatives", NULL, FN_PTR(JVM_RegisterMethodHandleMethods) },
+-  { CC"Java_sun_dyn_MethodHandleNatives_registerNatives",          NULL, FN_PTR(JVM_RegisterMethodHandleMethods) },  // AllowTransitionalJSR292
+-  { CC"Java_java_dyn_MethodHandleNatives_registerNatives",         NULL, FN_PTR(JVM_RegisterMethodHandleMethods) },  // AllowTransitionalJSR292
+   { CC"Java_sun_misc_Perf_registerNatives",                        NULL, FN_PTR(JVM_RegisterPerfMethods)         }
+ };
+ 
+diff --git a/src/share/vm/runtime/globals.cpp b/src/share/vm/runtime/globals.cpp
+--- a/src/share/vm/runtime/globals.cpp
++++ b/src/share/vm/runtime/globals.cpp
+@@ -63,6 +63,12 @@
+ 
+ bool Flag::is_unlocked() const {
+   if (strcmp(kind, "{diagnostic}") == 0) {
++    if (strcmp(name, "EnableInvokeDynamic") == 0 && UnlockExperimentalVMOptions && !UnlockDiagnosticVMOptions) {
++      // transitional logic to allow tests to run until they are changed
++      static int warned;
++      if (++warned == 1)  warning("Use -XX:+UnlockDiagnosticVMOptions before EnableInvokeDynamic flag");
++      return true;
++    }
+     return UnlockDiagnosticVMOptions;
+   } else if (strcmp(kind, "{experimental}") == 0 ||
+              strcmp(kind, "{C2 experimental}") == 0) {
+diff --git a/src/share/vm/runtime/globals.hpp b/src/share/vm/runtime/globals.hpp
+--- a/src/share/vm/runtime/globals.hpp
++++ b/src/share/vm/runtime/globals.hpp
+@@ -3735,13 +3735,7 @@
+   experimental(bool, TrustFinalNonStaticFields, false,                      \
+           "trust final non-static declarations for constant folding")       \
+                                                                             \
+-  experimental(bool, AllowTransitionalJSR292, true,                         \
+-          "recognize pre-PFD formats of invokedynamic")                     \
+-                                                                            \
+-  experimental(bool, PreferTransitionalJSR292, false,                       \
+-          "prefer pre-PFD APIs on boot class path, if they exist")          \
+-                                                                            \
+-  experimental(bool, AllowInvokeForInvokeGeneric, false,                    \
++  experimental(bool, AllowInvokeGeneric, true,                              \
+           "accept MethodHandle.invoke and MethodHandle.invokeGeneric "      \
+           "as equivalent methods")                                          \
+                                                                             \
+diff --git a/src/share/vm/utilities/constantTag.cpp b/src/share/vm/utilities/constantTag.cpp
+--- a/src/share/vm/utilities/constantTag.cpp
++++ b/src/share/vm/utilities/constantTag.cpp
+@@ -93,8 +93,6 @@
+       return "MethodType";
+     case JVM_CONSTANT_InvokeDynamic :
+       return "InvokeDynamic";
+-    case JVM_CONSTANT_InvokeDynamicTrans :
+-      return "InvokeDynamic/transitional";
+     case JVM_CONSTANT_Object :
+       return "Object";
+     case JVM_CONSTANT_Utf8 :
+diff --git a/src/share/vm/utilities/constantTag.hpp b/src/share/vm/utilities/constantTag.hpp
+--- a/src/share/vm/utilities/constantTag.hpp
++++ b/src/share/vm/utilities/constantTag.hpp
+@@ -86,8 +86,7 @@
+ 
+   bool is_method_type() const              { return _tag == JVM_CONSTANT_MethodType; }
+   bool is_method_handle() const            { return _tag == JVM_CONSTANT_MethodHandle; }
+-  bool is_invoke_dynamic() const           { return (_tag == JVM_CONSTANT_InvokeDynamic ||
+-                                                     _tag == JVM_CONSTANT_InvokeDynamicTrans); }
++  bool is_invoke_dynamic() const           { return _tag == JVM_CONSTANT_InvokeDynamic; }
+ 
+   bool is_loadable_constant() const {
+     return ((_tag >= JVM_CONSTANT_Integer && _tag <= JVM_CONSTANT_String) ||
+diff --git a/src/share/vm/runtime/arguments.cpp b/src/share/vm/runtime/arguments.cpp
+--- a/src/share/vm/runtime/arguments.cpp
++++ b/src/share/vm/runtime/arguments.cpp
+@@ -245,6 +245,7 @@
+   { "MaxLiveObjectEvacuationRatio",
+                            JDK_Version::jdk_update(6,24), JDK_Version::jdk(8) },
+   { "ForceSharedSpaces",   JDK_Version::jdk_update(6,25), JDK_Version::jdk(8) },
++  { "AllowTransitionalJSR292",       JDK_Version::jdk(7), JDK_Version::jdk(8) },
+   { NULL, JDK_Version(0), JDK_Version(0) }
+ };
+ 

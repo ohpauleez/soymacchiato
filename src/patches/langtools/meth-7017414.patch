@@ -1,0 +1,104 @@
+7017414: before the move of JSR 292 to package java.lang.invoke, javac must recognize the new package
+Summary: added support for future 292 package (support for old location 'java.dyn' will be removed in followup changeset)
+Reviewed-by: jjg
+(Modified for mlvm.)
+
+--- a/src/share/classes/com/sun/tools/javac/code/Flags.java	Fri Feb 04 17:30:28 2011 -0800
++++ b/src/share/classes/com/sun/tools/javac/code/Flags.java	Mon Feb 07 18:09:46 2011 +0000
+@@ -237,7 +237,7 @@ public class Flags {
+ 
+     /**
+      * Flag that marks a signature-polymorphic invoke method.
+-     * (These occur inside java.dyn.MethodHandle.)
++     * (These occur inside java.lang.invoke.MethodHandle.)
+      */
+     public static final long POLYMORPHIC_SIGNATURE = 1L<<40;
+ 
+--- a/src/share/classes/com/sun/tools/javac/code/Symtab.java	Fri Feb 04 17:30:28 2011 -0800
++++ b/src/share/classes/com/sun/tools/javac/code/Symtab.java	Mon Feb 07 18:09:46 2011 +0000
+@@ -124,7 +124,9 @@ public class Symtab {
+     public final Type stringBuilderType;
+     public final Type cloneableType;
+     public final Type serializableType;
++    public final Type transientMethodHandleType; // transient - 292
+     public final Type methodHandleType;
++    public final Type transientPolymorphicSignatureType; // transient - 292
+     public final Type polymorphicSignatureType;
+     public final Type invokeDynamicType;
+     public final Type throwableType;
+@@ -419,8 +421,10 @@ public class Symtab {
+         cloneableType = enterClass("java.lang.Cloneable");
+         throwableType = enterClass("java.lang.Throwable");
+         serializableType = enterClass("java.io.Serializable");
+-        methodHandleType = enterClass("java.dyn.MethodHandle");
+-        polymorphicSignatureType = enterClass("java.dyn.MethodHandle$PolymorphicSignature");
++        transientMethodHandleType = enterClass("java.dyn.MethodHandle"); // transient - 292
++        methodHandleType = enterClass("java.lang.invoke.MethodHandle");
++        transientPolymorphicSignatureType = enterClass("java.dyn.MethodHandle$PolymorphicSignature"); // transient - 292
++        polymorphicSignatureType = enterClass("java.lang.invoke.MethodHandle$PolymorphicSignature");
+         invokeDynamicType = enterClass("java.dyn.InvokeDynamic");
+         errorType = enterClass("java.lang.Error");
+         illegalArgumentExceptionType = enterClass("java.lang.IllegalArgumentException");
+@@ -464,6 +468,7 @@ public class Symtab {
+ 
+         synthesizeEmptyInterfaceIfMissing(cloneableType);
+         synthesizeEmptyInterfaceIfMissing(serializableType);
++        synthesizeEmptyInterfaceIfMissing(transientPolymorphicSignatureType); // transient - 292
+         synthesizeEmptyInterfaceIfMissing(polymorphicSignatureType);
+         synthesizeBoxTypeIfMissing(doubleType);
+         synthesizeBoxTypeIfMissing(floatType);
+
+--- a/src/share/classes/com/sun/tools/javac/comp/MemberEnter.java	Fri Feb 04 17:30:28 2011 -0800
++++ b/src/share/classes/com/sun/tools/javac/comp/MemberEnter.java	Mon Feb 07 18:09:46 2011 +0000
+@@ -787,10 +787,11 @@ public class MemberEnter extends JCTree.
+                 && s.owner.kind != MTH
+                 && types.isSameType(c.type, syms.deprecatedType))
+                 s.flags_field |= Flags.DEPRECATED;
+-            // Internally to java.dyn, a @PolymorphicSignature annotation
++            // Internally to java.lang.invoke, a @PolymorphicSignature annotation
+             // acts like a classfile attribute.
+             if (!c.type.isErroneous() &&
+-                    types.isSameType(c.type, syms.polymorphicSignatureType)) {
++                    (types.isSameType(c.type, syms.polymorphicSignatureType) ||
++                     types.isSameType(c.type, syms.transientPolymorphicSignatureType))) {
+                 if (!target.hasMethodHandles()) {
+                     // Somebody is compiling JDK7 source code to a JDK6 target.
+                     // Make it a strict warning, since it is unlikely but important.
+
+--- a/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java	Fri Feb 04 17:30:28 2011 -0800
++++ b/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java	Mon Feb 07 18:09:46 2011 +0000
+@@ -1321,7 +1321,9 @@ public class ClassReader implements Comp
+                     sym.flags_field |= PROPRIETARY;
+                 else
+                     proxies.append(proxy);
+-                if (majorVersion >= V51.major && proxy.type.tsym == syms.polymorphicSignatureType.tsym) {
++                if (majorVersion >= V51.major &&
++                        (proxy.type.tsym == syms.polymorphicSignatureType.tsym ||
++                         proxy.type.tsym == syms.transientPolymorphicSignatureType.tsym)) {
+                     sym.flags_field |= POLYMORPHIC_SIGNATURE;
+                 }
+             }
+
+--- a/src/share/classes/com/sun/tools/javac/util/Names.java	Fri Feb 04 17:30:28 2011 -0800
++++ b/src/share/classes/com/sun/tools/javac/util/Names.java	Mon Feb 07 18:09:46 2011 +0000
+@@ -73,7 +73,8 @@ public class Names {
+     public final Name java_io_Serializable;
+     public final Name serialVersionUID;
+     public final Name java_lang_Enum;
+-    public final Name java_dyn_MethodHandle;
++    public final Name transient_java_dyn_MethodHandle; // transient - 292
++    public final Name java_lang_invoke_MethodHandle;
+     public final Name java_dyn_InvokeDynamic;
+     public final Name package_info;
+     public final Name ConstantValue;
+@@ -183,7 +184,8 @@ public class Names {
+         java_lang_Cloneable = fromString("java.lang.Cloneable");
+         java_io_Serializable = fromString("java.io.Serializable");
+         java_lang_Enum = fromString("java.lang.Enum");
+-        java_dyn_MethodHandle = fromString("java.dyn.MethodHandle");
++        transient_java_dyn_MethodHandle = fromString("java.dyn.MethodHandle"); //transient - 292
++        java_lang_invoke_MethodHandle = fromString("java.lang.invoke.MethodHandle");
+         java_dyn_InvokeDynamic = fromString("java.dyn.InvokeDynamic");
+         package_info = fromString("package-info");
+         serialVersionUID = fromString("serialVersionUID");
+

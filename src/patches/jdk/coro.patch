@@ -1,0 +1,2290 @@
+diff --git a/src/share/classes/java/dyn/AsymCoroutine.java b/src/share/classes/java/dyn/AsymCoroutine.java
+new file mode 100755
+--- /dev/null
++++ b/src/share/classes/java/dyn/AsymCoroutine.java
+@@ -0,0 +1,179 @@
++/*
++ * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Oracle designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Oracle in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++package java.dyn;
++
++import java.util.Iterator;
++import java.util.NoSuchElementException;
++
++/**
++ * Implementation of asymmetric coroutines. A AsymCoroutine can be called by any coroutine (Coroutine and AsymCoroutine) and will return to
++ * its caller upon {@link #ret()}.
++ * <p>
++ * Similar to {@link Thread} there are two ways to implement a AsymCoroutine: either by implementing a subclass of AsymCoroutine (and
++ * overriding {@link #run()}) or by providing a {@link Runnable} to the AsymCoroutine constructor.
++ * <p>
++ * An implementation of a simple AsymCoroutine that always returns the average of all its previous inputs might look like this:
++ * <p>
++ * <hr>
++ * <blockquote>
++ * 
++ * <pre>
++ * class Average extends AsymCoroutine&lt;Integer, Integer&gt; {
++ * 	public Integer run(Integer value) {
++ * 		int sum = value;
++ * 		int count = 1;
++ * 		while (true) {
++ * 			sum += ret(sum / count++);
++ * 		}
++ * 	}
++ * }
++ * </pre>
++ * 
++ * </blockquote>
++ * <hr>
++ * <p>
++ * This AsymCoroutine can be invoked either by reading and writing the {@link #output} and {@link #input} fields and invoking the
++ * {@link #call()} method:
++ * <p>
++ * <blockquote>
++ * 
++ * <pre>
++ * Average avg = new Average();
++ * avg.input = 10;
++ * avg.call();
++ * System.out.println(avg.output);
++ * </pre>
++ * 
++ * </blockquote>
++ * <p>
++ * Another way to invoke this AsymCoroutine is by using the shortcut {@link #call(Object)} methods:
++ * <p>
++ * <blockquote>
++ * 
++ * <pre>
++ * Average avg = new Average();
++ * System.out.println(avg.call(10));
++ * </pre>
++ * 
++ * </blockquote>
++ * <p>
++ * 
++ * @author Lukas Stadler
++ * 
++ * @param <InT>
++ *            input type of this AsymCoroutine, Void if no input value is expected
++ * @param <OutT>
++ *            output type of this AsymCoroutine, Void if no output is produced
++ */
++public class AsymCoroutine<InT, OutT> extends CoroutineBase implements Iterable<OutT> {
++	CoroutineBase caller;
++	
++	private final AsymRunnable<? super InT, ? extends OutT> target; 
++
++	private InT input;
++	private OutT output;
++
++	public AsymCoroutine() {
++		target = null;
++		threadSupport.addCoroutine(this, -1);		
++	}
++
++	public AsymCoroutine(long stacksize) {
++		target = null;
++		threadSupport.addCoroutine(this, stacksize);
++	}
++
++	public AsymCoroutine(AsymRunnable<? super InT, ? extends OutT> target) {
++		this.target = target;
++		threadSupport.addCoroutine(this, -1);		
++	}
++
++	public AsymCoroutine(AsymRunnable<? super InT, ? extends OutT> target, long stacksize) {
++		this.target = target;
++		threadSupport.addCoroutine(this, stacksize);
++	}
++
++	public final OutT call(final InT input) {
++		this.input = input;
++		Thread.currentThread().getCoroutineSupport().asymmetricCall(this);
++		return output;
++	}
++
++	public final OutT call() {
++		Thread.currentThread().getCoroutineSupport().asymmetricCall(this);
++		return output;
++	}
++
++	public final InT ret(final OutT value) {
++		output = value;
++		Thread.currentThread().getCoroutineSupport().asymmetricReturn(this);
++		return input;
++	}
++
++	public final InT ret() {
++		Thread.currentThread().getCoroutineSupport().asymmetricReturn(this);
++		return input;
++	}
++
++	protected OutT run(InT value) {
++		return target.run(this, value);
++	}
++
++	private static class Iter<OutT> implements Iterator<OutT> {
++		private final AsymCoroutine<?, OutT> fiber;
++
++		public Iter(final AsymCoroutine<?, OutT> fiber) {
++			this.fiber = fiber;
++		}
++
++		@Override
++		public boolean hasNext() {
++			return !fiber.isFinished();
++		}
++
++		@Override
++		public OutT next() {
++			if (fiber.isFinished())
++				throw new NoSuchElementException();
++			return fiber.call();
++		}
++
++		@Override
++		public void remove() {
++			throw new UnsupportedOperationException();
++		}
++
++	}
++
++	@Override
++	public final Iterator<OutT> iterator() {
++		return new Iter<OutT>(this);
++	}
++
++	final void run() {
++		output = run(input);
++	}
++}
+diff --git a/src/share/classes/java/dyn/AsymRunnable.java b/src/share/classes/java/dyn/AsymRunnable.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/java/dyn/AsymRunnable.java
+@@ -0,0 +1,5 @@
++package java.dyn;
++
++public interface AsymRunnable<InT, OutT> {
++	public OutT run(AsymCoroutine<? extends InT, ? super OutT> coroutine, InT value);
++}
+diff --git a/src/share/classes/java/dyn/Coroutine.java b/src/share/classes/java/dyn/Coroutine.java
+new file mode 100755
+--- /dev/null
++++ b/src/share/classes/java/dyn/Coroutine.java
+@@ -0,0 +1,121 @@
++/*
++ * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Oracle designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Oracle in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++package java.dyn;
++
++/**
++ * Implementation of symmetric coroutines. A Coroutine will take part in thread-wide scheduling of coroutines. It transfers control to
++ * the next coroutine whenever yield is called.
++ * <p>
++ * Similar to {@link Thread} there are two ways to implement a Coroutine: either by implementing a subclass of Coroutine (and overriding
++ * {@link #run()}) or by providing a {@link Runnable} to the Coroutine constructor.
++ * <p>
++ * An implementation of a simple Coroutine might look like this:
++ * <p>
++ * <hr>
++ * <blockquote>
++ * 
++ * <pre>
++ * class Numbers extends Coroutine {
++ * 	public void run() {
++ * 		for (int i = 0; i &lt; 10; i++) {
++ * 			System.out.println(i);
++ * 			yield();
++ * 		}
++ * 	}
++ * }
++ * </pre>
++ * 
++ * </blockquote>
++ * <hr>
++ * <p>
++ * A Coroutine is active as soon as it is created, and will run as soon as control is transferred to it:
++ * <p>
++ * <blockquote>
++ * 
++ * <pre>
++ * new Numbers();
++ * for (int i = 0; i &lt; 10; i++)
++ * 	yield();
++ * </pre>
++ * 
++ * </blockquote>
++ * <p>
++ * @author Lukas Stadler
++ */
++public class Coroutine extends CoroutineBase {
++	private final Runnable target;
++
++	Coroutine next;
++	Coroutine last;
++
++	public Coroutine() {
++		this.target = null;
++		threadSupport.addCoroutine(this, -1);
++	}
++
++	public Coroutine(Runnable target) {
++		this.target = target;
++		threadSupport.addCoroutine(this, -1);
++	}
++	
++	public Coroutine(long stacksize) {
++		this.target = null;
++		threadSupport.addCoroutine(this, stacksize);
++	}
++
++	public Coroutine(Runnable target, long stacksize) {
++		this.target = target;
++		threadSupport.addCoroutine(this, stacksize);
++	}
++
++	// creates the initial coroutine for a new thread
++	Coroutine(CoroutineSupport threadSupport, long data) {
++		super(threadSupport, data);
++		this.target = null;
++	}
++
++	/**
++	 * Yields execution to the next coroutine in the current threads coroutine queue.
++	 */
++	public static void yield() {
++		Thread.currentThread().getCoroutineSupport().symmetricYield();
++	}
++	
++	public static void yieldTo(Coroutine target) {
++		Thread.currentThread().getCoroutineSupport().symmetricYieldTo(target);
++	}
++	
++	public void stop() {
++		Thread.currentThread().getCoroutineSupport().symmetricStopCoroutine(this);
++	}
++	
++	protected void run() {
++		assert Thread.currentThread() == threadSupport.getThread();
++		if (target != null) {
++			target.run();
++		}
++	}	
++}
+\ No newline at end of file
+diff --git a/src/share/classes/java/dyn/CoroutineBase.java b/src/share/classes/java/dyn/CoroutineBase.java
+new file mode 100755
+--- /dev/null
++++ b/src/share/classes/java/dyn/CoroutineBase.java
+@@ -0,0 +1,137 @@
++/*
++ * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Oracle designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Oracle in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++package java.dyn;
++
++public abstract class CoroutineBase {
++	transient Object context;
++	transient long data;
++
++	transient CoroutineLocal.CoroutineLocalMap coroutineLocals = null;
++
++	boolean finished = false;
++
++	transient CoroutineSupport threadSupport;
++
++	CoroutineBase() {
++		Thread thread = Thread.currentThread();
++		if (thread.getCoroutineSupport() == null)
++			thread.initializeCoroutineSupport();
++		this.threadSupport = thread.getCoroutineSupport();
++		this.context = this.threadSupport;
++	}
++
++	// creates the initial coroutine for a new thread
++	CoroutineBase(CoroutineSupport threadSupport, long data) {
++		this.threadSupport = threadSupport;
++		this.context = threadSupport.RUNNING;
++		this.data = data;
++	}
++
++	@SuppressWarnings({ "unused" })
++	private final void startInternal() {
++		assert threadSupport.getThread() == Thread.currentThread();
++		try {
++			if (CoroutineSupport.DEBUG)
++				System.out.println("starting coroutine " + this);
++			if (this instanceof Coroutine) {
++				threadSupport.symmetricStart(((Coroutine) this));
++				((Coroutine) this).run();
++			} else {
++				threadSupport.asymmetricStart(((AsymCoroutine<?, ?>) this));
++				((AsymCoroutine<?, ?>) this).run();
++			}
++		} catch (Throwable t) {
++			if (!(t instanceof CoroutineExitException))
++				t.printStackTrace();
++		} finally {
++			finished = true;
++			// use Thread.currentThread().getCoroutineSupport() because we might have been migrated to another thread!
++			if (this instanceof Coroutine)
++				Thread.currentThread().getCoroutineSupport().terminateCoroutine();
++			else
++				Thread.currentThread().getCoroutineSupport().terminateCallable();
++		}
++		assert threadSupport.getThread() == Thread.currentThread();
++	}
++
++	/**
++	 * Returns true if this coroutine has reached its end. Under normal circumstances this happens when the {@link #run()} method returns.
++	 */
++	public final boolean isFinished() {
++		return finished;
++	}
++
++	public String state() {
++		if (context == threadSupport)
++			return "idle";
++		else if (context == CoroutineSupport.TERMINATED)
++			return "terminated";
++		else if (context == threadSupport.RUNNING)
++			return "running";
++		else
++			throw new IllegalStateException("unknown coroutine context: " + context);
++	}
++	
++	/**
++	 * @return the thread that this coroutine is associated with
++	 * @throws NullPointerException if the coroutine has terminated
++	 */
++	public Thread getThread() {
++		return threadSupport.getThread();
++	}
++
++	public static CoroutineBase current() {
++		return Thread.currentThread().getCoroutineSupport().getCurrent();
++	}
++	
++	public boolean steal() {
++		CoroutineSupport threadSupport = Thread.currentThread().getCoroutineSupport();
++		if (threadSupport == null) {
++			Thread.currentThread().initializeCoroutineSupport();
++			threadSupport = Thread.currentThread().getCoroutineSupport();
++		}
++		return threadSupport.stealCoroutine(this);
++	}
++	
++	public CoroutineFrame[] serialize() {
++		CoroutineSupport threadSupport = Thread.currentThread().getCoroutineSupport();
++		if (threadSupport == null) {
++			Thread.currentThread().initializeCoroutineSupport();
++			threadSupport = Thread.currentThread().getCoroutineSupport();
++		}
++		return threadSupport.serializeCoroutine(this);
++	}
++	
++	public void deserialize(CoroutineFrame[] frames) {
++		CoroutineSupport threadSupport = Thread.currentThread().getCoroutineSupport();
++		if (threadSupport == null) {
++			Thread.currentThread().initializeCoroutineSupport();
++			threadSupport = Thread.currentThread().getCoroutineSupport();
++		}
++		threadSupport.replaceCoroutine(this, frames);
++	}
++	
++}
+diff --git a/src/share/classes/java/dyn/CoroutineExitException.java b/src/share/classes/java/dyn/CoroutineExitException.java
+new file mode 100755
+--- /dev/null
++++ b/src/share/classes/java/dyn/CoroutineExitException.java
+@@ -0,0 +1,45 @@
++/*
++ * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Oracle designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Oracle in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++package java.dyn;
++
++public class CoroutineExitException extends RuntimeException {
++	private static final long serialVersionUID = -2651365020938997924L;
++
++	public CoroutineExitException() {
++	}
++
++	public CoroutineExitException(String message, Throwable cause) {
++		super(message, cause);
++	}
++
++	public CoroutineExitException(String message) {
++		super(message);
++	}
++
++	public CoroutineExitException(Throwable cause) {
++		super(cause);
++	}
++}
+diff --git a/src/share/classes/java/dyn/CoroutineFrame.java b/src/share/classes/java/dyn/CoroutineFrame.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/java/dyn/CoroutineFrame.java
+@@ -0,0 +1,59 @@
++/*
++ * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Oracle designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Oracle in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++package java.dyn;
++
++import java.io.Serializable;
++import java.lang.reflect.Method;
++
++public class CoroutineFrame implements Serializable {
++	private static final long serialVersionUID = 5833458650915797757L;
++	
++	public Method method;
++	public int bci;
++
++	public int localCount;
++	public int expressionCount;
++
++	public long[] scalarValues;
++	public Object[] objectValues;
++
++	public CoroutineFrame(Method method, int bci, int localCount, int expressionCount, long[] scalarValues, Object[] objectValues) {
++		this.method = method;
++		this.bci = bci;
++		this.localCount = localCount;
++		this.expressionCount = expressionCount;
++		this.scalarValues = scalarValues;
++		this.objectValues = objectValues;
++	}
++
++	public int monitorCount() {
++		return objectValues.length - localCount - expressionCount;
++	}
++
++	public void dump() {
++		System.out.println("frame: " + method.getDeclaringClass().getSimpleName() +"."+method.getName() + "@" + bci + " (" + localCount + " locals, "+ expressionCount+" expressions, " + monitorCount() + " monitors)");
++	}
++}
+diff --git a/src/share/classes/java/dyn/CoroutineLocal.java b/src/share/classes/java/dyn/CoroutineLocal.java
+new file mode 100755
+--- /dev/null
++++ b/src/share/classes/java/dyn/CoroutineLocal.java
+@@ -0,0 +1,540 @@
++/*
++ * Copyright (c) 1997, 2010, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Oracle designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Oracle in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++package java.dyn;
++
++import java.lang.Object;
++import java.lang.Thread;
++import java.lang.UnsupportedOperationException;
++import java.lang.ref.*;
++import java.util.concurrent.atomic.AtomicInteger;
++
++public class CoroutineLocal<T> {
++	private final int coroutineLocalHashCode = nextHashCode();
++	private static AtomicInteger nextHashCode = new AtomicInteger();
++	private static final int HASH_INCREMENT = 0x61c88647;
++
++	private static int nextHashCode() {
++		return nextHashCode.getAndAdd(HASH_INCREMENT);
++	}
++
++	protected T initialValue() {
++		return null;
++	}
++
++	public CoroutineLocal() {
++	}
++
++	public T get() {
++		Thread.currentThread().initializeCoroutineSupport();
++		CoroutineBase t = Thread.currentThread().getCoroutineSupport().getCurrent();
++		CoroutineLocalMap map = getMap(t);
++		if (map != null) {
++			CoroutineLocalMap.Entry e = map.getEntry(this);
++			if (e != null)
++				return (T) e.value;
++		}
++		return setInitialValue();
++	}
++
++	/**
++	 * Variant of set() to establish initialValue. Used instead of set() in case user has overridden the set() method.
++	 * 
++	 * @return the initial value
++	 */
++	private T setInitialValue() {
++		T value = initialValue();
++		Thread.currentThread().initializeCoroutineSupport();
++		CoroutineBase t = Thread.currentThread().getCoroutineSupport().getCurrent();
++		CoroutineLocalMap map = getMap(t);
++		if (map != null)
++			map.set(this, value);
++		else
++			createMap(t, value);
++		return value;
++	}
++
++	/**
++	 * Sets the current thread's copy of this thread-local variable to the specified value. Most subclasses will have no need to override
++	 * this method, relying solely on the {@link #initialValue} method to set the values of thread-locals.
++	 * 
++	 * @param value the value to be stored in the current thread's copy of this thread-local.
++	 */
++	public void set(T value) {
++		Thread.currentThread().initializeCoroutineSupport();
++		CoroutineBase t = Thread.currentThread().getCoroutineSupport().getCurrent();
++		CoroutineLocalMap map = getMap(t);
++		if (map != null)
++			map.set(this, value);
++		else
++			createMap(t, value);
++	}
++
++	/**
++	 * Removes the current thread's value for this thread-local variable. If this thread-local variable is subsequently {@linkplain #get
++	 * read} by the current thread, its value will be reinitialized by invoking its {@link #initialValue} method, unless its value is
++	 * {@linkplain #set set} by the current thread in the interim. This may result in multiple invocations of the <tt>initialValue</tt>
++	 * method in the current thread.
++	 * 
++	 * @since 1.5
++	 */
++	public void remove() {
++		Thread.currentThread().initializeCoroutineSupport();
++		CoroutineLocalMap m = getMap(Thread.currentThread().getCoroutineSupport().getCurrent());
++		if (m != null)
++			m.remove(this);
++	}
++
++	CoroutineLocalMap getMap(CoroutineBase t) {
++		return t.coroutineLocals;
++	}
++
++	/**
++	 * Create the map associated with a ThreadLocal. Overridden in InheritableThreadLocal.
++	 * 
++	 * @param t the current thread
++	 * @param firstValue value for the initial entry of the map
++	 * @param map the map to store.
++	 */
++	void createMap(CoroutineBase t, T firstValue) {
++		t.coroutineLocals = new CoroutineLocalMap(this, firstValue);
++	}
++
++	/**
++	 * Factory method to create map of inherited thread locals. Designed to be called only from Thread constructor.
++	 * 
++	 * @param parentMap the map associated with parent thread
++	 * @return a map containing the parent's inheritable bindings
++	 */
++	static CoroutineLocalMap createInheritedMap(CoroutineLocalMap parentMap) {
++		return new CoroutineLocalMap(parentMap);
++	}
++
++	/**
++	 * Method childValue is visibly defined in subclass InheritableThreadLocal, but is internally defined here for the sake of providing
++	 * createInheritedMap factory method without needing to subclass the map class in InheritableThreadLocal. This technique is preferable
++	 * to the alternative of embedding instanceof tests in methods.
++	 */
++	T childValue(T parentValue) {
++		throw new UnsupportedOperationException();
++	}
++
++	/**
++	 * ThreadLocalMap is a customized hash map suitable only for maintaining thread local values. No operations are exported outside of the
++	 * ThreadLocal class. The class is package private to allow declaration of fields in class Thread. To help deal with very large and
++	 * long-lived usages, the hash table entries use WeakReferences for keys. However, since reference queues are not used, stale entries
++	 * are guaranteed to be removed only when the table starts running out of space.
++	 */
++	static class CoroutineLocalMap {
++
++		/**
++		 * The entries in this hash map extend WeakReference, using its main ref field as the key (which is always a ThreadLocal object).
++		 * Note that null keys (i.e. entry.get() == null) mean that the key is no longer referenced, so the entry can be expunged from
++		 * table. Such entries are referred to as "stale entries" in the code that follows.
++		 */
++		static class Entry extends WeakReference<CoroutineLocal> {
++			/** The value associated with this ThreadLocal. */
++			Object value;
++
++			Entry(CoroutineLocal k, Object v) {
++				super(k);
++				value = v;
++			}
++		}
++
++		/**
++		 * The initial capacity -- MUST be a power of two.
++		 */
++		private static final int INITIAL_CAPACITY = 16;
++
++		/**
++		 * The table, resized as necessary. table.length MUST always be a power of two.
++		 */
++		private Entry[] table;
++
++		/**
++		 * The number of entries in the table.
++		 */
++		private int size = 0;
++
++		/**
++		 * The next size value at which to resize.
++		 */
++		private int threshold; // Default to 0
++
++		/**
++		 * Set the resize threshold to maintain at worst a 2/3 load factor.
++		 */
++		private void setThreshold(int len) {
++			threshold = len * 2 / 3;
++		}
++
++		/**
++		 * Increment i modulo len.
++		 */
++		private static int nextIndex(int i, int len) {
++			return ((i + 1 < len) ? i + 1 : 0);
++		}
++
++		/**
++		 * Decrement i modulo len.
++		 */
++		private static int prevIndex(int i, int len) {
++			return ((i - 1 >= 0) ? i - 1 : len - 1);
++		}
++
++		/**
++		 * Construct a new map initially containing (firstKey, firstValue). ThreadLocalMaps are constructed lazily, so we only create one
++		 * when we have at least one entry to put in it.
++		 */
++		CoroutineLocalMap(CoroutineLocal firstKey, Object firstValue) {
++			table = new Entry[INITIAL_CAPACITY];
++			int i = firstKey.coroutineLocalHashCode & (INITIAL_CAPACITY - 1);
++			table[i] = new Entry(firstKey, firstValue);
++			size = 1;
++			setThreshold(INITIAL_CAPACITY);
++		}
++
++		/**
++		 * Construct a new map including all Inheritable ThreadLocals from given parent map. Called only by createInheritedMap.
++		 * 
++		 * @param parentMap the map associated with parent thread.
++		 */
++		private CoroutineLocalMap(CoroutineLocalMap parentMap) {
++			Entry[] parentTable = parentMap.table;
++			int len = parentTable.length;
++			setThreshold(len);
++			table = new Entry[len];
++
++			for (int j = 0; j < len; j++) {
++				Entry e = parentTable[j];
++				if (e != null) {
++					CoroutineLocal key = e.get();
++					if (key != null) {
++						Object value = key.childValue(e.value);
++						Entry c = new Entry(key, value);
++						int h = key.coroutineLocalHashCode & (len - 1);
++						while (table[h] != null)
++							h = nextIndex(h, len);
++						table[h] = c;
++						size++;
++					}
++				}
++			}
++		}
++
++		/**
++		 * Get the entry associated with key. This method itself handles only the fast path: a direct hit of existing key. It otherwise
++		 * relays to getEntryAfterMiss. This is designed to maximize performance for direct hits, in part by making this method readily
++		 * inlinable.
++		 * 
++		 * @param key the thread local object
++		 * @return the entry associated with key, or null if no such
++		 */
++		private Entry getEntry(CoroutineLocal key) {
++			int i = key.coroutineLocalHashCode & (table.length - 1);
++			Entry e = table[i];
++			if (e != null && e.get() == key)
++				return e;
++			else
++				return getEntryAfterMiss(key, i, e);
++		}
++
++		/**
++		 * Version of getEntry method for use when key is not found in its direct hash slot.
++		 * 
++		 * @param key the thread local object
++		 * @param i the table index for key's hash code
++		 * @param e the entry at table[i]
++		 * @return the entry associated with key, or null if no such
++		 */
++		private Entry getEntryAfterMiss(CoroutineLocal key, int i, Entry e) {
++			Entry[] tab = table;
++			int len = tab.length;
++
++			while (e != null) {
++				CoroutineLocal k = e.get();
++				if (k == key)
++					return e;
++				if (k == null)
++					expungeStaleEntry(i);
++				else
++					i = nextIndex(i, len);
++				e = tab[i];
++			}
++			return null;
++		}
++
++		/**
++		 * Set the value associated with key.
++		 * 
++		 * @param key the thread local object
++		 * @param value the value to be set
++		 */
++		private void set(CoroutineLocal key, Object value) {
++
++			// We don't use a fast path as with get() because it is at
++			// least as common to use set() to create new entries as
++			// it is to replace existing ones, in which case, a fast
++			// path would fail more often than not.
++
++			Entry[] tab = table;
++			int len = tab.length;
++			int i = key.coroutineLocalHashCode & (len - 1);
++
++			for (Entry e = tab[i]; e != null; e = tab[i = nextIndex(i, len)]) {
++				CoroutineLocal k = e.get();
++
++				if (k == key) {
++					e.value = value;
++					return;
++				}
++
++				if (k == null) {
++					replaceStaleEntry(key, value, i);
++					return;
++				}
++			}
++
++			tab[i] = new Entry(key, value);
++			int sz = ++size;
++			if (!cleanSomeSlots(i, sz) && sz >= threshold)
++				rehash();
++		}
++
++		/**
++		 * Remove the entry for key.
++		 */
++		private void remove(CoroutineLocal key) {
++			Entry[] tab = table;
++			int len = tab.length;
++			int i = key.coroutineLocalHashCode & (len - 1);
++			for (Entry e = tab[i]; e != null; e = tab[i = nextIndex(i, len)]) {
++				if (e.get() == key) {
++					e.clear();
++					expungeStaleEntry(i);
++					return;
++				}
++			}
++		}
++
++		/**
++		 * Replace a stale entry encountered during a set operation with an entry for the specified key. The value passed in the value
++		 * parameter is stored in the entry, whether or not an entry already exists for the specified key.
++		 * 
++		 * As a side effect, this method expunges all stale entries in the "run" containing the stale entry. (A run is a sequence of entries
++		 * between two null slots.)
++		 * 
++		 * @param key the key
++		 * @param value the value to be associated with key
++		 * @param staleSlot index of the first stale entry encountered while searching for key.
++		 */
++		private void replaceStaleEntry(CoroutineLocal key, Object value, int staleSlot) {
++			Entry[] tab = table;
++			int len = tab.length;
++			Entry e;
++
++			// Back up to check for prior stale entry in current run.
++			// We clean out whole runs at a time to avoid continual
++			// incremental rehashing due to garbage collector freeing
++			// up refs in bunches (i.e., whenever the collector runs).
++			int slotToExpunge = staleSlot;
++			for (int i = prevIndex(staleSlot, len); (e = tab[i]) != null; i = prevIndex(i, len))
++				if (e.get() == null)
++					slotToExpunge = i;
++
++			// Find either the key or trailing null slot of run, whichever
++			// occurs first
++			for (int i = nextIndex(staleSlot, len); (e = tab[i]) != null; i = nextIndex(i, len)) {
++				CoroutineLocal k = e.get();
++
++				// If we find key, then we need to swap it
++				// with the stale entry to maintain hash table order.
++				// The newly stale slot, or any other stale slot
++				// encountered above it, can then be sent to expungeStaleEntry
++				// to remove or rehash all of the other entries in run.
++				if (k == key) {
++					e.value = value;
++
++					tab[i] = tab[staleSlot];
++					tab[staleSlot] = e;
++
++					// Start expunge at preceding stale entry if it exists
++					if (slotToExpunge == staleSlot)
++						slotToExpunge = i;
++					cleanSomeSlots(expungeStaleEntry(slotToExpunge), len);
++					return;
++				}
++
++				// If we didn't find stale entry on backward scan, the
++				// first stale entry seen while scanning for key is the
++				// first still present in the run.
++				if (k == null && slotToExpunge == staleSlot)
++					slotToExpunge = i;
++			}
++
++			// If key not found, put new entry in stale slot
++			tab[staleSlot].value = null;
++			tab[staleSlot] = new Entry(key, value);
++
++			// If there are any other stale entries in run, expunge them
++			if (slotToExpunge != staleSlot)
++				cleanSomeSlots(expungeStaleEntry(slotToExpunge), len);
++		}
++
++		/**
++		 * Expunge a stale entry by rehashing any possibly colliding entries lying between staleSlot and the next null slot. This also
++		 * expunges any other stale entries encountered before the trailing null. See Knuth, Section 6.4
++		 * 
++		 * @param staleSlot index of slot known to have null key
++		 * @return the index of the next null slot after staleSlot (all between staleSlot and this slot will have been checked for
++		 *         expunging).
++		 */
++		private int expungeStaleEntry(int staleSlot) {
++			Entry[] tab = table;
++			int len = tab.length;
++
++			// expunge entry at staleSlot
++			tab[staleSlot].value = null;
++			tab[staleSlot] = null;
++			size--;
++
++			// Rehash until we encounter null
++			Entry e;
++			int i;
++			for (i = nextIndex(staleSlot, len); (e = tab[i]) != null; i = nextIndex(i, len)) {
++				CoroutineLocal k = e.get();
++				if (k == null) {
++					e.value = null;
++					tab[i] = null;
++					size--;
++				}
++				else {
++					int h = k.coroutineLocalHashCode & (len - 1);
++					if (h != i) {
++						tab[i] = null;
++
++						// Unlike Knuth 6.4 Algorithm R, we must scan until
++						// null because multiple entries could have been stale.
++						while (tab[h] != null)
++							h = nextIndex(h, len);
++						tab[h] = e;
++					}
++				}
++			}
++			return i;
++		}
++
++		/**
++		 * Heuristically scan some cells looking for stale entries. This is invoked when either a new element is added, or another stale one
++		 * has been expunged. It performs a logarithmic number of scans, as a balance between no scanning (fast but retains garbage) and a
++		 * number of scans proportional to number of elements, that would find all garbage but would cause some insertions to take O(n)
++		 * time.
++		 * 
++		 * @param i a position known NOT to hold a stale entry. The scan starts at the element after i.
++		 * 
++		 * @param n scan control: <tt>log2(n)</tt> cells are scanned, unless a stale entry is found, in which case
++		 *            <tt>log2(table.length)-1</tt> additional cells are scanned. When called from insertions, this parameter is the number
++		 *            of elements, but when from replaceStaleEntry, it is the table length. (Note: all this could be changed to be either
++		 *            more or less aggressive by weighting n instead of just using straight log n. But this version is simple, fast, and
++		 *            seems to work well.)
++		 * 
++		 * @return true if any stale entries have been removed.
++		 */
++		private boolean cleanSomeSlots(int i, int n) {
++			boolean removed = false;
++			Entry[] tab = table;
++			int len = tab.length;
++			do {
++				i = nextIndex(i, len);
++				Entry e = tab[i];
++				if (e != null && e.get() == null) {
++					n = len;
++					removed = true;
++					i = expungeStaleEntry(i);
++				}
++			}
++			while ((n >>>= 1) != 0);
++			return removed;
++		}
++
++		/**
++		 * Re-pack and/or re-size the table. First scan the entire table removing stale entries. If this doesn't sufficiently shrink the
++		 * size of the table, double the table size.
++		 */
++		private void rehash() {
++			expungeStaleEntries();
++
++			// Use lower threshold for doubling to avoid hysteresis
++			if (size >= threshold - threshold / 4)
++				resize();
++		}
++
++		/**
++		 * Double the capacity of the table.
++		 */
++		private void resize() {
++			Entry[] oldTab = table;
++			int oldLen = oldTab.length;
++			int newLen = oldLen * 2;
++			Entry[] newTab = new Entry[newLen];
++			int count = 0;
++
++			for (int j = 0; j < oldLen; ++j) {
++				Entry e = oldTab[j];
++				if (e != null) {
++					CoroutineLocal k = e.get();
++					if (k == null) {
++						e.value = null; // Help the GC
++					}
++					else {
++						int h = k.coroutineLocalHashCode & (newLen - 1);
++						while (newTab[h] != null)
++							h = nextIndex(h, newLen);
++						newTab[h] = e;
++						count++;
++					}
++				}
++			}
++
++			setThreshold(newLen);
++			size = count;
++			table = newTab;
++		}
++
++		/**
++		 * Expunge all stale entries in the table.
++		 */
++		private void expungeStaleEntries() {
++			Entry[] tab = table;
++			int len = tab.length;
++			for (int j = 0; j < len; j++) {
++				Entry e = tab[j];
++				if (e != null && e.get() == null)
++					expungeStaleEntry(j);
++			}
++		}
++	}
++}
+diff --git a/src/share/classes/java/dyn/CoroutineSupport.java b/src/share/classes/java/dyn/CoroutineSupport.java
+new file mode 100755
+--- /dev/null
++++ b/src/share/classes/java/dyn/CoroutineSupport.java
+@@ -0,0 +1,561 @@
++/*
++ * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Oracle designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Oracle in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++package java.dyn;
++
++import java.lang.reflect.Field;
++import java.lang.reflect.Method;
++
++import sun.misc.Unsafe;
++import sun.reflect.generics.reflectiveObjects.NotImplementedException;
++
++public class CoroutineSupport {
++	private static final int COROUTINE_STACKS_PER_THREAD = 100;
++	private static final int COROUTINE_STACK_HASH_MULT = 37;
++
++	// Controls debugging and tracing, for maximum performance the actual if(DEBUG/TRACE) code needs to be commented out
++	static final boolean DEBUG = false;
++	static final boolean TRACE = false;
++
++	static final Object TERMINATED = new Object();
++
++	// All the stacks that belong to this thread, a 0 entry means that the slot is unoccupied
++	private long[] stacks = new long[COROUTINE_STACKS_PER_THREAD];
++
++	// The thread that this CoroutineSupport belongs to. There's only one CoroutineSupport per Thread
++	private final Thread thread;
++	// The initial coroutine of the Thread
++	private final Coroutine threadCoroutine;
++
++	// The currently executing, symmetric or asymmetric coroutine
++	CoroutineBase currentCoroutine;
++	// The anchor of the doubly-linked ring of coroutines
++	Coroutine scheduledCoroutines;
++
++	// The last running coroutine (which needs to be released by setting its context)
++	CoroutineBase oldCoroutine;
++
++	private static final long coroContextOffset;
++	private static final Unsafe unsafe;
++
++	final Object RUNNING = new Object();
++	final Object LOCKED = new Object();
++
++	static {
++		registerNatives();
++		coroContextOffset = getFieldOffset(CoroutineBase.class, "context");
++		unsafe = Unsafe.getUnsafe();
++	}
++
++	private static long getFieldOffset(Class<?> clazz, String name) {
++		try {
++			Field f = clazz.getDeclaredField(name);
++			return Unsafe.getUnsafe().objectFieldOffset(f);
++		} catch (Exception e) {
++			throw new RuntimeException(e);
++		}
++	}
++
++	public CoroutineSupport(Thread thread) {
++		if (thread.getCoroutineSupport() != null)
++			throw new IllegalArgumentException("Cannot instantiate CoroutineThreadSupport for existing Thread");
++		this.thread = thread;
++		threadCoroutine = new Coroutine(this, getThreadCoroutine());
++		threadCoroutine.next = threadCoroutine;
++		threadCoroutine.last = threadCoroutine;
++		currentCoroutine = threadCoroutine;
++		scheduledCoroutines = threadCoroutine;
++	}
++
++	private int stackHash(CoroutineBase coro) {
++		// This makes sure that hash isn't negative because Math.abs isn't enough!
++		int hash = (coro.hashCode() * COROUTINE_STACK_HASH_MULT) >>> 1;
++		return hash % COROUTINE_STACKS_PER_THREAD;
++	}
++
++	private long getOrCreateStack(CoroutineBase coro, long stacksize) {
++		int index = stackHash(coro);
++		long stack = stacks[index];
++		if (stack == 0) {
++			stack = createCoroutineStack(stacksize);
++			if (DEBUG)
++				System.out.println("Created new stack " + stack + " for index " + index);
++			stacks[index] = stack;
++		}
++		return stack;
++	}
++
++	void addCoroutine(Coroutine coroutine, long stacksize) {
++		assert scheduledCoroutines != null;
++		assert currentCoroutine != null;
++
++		long stack = getOrCreateStack(coroutine, stacksize);
++		coroutine.data = createCoroutine(coroutine, stack);
++		if (DEBUG)
++			System.out.println("add Coroutine " + coroutine + " using stack: " + stack + ", data" + coroutine.data);
++
++		// add the coroutine into the doubly linked ring
++		coroutine.next = scheduledCoroutines.next;
++		coroutine.last = scheduledCoroutines;
++		scheduledCoroutines.next = coroutine;
++		coroutine.next.last = coroutine;
++	}
++
++	void addCoroutine(AsymCoroutine<?, ?> coroutine, long stacksize) {
++		long stack = getOrCreateStack(coroutine, stacksize);
++		coroutine.data = createCoroutine(coroutine, stack);
++		if (DEBUG)
++			System.out.println("add AsymCoroutine " + coroutine + " using stack: " + stack + ", data" + coroutine.data);
++
++		coroutine.caller = null;
++	}
++
++	Thread getThread() {
++		return thread;
++	}
++
++	private boolean isDisposable(AsymCoroutine<?, ?> coroutine) {
++		// TODO implement
++		return true;
++	}
++
++	public void drain() {
++		if (Thread.currentThread() != thread)
++			throw new IllegalArgumentException("Cannot drain another threads CoroutineThreadSupport");
++
++		if (DEBUG)
++			System.out.println("draining");
++		try {
++			// drain all scheduled coroutines
++			while (scheduledCoroutines.next != scheduledCoroutines)
++				symmetricExitInternal(scheduledCoroutines.next);
++
++			CoroutineBase coro;
++			while ((coro = cleanupCoroutine()) != null) {
++				System.out.println(coro);
++				throw new NotImplementedException();
++			}
++		} catch (Throwable t) {
++			t.printStackTrace();
++		}
++
++		// free all stack associated with this thread
++		for (long stack : stacks) {
++			if (stack != 0) {
++				freeCoroutineStack(stack);
++			}
++		}
++		stacks = null;
++	}
++
++	final void symmetricStart(Coroutine coroutine) {
++		oldCoroutine.context = this;
++	}
++
++	final void asymmetricStart(AsymCoroutine<?, ?> coroutine) {
++	}
++
++	void symmetricYield() {
++		if (scheduledCoroutines != currentCoroutine)
++			throw new IllegalThreadStateException("Cannot call yield from within an asymmetric coroutine");
++		assert currentCoroutine instanceof Coroutine;
++
++		if (TRACE)
++			System.out.println("locking for symmetric yield...");
++
++		Coroutine next;
++		do {
++			next = scheduledCoroutines.next;
++			if (next == scheduledCoroutines)
++				return;
++		} while (!unsafe.compareAndSwapObject(next, coroContextOffset, this, RUNNING));
++
++		if (TRACE)
++			System.out.println("symmetric yield to " + next);
++
++		prepareSwitch(next);
++		final Coroutine current = scheduledCoroutines;
++		oldCoroutine = current;
++		scheduledCoroutines = next;
++		currentCoroutine = next;
++
++		switchTo(oldCoroutine, next);
++
++		finishCoroutineSwitch(current.threadSupport);
++	}
++
++	public void symmetricYieldTo(Coroutine target) {
++		if (!unsafe.compareAndSwapObject(target, coroContextOffset, this, RUNNING)) {
++			coroutineLockFailed(target);
++			return;
++		}
++		if (scheduledCoroutines != currentCoroutine) {
++			target.context = this;
++			throw new IllegalThreadStateException("Cannot call yield from within an asymmetric coroutine");
++		}
++		assert currentCoroutine instanceof Coroutine;
++
++		moveCoroutine(scheduledCoroutines, target);
++
++		prepareSwitch(target);
++		final Coroutine current = scheduledCoroutines;
++		oldCoroutine = current;
++		scheduledCoroutines = target;
++		currentCoroutine = target;
++
++		switchTo(oldCoroutine, target);
++
++		finishCoroutineSwitch(current.threadSupport);
++	}
++
++	private void coroutineLockFailed(CoroutineBase target) {
++		if (target.context == RUNNING) {
++			assert target == scheduledCoroutines;
++		} else if (target.context == TERMINATED)
++			throw new IllegalArgumentException("cannot yield to terminated coroutine");
++		else if (target.context instanceof CoroutineSupport)
++			throw new IllegalArgumentException("cannot yield to a coroutine that belongs to another thread");
++		else {
++			throw new IllegalArgumentException("cannot yield to coroutine, context = " + target.context);
++		}
++	}
++
++	private void moveCoroutine(Coroutine a, Coroutine position) {
++		assert a.context != this && position.context != this;
++
++		// remove a from the ring
++		a.last.next = a.next;
++		a.next.last = a.last;
++
++		// ... and insert at the new position
++		a.next = position.next;
++		a.last = position;
++		a.next.last = a;
++		position.next = a;
++	}
++
++	public void symmetricStopCoroutine(Coroutine target) {
++		if (!unsafe.compareAndSwapObject(target, coroContextOffset, this, RUNNING)) {
++			coroutineLockFailed(target);
++			return;
++		}
++		if (scheduledCoroutines != currentCoroutine) {
++			target.context = this;
++			throw new IllegalThreadStateException("Cannot call yield from within an asymmetric coroutine");
++		}
++		assert currentCoroutine instanceof Coroutine;
++
++		moveCoroutine(scheduledCoroutines, target);
++
++		prepareSwitch(target);
++		final Coroutine current = scheduledCoroutines;
++		oldCoroutine = current;
++		scheduledCoroutines = target;
++		currentCoroutine = target;
++
++		switchToAndExit(oldCoroutine, target);
++
++		finishCoroutineSwitch(current.threadSupport);
++	}
++
++	void symmetricExitInternal(Coroutine coroutine) {
++		if (scheduledCoroutines != currentCoroutine)
++			throw new IllegalThreadStateException("Cannot call exitNext from within an unscheduled coroutine");
++		assert currentCoroutine instanceof Coroutine;
++		assert currentCoroutine != coroutine;
++
++		// remove the coroutine from the ring
++		coroutine.last.next = coroutine.next;
++		coroutine.next.last = coroutine.last;
++
++		if (!isDisposable(coroutine.data)) {
++			// and insert it before the current coroutine
++			coroutine.last = scheduledCoroutines.last;
++			coroutine.next = scheduledCoroutines;
++			coroutine.last.next = coroutine;
++			scheduledCoroutines.last = coroutine;
++
++			prepareSwitch(coroutine);
++			oldCoroutine = scheduledCoroutines;
++			scheduledCoroutines = coroutine;
++			currentCoroutine = coroutine;
++			switchToAndExit(oldCoroutine, coroutine);
++		}
++	}
++
++	void asymmetricCall(AsymCoroutine<?, ?> target) {
++		if (target.threadSupport != this) {
++			tryMigrateCoroutine(target);
++		}
++
++		if (!unsafe.compareAndSwapObject(target, coroContextOffset, this, RUNNING)) {
++			coroutineLockFailed(target);
++			return;
++		}
++
++		if (target.caller != null)
++			throw new IllegalArgumentException("Coroutine already in use");
++		if (target.data == 0)
++			throw new IllegalArgumentException("Target coroutine has already finished");
++		// if (TRACE)
++		// System.out.println("yieldCall " + target + " (" + target.data + ")");
++
++		prepareSwitch(target);
++		final CoroutineBase current = currentCoroutine;
++		target.caller = current;
++		currentCoroutine = target;
++		switchTo(target.caller, target);
++
++		finishCoroutineSwitch(current.threadSupport);
++	}
++
++	private final static void dummy() {
++	}
++
++	private static final void finishCoroutineSwitch(CoroutineSupport support) {
++		dummy();
++		support.oldCoroutine.context = support;
++		support.oldCoroutine = null;
++	}
++
++	private final void finishCoroutineSwitch() {
++		dummy();
++		oldCoroutine.context = this;
++		oldCoroutine = null;
++	}
++
++	void asymmetricReturn(final AsymCoroutine<?, ?> current) {
++		if (current != currentCoroutine)
++			throw new IllegalThreadStateException("cannot return from non-current fiber");
++		final CoroutineBase caller = current.caller;
++		// if (TRACE)
++		// System.out.println("yieldReturn " + caller + " (" + caller.data + ")");
++
++		prepareSwitch(caller);
++		current.caller = null;
++		oldCoroutine = current;
++		currentCoroutine = caller;
++		switchTo(current, currentCoroutine);
++	}
++
++	void asymmetricReturnAndTerminate(final AsymCoroutine<?, ?> current) {
++		if (current != currentCoroutine)
++			throw new IllegalThreadStateException("cannot return from non-current fiber");
++		final CoroutineBase caller = current.caller;
++		if (TRACE)
++			System.out.println("yieldReturn " + caller + " (" + caller.data + ")");
++
++		prepareSwitch(caller);
++		oldCoroutine = current;
++		current.caller = null;
++		currentCoroutine = caller;
++		switchToAndTerminate(current, currentCoroutine);
++	}
++
++	private void tryMigrateCoroutine(AsymCoroutine<?, ?> target) {
++		throw new IllegalArgumentException("Cannot activate a coroutine that belongs to another thread");
++	}
++
++	void terminateCoroutine() {
++		assert currentCoroutine == scheduledCoroutines;
++		assert currentCoroutine != threadCoroutine : "cannot exit thread coroutine";
++		assert scheduledCoroutines != scheduledCoroutines.next : "last coroutine shouldn't call coroutineexit";
++
++		Coroutine old = scheduledCoroutines;
++		oldCoroutine = old;
++		Coroutine forward = old.next;
++		prepareSwitch(forward);
++		currentCoroutine = forward;
++		scheduledCoroutines = forward;
++		old.last.next = old.next;
++		old.next.last = old.last;
++
++		if (DEBUG)
++			System.out.println("to be terminated: " + old);
++		switchToAndTerminate(old, forward);
++	}
++
++	void terminateCallable() {
++		assert currentCoroutine != scheduledCoroutines;
++		assert currentCoroutine instanceof AsymCoroutine<?, ?>;
++
++		assert currentCoroutine.context == RUNNING;
++		oldCoroutine = currentCoroutine;
++
++		if (DEBUG)
++			System.out.println("to be terminated: " + currentCoroutine);
++		asymmetricReturnAndTerminate((AsymCoroutine<?, ?>) currentCoroutine);
++	}
++
++	public boolean stealCoroutine(CoroutineBase coroutine) {
++		CoroutineSupport other = coroutine.threadSupport;
++		if (coroutine == other.threadCoroutine) {
++			throw new IllegalArgumentException("Cannot steal a threads initial coroutine");
++		}
++		if (other == this) {
++			throw new IllegalArgumentException("Cannot steal coroutine from current thread");
++		}
++
++		if (coroutine.isFinished()) {
++			throw new IllegalArgumentException("Cannot serialize a coroutine that is finished");
++		}
++		
++		Coroutine last = null;
++		if (coroutine instanceof Coroutine) {
++			Coroutine coro = (Coroutine) coroutine;
++			last = coro.last;
++
++			if (!unsafe.compareAndSwapObject(last, coroContextOffset, other, null)) {
++				if (TRACE)
++					System.out.println("unable to lock coroutine for stealing");
++				return false;
++			}
++		}
++
++		if (!unsafe.compareAndSwapObject(coroutine, coroContextOffset, other, null)) {
++			last.context = other;
++			if (TRACE)
++				System.out.println("unable to lock coroutine for stealing");
++			return false;
++		}
++		if (coroutine instanceof Coroutine && ((Coroutine) coroutine).last != last) {
++			last.context = other;
++			coroutine.context = other;
++			if (TRACE)
++				System.out.println("unable to lock coroutine for stealing");
++		}
++
++		long stack = getOrCreateStack(coroutine, -1);
++		if (!stealCoroutineData(coroutine.data, stack, coroutine.threadSupport.thread, this)) {
++			// something went wrong while stealing the native data structures - restore the coroutine
++			if (TRACE)
++				System.out.println("unable to steal coroutine native data structures");
++			coroutine.context = other;
++			return false;
++		}
++		if (TRACE)
++			System.out.println("successfully stole coroutine " + coroutine);
++		if (coroutine instanceof Coroutine) {
++			Coroutine coro = (Coroutine) coroutine;
++			moveCoroutine(coro, scheduledCoroutines);
++		}
++		coroutine.threadSupport = this;
++		coroutine.context = this;
++		if (last != null) {
++			last.context = other;
++		}
++		return true;
++	}
++
++	CoroutineFrame[] serializeCoroutine(CoroutineBase coroutine) {
++		if (coroutine.isFinished()) {
++			throw new IllegalArgumentException("Cannot serialize a coroutine that is finished");
++		}
++		CoroutineSupport other = coroutine.threadSupport;
++		if (coroutine == other.threadCoroutine) {
++			throw new IllegalArgumentException("Cannot serialize a threads initial coroutine");
++		}
++
++		if (!unsafe.compareAndSwapObject(coroutine, coroContextOffset, other, null)) {
++			if (TRACE)
++				System.out.println("unable to lock coroutine for serializing");
++			return null;
++		}
++
++		CoroutineFrame[] frames = serializeCoroutineData(coroutine.data);
++
++		coroutine.context = other;
++
++		return frames;
++	}
++
++	void replaceCoroutine(CoroutineBase coroutine, CoroutineFrame[] frames) {
++		if (coroutine == threadCoroutine) {
++			throw new IllegalArgumentException("Cannot replace a threads initial coroutine");
++		}
++
++		if (!unsafe.compareAndSwapObject(coroutine, coroContextOffset, this, LOCKED)) {
++			coroutineLockFailed(coroutine);
++			return;
++		}
++
++		if (coroutine instanceof Coroutine) {
++			CoroutineFrame[] newFrames = new CoroutineFrame[frames.length + 1];
++			System.arraycopy(frames, 0, newFrames, 0, frames.length);
++			Method finish = null;
++			try {
++				finish = CoroutineSupport.class.getDeclaredMethod("finishCoroutineSwitch");
++			} catch (Exception e) {
++				e.printStackTrace();
++			}
++			newFrames[frames.length] = new CoroutineFrame(finish, 0, 1, 0, new long[] { 0 }, new Object[] { this });
++
++			replaceCoroutineData(coroutine.data, newFrames);
++		} else {
++			replaceCoroutineData(coroutine.data, frames);
++		}
++
++		coroutine.context = this;
++	}
++
++	public boolean isCurrent(CoroutineBase coroutine) {
++		return coroutine == currentCoroutine;
++	}
++
++	public CoroutineBase getCurrent() {
++		return currentCoroutine;
++	}
++
++	private static native void registerNatives();
++
++	private static native long getThreadCoroutine();
++
++	private static native long createCoroutineStack(long stack_size);
++
++	private static native void freeCoroutineStack(long stack);
++
++	private static native long createCoroutine(CoroutineBase coroutine, long stack);
++
++	private static native void replaceCoroutineData(long data, CoroutineFrame[] frames);
++
++	private static native void freeCoroutine(long coroutine);
++
++	private static native void prepareSwitch(CoroutineBase target);
++
++	private static native void switchTo(CoroutineBase current, CoroutineBase target);
++
++	private static native void switchToAndTerminate(CoroutineBase current, CoroutineBase target);
++
++	private static native void switchToAndExit(CoroutineBase current, CoroutineBase target);
++
++	private static native boolean isDisposable(long coroutine);
++
++	private static native CoroutineBase cleanupCoroutine();
++
++	private static native boolean stealCoroutineData(long data, long stack, Thread thread, CoroutineSupport coroutineSupport);
++
++	private static native CoroutineFrame[] serializeCoroutineData(long data);
++
++}
+diff --git a/src/share/classes/java/lang/Thread.java b/src/share/classes/java/lang/Thread.java
+--- a/src/share/classes/java/lang/Thread.java
++++ b/src/share/classes/java/lang/Thread.java
+@@ -25,6 +25,7 @@
+ 
+ package java.lang;
+ 
++import java.dyn.CoroutineSupport;
+ import java.lang.ref.Reference;
+ import java.lang.ref.ReferenceQueue;
+ import java.lang.ref.WeakReference;
+@@ -259,6 +260,19 @@
+ 
+     /* Remembered Throwable from stop before start */
+     private Throwable throwableFromStop;
++    
++    
++    private CoroutineSupport coroutineSupport;
++    
++    public CoroutineSupport getCoroutineSupport() {
++    	return coroutineSupport;
++    }    
++    
++    public void initializeCoroutineSupport() {
++    	if(coroutineSupport == null)
++    		coroutineSupport = new CoroutineSupport(this);    	
++    }
++    
+ 
+     /**
+      * Returns a reference to the currently executing thread object.
+@@ -411,6 +425,7 @@
+ 
+         /* Set thread ID */
+         tid = nextThreadID();
++        
+     }
+ 
+     /**
+@@ -732,12 +747,15 @@
+             target.run();
+         }
+     }
+-
++    
+     /**
+      * This method is called by the system to give a Thread
+      * a chance to clean up before it actually exits.
+      */
+     private void exit() {
++    	if(coroutineSupport != null)
++    		coroutineSupport.drain();
++    	
+         if (group != null) {
+             group.threadTerminated(this);
+             group = null;
+@@ -2058,4 +2076,5 @@
+     private native void suspend0();
+     private native void resume0();
+     private native void interrupt0();
++    
+ }
+diff --git a/test/java/dyn/CoroutineMigrationTest.java b/test/java/dyn/CoroutineMigrationTest.java
+new file mode 100644
+--- /dev/null
++++ b/test/java/dyn/CoroutineMigrationTest.java
+@@ -0,0 +1,209 @@
++/*
++ * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Oracle designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Oracle in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++/* @test
++ * @summary unit tests for coroutine migration
++ * @run junit/othervm test.java.dyn.CoroutineMigrationTest
++ */
++
++package test.java.dyn;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++import java.dyn.AsymCoroutine;
++import java.dyn.Coroutine;
++import java.io.ByteArrayInputStream;
++import java.io.InputStream;
++import java.util.concurrent.SynchronousQueue;
++
++import javax.xml.parsers.SAXParser;
++import javax.xml.parsers.SAXParserFactory;
++
++import org.junit.Before;
++import org.junit.Test;
++import org.xml.sax.Attributes;
++import org.xml.sax.SAXException;
++import org.xml.sax.helpers.DefaultHandler;
++
++public class CoroutineMigrationTest {
++	private final class SymmetricCoroutine implements Runnable {
++		public void run() {
++			char c = 'm';
++			while (true) {
++				seq.append(c++);
++				Coroutine.yield();
++			}
++		}
++	}
++
++	private final class DummySymmetricCoroutine implements Runnable {
++		public void run() {
++			while (true) {
++				Coroutine.yield();
++			}
++		}
++	}
++
++	private StringBuilder seq;
++
++	@Before
++	public void before() {
++		seq = new StringBuilder();
++		seq.append("a");
++	}
++
++	@Test
++	public void migrationTestSymmetric() throws InterruptedException {
++		final Coroutine dummy1 = new Coroutine(new DummySymmetricCoroutine());
++		final Coroutine coroutine = new Coroutine(new SymmetricCoroutine());
++		final Coroutine dummy2 = new Coroutine(new DummySymmetricCoroutine());
++
++		final SynchronousQueue<Integer> queue = new SynchronousQueue<Integer>();
++
++		Thread thread = new Thread() {
++			public void run() {
++				try {
++					Thread.currentThread().initializeCoroutineSupport();
++					queue.take();
++					final Coroutine dummy1 = new Coroutine(new DummySymmetricCoroutine());
++					boolean b = coroutine.steal();
++					assertTrue(b);
++					final Coroutine dummy2 = new Coroutine(new DummySymmetricCoroutine());
++					seq.append('1');
++					Coroutine.yield();
++					seq.append('2');
++					queue.put(0);
++					queue.take();
++					dummy1.stop();
++					dummy2.stop();
++
++				} catch (InterruptedException e) {
++					e.printStackTrace();
++					seq.append("error");
++				}
++			}
++		};
++		thread.start();
++
++		Coroutine.yield();
++		queue.put(0);
++		queue.take();
++		boolean b = coroutine.steal();
++		assertTrue(b);
++		seq.append('b');
++		Coroutine.yield();
++		seq.append('c');
++		coroutine.stop();
++		Coroutine.yield();
++		seq.append('d');
++		queue.put(0);
++
++		dummy1.stop();
++		dummy2.stop();
++
++		assertEquals("am1n2bocd", seq.toString());
++	}
++
++	public static class AsymmetricCoroutine extends AsymCoroutine<Void, String> {
++		@Override
++		protected String run(Void value) {
++			try {
++				StringBuilder str = new StringBuilder();
++				str.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<a>");
++				for (int i = 0; i < 1000; i++) {
++					str.append("<node").append(i).append(">asdf</node").append(i).append(">\n");
++				}
++				str.append("</a>\n");
++				InputStream is = new ByteArrayInputStream(str.toString().getBytes("UTF-8"));
++				SAXParser parser = SAXParserFactory.newInstance().newSAXParser();
++				parser.parse(is, new DefaultHandler() {
++
++					@Override
++					public void startElement(String uri, String localName, String qName, Attributes attributes) throws SAXException {
++						ret(qName);
++					}
++
++				});
++			} catch (Exception e) {
++				e.printStackTrace();
++			}
++			return null;
++		}
++	}
++
++	private static final int RUNS = 20;
++	private static final int CALLS = 20;
++
++	private static volatile int counter = 0;
++
++	@Test
++	public void migrationTestAsymmetric() throws InterruptedException {
++		AsymmetricCoroutine coroutine = new AsymmetricCoroutine();
++
++		final SynchronousQueue<AsymmetricCoroutine> queue = new SynchronousQueue<AsymmetricCoroutine>();
++
++		Thread thread = new Thread() {
++			public void run() {
++				AsymmetricCoroutine coroutine;
++				try {
++					for (int j = 0; j < RUNS; j++) {
++						coroutine = queue.take();
++						boolean result = coroutine.steal();
++						assertTrue(result);
++						for (int i = 0; i < CALLS; i++) {
++							String v = coroutine.call();
++							assertEquals("node" + counter++, v);
++						}
++						queue.put(coroutine);
++					}
++					queue.take();
++				} catch (InterruptedException e) {
++					e.printStackTrace();
++				}
++			}
++		};
++		thread.start();
++
++		assertEquals("a", coroutine.call());
++
++		for (int j = 0; j < RUNS; j++) {
++			queue.put(coroutine);
++
++			coroutine = queue.take();
++			boolean result = coroutine.steal();
++			assertTrue(result);
++			for (int i = 0; i < CALLS; i++) {
++				String v = coroutine.call();
++				assertEquals("node" + counter++, v);
++			}
++		}
++		queue.put(coroutine);
++
++		thread.join();
++
++	}
++
++}
+diff --git a/test/java/dyn/CoroutineTest.java b/test/java/dyn/CoroutineTest.java
+new file mode 100644
+--- /dev/null
++++ b/test/java/dyn/CoroutineTest.java
+@@ -0,0 +1,321 @@
++/*
++ * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Oracle designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Oracle in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++/* @test
++ * @summary unit tests for coroutines
++ * @run junit/othervm test.java.dyn.CoroutineTest
++ */
++
++package test.java.dyn;
++
++import java.dyn.Coroutine;
++import java.dyn.AsymCoroutine;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++
++import static org.junit.Assert.*;
++
++import org.junit.Before;
++import org.junit.Test;
++
++public class CoroutineTest {
++	private StringBuilder seq;
++
++	@Before
++	public void before() {
++		seq = new StringBuilder();
++		seq.append("a");
++	}
++
++	@Test
++	public void symSequence() {
++		Coroutine coro = new Coroutine() {
++			protected void run() {
++				seq.append("c");
++				for (int i = 0; i < 3; i++) {
++					yield();
++					seq.append("e");
++				}
++			}
++		};
++		seq.append("b");
++		assertFalse(coro.isFinished());
++		Coroutine.yield();
++		for (int i = 0; i < 3; i++) {
++			seq.append("d");
++			assertFalse(coro.isFinished());
++			Coroutine.yield();
++		}
++		seq.append("f");
++		assertTrue(coro.isFinished());
++		Coroutine.yield();
++		seq.append("g");
++		assertEquals("abcdededefg", seq.toString());
++	}
++
++	@Test
++	public void symMultiSequence() {
++		for (int i = 0; i < 10; i++)
++			new Coroutine() {
++				protected void run() {
++					seq.append("c");
++					yield();
++					seq.append("e");
++				}
++			};
++		seq.append("b");
++		Coroutine.yield();
++		seq.append("d");
++		Coroutine.yield();
++		seq.append("f");
++		Coroutine.yield();
++		seq.append("g");
++		assertEquals("abccccccccccdeeeeeeeeeefg", seq.toString());
++	}
++
++	@Test
++	public void asymSequence() {
++		AsymCoroutine<Void, Void> coro = new AsymCoroutine<Void, Void>() {
++			protected Void run(Void value) {
++				seq.append(value + "b");
++				Object o = ret();
++				seq.append(o + "d");
++				return null;
++			}
++		};
++		assertFalse(coro.isFinished());
++		coro.call();
++		assertFalse(coro.isFinished());
++		seq.append("c");
++		coro.call();
++		seq.append("e");
++		assertTrue(coro.isFinished());
++
++		RuntimeException exception = null;
++		try {
++			coro.call();
++		} catch (RuntimeException e) {
++			exception = e;
++		}
++		assertNotNull(exception);
++		assertEquals("anullbcnullde", seq.toString());
++	}
++
++	@Test
++	public void asymMultiSequence() {
++		AsymCoroutine<Void, Void> coro = null;
++		for (int j = 4; j >= 0; j--) {
++			final AsymCoroutine<Void, Void> last = coro;
++			final int i = j;
++			coro = new AsymCoroutine<Void, Void>() {
++				protected Void run(Void value) {
++					seq.append("b" + i);
++					if (last != null)
++						last.call();
++					seq.append("c" + i);
++					ret();
++					seq.append("e" + i);
++					if (last != null)
++						last.call();
++					seq.append("f" + i);
++					return null;
++				}
++			};
++		}
++		seq.append("_");
++		assertFalse(coro.isFinished());
++		coro.call();
++		assertFalse(coro.isFinished());
++		seq.append("d");
++		coro.call();
++		seq.append("g");
++		assertTrue(coro.isFinished());
++
++		RuntimeException exception = null;
++		try {
++			coro.call();
++		} catch (RuntimeException e) {
++			exception = e;
++		}
++		assertNotNull(exception);
++		assertEquals("a_b0b1b2b3b4c4c3c2c1c0de0e1e2e3e4f4f3f2f1f0g", seq.toString());
++	}
++
++	@Test
++	public void asymReturnValue() {
++		AsymCoroutine<Integer, Integer> coro = new AsymCoroutine<Integer, Integer>() {
++			protected Integer run(Integer value) {
++				value = ret(value * 2 + 1);
++				value = ret(value * 2 + 2);
++				value = ret(value * 2 + 3);
++				value = ret(value * 2 + 4);
++				value = ret(value * 2 + 5);
++				return value * 2 + 6;
++			}
++		};
++		assertFalse(coro.isFinished());
++		assertEquals(2001, (int) coro.call(1000));
++		assertEquals(4002, (int) coro.call(2000));
++		assertEquals(6003, (int) coro.call(3000));
++		assertEquals(8004, (int) coro.call(4000));
++		assertEquals(10005, (int) coro.call(5000));
++		assertEquals(12006, (int) coro.call(6000));
++		assertTrue(coro.isFinished());
++	}
++
++	@Test
++	public void gcTest1() {
++		new Coroutine() {
++			protected void run() {
++				seq.append("c");
++				Integer v1 = 1;
++				Integer v2 = 14555668;
++				yield();
++				seq.append("e");
++				seq.append("(" + v1 + "," + v2 + ")");
++			}
++		};
++		seq.append("b");
++		System.gc();
++		Coroutine.yield();
++		System.gc();
++		seq.append("d");
++		Coroutine.yield();
++		seq.append("f");
++		Coroutine.yield();
++		seq.append("g");
++		assertEquals("abcde(1,14555668)fg", seq.toString());
++	}
++
++	@Test
++	public void exceptionTest1() {
++		Coroutine coro = new Coroutine() {
++			protected void run() {
++				seq.append("c");
++				long temp = System.nanoTime();
++				if (temp != 0)
++					throw new RuntimeException();
++				yield();
++				seq.append("e");
++			}
++		};
++		seq.append("b");
++		assertFalse(coro.isFinished());
++		Coroutine.yield();
++		seq.append("d");
++		Coroutine.yield();
++		seq.append("f");
++		assertEquals("abcdf", seq.toString());
++	}
++
++	@Test
++	public void largeStackframeTest() {
++		new Coroutine() {
++			protected void run() {
++				seq.append("c");
++				Integer v0 = 10000;
++				Integer v1 = 10001;
++				Integer v2 = 10002;
++				Integer v3 = 10003;
++				Integer v4 = 10004;
++				Integer v5 = 10005;
++				Integer v6 = 10006;
++				Integer v7 = 10007;
++				Integer v8 = 10008;
++				Integer v9 = 10009;
++				Integer v10 = 10010;
++				Integer v11 = 10011;
++				Integer v12 = 10012;
++				Integer v13 = 10013;
++				Integer v14 = 10014;
++				Integer v15 = 10015;
++				Integer v16 = 10016;
++				Integer v17 = 10017;
++				Integer v18 = 10018;
++				Integer v19 = 10019;
++				yield();
++				int sum = v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v10 + v11 + v12 + v13 + v14 + v15 + v16 + v17 + v18 + v19;
++				seq.append("e" + sum);
++			}
++		};
++		seq.append("b");
++		System.gc();
++		Coroutine.yield();
++		System.gc();
++		seq.append("d");
++		Coroutine.yield();
++		seq.append("f");
++		assertEquals("abcde200190f", seq.toString());
++	}
++
++	@Test
++	public void shaTest() {
++		Coroutine coro = new Coroutine(65536) {
++			protected void run() {
++				try {
++					MessageDigest digest = MessageDigest.getInstance("SHA");
++					digest.update("TestMessage".getBytes());
++					seq.append("b");
++					yield();
++					seq.append(digest.digest()[0]);
++				} catch (NoSuchAlgorithmException e) {
++					e.printStackTrace();
++				}
++			}
++		};
++		Coroutine.yield();
++		seq.append("c");
++		assertFalse(coro.isFinished());
++		Coroutine.yield();
++		assertTrue(coro.isFinished());
++		assertEquals("abc72", seq.toString());
++	}
++
++	// @Test
++	public void stackoverflowTest() {
++		for (int i = 0; i < 10; i++) {
++			new Coroutine(65536) {
++				int i = 0;
++
++				protected void run() {
++					System.out.println("start");
++					try {
++						iter();
++					} catch (StackOverflowError e) {
++						System.out.println("i: " + i);
++					}
++					System.out.println("asdf");
++				}
++
++				private void iter() {
++					System.out.print(".");
++					i++;
++					iter();
++				}
++			};
++		}
++		Coroutine.yield();
++	}
++}

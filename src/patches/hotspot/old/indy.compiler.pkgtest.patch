@@ -1,0 +1,241 @@
+diff --git a/src/share/vm/ci/ciInstanceKlass.cpp b/src/share/vm/ci/ciInstanceKlass.cpp
+--- a/src/share/vm/ci/ciInstanceKlass.cpp
++++ b/src/share/vm/ci/ciInstanceKlass.cpp
+@@ -232,8 +232,48 @@
+ // ------------------------------------------------------------------
+ // ciInstanceKlass::uses_default_loader
+ bool ciInstanceKlass::uses_default_loader() {
+-  VM_ENTRY_MARK;
+-  return loader() == NULL;
++  // Note:  We do not need to resolve the handle or enter the VM
++  // in order to test null-ness.
++  return _loader == NULL;
++}
++
++// ------------------------------------------------------------------
++// ciInstanceKlass::is_in_package
++//
++// Is this klass in the given package?
++bool ciInstanceKlass::is_in_package(const char* packagename, int len) {
++  // To avoid class loader mischief, this test always rejects application classes.
++  if (!uses_default_loader())
++    return false;
++  GUARDED_VM_ENTRY(
++    return is_in_package_impl(packagename, len);
++  )
++}
++
++bool ciInstanceKlass::is_in_package_impl(const char* packagename, int len) {
++  ASSERT_IN_VM;
++
++  // If packagename contains trailing '/' exclude it from the
++  // prefix-test since we test for it explicitly.
++  if (packagename[len - 1] == '/')
++    len--;
++
++  if (!name()->starts_with(packagename, len))
++    return false;
++
++  // Test if the class name is something like "java/lang".
++  if ((len + 1) > name()->utf8_length())
++    return false;
++
++  // Test for trailing '/'
++  if ((char) name()->byte_at(len) != '/')
++    return false;
++
++  // Make sure it's not actually in a subpackage:
++  if (name()->index_of_at(len+1, "/", 1) >= 0)
++    return false;
++
++  return true;
+ }
+ 
+ // ------------------------------------------------------------------
+diff --git a/src/share/vm/ci/ciInstanceKlass.hpp b/src/share/vm/ci/ciInstanceKlass.hpp
+--- a/src/share/vm/ci/ciInstanceKlass.hpp
++++ b/src/share/vm/ci/ciInstanceKlass.hpp
+@@ -79,6 +79,8 @@
+ 
+   const char* type_string() { return "ciInstanceKlass"; }
+ 
++  bool is_in_package_impl(const char* packagename, int len);
++
+   void print_impl(outputStream* st);
+ 
+   ciConstantPoolCache* field_cache();
+@@ -196,6 +198,12 @@
+ 
+   bool is_java_lang_Object();
+ 
++  // Is this klass in the given package?
++  bool is_in_package(const char* packagename) {
++    return is_in_package(packagename, (int) strlen(packagename));
++  }
++  bool is_in_package(const char* packagename, int len);
++
+   // What kind of ciObject is this?
+   bool is_instance_klass() { return true; }
+   bool is_java_klass()     { return true; }
+diff --git a/src/share/vm/ci/ciKlass.cpp b/src/share/vm/ci/ciKlass.cpp
+--- a/src/share/vm/ci/ciKlass.cpp
++++ b/src/share/vm/ci/ciKlass.cpp
+@@ -61,32 +61,6 @@
+ }
+ 
+ // ------------------------------------------------------------------
+-// ciKlass::is_in_package
+-//
+-// Is this klass in the given package?
+-bool ciKlass::is_in_package(const char* packagename) const {
+-  ResourceMark rm;
+-  size_t len = strlen(packagename);
+-  // If packagename contains trailing '/' exclude it from the
+-  // prefix-test since we test for it explicitly.
+-  if (packagename[len - 1] == '/')
+-    len--;
+-
+-  if (!name()->starts_with(packagename, len))
+-    return false;
+-
+-  // Test if the class name is something like "java/lang".
+-  if ((len + 1) > name()->utf8_length())
+-    return false;
+-
+-  // Test for trailing '/'
+-  if ((char) name()->byte_at(len) != '/')
+-    return false;
+-
+-  return true;
+-}
+-
+-// ------------------------------------------------------------------
+ // ciKlass::is_subtype_of
+ bool ciKlass::is_subtype_of(ciKlass* that) {
+   assert(is_loaded() && that->is_loaded(), "must be loaded");
+diff --git a/src/share/vm/ci/ciKlass.hpp b/src/share/vm/ci/ciKlass.hpp
+--- a/src/share/vm/ci/ciKlass.hpp
++++ b/src/share/vm/ci/ciKlass.hpp
+@@ -71,9 +71,6 @@
+   // What is the name of this klass?
+   ciSymbol* name() const { return _name; }
+ 
+-  // Is this klass in the given package?
+-  bool is_in_package(const char* packagename) const;
+-
+   // What is its layout helper value?
+   jint layout_helper() { return _layout_helper; }
+ 
+diff --git a/src/share/vm/ci/ciSymbol.cpp b/src/share/vm/ci/ciSymbol.cpp
+--- a/src/share/vm/ci/ciSymbol.cpp
++++ b/src/share/vm/ci/ciSymbol.cpp
+@@ -68,6 +68,14 @@
+ }
+ 
+ // ------------------------------------------------------------------
++// ciSymbol::index_of
++//
++// Determines where the symbol contains the given substring.
++int ciSymbol::index_of_at(int i, const char* str, int len) const {
++  GUARDED_VM_ENTRY(return get_symbolOop()->index_of_at(i, str, len);)
++}
++
++// ------------------------------------------------------------------
+ // ciSymbol::utf8_length
+ int ciSymbol::utf8_length() {
+   GUARDED_VM_ENTRY(return get_symbolOop()->utf8_length();)
+diff --git a/src/share/vm/ci/ciSymbol.hpp b/src/share/vm/ci/ciSymbol.hpp
+--- a/src/share/vm/ci/ciSymbol.hpp
++++ b/src/share/vm/ci/ciSymbol.hpp
+@@ -28,9 +28,9 @@
+ // machine.
+ class ciSymbol : public ciObject {
+   CI_PACKAGE_ACCESS
++  // These friends all make direct use of get_symbolOop:
+   friend class ciEnv;
+   friend class ciInstanceKlass;
+-  friend class ciKlass;
+   friend class ciSignature;
+   friend class ciMethod;
+   friend class ciObjArrayKlass;
+@@ -45,12 +45,9 @@
+ 
+   void print_impl(outputStream* st);
+ 
+-  int         byte_at(int i);
++  // This is public in symbolOop but private here, because the base can move:
+   jbyte*      base();
+ 
+-  // Tests if the symbol starts with the given prefix.
+-  bool starts_with(const char* prefix, int len) const;
+-
+   // Make a ciSymbol from a C string (implementation).
+   static ciSymbol* make_impl(const char* s);
+ 
+@@ -59,6 +56,15 @@
+   const char* as_utf8();
+   int         utf8_length();
+ 
++  // Return the i-th utf8 byte, where i < utf8_length
++  int         byte_at(int i);
++
++  // Tests if the symbol starts with the given prefix.
++  bool starts_with(const char* prefix, int len) const;
++
++  // Determines where the symbol contains the given substring.
++  int index_of_at(int i, const char* str, int len) const;
++
+   // What kind of ciObject is this?
+   bool is_symbol() { return true; }
+ 
+diff --git a/src/share/vm/oops/symbolOop.cpp b/src/share/vm/oops/symbolOop.cpp
+--- a/src/share/vm/oops/symbolOop.cpp
++++ b/src/share/vm/oops/symbolOop.cpp
+@@ -58,6 +58,31 @@
+ }
+ 
+ 
++// ------------------------------------------------------------------
++// symbolOopDesc::index_of
++//
++// Finds if the given string is a substring of this symbol's utf8 bytes.
++// Return -1 on failure.  Otherwise return the first index where str occurs.
++int symbolOopDesc::index_of_at(int i, const char* str, int len) const {
++  assert(i >= 0 && i <= utf8_length(), "oob");
++  if (len <= 0)  return 0;
++  char first_char = str[0];
++  address bytes = (address) ((symbolOopDesc*)this)->base();
++  address limit = bytes + utf8_length() - len;  // inclusive limit
++  address scan = bytes + i;
++  if (scan > limit)
++    return -1;
++  for (;;) {
++    scan = (address) memchr(scan, first_char, (limit + 1 - scan));
++    if (scan == NULL)
++      return -1;  // not found
++    assert(scan >= bytes+i && scan <= limit, "scan oob");
++    if (memcmp(scan, str, len) == 0)
++      return (int)(scan - bytes);
++  }
++}
++
++
+ char* symbolOopDesc::as_C_string(char* buf, int size) const {
+   if (size > 0) {
+     int len = MIN2(size - 1, utf8_length());
+diff --git a/src/share/vm/oops/symbolOop.hpp b/src/share/vm/oops/symbolOop.hpp
+--- a/src/share/vm/oops/symbolOop.hpp
++++ b/src/share/vm/oops/symbolOop.hpp
+@@ -80,6 +80,12 @@
+     return starts_with(prefix, (int) strlen(prefix));
+   }
+ 
++  // Tests if the symbol starts with the given prefix.
++  int index_of_at(int i, const char* str, int len) const;
++  int index_of_at(int i, const char* str) const {
++    return index_of_at(i, str, (int) strlen(str));
++  }
++
+   // Three-way compare for sorting; returns -1/0/1 if receiver is </==/> than arg
+   // note that the ordering is not alfabetical
+   inline int fast_compare(symbolOop other) const;

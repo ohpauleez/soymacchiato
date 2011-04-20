@@ -1,0 +1,796 @@
+6829189: Java programming with JSR 292 needs language support
+6754038: writing libraries in Java for non-Java languages requires method handle invocation
+MQ base = 80586310cc78 in http://hg.openjdk.java.net/bsd-port/bsd-port/langtools [2009-03-12]
+
+diff --git a/src/share/classes/com/sun/tools/classfile/OpCodes.java b/src/share/classes/com/sun/tools/classfile/OpCodes.java
+--- a/src/share/classes/com/sun/tools/classfile/OpCodes.java
++++ b/src/share/classes/com/sun/tools/classfile/OpCodes.java
+@@ -293,7 +293,7 @@
+     public static final int opc_invokespecial            = 183;
+     public static final int opc_invokestatic             = 184;
+     public static final int opc_invokeinterface          = 185;
+-//  public static final int opc_xxxunusedxxx             = 186;
++    public static final int opc_invokedynamic            = 186;
+     public static final int opc_new                      = 187;
+     public static final int opc_newarray                 = 188;
+     public static final int opc_anewarray                = 189;
+@@ -526,7 +526,7 @@
+         "invokespecial",        //      was "invokenonvirtual",
+         "invokestatic",
+         "invokeinterface",
+-        "bytecode 186",         //"xxxunusedxxx",
++        "invokedynamic",        // JSR 292
+         "new",
+         "newarray",
+         "anewarray",
+diff --git a/src/share/classes/com/sun/tools/javac/code/Symtab.java b/src/share/classes/com/sun/tools/javac/code/Symtab.java
+--- a/src/share/classes/com/sun/tools/javac/code/Symtab.java
++++ b/src/share/classes/com/sun/tools/javac/code/Symtab.java
+@@ -119,6 +119,8 @@
+     public final Type stringBuilderType;
+     public final Type cloneableType;
+     public final Type serializableType;
++    public final Type methodHandleType;
++    public final Type invokeDynamicType;
+     public final Type throwableType;
+     public final Type errorType;
+     public final Type illegalArgumentExceptionType;
+@@ -289,6 +291,24 @@
+         }
+     }
+ 
++    public void synthesizeMHTypeIfMissing(final Type type) {
++        final Completer completer = type.tsym.completer;
++        if (completer != null) {
++            type.tsym.completer = new Completer() {
++                public void complete(Symbol sym) throws CompletionFailure {
++                    try {
++                        completer.complete(sym);
++                    } catch (CompletionFailure e) {
++                        sym.flags_field |= (PUBLIC | ABSTRACT);
++                        ((ClassType) sym.type).supertype_field = objectType;
++                        // do not bother to create MH.type if not visibly declared
++                        // this sym just accumulates invoke(...) methods
++                    }
++                }
++            };
++        }
++    }
++
+     public void synthesizeBoxTypeIfMissing(final Type type) {
+         ClassSymbol sym = reader.enterClass(boxedName[type.tag]);
+         final Completer completer = sym.completer;
+@@ -405,6 +425,8 @@
+         cloneableType = enterClass("java.lang.Cloneable");
+         throwableType = enterClass("java.lang.Throwable");
+         serializableType = enterClass("java.io.Serializable");
++        methodHandleType = enterClass("java.dyn.MethodHandle");
++        invokeDynamicType = enterClass("java.dyn.InvokeDynamic");
+         errorType = enterClass("java.lang.Error");
+         illegalArgumentExceptionType = enterClass("java.lang.IllegalArgumentException");
+         exceptionType = enterClass("java.lang.Exception");
+@@ -441,6 +463,8 @@
+ 
+         synthesizeEmptyInterfaceIfMissing(cloneableType);
+         synthesizeEmptyInterfaceIfMissing(serializableType);
++        synthesizeMHTypeIfMissing(methodHandleType);
++        synthesizeMHTypeIfMissing(invokeDynamicType);
+         synthesizeBoxTypeIfMissing(doubleType);
+         synthesizeBoxTypeIfMissing(floatType);
+ 
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Attr.java b/src/share/classes/com/sun/tools/javac/comp/Attr.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Attr.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Attr.java
+@@ -118,6 +118,7 @@
+         relax = (options.get("-retrofit") != null ||
+                  options.get("-relax") != null);
+         useBeforeDeclarationWarning = options.get("useBeforeDeclarationWarning") != null;
++        allowInvokedynamic = options.get("invokedynamic") != null;
+     }
+ 
+     /** Switch: relax some constraints for retrofit mode.
+@@ -149,6 +150,10 @@
+      */
+     boolean allowAnonOuterThis;
+ 
++    /** Switch: allow invokedynamic syntax
++     */
++    boolean allowInvokedynamic;
++
+     /**
+      * Switch: warn about use of variable before declaration?
+      * RFE: 6425594
+@@ -438,14 +443,22 @@
+     }
+ 
+     /** Attribute a type argument list, returning a list of types.
++     *  Caller is responsible for calling checkRefTypes.
+      */
+-    List<Type> attribTypes(List<JCExpression> trees, Env<AttrContext> env) {
++    List<Type> attribAnyTypes(List<JCExpression> trees, Env<AttrContext> env) {
+         ListBuffer<Type> argtypes = new ListBuffer<Type>();
+         for (List<JCExpression> l = trees; l.nonEmpty(); l = l.tail)
+-            argtypes.append(chk.checkRefType(l.head.pos(), attribType(l.head, env)));
++            argtypes.append(attribType(l.head, env));
+         return argtypes.toList();
+     }
+ 
++    /** Attribute a type argument list, returning a list of types.
++     *  Check that all the types are references.
++     */
++    List<Type> attribTypes(List<JCExpression> trees, Env<AttrContext> env) {
++        List<Type> types = attribAnyTypes(trees, env);
++        return chk.checkRefTypes(trees, types);
++    }
+ 
+     /**
+      * Attribute type variables (of generic classes or methods).
+@@ -1194,6 +1207,7 @@
+ 
+         // The types of the actual method type arguments.
+         List<Type> typeargtypes = null;
++        boolean typeargtypesNonRefOK = false;
+ 
+         Name methName = TreeInfo.name(tree.meth);
+ 
+@@ -1281,7 +1295,7 @@
+             // Otherwise, we are seeing a regular method call.
+             // Attribute the arguments, yielding list of argument types, ...
+             argtypes = attribArgs(tree.args, localEnv);
+-            typeargtypes = attribTypes(tree.typeargs, localEnv);
++            typeargtypes = attribAnyTypes(tree.typeargs, localEnv);
+ 
+             // ... and attribute the method using as a prototype a methodtype
+             // whose formal argument types is exactly the list of actual
+@@ -1318,6 +1332,20 @@
+                               restype.tsym);
+             }
+ 
++            // as a special case, MethodHandle.<T>invoke(abc) and InvokeDynamic.<T>foo(abc)
++            // has type <T>, and T can be a primitive type.
++            if (tree.meth.getTag() == JCTree.SELECT && !typeargtypes.isEmpty()) {
++              Type selt = ((JCFieldAccess) tree.meth).selected.type;
++              if ((selt == syms.methodHandleType && methName == names.invoke) || selt == syms.invokeDynamicType) {
++                  assert types.isSameType(restype, typeargtypes.head) : mtype;
++                  typeargtypesNonRefOK = true;
++              }
++            }
++
++            if (!typeargtypesNonRefOK) {
++                chk.checkRefTypes(tree.typeargs, typeargtypes);
++            }
++
+             // Check that value of resulting type is admissible in the
+             // current context.  Also, capture the return type
+             result = check(tree, capture(restype), VAL, pkind, pt);
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Check.java b/src/share/classes/com/sun/tools/javac/comp/Check.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Check.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Check.java
+@@ -207,6 +207,12 @@
+      *  @param found      The type that was found.
+      */
+     Type typeTagError(DiagnosticPosition pos, Object required, Object found) {
++        // this error used to be raised by the parser,
++        // but has been delayed to this point:
++        if (found instanceof Type && ((Type)found).tag == VOID) {
++            log.error(pos, "illegal.start.of.type");
++            return syms.errType;
++        }
+         log.error(pos, "type.found.req", found, required);
+         return types.createErrorType(found instanceof Type ? (Type)found : syms.errType);
+     }
+@@ -547,6 +553,20 @@
+         }
+     }
+ 
++    /** Check that each type is a reference type, i.e. a class, interface or array type
++     *  or a type variable.
++     *  @param trees         Original trees, used for error reporting.
++     *  @param types         The types to be checked.
++     */
++    List<Type> checkRefTypes(List<JCExpression> trees, List<Type> types) {
++        List<JCExpression> tl = trees;
++        for (List<Type> l = types; l.nonEmpty(); l = l.tail) {
++            l.head = checkRefType(tl.head.pos(), l.head);
++            tl = tl.tail;
++        }
++        return types;
++    }
++
+     /** Check that type is a null or reference type.
+      *  @param pos           Position to be used for error reporting.
+      *  @param t             The type to be checked.
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Resolve.java b/src/share/classes/com/sun/tools/javac/comp/Resolve.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Resolve.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Resolve.java
+@@ -67,6 +67,7 @@
+     JCDiagnostic.Factory diags;
+     public final boolean boxingEnabled; // = source.allowBoxing();
+     public final boolean varargsEnabled; // = source.allowVarargs();
++    public final boolean allowInvokedynamic; // = options.get("invokedynamic");
+     private final boolean debugResolve;
+ 
+     public static Resolve instance(Context context) {
+@@ -104,6 +105,7 @@
+         varargsEnabled = source.allowVarargs();
+         Options options = Options.instance(context);
+         debugResolve = options.get("debugresolve") != null;
++        allowInvokedynamic = options.get("invokedynamic") != null;
+     }
+ 
+     /** error symbols, which are returned when resolution fails
+@@ -858,6 +860,79 @@
+         return bestSoFar;
+     }
+ 
++    /** Find or create an implicit method of exactly the given type (after erasure).
++     *  Searches in a side table, not the main scope of the site.
++     *  This emulates the lookup process required by JSR 292 in JVM.
++     *  @param env       The current environment.
++     *  @param site      The original type from where the selection
++     *                   takes place.
++     *  @param name      The method's name.
++     *  @param argtypes  The method's value arguments.
++     *  @param typeargtypes The method's type arguments
++     */
++    Symbol findImplicitMethod(Env<AttrContext> env,
++                              Type site,
++                              Name name,
++                              List<Type> argtypes,
++                              List<Type> typeargtypes) {
++        assert allowInvokedynamic;
++        assert site == syms.invokeDynamicType || (site == syms.methodHandleType && name == names.invoke);
++        ClassSymbol c = (ClassSymbol) site.tsym;
++        Scope implicit = c.members().next;
++        if (implicit == null) {
++            c.members().next = implicit = new Scope(c);
++        }
++        Type restype;
++        if (typeargtypes.isEmpty()) {
++            restype = syms.objectType;
++        } else {
++            restype = typeargtypes.head;
++            if (!typeargtypes.tail.isEmpty())
++                return methodNotFound;
++        }
++        List<Type> paramtypes = Type.map(argtypes, implicitArgType);
++        MethodType mtype = new MethodType(paramtypes,
++                                          restype,
++                                          List.<Type>nil(),
++                                          syms.methodClass);
++        int flags = PUBLIC | ABSTRACT;
++        if (site == syms.invokeDynamicType)  flags |= STATIC;
++        Symbol m = null;
++        for (Scope.Entry e = implicit.lookup(name);
++             e.scope != null;
++             e = e.next()) {
++            Symbol sym = e.sym;
++            assert sym.kind == MTH;
++            if (types.isSameType(mtype, sym.type)
++                && (sym.flags() & STATIC) == (flags & STATIC)) {
++                m = sym;
++                break;
++            }
++        }
++        if (m == null) {
++            // create the desired method
++            m = new MethodSymbol(flags, name, mtype, c);
++            implicit.enter(m);
++        }
++        assert argumentsAcceptable(argtypes, types.memberType(site, m).getParameterTypes(),
++                                   false, false, Warner.noWarnings);
++        assert null != instantiate(env, site, m, argtypes, typeargtypes, false, false, Warner.noWarnings);
++        return m;
++    }
++    //where
++        Mapping implicitArgType = new Mapping ("implicitArgType") {
++                public Type apply(Type t) { return implicitArgType(t); }
++            };
++        Type implicitArgType(Type argType) {
++            argType = types.erasure(argType);
++            if (argType.tag == BOT)
++                // nulls type as the marker type Null (which has no instances)
++                // TO DO: figure out how to access java.lang.Null safely, else throw nice error
++                //argType = types.boxedClass(syms.botType).type;
++                argType = types.boxedClass(syms.voidType).type;  // REMOVE
++            return argType;
++        }
++
+     /** Load toplevel or member class with given fully qualified name and
+      *  verify that it is accessible.
+      *  @param env       The current environment.
+@@ -1242,6 +1317,14 @@
+             methodResolutionCache.put(steps.head, sym);
+             steps = steps.tail;
+         }
++        if (sym.kind >= AMBIGUOUS &&
++            allowInvokedynamic &&
++            (site == syms.invokeDynamicType ||
++             site == syms.methodHandleType && name == names.invoke)) {
++            // lookup failed; supply an exactly-typed implicit method
++            sym = findImplicitMethod(env, site, name, argtypes, typeargtypes);
++            env.info.varArgs = false;
++        }
+         if (sym.kind >= AMBIGUOUS) {//if nothing is found return the 'first' error
+             MethodResolutionPhase errPhase =
+                     firstErroneousResolutionPhase();
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/ByteCodes.java b/src/share/classes/com/sun/tools/javac/jvm/ByteCodes.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/ByteCodes.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/ByteCodes.java
+@@ -225,7 +225,7 @@
+         invokespecial   = 183,
+         invokestatic    = 184,
+         invokeinterface = 185,
+-        // ___unused___ = 186,
++        invokedynamic   = 186,
+         new_            = 187,
+         newarray        = 188,
+         anewarray       = 189,
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/Code.java b/src/share/classes/com/sun/tools/javac/jvm/Code.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Code.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/Code.java
+@@ -456,6 +456,19 @@
+         state.push(mtype.getReturnType());
+     }
+ 
++    /** Emit an invokedynamic instruction.
++     */
++    public void emitInvokedynamic(int desc, Type mtype) {
++        // N.B. this format is under consideration by the JSR 292 EG
++        int argsize = width(mtype.getParameterTypes());
++        emitop(invokedynamic);
++        if (!alive) return;
++        emit2(desc);
++        emit2(0);
++        state.pop(argsize);
++        state.push(mtype.getReturnType());
++    }
++
+     /** Emit an opcode with no operand field.
+      */
+     public void emitop0(int op) {
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/Gen.java b/src/share/classes/com/sun/tools/javac/jvm/Gen.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Gen.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/Gen.java
+@@ -119,6 +119,7 @@
+             : options.get("-g:vars") != null;
+         genCrt = options.get("-Xjcov") != null;
+         debugCode = options.get("debugcode") != null;
++        allowInvokedynamic = options.get("invokedynamic") != null;
+ 
+         generateIproxies =
+             target.requiresIproxy() ||
+@@ -155,6 +156,7 @@
+     private final boolean varDebugInfo;
+     private final boolean genCrt;
+     private final boolean debugCode;
++    private final boolean allowInvokedynamic;
+ 
+     /** Default limit of (approximate) size of finalizer to inline.
+      *  Zero means always use jsr.  100 or greater means never use
+@@ -2140,6 +2142,9 @@
+             }
+             result = items.
+                 makeImmediateItem(sym.type, ((VarSymbol) sym).getConstValue());
++        } else if (allowInvokedynamic && sym.kind == MTH && ssym == syms.invokeDynamicType.tsym) {
++            base.drop();
++            result = items.makeDynamicItem(sym);
+         } else {
+             if (!accessSuper)
+                 sym = binaryQualifier(sym, tree.selected.type);
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/Items.java b/src/share/classes/com/sun/tools/javac/jvm/Items.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Items.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/Items.java
+@@ -139,6 +139,13 @@
+         return new StaticItem(member);
+     }
+ 
++    /** Make an item representing a dynamically invoked method.
++     *  @param member   The represented symbol.
++     */
++    Item makeDynamicItem(Symbol member) {
++        return new DynamicItem(member);
++    }
++
+     /** Make an item representing an instance variable or method.
+      *  @param member       The represented symbol.
+      *  @param nonvirtual   Is the reference not virtual? (true for constructors
+@@ -457,6 +464,38 @@
+         }
+     }
+ 
++    /** An item representing a dynamic call site.
++     */
++    class DynamicItem extends StaticItem {
++        DynamicItem(Symbol member) {
++            super(member);
++            assert member.owner == syms.invokeDynamicType.tsym;
++        }
++
++        Item load() {
++            assert false;
++            return null;
++        }
++
++        void store() {
++            assert false;
++        }
++
++        Item invoke() {
++            // assert target.hasNativeInvokeDynamic();
++            MethodType mtype = (MethodType)member.erasure(types);
++            int rescode = Code.typecode(mtype.restype);
++            ClassFile.NameAndType descr = new ClassFile.NameAndType(member.name, mtype);
++            code.emitInvokedynamic(pool.put(descr), mtype);
++            return stackItem[rescode];
++        }
++
++        public String toString() {
++            return "dynamic(" + member + ")";
++        }
++    }
++
++
+     /** An item representing an instance variable or method.
+      */
+     class MemberItem extends Item {
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/Target.java b/src/share/classes/com/sun/tools/javac/jvm/Target.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Target.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/Target.java
+@@ -253,6 +253,12 @@
+         return compareTo(JDK1_5) >= 0;
+     }
+ 
++    /** Does the VM support an invokedynamic instruction?
++     */
++    public boolean hasInvokedynamic() {
++        return compareTo(JDK1_7) >= 0;
++    }
++
+     /** Although we may not have support for class literals, should we
+      *  avoid initializing the class that the literal refers to?
+      *  See 4468823
+diff --git a/src/share/classes/com/sun/tools/javac/main/Main.java b/src/share/classes/com/sun/tools/javac/main/Main.java
+--- a/src/share/classes/com/sun/tools/javac/main/Main.java
++++ b/src/share/classes/com/sun/tools/javac/main/Main.java
+@@ -268,14 +268,19 @@
+                     }
+                     return null;
+                 } else {
+-                    options.put("-target", source.requiredTarget().name);
++                    target = source.requiredTarget();
++                    options.put("-target", target.name);
+                 }
+             } else {
+                 if (targetString == null && !source.allowGenerics()) {
+-                    options.put("-target", Target.JDK1_4.name);
++                    target = Target.JDK1_4;
++                    options.put("-target", target.name);
+                 }
+             }
+         }
++        if (target.hasInvokedynamic()) {
++            options.put("invokedynamic",  "invokedynamic");
++        }
+         return filenames.toList();
+     }
+     // where
+diff --git a/src/share/classes/com/sun/tools/javac/parser/JavacParser.java b/src/share/classes/com/sun/tools/javac/parser/JavacParser.java
+--- a/src/share/classes/com/sun/tools/javac/parser/JavacParser.java
++++ b/src/share/classes/com/sun/tools/javac/parser/JavacParser.java
+@@ -1034,7 +1034,13 @@
+                     return illegal(pos);
+                 }
+             } else {
+-                return illegal();
++                // Support the corner case of myMethodHandle.<void>invoke() by passing
++                // a void type (like other primitive types) to the next phase.
++                // The error will be reported in Attr.attribTypes or Attr.visitApply.
++                JCPrimitiveTypeTree ti = to(F.at(pos).TypeIdent(TypeTags.VOID));
++                S.nextToken();
++                return ti;
++                //return illegal();
+             }
+             break;
+         default:
+diff --git a/src/share/classes/com/sun/tools/javac/util/Names.java b/src/share/classes/com/sun/tools/javac/util/Names.java
+--- a/src/share/classes/com/sun/tools/javac/util/Names.java
++++ b/src/share/classes/com/sun/tools/javac/util/Names.java
+@@ -73,6 +73,8 @@
+     public final Name java_io_Serializable;
+     public final Name serialVersionUID;
+     public final Name java_lang_Enum;
++    public final Name java_dyn_MethodHandle;
++    public final Name java_dyn_InvokeDynamic;
+     public final Name package_info;
+     public final Name ConstantValue;
+     public final Name LineNumberTable;
+@@ -111,6 +113,7 @@
+     public final Name value;
+     public final Name getMessage;
+     public final Name getClass;
++    public final Name invoke;
+     public final Name TYPE;
+     public final Name FIELD;
+     public final Name METHOD;
+@@ -175,6 +178,8 @@
+         java_lang_Cloneable = fromString("java.lang.Cloneable");
+         java_io_Serializable = fromString("java.io.Serializable");
+         java_lang_Enum = fromString("java.lang.Enum");
++        java_dyn_MethodHandle = fromString("java.dyn.MethodHandle");
++        java_dyn_InvokeDynamic = fromString("java.dyn.InvokeDynamic");
+         package_info = fromString("package-info");
+         serialVersionUID = fromString("serialVersionUID");
+         ConstantValue = fromString("ConstantValue");
+@@ -216,6 +221,7 @@
+         value = fromString("value");
+         getMessage = fromString("getMessage");
+         getClass = fromString("getClass");
++        invoke = fromString("invoke");
+ 
+         TYPE = fromString("TYPE");
+         FIELD = fromString("FIELD");
+diff --git a/src/share/classes/com/sun/tools/javap/CodeWriter.java b/src/share/classes/com/sun/tools/javap/CodeWriter.java
+--- a/src/share/classes/com/sun/tools/javap/CodeWriter.java
++++ b/src/share/classes/com/sun/tools/javap/CodeWriter.java
+@@ -263,6 +263,13 @@
+                     printConstant(index);
+                     return 5;
+                 }
++            case opc_invokedynamic:
++                {
++                    int index = attr.getUnsignedShort(pc + 1);
++                    print("\t#" + index + "; //");
++                    printConstant(index);
++                    return 5;
++                }
+             case opc_multianewarray:
+                 {
+                     int index = attr.getUnsignedShort(pc + 1);
+diff --git a/test/tools/javac/meth/InvokeDyn.java b/test/tools/javac/meth/InvokeDyn.java
+new file mode 100644
+--- /dev/null
++++ b/test/tools/javac/meth/InvokeDyn.java
+@@ -0,0 +1,59 @@
++/*
++ * Copyright 2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++
++/*
++ * @test
++ * @bug 6754038
++ * @summary Generate call sites for method handle
++ * @author jrose
++ *
++ * @library ..
++ * @compile -source 7 -target 7 InvokeDyn.java
++ */
++//No: @run main/othervm -XX:+EnableInvokeDynamic meth.InvokeDyn
++
++/*
++ * Standalone testing:
++ * <code>
++ * $ cd $MY_REPO_DIR/langtools
++ * $ (cd make; make)
++ * $ ./dist/bootstrap/bin/javac -d dist test/tools/javac/meth/InvokeDyn.java
++ * $ javap -c -classpath dist meth.InvokeDyn
++ * </code>
++ */
++
++package meth;
++
++import java.dyn.InvokeDynamic;
++
++public class InvokeDyn {
++    void test() {
++        Object x = "hello";
++        InvokeDynamic.greet(x, "world", 123);
++        InvokeDynamic.greet(x, "mundus", 456);
++        InvokeDynamic.greet(x, "kosmos", 789);
++        InvokeDynamic.<String>cogitate(10.11121, 3.14);
++        InvokeDynamic.<void>#"yow: what I mean to say is, please treat this one specially"(null);
++        InvokeDynamic.<int>invoke("goodbye");
++    }
++}
+diff --git a/test/tools/javac/meth/InvokeMH.java b/test/tools/javac/meth/InvokeMH.java
+new file mode 100644
+--- /dev/null
++++ b/test/tools/javac/meth/InvokeMH.java
+@@ -0,0 +1,75 @@
++/*
++ * Copyright 2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++
++/*
++ * @test
++ * @bug 6754038
++ * @summary Generate call sites for method handle
++ * @author jrose
++ *
++ * @compile -source 7 -target 7 InvokeMH.java
++ */
++
++/*
++ * Standalone testing:
++ * <code>
++ * $ cd $MY_REPO_DIR/langtools
++ * $ (cd make; make)
++ * $ ./dist/bootstrap/bin/javac -d dist test/tools/javac/meth/InvokeMH.java
++ * $ javap -c -classpath dist meth.InvokeMH
++ * </code>
++ */
++
++package meth;
++
++import java.dyn.MethodHandle;
++
++public class InvokeMH {
++    void test(MethodHandle mh_SiO,
++              MethodHandle mh_vS,
++              MethodHandle mh_vi,
++              MethodHandle mh_vv) {
++        Object o; String s; int i;  // for return type testing
++
++        // next five must have sig = (String,int)Object
++        mh_SiO.invoke("world", 123);
++        mh_SiO.invoke("mundus", 456);
++        Object k = "kosmos";
++        mh_SiO.invoke((String)k, 789);
++        o = mh_SiO.invoke((String)null, 000);
++        o = mh_SiO.<Object>invoke("arda", -123);
++
++        // sig = ()String
++        s = mh_vS.<String>invoke();
++
++        // sig = ()int
++        i = mh_vi.<int>invoke();
++        o = mh_vi.<int>invoke();
++        //s = mh_vi.<int>invoke(); //BAD
++        mh_vi.<int>invoke();
++
++        // sig = ()void
++        //o = mh_vv.<void>invoke(); //BAD
++        mh_vv.<void>invoke();
++    }
++}
+diff --git a/test/tools/javac/meth/MakeNegTests.sh b/test/tools/javac/meth/MakeNegTests.sh
+new file mode 100644
+--- /dev/null
++++ b/test/tools/javac/meth/MakeNegTests.sh
+@@ -0,0 +1,98 @@
++#!/bin/sh
++
++#
++# Copyright 2008 Sun Microsystems, Inc.  All Rights Reserved.
++# DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++#
++# This code is free software; you can redistribute it and/or modify it
++# under the terms of the GNU General Public License version 2 only, as
++# published by the Free Software Foundation.
++#
++# This code is distributed in the hope that it will be useful, but WITHOUT
++# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++# version 2 for more details (a copy is included in the LICENSE file that
++# accompanied this code).
++#
++# You should have received a copy of the GNU General Public License version
++# 2 along with this work; if not, write to the Free Software Foundation,
++# Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++#
++# Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++# CA 95054 USA or visit www.sun.com if you need additional information or
++# have any questions.
++#
++
++# @test
++# @bug 6754038
++# @summary Verify correct rejection of strongly typed return values
++# @run shell MakeNegTests.sh
++
++default_template=InvokeMH.java
++javacflags='-source 7 -target 7'
++# the rest of this file is a generic "//BAD"-line tester
++
++: ${TESTSRC=.} ${TESTCLASSES=.}
++javac="${TESTJAVA+${TESTJAVA}/bin/}javac"
++
++verbose=false quiet=false
++
++main() {
++  case "${@-}" in
++  *.java*)
++    for template in "$@"; do
++      expand_and_test "$template"
++    done;;
++  *) expand_and_test "${TESTSRC}/$default_template";;
++  esac
++}
++
++expand_and_test() {
++  template=$1
++  expand "$@"
++  testneg "$@"
++}
++
++expand() {
++  template=$1
++  badlines=` grep -n < "$template" '//BAD' `
++  badcount=` echo "$badlines" | wc -l `
++  [ $badcount -gt 0 ] || { echo "No negative test cases in $template"; exit 1; }
++  $quiet || echo "Expanding $badcount negative test cases from $template:"
++  $quiet || echo "$badlines"
++  badnums=` echo "$badlines" | sed 's/:.*//' `
++  casestem=` getcasestem "$template" `
++  tclassname=` basename "$template" .java `
++  rm -f "$casestem"*.java
++  for badnum in $badnums; do
++    casefile="$casestem"${badnum}.java
++    cclassname=` basename "$casefile" .java `
++    sed < "$template" > "$casefile" "
++      s|@compile|@compile/fail|
++      / @[a-z]/s|@|##|
++      ${badnum}s:^ *[/*]*:    :
++      s/${tclassname}/${cclassname}/g
++    "
++    $verbose && diff -u "$template" "$casefile"
++  done
++}
++
++getcasestem() {
++  echo "$1" | sed 's/\.java$//;s/_BAD[0-9]*$//;s/$/_BAD/'
++}
++
++testneg() {
++  template=$1
++  for casefile in ` getcasestem "$template" `*.java; do
++    $quiet || echo -------- $javac $javacflags "$casefile"
++    $javac $javacflags "$casefile" > "$casefile".errlog 2>&1 && {
++      echo "*** Compilation unexpectedly succeeded:  $casefile"
++      exit 1
++    }
++    $quiet || echo "Compilation failed as expected"
++    $quiet || head ` $verbose || echo -3 ` < "$casefile".errlog
++    rm "$casefile".errlog
++  done
++}
++
++main "$@"

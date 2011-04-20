@@ -1,0 +1,574 @@
+diff -r 0f653be1a42f src/share/classes/com/sun/tools/javac/comp/Lower.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Lower.java	Thu May 14 10:58:12 2009 -0700
++++ b/src/share/classes/com/sun/tools/javac/comp/Lower.java	Thu Jun 04 10:19:02 2009 +0200
+@@ -421,7 +421,7 @@ public class Lower extends TreeTranslato
+                                                      forEnum.type,
+                                                      List.<Type>nil());
+             JCExpression size = make // Color.values().length
+-                .Select(make.App(make.QualIdent(valuesMethod)),
++                .Select(make.App(make.QualIdent(valuesMethod), false),
+                         syms.lengthVar);
+             JCExpression mapVarInit = make
+                 .NewArray(make.Type(syms.intType), List.of(size), null)
+@@ -445,7 +445,7 @@ public class Lower extends TreeTranslato
+                 JCExpression assign = make
+                     .Assign(make.Indexed(mapVar,
+                                          make.App(make.Select(make.QualIdent(enumerator),
+-                                                              ordinalMethod))),
++                                                              ordinalMethod), false)),
+                             make.Literal(mappedValue))
+                     .setType(syms.intType);
+                 JCStatement exec = make.Exec(assign);
+@@ -550,7 +550,7 @@ public class Lower extends TreeTranslato
+                                              names.valueOf,
+                                              syms.stringType,
+                                              List.of(tree.type));
+-            return make.App(make.QualIdent(valueOfSym), List.of(tree));
++            return make.App(make.QualIdent(valueOfSym), List.of(tree), false);
+         }
+     }
+ 
+@@ -1049,7 +1049,7 @@ public class Lower extends TreeTranslato
+                         JCExpression receiver = make.Select(
+                             base != null ? base : make.QualIdent(access.owner),
+                             access);
+-                        return make.App(receiver, args);
++                        return make.App(receiver, args, false);
+ 
+                     // Other accesses to members of outer classes get a
+                     // qualifier.
+@@ -1187,7 +1187,7 @@ public class Lower extends TreeTranslato
+             }
+             stat = make.Return(expr.setType(sym.type));
+         } else {
+-            stat = make.Call(make.App(ref, args));
++            stat = make.Call(make.App(ref, args, false));
+         }
+         md.body = make.Block(0, List.of(stat));
+ 
+@@ -1220,7 +1220,8 @@ public class Lower extends TreeTranslato
+                 make.Call(
+                     make.App(
+                         callee,
+-                        make.Idents(md.params.reverse().tail.reverse())))));
++                        make.Idents(md.params.reverse().tail.reverse()),
++                        false))));
+         return md;
+     }
+ 
+@@ -1588,7 +1589,8 @@ public class Lower extends TreeTranslato
+                 Block(0, List.<JCStatement>of(make.
+                               Call(make. // return
+                                    App(make.
+-                                       Ident(forNameSym), args))));
++                                       Ident(forNameSym), args,
++                                       false))));
+         } else {
+             // forNameSym := java.lang.Class.forName(String s)
+             Symbol forNameSym = lookupMethod(make_pos,
+@@ -1603,7 +1605,8 @@ public class Lower extends TreeTranslato
+                                   QualIdent(forNameSym),
+                                   List.<JCExpression>of(make.
+                                                         Ident(md.params.
+-                                                              head.sym))))));
++                                                              head.sym)),
++                                                              false))));
+         }
+ 
+         // catchParam := ClassNotFoundException e1
+@@ -1632,7 +1635,8 @@ public class Lower extends TreeTranslato
+                 Throw(makeNewClass(syms.noClassDefFoundErrorType,
+                           List.<JCExpression>of(make.App(make.Select(make.Ident(catchParam),
+                                                                      getMessageSym),
+-                                                         List.<JCExpression>nil()))));
++                                                         List.<JCExpression>nil(),
++                                                         false))));
+         }
+ 
+         // rethrowStmt := "( $rethrow )"
+@@ -1654,7 +1658,7 @@ public class Lower extends TreeTranslato
+             assert left.type != null;
+             Symbol funcsym = lookupMethod(make_pos, name, left.type,
+                                           TreeInfo.types(args));
+-            return make.App(make.Select(left, funcsym), args);
++            return make.App(make.Select(left, funcsym), args, false);
+         }
+ 
+     /** The Name Of The variable to cache T.class values.
+@@ -1741,7 +1745,8 @@ public class Lower extends TreeTranslato
+                     make.App(
+                         make.Ident(classDollarSym(pos)),
+                         List.<JCExpression>of(make.Literal(CLASS, sig)
+-                                              .setType(syms.stringType))))
++                                              .setType(syms.stringType)),
++                                              false))
+                 .setType(types.erasure(syms.classType)),
+                 make.Ident(cs)).setType(types.erasure(syms.classType));
+         default:
+@@ -1785,7 +1790,7 @@ public class Lower extends TreeTranslato
+             JCExpression notStatus = makeUnary(JCTree.NOT, make.App(make.Select(
+                     classOfType(types.erasure(outermostClass.type),
+                                 containerDef.pos()),
+-                    desiredAssertionStatusSym)));
++                    desiredAssertionStatusSym), false));
+             JCVariableDecl assertDisabledDef = make.VarDef(assertDisabledSym,
+                                                    notStatus);
+             containerDef.defs = containerDef.defs.prepend(assertDisabledDef);
+@@ -2119,7 +2124,8 @@ public class Lower extends TreeTranslato
+             JCTypeCast valuesResult =
+                 make.TypeCast(valuesSym.type.getReturnType(),
+                               make.App(make.Select(make.Ident(valuesVar),
+-                                                   syms.arrayCloneMethod)));
++                                                   syms.arrayCloneMethod),
++                                                   false));
+             valuesBody = List.<JCStatement>of(make.Return(valuesResult));
+         } else {
+             // template: T[] $result = new T[$values.length];
+@@ -2156,7 +2162,8 @@ public class Lower extends TreeTranslato
+                                                systemArraycopyMethod),
+                           List.of(make.Ident(valuesVar), make.Literal(0),
+                                   make.Ident(resultVar), make.Literal(0),
+-                                  make.Select(make.Ident(valuesVar), syms.lengthVar))));
++                                  make.Select(make.Ident(valuesVar), syms.lengthVar)),
++                                  false));
+ 
+             // template: return $result;
+             JCStatement ret = make.Return(make.Ident(resultVar));
+@@ -2663,7 +2670,7 @@ public class Lower extends TreeTranslato
+                                              box,
+                                              List.<Type>nil()
+                                              .prepend(tree.type));
+-            return make.App(make.QualIdent(valueOfSym), List.of(tree));
++            return make.App(make.QualIdent(valueOfSym), List.of(tree),false);
+         }
+     }
+ 
+@@ -2677,7 +2684,7 @@ public class Lower extends TreeTranslato
+                                        unboxedType.tsym.name.append(names.Value), // x.intValue()
+                                        tree.type,
+                                        List.<Type>nil());
+-        return make.App(make.Select(tree, valueSym));
++        return make.App(make.Select(tree, valueSym), false);
+     }
+ 
+     /** Visitor method for parenthesized expressions.
+@@ -2991,17 +2998,17 @@ public class Lower extends TreeTranslato
+                                             currentMethodSym);
+             JCStatement init = make.
+                 VarDef(itvar,
+-                       make.App(make.Select(tree.expr, iterator)));
++                       make.App(make.Select(tree.expr, iterator), false));
+             Symbol hasNext = lookupMethod(tree.expr.pos(),
+                                           names.hasNext,
+                                           itvar.type,
+                                           List.<Type>nil());
+-            JCMethodInvocation cond = make.App(make.Select(make.Ident(itvar), hasNext));
++            JCMethodInvocation cond = make.App(make.Select(make.Ident(itvar), hasNext),false);
+             Symbol next = lookupMethod(tree.expr.pos(),
+                                        names.next,
+                                        itvar.type,
+                                        List.<Type>nil());
+-            JCExpression vardefinit = make.App(make.Select(make.Ident(itvar), next));
++            JCExpression vardefinit = make.App(make.Select(make.Ident(itvar), next), false);
+             if (tree.var.type.isPrimitive())
+                 vardefinit = make.TypeCast(types.upperBound(iteratorTarget), vardefinit);
+             else
+@@ -3104,7 +3111,8 @@ public class Lower extends TreeTranslato
+                                             List.<Type>nil());
+         JCArrayAccess selector = make.Indexed(map.mapVar,
+                                         make.App(make.Select(tree.selector,
+-                                                             ordinalMethod)));
++                                                             ordinalMethod),
++                                                             false));
+         ListBuffer<JCCase> cases = new ListBuffer<JCCase>();
+         for (JCCase c : tree.cases) {
+             if (c.pat != null) {
+diff -r 0f653be1a42f src/share/classes/com/sun/tools/javac/comp/MemberEnter.java
+--- a/src/share/classes/com/sun/tools/javac/comp/MemberEnter.java	Thu May 14 10:58:12 2009 -0700
++++ b/src/share/classes/com/sun/tools/javac/comp/MemberEnter.java	Thu Jun 04 10:19:03 2009 +0200
+@@ -1108,6 +1108,6 @@ public class MemberEnter extends JCTree.
+             meth = make.Ident(names._super);
+         }
+         List<JCExpression> typeargs = typarams.nonEmpty() ? make.Types(typarams) : null;
+-        return make.Exec(make.Apply(typeargs, meth, make.Idents(params)));
++        return make.Exec(make.Apply(typeargs, meth, make.Idents(params), false));
+     }
+ }
+diff -r 0f653be1a42f src/share/classes/com/sun/tools/javac/comp/TransTypes.java
+--- a/src/share/classes/com/sun/tools/javac/comp/TransTypes.java	Thu May 14 10:58:12 2009 -0700
++++ b/src/share/classes/com/sun/tools/javac/comp/TransTypes.java	Thu Jun 04 10:19:03 2009 +0200
+@@ -239,7 +239,8 @@ public class TransTypes extends TreeTran
+                 make.Apply(
+                            null,
+                            make.Select(receiver, impl).setType(calltype),
+-                           translateArgs(make.Idents(md.params), origErasure.getParameterTypes(), null))
++                           translateArgs(make.Idents(md.params), origErasure.getParameterTypes(), null),
++                           false)
+                 .setType(calltype);
+             JCStatement stat = (origErasure.getReturnType().tag == VOID)
+                 ? make.Exec(call)
+diff -r 0f653be1a42f src/share/classes/com/sun/tools/javac/jvm/Gen.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Gen.java	Thu May 14 10:58:12 2009 -0700
++++ b/src/share/classes/com/sun/tools/javac/jvm/Gen.java	Thu Jun 04 10:19:03 2009 +0200
+@@ -348,8 +348,8 @@ public class Gen extends JCTree.Visitor 
+                     boolean isStatic) {
+         Symbol msym = rs.
+             resolveInternalMethod(pos, attrEnv, site, name, argtypes, null);
+-        if (isStatic) items.makeStaticItem(msym).invoke();
+-        else items.makeMemberItem(msym, name == names.init).invoke();
++        if (isStatic) items.makeStaticItem(msym).invoke(false);
++        else items.makeMemberItem(msym, name == names.init).invoke(false);
+     }
+ 
+     /** Is the given method definition an access method
+@@ -1679,7 +1679,7 @@ public class Gen extends JCTree.Visitor 
+         // outer instance of a super(...) call appears as first parameter).
+         genArgs(tree.args,
+                 TreeInfo.symbol(tree.meth).externalType(types).getParameterTypes());
+-        result = m.invoke();
++        result = m.invoke(tree.isTail());
+     }
+ 
+     public void visitConditional(JCConditional tree) {
+@@ -1720,7 +1720,7 @@ public class Gen extends JCTree.Visitor 
+         // any implicit outer instance appears as first parameter).
+         genArgs(tree.args, tree.constructor.externalType(types).getParameterTypes());
+ 
+-        items.makeMemberItem(tree.constructor, true).invoke();
++        items.makeMemberItem(tree.constructor, true).invoke(false);
+         result = items.makeStackItem(tree.type);
+     }
+ 
+@@ -1963,7 +1963,7 @@ public class Gen extends JCTree.Visitor 
+             if (t.tag > lastBaseTag && t.tsym != syms.stringType.tsym) {
+                 t = syms.objectType;
+             }
+-            items.makeMemberItem(getStringBufferAppend(tree, t), false).invoke();
++            items.makeMemberItem(getStringBufferAppend(tree, t), false).invoke(false);
+         }
+         Symbol getStringBufferAppend(JCTree tree, Type t) {
+             assert t.constValue() == null;
+diff -r 0f653be1a42f src/share/classes/com/sun/tools/javac/jvm/Items.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Items.java	Thu May 14 10:58:12 2009 -0700
++++ b/src/share/classes/com/sun/tools/javac/jvm/Items.java	Thu Jun 04 10:19:03 2009 +0200
+@@ -214,7 +214,7 @@ public class Items {
+ 
+         /** Generate code to invoke method represented by this item.
+          */
+-        Item invoke() {
++        Item invoke(boolean isTail) {
+             throw new AssertionError(this);
+         }
+ 
+@@ -452,9 +452,10 @@ public class Items {
+             code.emitop2(putstatic, pool.put(member));
+         }
+ 
+-        Item invoke() {
++        Item invoke(boolean isTail) {
+             MethodType mtype = (MethodType)member.erasure(types);
+             int rescode = Code.typecode(mtype.restype);
++            if (isTail) code.emitop0(196);
+             code.emitInvokestatic(pool.put(member), mtype);
+             return stackItem[rescode];
+         }
+@@ -523,9 +524,10 @@ public class Items {
+             code.emitop2(putfield, pool.put(member));
+         }
+ 
+-        Item invoke() {
++        Item invoke(boolean isTail) {
+             MethodType mtype = (MethodType)member.externalType(types);
+             int rescode = Code.typecode(mtype.restype);
++            if (isTail) code.emitop0(196);
+             if ((member.owner.flags() & Flags.INTERFACE) != 0) {
+                 code.emitInvokeinterface(pool.put(member), mtype);
+             } else if (nonvirtual) {
+diff -r 0f653be1a42f src/share/classes/com/sun/tools/javac/parser/JavacParser.java
+--- a/src/share/classes/com/sun/tools/javac/parser/JavacParser.java	Thu May 14 10:58:12 2009 -0700
++++ b/src/share/classes/com/sun/tools/javac/parser/JavacParser.java	Thu Jun 04 10:19:03 2009 +0200
+@@ -656,7 +656,7 @@ public class JavacParser implements Pars
+      *  TypeNoParams2 = TypeNoParams3
+      */
+     JCExpression term2() {
+-        JCExpression t = term3();
++        JCExpression t = term3(false);
+         if ((mode & EXPR) != 0 && prec(S.token()) >= TreeInfo.orPrec) {
+             mode = EXPR;
+             return term2Rest(t, TreeInfo.orPrec);
+@@ -694,7 +694,7 @@ public class JavacParser implements Pars
+             topOp = S.token();
+             int pos = S.pos();
+             S.nextToken();
+-            odStack[top] = topOp == INSTANCEOF ? parseType() : term3();
++            odStack[top] = topOp == INSTANCEOF ? parseType() : term3(false);
+             while (top > 0 && prec(topOp) >= prec(S.token())) {
+                 odStack[top-1] = makeOp(pos, topOp, odStack[top-1],
+                                         odStack[top]);
+@@ -798,7 +798,7 @@ public class JavacParser implements Pars
+      *                   | "." ( CLASS | THIS | [TypeArguments] SUPER Arguments | NEW [TypeArguments] InnerCreator )
+      *                   ]
+      *                 | BasicType BracketsOpt "." CLASS
+-     *  PrefixOp       = "++" | "--" | "!" | "~" | "+" | "-"
++     *  PrefixOp       = "++" | "--" | "!" | "~" | "+" | "-" | "goto"
+      *  PostfixOp      = "++" | "--"
+      *  Type3          = Ident { "." Ident } [TypeArguments] {TypeSelector} BracketsOpt
+      *                 | BasicType
+@@ -811,7 +811,7 @@ public class JavacParser implements Pars
+      *  TypeSelector   = "." Ident [TypeArguments]
+      *  SuperSuffix    = Arguments | "." Ident [Arguments]
+      */
+-    protected JCExpression term3() {
++    protected JCExpression term3(boolean isTail) {
+         int pos = S.pos();
+         JCExpression t;
+         List<JCExpression> typeArgs = typeArgumentsOpt(EXPR);
+@@ -833,7 +833,7 @@ public class JavacParser implements Pars
+                     mode = EXPR;
+                     t = literal(names.hyphen);
+                 } else {
+-                    t = term3();
++                    t = term3(isTail);
+                     return F.at(pos).Unary(unoptag(token), t);
+                 }
+             } else return illegal();
+@@ -842,7 +842,7 @@ public class JavacParser implements Pars
+             if (typeArgs == null && (mode & EXPR) != 0) {
+                 S.nextToken();
+                 mode = EXPR | TYPE | NOPARAMS;
+-                t = term3();
++                t = term3(isTail);
+                 if ((mode & TYPE) != 0 && S.token() == LT) {
+                     // Could be a cast to a parameterized type
+                     int op = JCTree.LT;
+@@ -850,7 +850,7 @@ public class JavacParser implements Pars
+                     S.nextToken();
+                     mode &= (EXPR | TYPE);
+                     mode |= TYPEARG;
+-                    JCExpression t1 = term3();
++                    JCExpression t1 = term3(isTail);
+                     if ((mode & TYPE) != 0 &&
+                         (S.token() == COMMA || S.token() == GT)) {
+                         mode = TYPE;
+@@ -885,7 +885,7 @@ public class JavacParser implements Pars
+                 lastmode = mode;
+                 mode = EXPR;
+                 if ((lastmode & EXPR) == 0) {
+-                    JCExpression t1 = term3();
++                    JCExpression t1 = term3(isTail);
+                     return F.at(pos).TypeCast(t, t1);
+                 } else if ((lastmode & TYPE) != 0) {
+                     switch (S.token()) {
+@@ -898,7 +898,7 @@ public class JavacParser implements Pars
+                     case NEW: case IDENTIFIER: case ASSERT: case ENUM:
+                     case BYTE: case SHORT: case CHAR: case INT:
+                     case LONG: case FLOAT: case DOUBLE: case BOOLEAN: case VOID:
+-                        JCExpression t1 = term3();
++                        JCExpression t1 = term3(isTail);
+                         return F.at(pos).TypeCast(t, t1);
+                     }
+                 }
+@@ -911,16 +911,16 @@ public class JavacParser implements Pars
+                 t = to(F.at(pos).Ident(names._this));
+                 S.nextToken();
+                 if (typeArgs == null)
+-                    t = argumentsOpt(null, t);
++                    t = argumentsOpt(null, t, isTail);
+                 else
+-                    t = arguments(typeArgs, t);
++                    t = arguments(typeArgs, t, isTail);
+                 typeArgs = null;
+             } else return illegal();
+             break;
+         case SUPER:
+             if ((mode & EXPR) != 0) {
+                 mode = EXPR;
+-                t = to(superSuffix(typeArgs, F.at(pos).Ident(names._super)));
++                t = to(superSuffix(typeArgs, F.at(pos).Ident(names._super), isTail));
+                 typeArgs = null;
+             } else return illegal();
+             break;
+@@ -941,6 +941,12 @@ public class JavacParser implements Pars
+                 t = creator(pos, typeArgs);
+                 typeArgs = null;
+             } else return illegal();
++            break;
++        case GOTO:
++            isTail=true;
++            S.nextToken();
++            mode = EXPR;
++            t = term3(isTail);
+             break;
+         case IDENTIFIER: case ASSERT: case ENUM:
+             if (typeArgs != null) return illegal();
+@@ -967,7 +973,7 @@ public class JavacParser implements Pars
+                 case LPAREN:
+                     if ((mode & EXPR) != 0) {
+                         mode = EXPR;
+-                        t = arguments(typeArgs, t);
++                        t = arguments(typeArgs, t, isTail);
+                         typeArgs = null;
+                     }
+                     break loop;
+@@ -994,7 +1000,7 @@ public class JavacParser implements Pars
+                         case SUPER:
+                             mode = EXPR;
+                             t = to(F.at(pos).Select(t, names._super));
+-                            t = superSuffix(typeArgs, t);
++                            t = superSuffix(typeArgs, t, isTail);
+                             typeArgs = null;
+                             break loop;
+                         case NEW:
+@@ -1075,7 +1081,7 @@ public class JavacParser implements Pars
+                     mode = EXPR;
+                     t = to(F.at(pos1).Select(t, names._super));
+                     S.nextToken();
+-                    t = arguments(typeArgs, t);
++                    t = arguments(typeArgs, t, false);
+                     typeArgs = null;
+                 } else if (S.token() == NEW && (mode & EXPR) != 0) {
+                     if (typeArgs != null) return illegal();
+@@ -1087,7 +1093,7 @@ public class JavacParser implements Pars
+                     typeArgs = null;
+                 } else {
+                     t = toP(F.at(pos1).Select(t, ident()));
+-                    t = argumentsOpt(typeArgs, typeArgumentsOpt(t));
++                    t = argumentsOpt(typeArgs, typeArgumentsOpt(t), isTail);
+                     typeArgs = null;
+                 }
+             } else {
+@@ -1105,16 +1111,16 @@ public class JavacParser implements Pars
+ 
+     /** SuperSuffix = Arguments | "." [TypeArguments] Ident [Arguments]
+      */
+-    JCExpression superSuffix(List<JCExpression> typeArgs, JCExpression t) {
++    JCExpression superSuffix(List<JCExpression> typeArgs, JCExpression t, boolean isTail) {
+         S.nextToken();
+         if (S.token() == LPAREN || typeArgs != null) {
+-            t = arguments(typeArgs, t);
++            t = arguments(typeArgs, t, isTail);
+         } else {
+             int pos = S.pos();
+             accept(DOT);
+             typeArgs = (S.token() == LT) ? typeArguments() : null;
+             t = toP(F.at(pos).Select(t, ident()));
+-            t = argumentsOpt(typeArgs, t);
++            t = argumentsOpt(typeArgs, t, isTail);
+         }
+         return t;
+     }
+@@ -1129,10 +1135,10 @@ public class JavacParser implements Pars
+ 
+     /** ArgumentsOpt = [ Arguments ]
+      */
+-    JCExpression argumentsOpt(List<JCExpression> typeArgs, JCExpression t) {
++    JCExpression argumentsOpt(List<JCExpression> typeArgs, JCExpression t, boolean isTail) {
+         if ((mode & EXPR) != 0 && S.token() == LPAREN || typeArgs != null) {
+             mode = EXPR;
+-            return arguments(typeArgs, t);
++            return arguments(typeArgs, t, isTail);
+         } else {
+             return t;
+         }
+@@ -1158,10 +1164,10 @@ public class JavacParser implements Pars
+         return args.toList();
+     }
+ 
+-    JCMethodInvocation arguments(List<JCExpression> typeArgs, JCExpression t) {
++    JCMethodInvocation arguments(List<JCExpression> typeArgs, JCExpression t, boolean isTail) {
+         int pos = S.pos();
+         List<JCExpression> args = arguments();
+-        return toP(F.at(pos).Apply(typeArgs, t, args));
++        return toP(F.at(pos).Apply(typeArgs, t, args, isTail));
+     }
+ 
+     /**  TypeArgumentsOpt = [ TypeArguments ]
+diff -r 0f653be1a42f src/share/classes/com/sun/tools/javac/tree/JCTree.java
+--- a/src/share/classes/com/sun/tools/javac/tree/JCTree.java	Thu May 14 10:58:12 2009 -0700
++++ b/src/share/classes/com/sun/tools/javac/tree/JCTree.java	Thu Jun 04 10:19:03 2009 +0200
+@@ -1280,14 +1280,17 @@ public abstract class JCTree implements 
+         public JCExpression meth;
+         public List<JCExpression> args;
+         public Type varargsElement;
++        public boolean isTail;
+         protected JCMethodInvocation(List<JCExpression> typeargs,
+                         JCExpression meth,
+-                        List<JCExpression> args)
++                        List<JCExpression> args,
++                        boolean isTail)
+         {
+             this.typeargs = (typeargs == null) ? List.<JCExpression>nil()
+                                                : typeargs;
+             this.meth = meth;
+             this.args = args;
++            this.isTail = isTail;
+         }
+         @Override
+         public void accept(Visitor v) { v.visitApply(this); }
+@@ -1296,6 +1299,7 @@ public abstract class JCTree implements 
+         public List<JCExpression> getTypeArguments() {
+             return typeargs;
+         }
++        public boolean isTail() { return isTail; }
+         public JCExpression getMethodSelect() { return meth; }
+         public List<JCExpression> getArguments() {
+             return args;
+@@ -2090,7 +2094,8 @@ public abstract class JCTree implements 
+         JCAssert Assert(JCExpression cond, JCExpression detail);
+         JCMethodInvocation Apply(List<JCExpression> typeargs,
+                     JCExpression fn,
+-                    List<JCExpression> args);
++                    List<JCExpression> args,
++                    boolean isTail);
+         JCNewClass NewClass(JCExpression encl,
+                           List<JCExpression> typeargs,
+                           JCExpression clazz,
+diff -r 0f653be1a42f src/share/classes/com/sun/tools/javac/tree/TreeCopier.java
+--- a/src/share/classes/com/sun/tools/javac/tree/TreeCopier.java	Thu May 14 10:58:12 2009 -0700
++++ b/src/share/classes/com/sun/tools/javac/tree/TreeCopier.java	Thu Jun 04 10:19:03 2009 +0200
+@@ -244,7 +244,7 @@ public class TreeCopier<P> implements Tr
+         List<JCExpression> typeargs = copy(t.typeargs, p);
+         JCExpression meth = copy(t.meth, p);
+         List<JCExpression> args = copy(t.args, p);
+-        return M.at(t.pos).Apply(typeargs, meth, args);
++        return M.at(t.pos).Apply(typeargs, meth, args, t.isTail());
+     }
+ 
+     public JCTree visitModifiers(ModifiersTree node, P p) {
+diff -r 0f653be1a42f src/share/classes/com/sun/tools/javac/tree/TreeMaker.java
+--- a/src/share/classes/com/sun/tools/javac/tree/TreeMaker.java	Thu May 14 10:58:12 2009 -0700
++++ b/src/share/classes/com/sun/tools/javac/tree/TreeMaker.java	Thu Jun 04 10:19:03 2009 +0200
+@@ -318,9 +318,10 @@ public class TreeMaker implements JCTree
+ 
+     public JCMethodInvocation Apply(List<JCExpression> typeargs,
+                        JCExpression fn,
+-                       List<JCExpression> args)
++                       List<JCExpression> args,
++                       boolean isTail)
+     {
+-        JCMethodInvocation tree = new JCMethodInvocation(typeargs, fn, args);
++        JCMethodInvocation tree = new JCMethodInvocation(typeargs, fn, args, isTail);
+         tree.pos = pos;
+         return tree;
+     }
+@@ -576,15 +577,16 @@ public class TreeMaker implements JCTree
+      * Create a method invocation from a method tree and a list of
+      * argument trees.
+      */
+-    public JCMethodInvocation App(JCExpression meth, List<JCExpression> args) {
+-        return Apply(null, meth, args).setType(meth.type.getReturnType());
++    public JCMethodInvocation App(JCExpression meth, List<JCExpression> args,
++            boolean isTail) {
++        return Apply(null, meth, args, isTail).setType(meth.type.getReturnType());
+     }
+ 
+     /**
+      * Create a no-arg method invocation from a method tree
+      */
+-    public JCMethodInvocation App(JCExpression meth) {
+-        return Apply(null, meth, List.<JCExpression>nil()).setType(meth.type.getReturnType());
++    public JCMethodInvocation App(JCExpression meth, boolean isTail) {
++        return Apply(null, meth, List.<JCExpression>nil(), isTail).setType(meth.type.getReturnType());
+     }
+ 
+     /** Create a method invocation from a method tree and a list of argument trees.

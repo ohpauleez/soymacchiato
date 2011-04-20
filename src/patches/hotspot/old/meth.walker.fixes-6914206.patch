@@ -1,0 +1,268 @@
+diff --git a/src/share/vm/ci/ciMethod.cpp b/src/share/vm/ci/ciMethod.cpp
+--- a/src/share/vm/ci/ciMethod.cpp
++++ b/src/share/vm/ci/ciMethod.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -700,6 +700,12 @@
+   return flag;
+ }
+ 
++bool ciMethod::is_method_handle_adapter() const {
++  check_is_loaded();
++  VM_ENTRY_MARK;
++  return get_methodOop()->is_method_handle_adapter();
++}
++
+ ciInstance* ciMethod::method_handle_type() {
+   check_is_loaded();
+   VM_ENTRY_MARK;
+diff --git a/src/share/vm/ci/ciMethod.hpp b/src/share/vm/ci/ciMethod.hpp
+--- a/src/share/vm/ci/ciMethod.hpp
++++ b/src/share/vm/ci/ciMethod.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -215,7 +215,10 @@
+   bool check_call(int refinfo_index, bool is_static) const;
+   void build_method_data();  // make sure it exists in the VM also
+   int scale_count(int count, float prof_factor = 1.);  // make MDO count commensurate with IIC
+-  bool is_method_handle_invoke() const;
++
++  // JSR 292 support
++  bool is_method_handle_invoke()  const;
++  bool is_method_handle_adapter() const;
+   ciInstance* method_handle_type();
+ 
+   // What kind of ciObject is this?
+diff --git a/src/share/vm/classfile/systemDictionary.hpp b/src/share/vm/classfile/systemDictionary.hpp
+--- a/src/share/vm/classfile/systemDictionary.hpp
++++ b/src/share/vm/classfile/systemDictionary.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -145,7 +145,7 @@
+   template(Linkage_klass,                java_dyn_Linkage,               Opt) \
+   template(CallSite_klass,               java_dyn_CallSite,              Opt) \
+   template(InvokeDynamic_klass,          java_dyn_InvokeDynamic,         Opt) \
+-  /* Note: MethodHandle must be first, and Dynamic last in group */           \
++  /* Note: MethodHandle must be first, and InvokeDynamic last in group */     \
+                                                                               \
+   template(vector_klass,                 java_util_Vector,               Pre) \
+   template(hashtable_klass,              java_util_Hashtable,            Pre) \
+diff --git a/src/share/vm/includeDB_core b/src/share/vm/includeDB_core
+--- a/src/share/vm/includeDB_core
++++ b/src/share/vm/includeDB_core
+@@ -1,5 +1,5 @@
+ //
+-// Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++// Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+ // DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ //
+ // This code is free software; you can redistribute it and/or modify it
+@@ -3502,6 +3502,7 @@
+ reflection.cpp                          javaClasses.hpp
+ reflection.cpp                          jvm.h
+ reflection.cpp                          linkResolver.hpp
++reflection.cpp                          methodHandleWalk.hpp
+ reflection.cpp                          objArrayKlass.hpp
+ reflection.cpp                          objArrayOop.hpp
+ reflection.cpp                          oopFactory.hpp
+diff --git a/src/share/vm/oops/methodOop.cpp b/src/share/vm/oops/methodOop.cpp
+--- a/src/share/vm/oops/methodOop.cpp
++++ b/src/share/vm/oops/methodOop.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -821,6 +821,18 @@
+   return pchase;
+ }
+ 
++//------------------------------------------------------------------------------
++// methodOopDesc::is_method_handle_adapter
++//
++// Tests if this method is an internal adapter frame from the
++// MethodHandleCompiler.
++bool methodOopDesc::is_method_handle_adapter() const {
++  return ((name() == vmSymbols::invoke_name() &&
++           method_holder() == SystemDictionary::MethodHandle_klass())
++          ||
++          method_holder() == SystemDictionary::InvokeDynamic_klass());
++}
++
+ methodHandle methodOopDesc::make_invoke_method(KlassHandle holder,
+                                                symbolHandle signature,
+                                                Handle method_type, TRAPS) {
+diff --git a/src/share/vm/oops/methodOop.hpp b/src/share/vm/oops/methodOop.hpp
+--- a/src/share/vm/oops/methodOop.hpp
++++ b/src/share/vm/oops/methodOop.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -525,6 +525,9 @@
+ 
+   // JSR 292 support
+   bool is_method_handle_invoke() const              { return access_flags().is_method_handle_invoke(); }
++  // Tests if this method is an internal adapter frame from the
++  // MethodHandleCompiler.
++  bool is_method_handle_adapter() const;
+   static methodHandle make_invoke_method(KlassHandle holder,
+                                          symbolHandle signature,
+                                          Handle method_type,
+@@ -538,6 +541,7 @@
+   // all without checking for a stack overflow
+   static int extra_stack_entries() { return (EnableMethodHandles ? (int)MethodHandlePushLimit : 0) + (EnableInvokeDynamic ? 3 : 0); }
+   static int extra_stack_words();  // = extra_stack_entries() * Interpreter::stackElementSize()
++
+   // RedefineClasses() support:
+   bool is_old() const                               { return access_flags().is_old(); }
+   void set_is_old()                                 { _access_flags.set_is_old(); }
+diff --git a/src/share/vm/opto/library_call.cpp b/src/share/vm/opto/library_call.cpp
+--- a/src/share/vm/opto/library_call.cpp
++++ b/src/share/vm/opto/library_call.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -3697,12 +3697,14 @@
+ 
+ // Helper routine for above
+ bool LibraryCallKit::is_method_invoke_or_aux_frame(JVMState* jvms) {
++  ciMethod* method = jvms->method();
++
+   // Is this the Method.invoke method itself?
+-  if (jvms->method()->intrinsic_id() == vmIntrinsics::_invoke)
++  if (method->intrinsic_id() == vmIntrinsics::_invoke)
+     return true;
+ 
+   // Is this a helper, defined somewhere underneath MethodAccessorImpl.
+-  ciKlass* k = jvms->method()->holder();
++  ciKlass* k = method->holder();
+   if (k->is_instance_klass()) {
+     ciInstanceKlass* ik = k->as_instance_klass();
+     for (; ik != NULL; ik = ik->super()) {
+@@ -3712,6 +3714,10 @@
+       }
+     }
+   }
++  else if (method->is_method_handle_adapter()) {
++    // This is an internal adapter frame from the MethodHandleCompiler -- skip it
++    return true;
++  }
+ 
+   return false;
+ }
+diff --git a/src/share/vm/prims/methodHandleWalk.cpp b/src/share/vm/prims/methodHandleWalk.cpp
+--- a/src/share/vm/prims/methodHandleWalk.cpp
++++ b/src/share/vm/prims/methodHandleWalk.cpp
+@@ -631,6 +631,7 @@
+   Handle first_mtype(THREAD, chain().method_type_oop());
+   // _rklass is NULL for primitives.
+   _rtype = java_lang_Class::as_BasicType(java_dyn_MethodType::rtype(first_mtype()), &_rklass);
++  if (_rtype == T_ARRAY)  _rtype = T_OBJECT;
+ 
+   int params = _callee->size_of_parameters();  // Incoming arguments plus receiver.
+   _num_params = for_invokedynamic() ? params - 1 : params;  // XXX Check if callee is static?
+@@ -957,10 +958,13 @@
+   symbolOop name      = m->name();
+   symbolOop signature = m->signature();
+ 
+-  // This generated adapter method should be in the same class as the
+-  // DMH target method (for accessability reasons).
+   if (tailcall) {
+-    _target_klass = klass;
++    // Actually, in order to make these methods more recognizable,
++    // let's put them in holder classes MethodHandle and InvokeDynamic.
++    // That way stack walkers and compiler heuristics can recognize them.
++    _target_klass = (for_invokedynamic()
++                     ? SystemDictionary::InvokeDynamic_klass()
++                     : SystemDictionary::MethodHandle_klass());
+   }
+ 
+   // instanceKlass* ik = instanceKlass::cast(klass);
+@@ -1017,6 +1021,7 @@
+   // If tailcall, we have walked all the way to a direct method handle.
+   // Otherwise, make a recursive call to some helper routine.
+   BasicType rbt = m->result_type();
++  if (rbt == T_ARRAY)  rbt = T_OBJECT;
+   ArgToken ret;
+   if (tailcall) {
+     if (rbt != _rtype) {
+diff --git a/src/share/vm/prims/methodHandleWalk.hpp b/src/share/vm/prims/methodHandleWalk.hpp
+--- a/src/share/vm/prims/methodHandleWalk.hpp
++++ b/src/share/vm/prims/methodHandleWalk.hpp
+@@ -404,4 +404,10 @@
+ 
+   // Compile the given MH chain into bytecode.
+   methodHandle compile(TRAPS);
++
++  // Tests if the given class is a MH adapter holder.
++  static bool klass_is_method_handle_adapter_holder(klassOop klass) {
++    return (klass == SystemDictionary::MethodHandle_klass() ||
++            klass == SystemDictionary::InvokeDynamic_klass());
++  }
+ };
+diff --git a/src/share/vm/runtime/reflection.cpp b/src/share/vm/runtime/reflection.cpp
+--- a/src/share/vm/runtime/reflection.cpp
++++ b/src/share/vm/runtime/reflection.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -482,6 +482,11 @@
+       under_host_klass(accessee_ik, accessor))
+     return true;
+ 
++  // Adapter frames can access anything.
++  if (MethodHandleCompiler::klass_is_method_handle_adapter_holder(accessor))
++    // This is an internal adapter frame from the MethodHandleCompiler.
++    return true;
++
+   if (RelaxAccessControlCheck ||
+       (accessor_ik->major_version() < JAVA_1_5_VERSION &&
+        accessee_ik->major_version() < JAVA_1_5_VERSION)) {
+diff --git a/src/share/vm/runtime/vframe.cpp b/src/share/vm/runtime/vframe.cpp
+--- a/src/share/vm/runtime/vframe.cpp
++++ b/src/share/vm/runtime/vframe.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -432,6 +432,8 @@
+               Klass::cast(method()->method_holder())
+                  ->is_subclass_of(SystemDictionary::reflect_method_accessor_klass())) {
+       // This is an auxilary frame -- skip it
++    } else if (method()->is_method_handle_adapter()) {
++      // This is an internal adapter frame from the MethodHandleCompiler -- skip it
+     } else {
+       // This is non-excluded frame, we need to count it against the depth
+       if (depth-- <= 0) {

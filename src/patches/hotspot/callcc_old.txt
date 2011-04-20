@@ -1,0 +1,34 @@
+6655643: some dynamic languages need stack reification
+Summary: low-level continuation support
+
+http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=6655643
+
+Features:
+- lazy continuation storage
+- optionally delimited continuations
+
+Authors:
+- Lukas Stadler (JKU, Linz)
+- John Rose (Sun)
+
+Tests:
+	(These are junit tests, they serve mainly to explain the usage of Continuations)
+	javax.stack.*
+
+Incremental testing:
+This does not require a full JDK build.
+
+$ rm -rf build/bootcp
+$ mkdir build/bootcp
+
+$ files='
+sources/jdk/src/share/classes/javax/stack/Continuation.java
+sources/jdk/src/share/classes/javax/stack/Continuable.java
+sources/jdk/src/share/classes/javax/stack/ContinuableAccess.java
+sources/jdk/src/share/classes/javax/stack/ContinuationPermission.java
+sources/jdk/src/share/classes/javax/stack/DelimitedRunnable.java
+sources/jdk/src/share/classes/javax/stack/Fiber.java
+sources/jdk/test/javax/stack/*.java
+'
+$ javac -d build/bootcp $files
+$ java -XXaltjvm=?? -Xbootclasspath/p:build/bootcp TestCopyStack

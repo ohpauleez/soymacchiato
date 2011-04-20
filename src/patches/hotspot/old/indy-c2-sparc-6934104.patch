@@ -1,0 +1,92 @@
+diff --git a/src/cpu/sparc/vm/runtime_sparc.cpp b/src/cpu/sparc/vm/runtime_sparc.cpp
+--- a/src/cpu/sparc/vm/runtime_sparc.cpp
++++ b/src/cpu/sparc/vm/runtime_sparc.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1998-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1998-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -116,6 +116,11 @@
+   __ mov(O0, G3_scratch);             // Move handler address to temp
+   __ restore();
+ 
++  // Restore SP from L7 if the exception PC is a MethodHandle call site.
++  __ lduw(Address(G2_thread, JavaThread::is_method_handle_return_offset()), O7);
++  __ tst(O7);
++  __ movcc(Assembler::notZero, false, Assembler::icc, L7, SP);
++
+   // G3_scratch contains handler address
+   // Since this may be the deopt blob we must set O7 to look like we returned
+   // from the original pc that threw the exception
+diff --git a/src/cpu/sparc/vm/sparc.ad b/src/cpu/sparc/vm/sparc.ad
+--- a/src/cpu/sparc/vm/sparc.ad
++++ b/src/cpu/sparc/vm/sparc.ad
+@@ -531,7 +531,10 @@
+ //       The "return address" is the address of the call instruction, plus 8.
+ 
+ int MachCallStaticJavaNode::ret_addr_offset() {
+-  return NativeCall::instruction_size;  // call; delay slot
++  int offset = NativeCall::instruction_size;  // call; delay slot
++  if (_method_handle_invoke)
++    offset += 4;  // restore SP
++  return offset;
+ }
+ 
+ int MachCallDynamicJavaNode::ret_addr_offset() {
+@@ -1886,7 +1889,7 @@
+ }
+ 
+ const RegMask Matcher::method_handle_invoke_SP_save_mask() {
+-  return RegMask();
++  return L7_REGP_mask;
+ }
+ 
+ %}
+@@ -2474,6 +2477,16 @@
+                     /*preserve_g2=*/true, /*force far call*/true);
+   %}
+ 
++  enc_class preserve_SP %{
++    MacroAssembler _masm(&cbuf);
++    __ mov(SP, L7);
++  %}
++
++  enc_class restore_SP %{
++    MacroAssembler _masm(&cbuf);
++    __ mov(L7, SP);
++  %}
++
+   enc_class Java_Static_Call (method meth) %{    // JAVA STATIC CALL
+     // CALL to fixup routine.  Fixup routine uses ScopeDesc info to determine
+     // who we intended to call.
+@@ -9228,6 +9241,7 @@
+ // Call Java Static Instruction
+ instruct CallStaticJavaDirect( method meth ) %{
+   match(CallStaticJava);
++  predicate(! ((CallStaticJavaNode*)n)->is_method_handle_invoke());
+   effect(USE meth);
+ 
+   size(8);
+@@ -9238,6 +9252,20 @@
+   ins_pipe(simple_call);
+ %}
+ 
++// Call Java Static Instruction (method handle version)
++instruct CallStaticJavaHandle(method meth, l7RegP l7) %{
++  match(CallStaticJava);
++  predicate(((CallStaticJavaNode*)n)->is_method_handle_invoke());
++  effect(USE meth, KILL l7);
++
++  size(8);
++  ins_cost(CALL_COST);
++  format %{ "CALL,static/MethodHandle  ; NOP ==> " %}
++  ins_encode(preserve_SP, Java_Static_Call(meth), restore_SP, call_epilog);
++  ins_pc_relative(1);
++  ins_pipe(simple_call);
++%}
++
+ // Call Java Dynamic Instruction
+ instruct CallDynamicJavaDirect( method meth ) %{
+   match(CallDynamicJava);

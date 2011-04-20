@@ -1,0 +1,500 @@
+6829189: Java programming with JSR 292 needs language support
+6746458: writing libraries in Java for non-Java languages requires support for exotic identifiers
+Summary: Language changes documented in http://wikis.sun.com/display/mlvm/ProjectCoinProposal
+MQ base = 80586310cc78 in http://hg.openjdk.java.net/bsd-port/bsd-port/langtools [2009-03-12]
+
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java b/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
+@@ -2164,6 +2164,7 @@
+                     String binaryName = fileManager.inferBinaryName(currentLoc, fo);
+                     String simpleName = binaryName.substring(binaryName.lastIndexOf(".") + 1);
+                     if (SourceVersion.isIdentifier(simpleName) ||
++                        fo.getKind() == JavaFileObject.Kind.CLASS ||
+                         simpleName.equals("package-info"))
+                         includeClassFile(p, fo);
+                     break;
+diff --git a/src/share/classes/com/sun/tools/javac/parser/Scanner.java b/src/share/classes/com/sun/tools/javac/parser/Scanner.java
+--- a/src/share/classes/com/sun/tools/javac/parser/Scanner.java
++++ b/src/share/classes/com/sun/tools/javac/parser/Scanner.java
+@@ -317,7 +317,7 @@
+ 
+     /** Read next character in character or string literal and copy into sbuf.
+      */
+-    private void scanLitChar() {
++    private void scanLitChar(boolean forBytecodeName) {
+         if (ch == '\\') {
+             if (buf[bp+1] == '\\' && unicodeConversionBp != bp) {
+                 bp++;
+@@ -357,6 +357,18 @@
+                     putChar('\"'); scanChar(); break;
+                 case '\\':
+                     putChar('\\'); scanChar(); break;
++                case '|': case ',': case '?': case '%':
++                case '^': case '_': case '{': case '}':
++                case '!': case '-': case '=':
++                    if (forBytecodeName) {
++                        // Accept escape sequences for dangerous bytecode chars.
++                        // This is illegal in normal Java string or character literals.
++                        // Note that the escape sequence itself is passed through.
++                        putChar('\\'); putChar(ch); scanChar();
++                    } else {
++                        lexError(bp, "illegal.esc.char");
++                    }
++                    break;
+                 default:
+                     lexError(bp, "illegal.esc.char");
+                 }
+@@ -365,6 +377,24 @@
+             putChar(ch); scanChar();
+         }
+     }
++    private void scanLitChar() {
++        scanLitChar(false);
++    }
++
++    /** Read next character in an exotic name #"foo"
++     */
++    private void scanBytecodeNameChar() {
++        switch (ch) {
++        // reject any "dangerous" char which is illegal somewhere in the JVM spec
++        // cf. http://blogs.sun.com/jrose/entry/symbolic_freedom_in_the_vm
++        case '/': case '.': case ';':  // illegal everywhere
++        case '<': case '>':  // illegal in methods, dangerous in classes
++        case '[':  // illegal in classes
++            lexError(bp, "illegal.bytecode.ident.char", String.valueOf((int)ch));
++            break;
++        }
++        scanLitChar(true);
++    }
+ 
+     /** Read fractional part of hexadecimal floating point number.
+      */
+@@ -915,6 +945,26 @@
+                         lexError(pos, "unclosed.str.lit");
+                     }
+                     return;
++                case '#':
++                    scanChar();
++                    if (ch == '\"') {
++                        scanChar();
++                        if (ch == '\"')
++                            lexError(pos, "empty.bytecode.ident");
++                        while (ch != '\"' && ch != CR && ch != LF && bp < buflen) {
++                            scanBytecodeNameChar();
++                        }
++                        if (ch == '\"') {
++                            name = names.fromChars(sbuf, 0, sp);
++                            token = IDENTIFIER;  // even if #"int" or #"do"
++                            scanChar();
++                        } else {
++                            lexError(pos, "unclosed.bytecode.ident");
++                        }
++                    } else {
++                        lexError("illegal.char", String.valueOf((int)'#'));
++                    }
++                    return;
+                 default:
+                     if (isSpecial(ch)) {
+                         scanOperator();
+diff --git a/src/share/classes/com/sun/tools/javac/resources/compiler.properties b/src/share/classes/com/sun/tools/javac/resources/compiler.properties
+--- a/src/share/classes/com/sun/tools/javac/resources/compiler.properties
++++ b/src/share/classes/com/sun/tools/javac/resources/compiler.properties
+@@ -144,6 +144,8 @@
+ 
+ compiler.err.else.without.if=\
+     ''else'' without ''if''
++compiler.err.empty.bytecode.ident=\
++    empty bytecode identifier
+ compiler.err.empty.char.lit=\
+     empty character literal
+ compiler.err.encl.class.required=\
+@@ -186,6 +188,8 @@
+ 
+ compiler.err.icls.cant.have.static.decl=\
+     inner classes cannot have static declarations
++compiler.err.illegal.bytecode.ident.char=\
++    illegal bytecode identifier character: \\{0}
+ compiler.err.illegal.char=\
+     illegal character: \\{0}
+ compiler.err.illegal.char.for.encoding=\
+@@ -445,6 +449,8 @@
+ compiler.err.types.incompatible.diff.ret=\
+     types {0} and {1} are incompatible; both define {2}, but with unrelated return types
+ 
++compiler.err.unclosed.bytecode.ident=\
++    unclosed bytecode identifier
+ compiler.err.unclosed.char.lit=\
+     unclosed character literal
+ compiler.err.unclosed.comment=\
+diff --git a/src/share/classes/com/sun/tools/javap/ConstantWriter.java b/src/share/classes/com/sun/tools/javap/ConstantWriter.java
+--- a/src/share/classes/com/sun/tools/javap/ConstantWriter.java
++++ b/src/share/classes/com/sun/tools/javap/ConstantWriter.java
+@@ -339,7 +339,7 @@
+             cp = name.codePointAt(k);
+             if ((cc == '/' && !Character.isJavaIdentifierStart(cp))
+                     || (cp != '/' && !Character.isJavaIdentifierPart(cp))) {
+-                return "\"" + name + "\"";
++                return "\"" + addEscapes(name) + "\"";
+             }
+             cc = cp;
+         }
+@@ -347,6 +347,33 @@
+         return name;
+     }
+ 
++    /* If name requires escapes, put them in, so it can be a string body. */
++    private static String addEscapes(String name) {
++        String esc = "\\\"\n\t";
++        String rep = "\\\"nt";
++        StringBuilder buf = null;
++        int nextk = 0;
++        int len = name.length();
++        for (int k = 0; k < len; k++) {
++            char cp = name.charAt(k);
++            int n = esc.indexOf(cp);
++            if (n >= 0) {
++                if (buf == null)
++                    buf = new StringBuilder(len * 2);
++                if (nextk < k)
++                    buf.append(name, nextk, k);
++                buf.append('\\');
++                buf.append(rep.charAt(n));
++                nextk = k+1;
++            }
++        }
++        if (buf == null)
++            return name;
++        if (nextk < len)
++            buf.append(name, nextk, len);
++        return buf.toString();
++    }
++
+     private ClassWriter classWriter;
+     private Options options;
+ }
+diff --git a/test/tools/javac/quid/MakeNegTests.sh b/test/tools/javac/quid/MakeNegTests.sh
+new file mode 100644
+--- /dev/null
++++ b/test/tools/javac/quid/MakeNegTests.sh
+@@ -0,0 +1,97 @@
++#!/bin/sh
++
++#
++# Copyright 2008 Sun Microsystems, Inc.  All Rights Reserved.
++# DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++#
++# This code is free software; you can redistribute it and/or modify it
++# under the terms of the GNU General Public License version 2 only, as
++# published by the Free Software Foundation.
++#
++# This code is distributed in the hope that it will be useful, but WITHOUT
++# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++# version 2 for more details (a copy is included in the LICENSE file that
++# accompanied this code).
++#
++# You should have received a copy of the GNU General Public License version
++# 2 along with this work; if not, write to the Free Software Foundation,
++# Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++#
++# Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++# CA 95054 USA or visit www.sun.com if you need additional information or
++# have any questions.
++#
++
++# @test
++# @bug 6746458
++# @summary Verify correct rejection of illegal quoted identifiers.
++# @run shell MakeNegTests.sh
++
++default_template=QuotedIdent.java
++# the rest of this file is a generic "//BAD"-line tester
++
++: ${TESTSRC=.} ${TESTCLASSES=.}
++javac="${TESTJAVA+${TESTJAVA}/bin/}javac"
++
++verbose=false quiet=false
++
++main() {
++  case "${@-}" in
++  *.java*)
++    for template in "$@"; do
++      expand_and_test "$template"
++    done;;
++  *) expand_and_test "${TESTSRC}/$default_template";;
++  esac
++}
++
++expand_and_test() {
++  template=$1
++  expand "$@"
++  testneg "$@"
++}
++
++expand() {
++  template=$1
++  badlines=` grep -n < "$template" '//BAD' `
++  badcount=` echo "$badlines" | wc -l `
++  [ $badcount -gt 0 ] || { echo "No negative test cases in $template"; exit 1; }
++  $quiet || echo "Expanding $badcount negative test cases from $template:"
++  $quiet || echo "$badlines"
++  badnums=` echo "$badlines" | sed 's/:.*//' `
++  casestem=` getcasestem "$template" `
++  tclassname=` basename "$template" .java `
++  rm "$casestem"*.java
++  for badnum in $badnums; do
++    casefile="$casestem"${badnum}.java
++    cclassname=` basename "$casefile" .java `
++    sed < "$template" > "$casefile" "
++      s|@compile|@compile/fail|
++      / @[a-z]/s|@|##|
++      ${badnum}s:^ *[/*]*:    :
++      s/${tclassname}/${cclassname}/g
++    "
++    $verbose && diff -u "$template" "$casefile"
++  done
++}
++
++getcasestem() {
++  echo "$1" | sed 's/\.java$//;s/_BAD[0-9]*$//;s/$/_BAD/'
++}
++
++testneg() {
++  template=$1
++  for casefile in ` getcasestem "$template" `*.java; do
++    $quiet || echo -------- $javac "$casefile"
++    $javac "$casefile" > "$casefile".errlog 2>&1 && {
++      echo "*** Compilation unexpectedly succeeded:  $casefile"
++      exit 1
++    }
++    $quiet || echo "Compilation failed as expected"
++    $quiet || head ` $verbose || echo -3 ` < "$casefile".errlog
++    rm "$casefile".errlog
++  done
++}
++
++main "$@"
+diff --git a/test/tools/javac/quid/QuotedIdent.java b/test/tools/javac/quid/QuotedIdent.java
+new file mode 100644
+--- /dev/null
++++ b/test/tools/javac/quid/QuotedIdent.java
+@@ -0,0 +1,132 @@
++/*
++ * Copyright 2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++
++/*
++ * @test
++ * @bug 6746458
++ * @summary Verify correct lexing of quoted identifiers.
++ * @author jrose
++ *
++ * @library ..
++ * @run main quid.QuotedIdent
++ */
++
++/*
++ * Standalone testing:
++ * <code>
++ * $ cd $MY_REPO_DIR/langtools
++ * $ (cd make; make)
++ * $ ./dist/bootstrap/bin/javac -d dist test/tools/javac/quid/QuotedIdent.java
++ * $ java -version  # should print 1.6 or later
++ * $ java -cp dist quid.QuotedIdent
++ * </code>
++ */
++
++package quid;
++
++public class QuotedIdent {
++    static void check(int testid, String have, String expect)
++                throws RuntimeException {
++        if ((have == null && have != expect) ||
++                (have != null && !have.equals(expect))) {
++            String msg =
++                "TEST " + testid + ": HAVE \"" +
++                have + "\" EXPECT \"" + expect + "\"";
++            System.out.println("StringConversion: " + msg);
++            throw new RuntimeException(msg);
++        }
++    }
++
++    // negative tests:
++    //static class #"" { } //BAD empty ident name
++    //static class #"<foo>" { } //BAD bad char in ident name
++    /*static class /*(//BAD ident name interrupted by newline) #"jump:
++    " { } /* uncomment previous line to attempt class w/ bad name */
++
++    static class #"int" extends Number {
++        final int #"int";
++        #"int"(int #"int") {
++            this.#"int" = #"int";
++        }
++        static #"int" valueOf(int #"int") {
++            return new #"int"(#"int");
++        }
++        public int intValue() { return #"int"; }
++        public long longValue() { return #"int"; }
++        public float floatValue() { return #"int"; }
++        public double doubleValue() { return #"int"; }
++        public String toString() { return String.valueOf(#"int"); }
++    }
++
++    class #"*86" {
++        String #"555-1212"() { return "[*86.555-1212]"; }
++    }
++    static#"*86"#"MAKE-*86"() {   // note close spacing
++        return new QuotedIdent().new#"*86"();
++    }
++
++    static String bar() { return "[bar]"; }
++
++    public static void main(String[] args) throws Exception {
++        String s;
++
++        String #"sticky \' wicket" = "wicked ' stick";
++        s = #"sticky ' wicket";
++        check(11, s, "wicked \' stick");
++        check(12, #"s", s);
++        check(13, #"\163", s);
++
++        s = #"QuotedIdent".bar();
++        check(21, s, "[bar]");
++
++        s = #"int".valueOf(123).toString();
++        check(22, s, "123");
++
++        s = #"MAKE-*86"().#"555-1212"();
++        check(23, s, "[*86.555-1212]");
++
++        class#"{{{inmost}}}" { }
++        s = new#"{{{inmost}}}"().getClass().getName();
++        if (!s.endsWith("{{{inmost}}}"))
++            check(24, s, "should end with \"{{{inmost}}}\"");
++
++        s = #"Yog-Shoggoth".#"(nameless ululation)";
++        check(25, s, "Tekeli-li!");
++
++        s = #"int".class.getName();
++        check(31, s, QuotedIdent.class.getName()+"$int");
++
++        Class x86 = Class.forName(QuotedIdent.class.getName()+"$*86");
++        if (x86 != #"*86".class)
++            check(32, "reflected "+x86, "static "+#"*86".class);
++
++        s = (String) x86.getDeclaredMethod("555-1212").invoke(#"MAKE-*86"());
++        check(31, s, "[*86.555-1212]");
++
++        System.out.println("OK");
++    }
++}
++
++interface #"Yog-Shoggoth" {
++    final String #"(nameless ululation)" = "Tekeli-li!";
++}
+diff --git a/test/tools/javac/quid/QuotedIdent2.java b/test/tools/javac/quid/QuotedIdent2.java
+new file mode 100644
+--- /dev/null
++++ b/test/tools/javac/quid/QuotedIdent2.java
+@@ -0,0 +1,81 @@
++/*
++ * Copyright 2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++
++/*
++ * @test
++ * @bug 6746458
++ * @summary Verify correct separate compilation of classes with extended identifiers.
++ * @author jrose
++ *
++ * @library ..
++ * @run main quid.QuotedIdent2
++ */
++/*
++ * Standalone testing:
++ * <code>
++ * $ cd $MY_REPO_DIR/langtools
++ * $ (cd make; make)
++ * $ ./dist/bootstrap/bin/javac -d dist test/tools/javac/quid/QuotedIdent.java
++ * $ ./dist/bootstrap/bin/javac -d dist -cp dist test/tools/javac/quid/QuotedIdent2.java
++ * $ java -version  # should print 1.6 or later
++ * $ java -cp dist QuotedIdent2
++ * </code>
++ */
++
++package quid;
++
++import quid.QuotedIdent.*;
++import quid.QuotedIdent.#"*86";
++import static quid.QuotedIdent.#"MAKE-*86";
++
++public class QuotedIdent2 {
++    static void check(int testid, String have, String expect)
++                throws RuntimeException {
++        QuotedIdent.check(testid, have, expect);
++    }
++
++    public static void main(String[] args) throws Exception {
++        String s;
++
++        s = #"int".valueOf(123).toString();
++        check(22, s, "123");
++
++        s = #"MAKE-*86"().#"555-1212"();
++        check(23, s, "[*86.555-1212]");
++
++        s = #"Yog-Shoggoth".#"(nameless ululation)";
++        check(25, s, "Tekeli-li!");
++
++        s = QuotedIdent.#"int".class.getName();
++        check(31, s, QuotedIdent.class.getName()+"$int");
++
++        Class x86 = Class.forName(QuotedIdent.class.getName()+"$*86");
++        if (x86 != #"*86".class)
++            check(32, "reflected "+x86, "static "+#"*86".class);
++
++        s = (String) x86.getDeclaredMethod("555-1212").invoke(QuotedIdent.#"MAKE-*86"());
++        check(31, s, "[*86.555-1212]");
++
++        System.out.println("OK");
++    }
++}

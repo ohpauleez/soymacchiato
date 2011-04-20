@@ -1,0 +1,66 @@
+7009600: JSR 292 Server compiler crashes in Compile::find_intrinsic(ciMethod*, bool)
+Summary: catch errors during the compile-time processing of method handles; back out cleanly
+Reviewed-by: twisti
+
+diff --git a/src/share/vm/ci/ciMethodHandle.cpp b/src/share/vm/ci/ciMethodHandle.cpp
+--- a/src/share/vm/ci/ciMethodHandle.cpp
++++ b/src/share/vm/ci/ciMethodHandle.cpp
+@@ -42,9 +42,20 @@
+   methodHandle callee(_callee->get_methodOop());
+   // We catch all exceptions here that could happen in the method
+   // handle compiler and stop the VM.
+-  MethodHandleCompiler mhc(h, callee, is_invokedynamic, CATCH);
+-  methodHandle m = mhc.compile(CATCH);
+-  return CURRENT_ENV->get_object(m())->as_method();
++  MethodHandleCompiler mhc(h, callee, is_invokedynamic, THREAD);
++  if (!HAS_PENDING_EXCEPTION) {
++    methodHandle m = mhc.compile(THREAD);
++    if (!HAS_PENDING_EXCEPTION) {
++      return CURRENT_ENV->get_object(m())->as_method();
++    }
++  }
++  if (PrintMiscellaneous && (Verbose || WizardMode)) {
++    tty->print("*** ciMethodHandle::get_adapter => ");
++    PENDING_EXCEPTION->print();
++    tty->print("*** get_adapter (%s): ", is_invokedynamic ? "indy" : "mh"); ((ciObject*)this)->print(); //@@
++  }
++  CLEAR_PENDING_EXCEPTION;
++  return NULL;
+ }
+ 
+ 
+diff --git a/src/share/vm/opto/doCall.cpp b/src/share/vm/opto/doCall.cpp
+--- a/src/share/vm/opto/doCall.cpp
++++ b/src/share/vm/opto/doCall.cpp
+@@ -63,6 +63,7 @@
+                                        JVMState* jvms, bool allow_inline,
+                                        float prof_factor) {
+   CallGenerator* cg;
++  guarantee(call_method != NULL, "failed method resolution");
+ 
+   // Dtrace currently doesn't work unless all calls are vanilla
+   if (env()->dtrace_method_probes()) {
+@@ -130,8 +131,9 @@
+ 
+         // Get an adapter for the MethodHandle.
+         ciMethod* target_method = method_handle->get_method_handle_adapter();
+-
+-        CallGenerator* hit_cg = this->call_generator(target_method, vtable_index, false, jvms, true, prof_factor);
++        CallGenerator* hit_cg = NULL;
++        if (target_method != NULL)
++          hit_cg = this->call_generator(target_method, vtable_index, false, jvms, true, prof_factor);
+         if (hit_cg != NULL && hit_cg->is_inline())
+           return hit_cg;
+       }
+@@ -152,8 +154,9 @@
+ 
+       // Get an adapter for the MethodHandle.
+       ciMethod* target_method = method_handle->get_invokedynamic_adapter();
+-
+-      CallGenerator* hit_cg = this->call_generator(target_method, vtable_index, false, jvms, true, prof_factor);
++      CallGenerator* hit_cg = NULL;
++      if (target_method != NULL)
++        hit_cg = this->call_generator(target_method, vtable_index, false, jvms, true, prof_factor);
+       if (hit_cg != NULL && hit_cg->is_inline()) {
+         CallGenerator* miss_cg = CallGenerator::for_dynamic_call(call_method);
+         return CallGenerator::for_predicted_dynamic_call(method_handle, miss_cg, hit_cg, prof_factor);

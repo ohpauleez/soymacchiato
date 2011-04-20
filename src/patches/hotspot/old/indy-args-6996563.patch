@@ -1,0 +1,37 @@
+6996563: 6984311 changes forgot to update vmStructs.cpp for new field _operands
+Summary: Add missing line to vmStructs.  Also fix bug with class dumper.
+Reviewed-by: twisti, kvn
+
+diff --git a/agent/src/share/classes/sun/jvm/hotspot/tools/jcore/ClassWriter.java b/agent/src/share/classes/sun/jvm/hotspot/tools/jcore/ClassWriter.java
+--- a/agent/src/share/classes/sun/jvm/hotspot/tools/jcore/ClassWriter.java
++++ b/agent/src/share/classes/sun/jvm/hotspot/tools/jcore/ClassWriter.java
+@@ -303,12 +303,12 @@
+                 case JVM_CONSTANT_MethodHandle: {
+                      dos.writeByte(cpConstType);
+                      int value = cpool.getIntAt(ci);
+-                     short bootstrapMethodIndex = (short) extractLowShortFromInt(value);
+-                     short nameAndTypeIndex = (short) extractHighShortFromInt(value);
+-                     dos.writeShort(bootstrapMethodIndex);
+-                     dos.writeShort(nameAndTypeIndex);
+-                     if (DEBUG) debugMessage("CP[" + ci + "] = indy BSM = " +
+-                           bootstrapMethodIndex + ", N&T = " + nameAndTypeIndex);
++                     byte refKind = (byte) extractLowShortFromInt(value);
++                     short memberIndex = (short) extractHighShortFromInt(value);
++                     dos.writeByte(refKind);
++                     dos.writeShort(memberIndex);
++                     if (DEBUG) debugMessage("CP[" + ci + "] = MH kind = " +
++                           refKind + ", mem = " + memberIndex);
+                      break;
+                 }
+ 
+diff --git a/src/share/vm/runtime/vmStructs.cpp b/src/share/vm/runtime/vmStructs.cpp
+--- a/src/share/vm/runtime/vmStructs.cpp
++++ b/src/share/vm/runtime/vmStructs.cpp
+@@ -86,6 +86,7 @@
+   nonstatic_field(constantPoolOopDesc,         _tags,                                         typeArrayOop)                          \
+   nonstatic_field(constantPoolOopDesc,         _cache,                                        constantPoolCacheOop)                  \
+   nonstatic_field(constantPoolOopDesc,         _pool_holder,                                  klassOop)                              \
++  nonstatic_field(constantPoolOopDesc,         _operands,                                     typeArrayOop)                          \
+   nonstatic_field(constantPoolOopDesc,         _length,                                       int)                                   \
+   nonstatic_field(constantPoolCacheOopDesc,    _length,                                       int)                                   \
+   nonstatic_field(constantPoolCacheOopDesc,    _constant_pool,                                constantPoolOop)                       \

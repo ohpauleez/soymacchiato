@@ -1,0 +1,26 @@
+diff --git a/make/bsd/makefiles/vm.make b/make/bsd/makefiles/vm.make
+--- a/make/bsd/makefiles/vm.make
++++ b/make/bsd/makefiles/vm.make
+@@ -125,6 +125,8 @@
+   LIBJVM   = lib$(JVM).dylib
+   LIBJVM_G = lib$(JVM)$(G_SUFFIX).dylib
+   CFLAGS  += -D_XOPEN_SOURCE -D_DARWIN_C_SOURCE
++  # for gcc -x assembler-with-cpp version 4.2.1 (Apple Inc. build 5664):
++  ASFLAGS += -D__APPLE__
+ else
+   LIBJVM   = lib$(JVM).so
+   LIBJVM_G = lib$(JVM)$(G_SUFFIX).so
+diff --git a/src/os_cpu/bsd_x86/vm/bsd_x86_32.s b/src/os_cpu/bsd_x86/vm/bsd_x86_32.s
+--- a/src/os_cpu/bsd_x86/vm/bsd_x86_32.s
++++ b/src/os_cpu/bsd_x86/vm/bsd_x86_32.s
+@@ -689,8 +689,8 @@
+         # Support for jlong Atomic::load and Atomic::store.
+         # void _Atomic_move_long(volatile jlong* src, volatile jlong* dst)
+         .p2align 4,,15
+-	.type    _Atomic_move_long,@function
+-_Atomic_move_long:
++	ELF_TYPE(_Atomic_move_long,@function)
++SYMBOL(_Atomic_move_long):
+         movl     4(%esp), %eax   # src
+         fildll    (%eax)
+         movl     8(%esp), %eax   # dest

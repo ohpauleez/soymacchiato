@@ -1,0 +1,42 @@
+Hack for javac to dump its stack on the first error report.
+
+diff --git a/src/share/classes/com/sun/tools/javac/util/FatalError.java b/src/share/classes/com/sun/tools/javac/util/FatalError.java
+--- a/src/share/classes/com/sun/tools/javac/util/FatalError.java
++++ b/src/share/classes/com/sun/tools/javac/util/FatalError.java
+@@ -41,6 +41,7 @@
+      */
+     public FatalError() {
+         super();
++        Thread.dumpStack();
+     }
+ 
+     /** Construct a <code>FatalError</code> with the specified detail message.
+@@ -48,6 +49,7 @@
+      */
+     public FatalError(JCDiagnostic d) {
+         super(d.toString());
++        Thread.dumpStack();
+     }
+ 
+     /** Construct a <code>FatalError</code> with the specified detail message.
+@@ -56,5 +58,6 @@
+      */
+     public FatalError(String s) {
+         super(s);
++        Thread.dumpStack();
+     }
+ }
+diff --git a/src/share/classes/com/sun/tools/javac/util/JCDiagnostic.java b/src/share/classes/com/sun/tools/javac/util/JCDiagnostic.java
+--- a/src/share/classes/com/sun/tools/javac/util/JCDiagnostic.java
++++ b/src/share/classes/com/sun/tools/javac/util/JCDiagnostic.java
+@@ -161,8 +161,10 @@
+          */
+         public JCDiagnostic create(
+                 DiagnosticType kind, LintCategory lc, boolean isMandatory, DiagnosticSource source, DiagnosticPosition pos, String key, Object... args) {
++            if (kind == ERROR && (errdumps++ == 0))  Thread.dumpStack();
+             return new JCDiagnostic(formatter, kind, lc, isMandatory, source, pos, qualify(kind, key), args);
+         }
++        static int errdumps;
+ 
+         protected String qualify(DiagnosticType t, String key) {
+             return prefix + "." + t.key + "." + key;

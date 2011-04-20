@@ -1,0 +1,2416 @@
+6939861: JVM should handle more conversion operations
+Reviewed-by: ?
+
+diff --git a/src/cpu/sparc/vm/methodHandles_sparc.cpp b/src/cpu/sparc/vm/methodHandles_sparc.cpp
+--- a/src/cpu/sparc/vm/methodHandles_sparc.cpp
++++ b/src/cpu/sparc/vm/methodHandles_sparc.cpp
+@@ -175,7 +175,7 @@
+ 
+ 
+ #ifdef ASSERT
+-static void verify_argslot(MacroAssembler* _masm, Register argslot_reg, Register temp_reg, const char* error_message) {
++void MethodHandles::verify_argslot(MacroAssembler* _masm, Register argslot_reg, Register temp_reg, const char* error_message) {
+   // Verify that argslot lies within (Gargs, FP].
+   Label L_ok, L_bad;
+   BLOCK_COMMENT("{ verify_argslot");
+diff --git a/src/cpu/sparc/vm/methodHandles_sparc.hpp b/src/cpu/sparc/vm/methodHandles_sparc.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/cpu/sparc/vm/methodHandles_sparc.hpp
+@@ -0,0 +1,40 @@
++/*
++ * Copyright 2011 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ *
++ */
++
++// Platform-specific definitions for method handles.
++// These definitions are inlined into class MethodHandles.
++
++  static void insert_arg_slots(MacroAssembler* _masm,
++                               RegisterOrConstant arg_slots,
++                               int arg_mask,
++                               Register argslot_reg,
++                               Register temp_reg, Register temp2_reg, Register temp3_reg);
++
++  static void remove_arg_slots(MacroAssembler* _masm,
++                               RegisterOrConstant arg_slots,
++                               Register argslot_reg,
++                               Register temp_reg, Register temp2_reg, Register temp3_reg);
++
++  static void verify_argslot(MacroAssembler* _masm,
++                             Register argslot_reg, const char* error_message) NOT_DEBUG_RETURN;
+diff --git a/src/cpu/x86/vm/assembler_x86.hpp b/src/cpu/x86/vm/assembler_x86.hpp
+--- a/src/cpu/x86/vm/assembler_x86.hpp
++++ b/src/cpu/x86/vm/assembler_x86.hpp
+@@ -2010,6 +2010,10 @@
+   void addptr(Register dst, Address src) { LP64_ONLY(addq(dst, src)) NOT_LP64(addl(dst, src)); }
+   void addptr(Register dst, int32_t src);
+   void addptr(Register dst, Register src);
++  void addptr(Register dst, RegisterOrConstant src) {
++    if (src.is_constant()) addptr(dst, (int) src.as_constant());
++    else                   addptr(dst,       src.as_register());
++  }
+ 
+   void andptr(Register dst, int32_t src);
+   void andptr(Register src1, Register src2) { LP64_ONLY(andq(src1, src2)) NOT_LP64(andl(src1, src2)) ; }
+@@ -2071,7 +2075,10 @@
+   void subptr(Register dst, Address src) { LP64_ONLY(subq(dst, src)) NOT_LP64(subl(dst, src)); }
+   void subptr(Register dst, int32_t src);
+   void subptr(Register dst, Register src);
+-
++  void subptr(Register dst, RegisterOrConstant src) {
++    if (src.is_constant()) subptr(dst, (int) src.as_constant());
++    else                   subptr(dst,       src.as_register());
++  }
+ 
+   void sbbptr(Address dst, int32_t src) { LP64_ONLY(sbbq(dst, src)) NOT_LP64(sbbl(dst, src)); }
+   void sbbptr(Register dst, int32_t src) { LP64_ONLY(sbbq(dst, src)) NOT_LP64(sbbl(dst, src)); }
+@@ -2269,6 +2276,11 @@
+ 
+   void movptr(Address dst, Register src);
+ 
++  void movptr(Register dst, RegisterOrConstant src) {
++    if (src.is_constant()) movptr(dst, src.as_constant());
++    else                   movptr(dst, src.as_register());
++  }
++
+ #ifdef _LP64
+   // Generally the next two are only used for moving NULL
+   // Although there are situations in initializing the mark word where
+diff --git a/src/cpu/x86/vm/methodHandles_x86.cpp b/src/cpu/x86/vm/methodHandles_x86.cpp
+--- a/src/cpu/x86/vm/methodHandles_x86.cpp
++++ b/src/cpu/x86/vm/methodHandles_x86.cpp
+@@ -69,9 +69,238 @@
+   return me;
+ }
+ 
++// Given a fresh incoming stack frame, build a new ricochet frame.
++// On entry, TOS points at a return PC, and RBP is the callers frame ptr.
++void MethodHandles::RicochetFrame::start_ricochet_frame(MacroAssembler* _masm,
++                                                        Address saved_args_base,
++                                                        Register saved_target,
++                                                        Register temp_reg) {
++  trace_method_handle(_masm, "start_ricochet_frame");
++  BLOCK_COMMENT("start_ricochet_frame {");
++  assert_different_registers(saved_args_base.base(), saved_target, temp_reg);
++  // Build a frame which is similar to an interpreter frame.
++  // Cf. TemplateInterpreterGenerator::generate_fixed_frame.
++  // usual state:
++  //   sp+1: transformed adapter args...
++  //   sp+0: return pc
++  // enter();  // Don't do this yet!
++  __ lea(temp_reg, saved_args_base);
++  __ subptr(rsp, sender_pc_offset_in_bytes());
++  __ movptr(Address(rsp, saved_args_base_offset_in_bytes()), temp_reg);
++  __ movptr(Address(rsp, saved_target_offset_in_bytes()), saved_target);
++  __ load_heap_oop(temp_reg, Address(saved_target, java_lang_invoke_MethodHandle::type_offset_in_bytes()));
++  __ movptr(Address(rsp, saved_arg_types_offset_in_bytes()), temp_reg);
++  __ movptr(Address(rsp, flags_offset_in_bytes()), (int32_t) _is_adapter_frame);
++  DEBUG_ONLY(__ movptr(Address(rsp, last_sp_offset_in_bytes()), NULL_WORD));
++  __ movptr(Address(rsp, sender_sp_offset_in_bytes()), saved_last_sp_register());
++  Address sender_link_addr(rsp, sender_link_offset_in_bytes());
++  __ movptr(sender_link_addr, rbp);
++  // Now the frame is ready to go live:
++  __ lea(rbp, sender_link_addr);  // new BP points to old BP, as usual
++  // rsp: struct_address: struct RicochetFrame {...}
++
++  // add a magic number in debug mode
++  DEBUG_ONLY(__ push((int32_t) MAGIC_NUMBER_VALUE));
++
++  BLOCK_COMMENT("} start_ricochet_frame");
++
++  // At this point, we are ready to push one or more subcontinuations.
++
++  if (VerifyMethodHandles)
++    // This is overkill, since we just built a clean RicochetFrame.
++    // But it does test the verifier itself, against false negatives.
++    verify_clean(_masm);
++}
++
++void MethodHandles::RicochetFrame::save_last_sp(MacroAssembler* _masm) {
++  BLOCK_COMMENT("{ save_last_sp");
+ #ifdef ASSERT
+-static void verify_argslot(MacroAssembler* _masm, Register argslot_reg,
+-                           const char* error_message) {
++  { Label L_ok;
++    // Check that ricochet_bp > ricochet_last_sp >= this_sp
++    __ cmpptr(RicochetFrame::struct_address(last_sp_offset_in_bytes()), (int32_t) NULL_WORD);
++    __ jcc(Assembler::equal, L_ok);
++    __ stop("last_sp should be zero");
++    __ bind(L_ok);
++  }
++#endif //ASSERT
++  __ movptr(struct_address(last_sp_offset_in_bytes()), rsp);
++  BLOCK_COMMENT("} save_last_sp");
++}
++
++// After a ricochet frame has been set up, and any sub-continuation args
++// have been pushed, call this.  The label must point to code which
++// takes zero arguments and a return PC (and last_sp in rsi) and
++// moves arguments around.
++void MethodHandles::RicochetFrame::do_recursive_call(MacroAssembler* _masm,
++                                                     Register rcx_target) {
++  Register rdx_temp = rdx;  // used locally
++  assert(rcx_target == rcx, "must already have target in rcx");
++  if (VerifyMethodHandles)
++    verify_method_handle(_masm, rcx_target);
++  // rsi is an output of this code, as well as RF._last_sp
++  __ movptr(saved_last_sp_register(), struct_address(last_sp_offset_in_bytes()));
++  trace_method_handle(_masm, "do_recursive_call");
++  BLOCK_COMMENT("do_recursive_call");
++  // Push the special magic PC:
++  __ pushptr(ExternalAddress(SharedRuntime::ricochet_blob()->bounce_addr()).addr());
++  __ jump_to_method_handle_entry(rcx_target, rdx_temp);
++}
++
++// Inverse to start_ricochet_frame.
++// Take down the frame and prepare to launch another MH call.
++// Cf. InterpreterMacroAssembler::remove_activation.
++void MethodHandles::RicochetFrame::end_ricochet_frame(MacroAssembler* _masm,
++                                                      Register saved_target) {
++  trace_method_handle(_masm, "end_ricochet_frame");
++  BLOCK_COMMENT("end_ricochet_frame");
++  __ movptr(saved_target, struct_address(saved_target_offset_in_bytes()));
++  if (VerifyMethodHandles)
++    verify_method_handle(_masm, saved_target);
++  __ movptr(saved_last_sp_register(), struct_address(sender_sp_offset_in_bytes()));
++  __ leave();
++}
++
++void MethodHandles::RicochetFrame::generate_ricochet_blob(MacroAssembler* _masm,
++                                                          // output params:
++                                                          int& frame_size_in_words,
++                                                          int& bounce_offset) {
++  frame_size_in_words = RicochetFrame::frame_size_in_bytes() / wordSize;
++
++  address start = __ pc();
++
++#ifdef ASSERT
++  __ hlt(); __ hlt(); __ hlt();
++  // here's a hint of something special:
++  __ push(RicochetFrame::MAGIC_NUMBER_VALUE);
++#endif //ASSERT
++  __ hlt();  // not reached
++
++  // This code enters when returning to a ricochet adapter.
++  // A return PC has just been popped from the stack.
++  // Return values are in registers.
++  // The ebp points into the RicochetFrame, whose last_sp
++  // value points to a sub-continuation we must return to.
++
++  bounce_offset = __ pc() - start;
++
++  Address last_sp_addr = RicochetFrame::struct_address(RicochetFrame::last_sp_offset_in_bytes());
++
++#ifdef ASSERT
++  trace_method_handle(_masm, "ricochet_blob.bounce");
++  if (VerifyMethodHandles) {
++    BLOCK_COMMENT("verify_bounce_sp {");
++    Label L_bad, L_ok;
++    // Check that ricochet_bp > ricochet_last_sp >= this_sp
++    Register temp_reg = rcx;  // known dead on return
++    __ movptr(temp_reg, last_sp_addr);
++    __ cmpptr(rsp, temp_reg);
++    __ jcc(Assembler::greater, L_bad);
++    __ cmpptr(rbp, temp_reg);
++    __ jcc(Assembler::greater, L_ok);
++    __ bind(L_bad);
++    __ stop("returning into damaged ricochet frame");
++    __ bind(L_ok);
++    BLOCK_COMMENT("} verify bounce sp");
++  }
++#endif //ASSERT
++
++  BLOCK_COMMENT("ricochet_blob.bounce");
++  __ movptr(rsp, last_sp_addr);
++
++#ifdef ASSERT
++  __ movptr(last_sp_addr, NULL_WORD);
++  if (VerifyMethodHandles)
++    RicochetFrame::verify_clean(_masm, true);
++#endif //ASSERT
++
++  __ ret(0);
++}
++
++// Emit code to verify that the RSP is pointing at a clean ricochet frame
++// with a prepended MAGIC_NUMBER_VALUE.
++#ifdef ASSERT
++void MethodHandles::RicochetFrame::verify_clean(MacroAssembler* _masm, bool allow_subcon) {
++  verify_offsets();
++  Register temp_reg = rdi;
++  Label L_bad, L_ok;
++  BLOCK_COMMENT("verify_clean {");
++  __ push(temp_reg);
++  // RSP: temp_reg, {subcon?}, magic, {frame...}
++  __ lea(temp_reg, struct_address(-2*wordSize));
++  __ cmpptr(temp_reg, rsp);
++  if (!allow_subcon)
++        __ jcc(Assembler::notEqual, L_bad);
++  else  __ jcc(Assembler::less, L_bad);
++  // Magic number must check out:
++  __ movptr(temp_reg, struct_address(-wordSize));
++  __ cmpl(temp_reg, (int32_t) MAGIC_NUMBER_VALUE);
++  __ jcc(Assembler::notEqual, L_bad);
++  // last_sp must be nulled out at this point:
++  __ cmpptr(struct_address(last_sp_offset_in_bytes()), (int32_t) NULL_WORD);
++  __ jcc(Assembler::equal, L_ok);
++  __ bind(L_bad);
++  __ pop(temp_reg);
++  __ stop("damaged ricochet frame");
++  __ bind(L_ok);
++  __ pop(temp_reg);
++  BLOCK_COMMENT("} verify_clean");
++}
++#endif //ASSERT
++
++void MethodHandles::load_klass_from_Class(MacroAssembler* _masm, Register klass_reg) {
++  if (VerifyMethodHandles)
++    verify_klass(_masm, klass_reg, SystemDictionaryHandles::Class_klass(),
++                 "AMH argument is a Class");
++  __ load_heap_oop(klass_reg, Address(klass_reg, java_lang_Class::klass_offset_in_bytes()));
++}
++
++void MethodHandles::load_stack_move(MacroAssembler* _masm,
++                                    Register rdi_stack_move,
++                                    Register rcx_amh,
++                                    bool might_be_negative) {
++  Address rcx_amh_conversion(rcx_amh, java_lang_invoke_AdapterMethodHandle::conversion_offset_in_bytes());
++  __ movl(rdi_stack_move, rcx_amh_conversion);
++  __ sarl(rdi_stack_move, CONV_STACK_MOVE_SHIFT);
++#ifdef _LP64
++  if (might_be_negative) {
++    // clean high bits of stack motion register (was loaded as an int)
++    __ movslq(rdi_stack_move, rdi_stack_move);
++  }
++#endif //_LP64
++  if (VerifyMethodHandles) {
++    Label L_ok, L_bad;
++    int32_t stack_move_limit = 0x4000;  // extra-large
++    __ cmpptr(rdi_stack_move, stack_move_limit);
++    __ jcc(Assembler::greaterEqual, L_bad);
++    __ cmpptr(rdi_stack_move, -stack_move_limit);
++    __ jcc(Assembler::greater, L_ok);
++    __ bind(L_bad);
++    __ stop("load_stack_move of garbage value");
++    __ bind(L_ok);
++  }
++}
++
++#ifndef PRODUCT
++void MethodHandles::RicochetFrame::verify_offsets() {
++  // Check compatibility of this struct with the more generally used offsets of class frame:
++  int ebp_off = frame_size_in_bytes();  // offset from struct base to local rbp value
++  assert(ebp_off + wordSize*frame::interpreter_frame_method_offset      == flags_offset_in_bytes(), "");
++  assert(ebp_off + wordSize*frame::interpreter_frame_last_sp_offset     == last_sp_offset_in_bytes(), "");
++  assert(ebp_off + wordSize*frame::interpreter_frame_sender_sp_offset   == sender_sp_offset_in_bytes(), "");
++  assert(ebp_off + wordSize*frame::link_offset                          == sender_link_offset_in_bytes(), "");
++  assert(ebp_off + wordSize*frame::return_addr_offset                   == sender_pc_offset_in_bytes(), "");
++}
++
++void MethodHandles::RicochetFrame::verify() const {
++  verify_offsets();
++  assert(magic_number() == MAGIC_NUMBER_VALUE, "");
++}
++#endif //PRODUCT
++
++#ifdef ASSERT
++void MethodHandles::verify_argslot(MacroAssembler* _masm,
++                                   Register argslot_reg,
++                                   const char* error_message) {
+   // Verify that argslot lies within (rsp, rbp].
+   Label L_ok, L_bad;
+   BLOCK_COMMENT("{ verify_argslot");
+@@ -84,8 +313,102 @@
+   __ bind(L_ok);
+   BLOCK_COMMENT("} verify_argslot");
+ }
+-#endif
+ 
++void MethodHandles::verify_argslots(MacroAssembler* _masm,
++                                    RegisterOrConstant arg_slots,
++                                    Register arg_slot_base_reg,
++                                    bool negate_argslots,
++                                    const char* error_message) {
++  // Verify that [argslot..argslot+size) lies within (rsp, rbp).
++  Label L_ok, L_bad;
++  Register temp_reg = rdi;
++  BLOCK_COMMENT("{ verify_argslots");
++  __ push(temp_reg);
++  if (negate_argslots) {
++    if (arg_slots.is_constant()) {
++      arg_slots = -1 * arg_slots.as_constant();
++    } else {
++      __ movptr(temp_reg, arg_slots);
++      __ negptr(temp_reg);
++      arg_slots = temp_reg;
++    }
++  }
++  __ lea(temp_reg, Address(arg_slot_base_reg, arg_slots, Address::times_ptr));
++  __ cmpptr(temp_reg, rbp);
++  __ pop(temp_reg);
++  __ jcc(Assembler::above, L_bad);
++  __ cmpptr(rsp, arg_slot_base_reg);
++  __ jcc(Assembler::below, L_ok);
++  __ bind(L_bad);
++  __ stop(error_message);
++  __ bind(L_ok);
++  BLOCK_COMMENT("} verify_argslots");
++}
++
++void MethodHandles::verify_stack_move(MacroAssembler* _masm,
++                                      RegisterOrConstant arg_slots, int direction) {
++  enum { UNREASONABLE_STACK_MOVE = 256 * 4 };  // limit of 255 arguments
++  assert(direction != 0, "+1 or -1");
++  if (arg_slots.is_register()) {
++    Label L_ok, L_bad;
++    BLOCK_COMMENT("{ verify_stack_move");
++    __ cmpptr(arg_slots.as_register(), (int32_t) NULL_WORD);
++    if (direction > 0) {
++      __ jcc(Assembler::lessEqual, L_bad);
++      __ cmpptr(arg_slots.as_register(), (int32_t) UNREASONABLE_STACK_MOVE);
++      __ jcc(Assembler::greater, L_bad);
++    } else {
++      __ jcc(Assembler::greaterEqual, L_bad);
++      __ cmpptr(arg_slots.as_register(), (int32_t) -UNREASONABLE_STACK_MOVE);
++      __ jcc(Assembler::less, L_bad);
++    }
++    __ testl(arg_slots.as_register(), -stack_move_unit() - 1);
++    __ jcc(Assembler::zero, L_ok);
++    __ bind(L_bad);
++    if (direction > 0)
++      __ stop("assert arg_slots > 0 and clear low bits");
++    else
++      __ stop("assert arg_slots < 0 and clear low bits");
++    __ bind(L_ok);
++    BLOCK_COMMENT("} verify_stack_move");
++  } else {
++    intptr_t size = arg_slots.as_constant();
++    if (direction < 0)  size = -size;
++    assert(size >= 0, "correct direction of constant move");
++    assert(size < UNREASONABLE_STACK_MOVE, "reasonable size of constant move");
++    assert(size % -stack_move_unit() == 0, "");
++  }
++}
++
++void MethodHandles::verify_klass(MacroAssembler* _masm,
++                                 Register obj, KlassHandle klass,
++                                 const char* error_message) {
++  oop* klass_addr = klass.raw_value();
++  assert(klass_addr >= SystemDictionaryHandles::Object_klass().raw_value() &&
++         klass_addr <= SystemDictionaryHandles::Long_klass().raw_value(),
++         "must be one of the SystemDictionaryHandles");
++  Register temp = rdi;
++  Label L_ok, L_bad;
++  BLOCK_COMMENT("{ verify_klass");
++  __ verify_oop(obj);
++  __ testptr(obj, obj);
++  __ jcc(Assembler::zero, L_bad);
++  __ push(temp);
++  __ load_klass(temp, obj);
++  __ cmpptr(temp, ExternalAddress((address) klass_addr));
++  __ jcc(Assembler::equal, L_ok);
++  intptr_t super_check_offset = klass->super_check_offset();
++  __ movptr(temp, Address(temp, super_check_offset));
++  __ cmpptr(temp, ExternalAddress((address) klass_addr));
++  __ jcc(Assembler::equal, L_ok);
++  __ pop(temp);
++  __ bind(L_bad);
++  __ stop(error_message);
++  __ bind(L_ok);
++  __ pop(temp);
++  BLOCK_COMMENT("} verify_klass");
++}
++#endif //ASSERT
+ 
+ // Code generation
+ address MethodHandles::generate_method_handle_interpreter_entry(MacroAssembler* _masm) {
+@@ -185,40 +508,33 @@
+   return entry_point;
+ }
+ 
++static void load_vmargslot(MacroAssembler* _masm, Register result, Address vmargslot_addr) {
++  __ load_unsigned_short(result, vmargslot_addr);
++  assert(java_lang_invoke_BoundMethodHandle::ARG_SLOT_MASK == (u2)-1, "else change previous line");
++}
++
++// Workaround for C++ overloading nastiness on '0' for RegisterOrConstant.
++static RegisterOrConstant constant(int value) {
++  return RegisterOrConstant(value);
++}
++
+ // Helper to insert argument slots into the stack.
+ // arg_slots must be a multiple of stack_move_unit() and <= 0
++// rax_argslot is decremented to point to the new (shifted) location of the argslot
++// But, rdx_temp ends up holding the original value of rax_argslot.
+ void MethodHandles::insert_arg_slots(MacroAssembler* _masm,
+                                      RegisterOrConstant arg_slots,
+                                      int arg_mask,
+                                      Register rax_argslot,
+-                                     Register rbx_temp, Register rdx_temp, Register temp3_reg) {
+-  assert(temp3_reg == noreg, "temp3 not required");
++                                     Register rbx_temp, Register rdx_temp) {
++  if (arg_slots.is_constant() && arg_slots.as_constant() == 0)
++    return;
+   assert_different_registers(rax_argslot, rbx_temp, rdx_temp,
+                              (!arg_slots.is_register() ? rsp : arg_slots.as_register()));
+-
+-#ifdef ASSERT
+-  verify_argslot(_masm, rax_argslot, "insertion point must fall within current frame");
+-  if (arg_slots.is_register()) {
+-    Label L_ok, L_bad;
+-    __ cmpptr(arg_slots.as_register(), (int32_t) NULL_WORD);
+-    __ jccb(Assembler::greater, L_bad);
+-    __ testl(arg_slots.as_register(), -stack_move_unit() - 1);
+-    __ jccb(Assembler::zero, L_ok);
+-    __ bind(L_bad);
+-    __ stop("assert arg_slots <= 0 and clear low bits");
+-    __ bind(L_ok);
+-  } else {
+-    assert(arg_slots.as_constant() <= 0, "");
+-    assert(arg_slots.as_constant() % -stack_move_unit() == 0, "");
+-  }
+-#endif //ASSERT
+-
+-#ifdef _LP64
+-  if (arg_slots.is_register()) {
+-    // clean high bits of stack motion register (was loaded as an int)
+-    __ movslq(arg_slots.as_register(), arg_slots.as_register());
+-  }
+-#endif
++  if (VerifyMethodHandles)
++    verify_argslot(_masm, rax_argslot, "insertion point must fall within current frame");
++  if (VerifyMethodHandles)
++    verify_stack_move(_masm, arg_slots, -1);
+ 
+   // Make space on the stack for the inserted argument(s).
+   // Then pull down everything shallower than rax_argslot.
+@@ -250,39 +566,18 @@
+ // Helper to remove argument slots from the stack.
+ // arg_slots must be a multiple of stack_move_unit() and >= 0
+ void MethodHandles::remove_arg_slots(MacroAssembler* _masm,
+-                                    RegisterOrConstant arg_slots,
+-                                    Register rax_argslot,
+-                                     Register rbx_temp, Register rdx_temp, Register temp3_reg) {
+-  assert(temp3_reg == noreg, "temp3 not required");
++                                     RegisterOrConstant arg_slots,
++                                     Register rax_argslot,
++                                     Register rbx_temp, Register rdx_temp) {
++  if (arg_slots.is_constant() && arg_slots.as_constant() == 0)
++    return;
+   assert_different_registers(rax_argslot, rbx_temp, rdx_temp,
+                              (!arg_slots.is_register() ? rsp : arg_slots.as_register()));
+-
+-#ifdef ASSERT
+-  // Verify that [argslot..argslot+size) lies within (rsp, rbp).
+-  __ lea(rbx_temp, Address(rax_argslot, arg_slots, Address::times_ptr));
+-  verify_argslot(_masm, rbx_temp, "deleted argument(s) must fall within current frame");
+-  if (arg_slots.is_register()) {
+-    Label L_ok, L_bad;
+-    __ cmpptr(arg_slots.as_register(), (int32_t) NULL_WORD);
+-    __ jccb(Assembler::less, L_bad);
+-    __ testl(arg_slots.as_register(), -stack_move_unit() - 1);
+-    __ jccb(Assembler::zero, L_ok);
+-    __ bind(L_bad);
+-    __ stop("assert arg_slots >= 0 and clear low bits");
+-    __ bind(L_ok);
+-  } else {
+-    assert(arg_slots.as_constant() >= 0, "");
+-    assert(arg_slots.as_constant() % -stack_move_unit() == 0, "");
+-  }
+-#endif //ASSERT
+-
+-#ifdef _LP64
+-  if (false) {                  // not needed, since register is positive
+-    // clean high bits of stack motion register (was loaded as an int)
+-    if (arg_slots.is_register())
+-      __ movslq(arg_slots.as_register(), arg_slots.as_register());
+-  }
+-#endif
++  if (VerifyMethodHandles)
++    verify_argslots(_masm, arg_slots, rax_argslot, false,
++                    "deleted argument(s) must fall within current frame");
++  if (VerifyMethodHandles)
++    verify_stack_move(_masm, arg_slots, +1);
+ 
+   BLOCK_COMMENT("remove_arg_slots {");
+   // Pull up everything shallower than rax_argslot.
+@@ -312,6 +607,136 @@
+   BLOCK_COMMENT("} remove_arg_slots");
+ }
+ 
++// Helper to copy argument slots to a shallower position on the stack.
++// arg_slots must be a multiple of stack_move_unit() and <= 0
++// insert_location must refer to a lower address within the stack
++void MethodHandles::copy_arg_slots(MacroAssembler* _masm,
++                                   RegisterOrConstant arg_slots,
++                                   Register rax_argslot,
++                                   Address insert_location,
++                                   Register rbx_temp, Register rdx_temp) {
++  if (arg_slots.is_constant() && arg_slots.as_constant() == 0)
++    return;
++  assert_different_registers(rax_argslot, rbx_temp, rdx_temp,
++                             insert_location.base(),
++                             (!arg_slots.is_register() ? rbp : arg_slots.as_register()));
++  if (VerifyMethodHandles)
++    verify_stack_move(_masm, arg_slots, -1);
++
++  int constant_arg_slots = 0;
++  if (arg_slots.is_constant()) {
++    constant_arg_slots = arg_slots.as_constant();
++    assert(constant_arg_slots < 0, "");
++  }
++
++  int constant_stack_header = -1;
++  if (insert_location.base() == rsp) {
++    constant_stack_header = insert_location.disp();
++    assert(constant_stack_header % wordSize == 0, "");
++  }
++
++  Label L_done;
++  BLOCK_COMMENT("copy_arg_slots {");
++
++  if (constant_stack_header >= 0 && constant_stack_header <= wordSize*2) {
++    Label L_skip;
++    // Easy case:  There are 0, 1, or 2 words to carry down with the TOS.
++    int pops = constant_stack_header / wordSize;
++    int pushes = -1 * constant_arg_slots;
++    if (constant_arg_slots == 0) {
++      // Emit code to dynamically check for the common case, one slot.
++      pushes = 1;
++      __ cmpl(arg_slots.as_register(), -1);
++      __ jccb(Assembler::notEqual, L_skip);
++    }
++    if (pops >= 1)  __ pop(rbx_temp);
++    if (pops >= 2)  __ pop(rdx_temp);
++    // Use the push instruction to perform the copies.
++    for (int slot = pushes - 1; slot >= 0; slot--) {
++      __ pushptr(Address(rax_argslot, slot * wordSize));
++    }
++    if (pops >= 2)  __ push(rdx_temp);
++    if (pops >= 1)  __ push(rbx_temp);
++    if (arg_slots.is_register()) {
++      __ jmp(L_done);
++      __ bind(L_skip);
++    } else {
++      BLOCK_COMMENT("} copy_arg_slots");
++      return;
++    }
++  }
++
++  // Make space on the stack for the copied argument(s).
++  // Pull down everything shallower than insert_location.
++  if (constant_stack_header >= 0 && constant_stack_header <= wordSize*2) {
++    // Easy case:  There are 0, 1, or 2 words to carry down with the TOS.
++    int pops = constant_stack_header / wordSize;
++    if (pops >= 1)  __ pop(rbx_temp);
++    if (pops >= 2)  __ pop(rdx_temp);
++    __ lea(rsp, Address(rsp, arg_slots, Address::times_ptr));
++    if (pops >= 2)  __ push(rdx_temp);
++    if (pops >= 1)  __ push(rbx_temp);
++  } else {
++    Untested("dup args to middle of arg list");
++    __ push(rax_argslot);
++    if (insert_location.base() == rsp)
++          __ lea(rax_argslot, insert_location.plus_disp(wordSize));
++    else  __ lea(rax_argslot, insert_location);
++    insert_arg_slots(_masm, arg_slots, _INSERT_NO_MASK,
++                     rax_argslot, rbx_temp, rdx_temp);
++    __ pop(rax_argslot);
++  }
++
++  // Pull down the insert location by the same amount as rsp was pulled down
++  if (insert_location.base() != rsp) {
++    if (constant_arg_slots < 0) {
++      insert_location = insert_location.plus_disp(constant_arg_slots * wordSize);
++    } else {
++      __ lea(insert_location.base(),
++             Address(insert_location.base(), arg_slots, Address::times_ptr));
++    }
++  }
++
++  // Now copy the required number of argument words into the new space.
++  if (constant_arg_slots < 0) {
++    for (int slot = 0; slot < -1 * constant_arg_slots; slot++) {
++      __ movptr(rbx_temp, Address(rax_argslot, slot * wordSize));
++      __ movptr(insert_location.plus_disp(slot * wordSize), rbx_temp);
++    }
++  } else {
++    // Copy [argslot, argslot+size) down to insert_location.  In pseudo-code:
++    //   offset = &insert_location - rax_argslot
++    //   for (rdx = argslot + size - 1; rdx >= argslot; rdx--)
++    //     rdx[offset] = rdx[0]
++    Register rdi_size = arg_slots.as_register();
++    Register rsi_offset = rsi;
++    assert_different_registers(rax_argslot, rbx_temp, rdx_temp, rsi_offset, rdi_size);
++    int rdi_rsi_push_size = 2*wordSize;
++    { __ push(rdi_size); __ push(rsi_offset); }
++#define POP_RDI_RSI \
++    { __ pop(rsi_offset); __ pop(rdi_size); }
++    __ negptr(rdi_size);
++    if (insert_location.base() != rsp)
++          __ lea(rsi_offset, insert_location);
++    else  __ lea(rsi_offset, insert_location.plus_disp(rdi_rsi_push_size));
++    __ subptr(rsi_offset, rax_argslot);
++    __ lea(rdx_temp, Address(rax_argslot, rdi_size, Address::times_ptr, -wordSize));
++    {
++      Label loop;
++      __ BIND(loop);
++      // pull one word down each time through the loop
++      __ movptr(rbx_temp, Address(rdx_temp, 0));
++      __ movptr(Address(rdx_temp, rsi_offset, Address::times_1), rbx_temp);
++      __ subptr(rdx_temp, wordSize);
++      __ cmpptr(rdx_temp, rax_argslot);
++      __ jccb(Assembler::greaterEqual, loop);
++    }
++    POP_RDI_RSI;
++  }
++  __ bind(L_done);
++  BLOCK_COMMENT("} copy_arg_slots");
++}
++
+ #ifndef PRODUCT
+ extern "C" void print_method_handle(oop mh);
+ void trace_method_handle_stub(const char* adaptername,
+@@ -322,7 +747,13 @@
+                               intptr_t* saved_bp) {
+   // called as a leaf from native code: do not block the JVM!
+   intptr_t* last_sp = (intptr_t*) saved_bp[frame::interpreter_frame_last_sp_offset];
+-  intptr_t* base_sp = (intptr_t*) saved_bp[frame::interpreter_frame_monitor_block_top_offset];
++  intptr_t* base_sp = last_sp;
++  typedef MethodHandles::RicochetFrame RicochetFrame;
++  RicochetFrame* rfp = (RicochetFrame*)((address)saved_bp - RicochetFrame::sender_link_offset_in_bytes());
++  if ((rfp->flags() & RicochetFrame::_is_adapter_frame) == 0) {
++    // Probably an interpreter frame.
++    base_sp = (intptr_t*) saved_bp[frame::interpreter_frame_monitor_block_top_offset];
++  }
+   printf("MH %s mh="INTPTR_FORMAT" sp=("INTPTR_FORMAT"+"INTX_FORMAT") stack_size="INTX_FORMAT" bp="INTPTR_FORMAT"\n",
+          adaptername, (intptr_t)mh, (intptr_t)entry_sp, (intptr_t)(saved_sp - entry_sp), (intptr_t)(base_sp - last_sp), (intptr_t)saved_bp);
+   if (last_sp != saved_sp && last_sp != NULL)
+@@ -376,13 +807,15 @@
+          |(1<<java_lang_invoke_AdapterMethodHandle::OP_CHECK_CAST)
+          |(1<<java_lang_invoke_AdapterMethodHandle::OP_PRIM_TO_PRIM)
+          |(1<<java_lang_invoke_AdapterMethodHandle::OP_REF_TO_PRIM)
++         |(!OptimizeMethodHandles || FLAG_IS_DEFAULT(OptimizeMethodHandles) ? 0 :
++           (1<<java_lang_invoke_AdapterMethodHandle::OP_PRIM_TO_REF)
++           )
+          |(1<<java_lang_invoke_AdapterMethodHandle::OP_SWAP_ARGS)
+          |(1<<java_lang_invoke_AdapterMethodHandle::OP_ROT_ARGS)
+          |(1<<java_lang_invoke_AdapterMethodHandle::OP_DUP_ARGS)
+          |(1<<java_lang_invoke_AdapterMethodHandle::OP_DROP_ARGS)
+-         //|(1<<java_lang_invoke_AdapterMethodHandle::OP_SPREAD_ARGS) //BUG!
++         |(1<<java_lang_invoke_AdapterMethodHandle::OP_SPREAD_ARGS)
+          );
+-  // FIXME: MethodHandlesTest gets a crash if we enable OP_SPREAD_ARGS.
+ }
+ 
+ //------------------------------------------------------------------------------
+@@ -403,10 +836,11 @@
+   const Register rax_argslot = rax;
+   const Register rbx_temp    = rbx;
+   const Register rdx_temp    = rdx;
++  const Register rdi_temp    = rdi;
+ 
+   // This guy is set up by prepare_to_jump_from_interpreted (from interpreted calls)
+   // and gen_c2i_adapter (from compiled calls):
+-  const Register saved_last_sp = LP64_ONLY(r13) NOT_LP64(rsi);
++  const Register saved_last_sp = saved_last_sp_register();
+ 
+   // Argument registers for _raise_exception.
+   // 32-bit: Pass first two oop/int args in registers ECX and EDX.
+@@ -483,6 +917,10 @@
+     }
+     break;
+ 
++  case _invokegeneric_mh:
++    __ unimplemented(entry_name(ek)); // %%% FIXME: NYI
++    break;
++
+   case _invokestatic_mh:
+   case _invokespecial_mh:
+     {
+@@ -554,7 +992,6 @@
+       __ load_klass(rax_klass, rcx_recv);
+       __ verify_oop(rax_klass);
+ 
+-      Register rdi_temp   = rdi;
+       Register rbx_method = rbx_index;
+ 
+       // get interface klass
+@@ -596,7 +1033,7 @@
+       get_ek_bound_mh_info(ek, arg_type, arg_mask, arg_slots);
+ 
+       // make room for the new argument:
+-      __ movl(rax_argslot, rcx_bmh_vmargslot);
++      load_vmargslot(_masm, rax_argslot, rcx_bmh_vmargslot);
+       __ lea(rax_argslot, __ argument_address(rax_argslot));
+ 
+       insert_arg_slots(_masm, arg_slots * stack_move_unit(), arg_mask, rax_argslot, rbx_temp, rdx_temp);
+@@ -641,12 +1078,12 @@
+       Register rbx_klass = rbx_temp; // interesting AMH data
+ 
+       // check a reference argument before jumping to the next layer of MH:
+-      __ movl(rax_argslot, rcx_amh_vmargslot);
++      load_vmargslot(_masm, rax_argslot, rcx_amh_vmargslot);
+       vmarg = __ argument_address(rax_argslot);
+ 
+       // What class are we casting to?
+       __ load_heap_oop(rbx_klass, rcx_amh_argument); // this is a Class object!
+-      __ load_heap_oop(rbx_klass, Address(rbx_klass, java_lang_Class::klass_offset_in_bytes()));
++      load_klass_from_Class(_masm, rbx_klass);
+ 
+       Label done;
+       __ movptr(rdx_temp, vmarg);
+@@ -663,7 +1100,7 @@
+       // If we get here, the type check failed!
+       // Call the wrong_method_type stub, passing the failing argument type in rax.
+       Register rax_mtype = rax_argslot;
+-      __ movl(rax_argslot, rcx_amh_vmargslot);  // reload argslot field
++      load_vmargslot(_masm, rax_argslot, rcx_amh_vmargslot);  // reload argslot field
+       __ movptr(rdx_temp, vmarg);
+ 
+       assert_different_registers(rarg2_required, rdx_temp);
+@@ -681,6 +1118,7 @@
+ 
+   case _adapter_prim_to_prim:
+   case _adapter_ref_to_prim:
++  case _adapter_prim_to_ref:
+     // handled completely by optimized cases
+     __ stop("init_AdapterMethodHandle should not issue this");
+     break;
+@@ -691,7 +1129,7 @@
+   case _adapter_opt_unboxi:     // optimized subcase of adapt_ref_to_prim
+     {
+       // perform an in-place conversion to int or an int subword
+-      __ movl(rax_argslot, rcx_amh_vmargslot);
++      load_vmargslot(_masm, rax_argslot, rcx_amh_vmargslot);
+       vmarg = __ argument_address(rax_argslot);
+ 
+       switch (ek) {
+@@ -767,7 +1205,7 @@
+   case _adapter_opt_unboxl:     // optimized subcase of adapt_ref_to_prim
+     {
+       // perform an in-place int-to-long or ref-to-long conversion
+-      __ movl(rax_argslot, rcx_amh_vmargslot);
++      load_vmargslot(_masm, rax_argslot, rcx_amh_vmargslot);
+ 
+       // on a little-endian machine we keep the first slot and add another after
+       __ lea(rax_argslot, __ argument_address(rax_argslot, 1));
+@@ -820,7 +1258,7 @@
+   case _adapter_opt_d2f:        // optimized subcase of adapt_prim_to_prim
+     {
+       // perform an in-place floating primitive conversion
+-      __ movl(rax_argslot, rcx_amh_vmargslot);
++      load_vmargslot(_masm, rax_argslot, rcx_amh_vmargslot);
+       __ lea(rax_argslot, __ argument_address(rax_argslot, 1));
+       if (ek == _adapter_opt_f2d) {
+         insert_arg_slots(_masm, stack_move_unit(), _INSERT_INT_MASK,
+@@ -858,8 +1296,95 @@
+     }
+     break;
+ 
+-  case _adapter_prim_to_ref:
+-    __ unimplemented(entry_name(ek)); // %%% FIXME: NYI
++  case _adapter_opt_filter_1:
++  case _adapter_opt_collect_2:
++  case _adapter_opt_collect_3:
++  case _adapter_opt_collect_more:
++    {
++      // Pass 1 or more argument slots to the recursive target.
++      // Replace all those slots by the result of the recursive call.
++      int slot_count_constant = -1;
++      switch ((int)ek) {
++      case _adapter_opt_filter_1:     slot_count_constant = 1; break;
++      case _adapter_opt_collect_2:    slot_count_constant = 2; break;
++      case _adapter_opt_collect_3:    slot_count_constant = 3; break;
++      case _adapter_opt_collect_more: break;
++      default: assert(false, "");
++      }
++
++      // The argslot points to the primitive to be boxed,
++      // or to the arguments to filter or collect.
++      Register rbx_saved_argslot = rbx_temp;
++      Register rax_temp = rax_argslot;
++      DEBUG_ONLY(void** rax_argslot); // don't use me!
++      load_vmargslot(_masm, rbx_saved_argslot, rcx_amh_vmargslot);
++      __ lea(rbx_saved_argslot, __ argument_address(rbx_saved_argslot));
++
++      // This must be implemented as a ricochet, since the recursive target
++      // might have to GC and/or block.
++      RicochetFrame::start_ricochet_frame(_masm,
++                                          __ argument_address(constant(0)),
++                                          rcx_recv, rdx_temp);
++
++      Label L_subcon;
++      // Save and restore extra state across the recursive call:
++      __ push(rbx_saved_argslot);
++      __ call(L_subcon, relocInfo::none);
++      __ pop(rbx_saved_argslot);
++      if (VerifyMethodHandles)
++        RicochetFrame::verify_clean(_masm);
++
++      // After the recursive call finishes, store the result back into the argslot.
++      __ movptr(Address(rbx_saved_argslot, 0), rax_temp);
++
++      RegisterOrConstant stack_move;
++      Register rdi_stack_move = rdi_temp;
++
++      // Pop the frame and delete any extra arguments we don't need.
++      RicochetFrame::end_ricochet_frame(_masm, rcx_recv);
++      if (slot_count_constant != -1) {
++        int pop_all_but_one = -stack_move_unit() * (slot_count_constant-1);
++        stack_move = pop_all_but_one;
++      } else {
++        load_stack_move(_masm, rdi_stack_move, rcx_recv, false);
++        stack_move = rdi_stack_move;
++      }
++      remove_arg_slots(_masm, stack_move, rbx_saved_argslot, rax_temp, rdx_temp);
++
++      // Load the final target and go.
++      __ movptr(rcx_recv, rcx_mh_vmtarget);
++      __ jump_to_method_handle_entry(rcx_recv, rdx_temp);
++      __ hlt(); // --------------------
++
++      // Come here when a new ricochet frame has been set up
++      // and a subcontinuation PC is pushed.
++      __ BIND(L_subcon);
++      RicochetFrame::save_last_sp(_masm);  // this lets us get back to the subcon
++
++      // Marshal the arguments for the recursive call.
++      if (slot_count_constant != -1) {
++        int push_all = stack_move_unit() * slot_count_constant;
++        stack_move = push_all;
++      } else {
++        load_stack_move(_masm, rdi_stack_move, rcx_recv, false);
++        __ negptr(rdi_stack_move);  // needs to be negative for copy_arg_slots
++        __ addptr(rdi_stack_move, stack_move_unit());
++        stack_move = rdi_stack_move;
++      }
++
++      // Copy down the arguments directly to TOS.
++      Address tos_address(rsp, 0);
++      copy_arg_slots(_masm, stack_move, rbx_saved_argslot,
++                     tos_address, rax_temp, rdx_temp);
++
++      // Load the recursive target.
++      // In the case of a boxing call, the recursive call is to a 'boxer' method,
++      // such as Integer.valueOf or Long.valueOf.  In the case of a filter
++      // or collect call, it will take one or more arguments, transform them,
++      // and return some result, to store back into argslot.
++      __ movptr(rcx_recv, rcx_amh_argument);
++      RicochetFrame::do_recursive_call(_masm, rcx_recv);
++    }
+     break;
+ 
+   case _adapter_swap_args:
+@@ -879,7 +1404,7 @@
+       get_ek_adapter_opt_swap_rot_info(ek, swap_bytes, rotate);
+ 
+       // 'argslot' is the position of the first argument to swap
+-      __ movl(rax_argslot, rcx_amh_vmargslot);
++      load_vmargslot(_masm, rax_argslot, rcx_amh_vmargslot);
+       __ lea(rax_argslot, __ argument_address(rax_argslot));
+ 
+       // 'vminfo' is the second
+@@ -888,7 +1413,8 @@
+       assert(CONV_VMINFO_SHIFT == 0, "preshifted");
+       __ andl(rbx_destslot, CONV_VMINFO_MASK);
+       __ lea(rbx_destslot, __ argument_address(rbx_destslot));
+-      DEBUG_ONLY(verify_argslot(_masm, rbx_destslot, "swap point must fall within current frame"));
++      if (VerifyMethodHandles)
++        verify_argslot(_masm, rbx_destslot, "swap point must fall within current frame");
+ 
+       if (!rotate) {
+         for (int i = 0; i < swap_bytes; i += wordSize) {
+@@ -925,7 +1451,7 @@
+           //   rbx = dest_addr
+           //   while (rax >= rbx) *(rax + swap_bytes) = *(rax + 0), rax--;
+           Label loop;
+-          __ bind(loop);
++          __ BIND(loop);
+           __ movptr(rdx_temp, Address(rax_argslot, 0));
+           __ movptr(Address(rax_argslot, swap_bytes), rdx_temp);
+           __ addptr(rax_argslot, -wordSize);
+@@ -949,7 +1475,7 @@
+           //   rbx = dest_addr
+           //   while (rax <= rbx) *(rax - swap_bytes) = *(rax + 0), rax++;
+           Label loop;
+-          __ bind(loop);
++          __ BIND(loop);
+           __ movptr(rdx_temp, Address(rax_argslot, 0));
+           __ movptr(Address(rax_argslot, -swap_bytes), rdx_temp);
+           __ addptr(rax_argslot, wordSize);
+@@ -972,57 +1498,21 @@
+   case _adapter_dup_args:
+     {
+       // 'argslot' is the position of the first argument to duplicate
+-      __ movl(rax_argslot, rcx_amh_vmargslot);
++      load_vmargslot(_masm, rax_argslot, rcx_amh_vmargslot);
+       __ lea(rax_argslot, __ argument_address(rax_argslot));
+ 
+       // 'stack_move' is negative number of words to duplicate
+-      Register rdx_stack_move = rdx_temp;
+-      __ movl2ptr(rdx_stack_move, rcx_amh_conversion);
+-      __ sarptr(rdx_stack_move, CONV_STACK_MOVE_SHIFT);
++      Register rdi_stack_move = rdi_temp;
++      load_stack_move(_masm, rdi_stack_move, rcx_recv, true);
+ 
+-      int argslot0_num = 0;
+-      Address argslot0 = __ argument_address(RegisterOrConstant(argslot0_num));
+-      assert(argslot0.base() == rsp, "");
+-      int pre_arg_size = argslot0.disp();
+-      assert(pre_arg_size % wordSize == 0, "");
+-      assert(pre_arg_size > 0, "must include PC");
+-
+-      // remember the old rsp+1 (argslot[0])
+-      Register rbx_oldarg = rbx_temp;
+-      __ lea(rbx_oldarg, argslot0);
+-
+-      // move rsp down to make room for dups
+-      __ lea(rsp, Address(rsp, rdx_stack_move, Address::times_ptr));
+-
+-      // compute the new rsp+1 (argslot[0])
+-      Register rdx_newarg = rdx_temp;
+-      __ lea(rdx_newarg, argslot0);
+-
+-      __ push(rdi);             // need a temp
+-      // (preceding push must be done after arg addresses are taken!)
+-
+-      // pull down the pre_arg_size data (PC)
+-      for (int i = -pre_arg_size; i < 0; i += wordSize) {
+-        __ movptr(rdi, Address(rbx_oldarg, i));
+-        __ movptr(Address(rdx_newarg, i), rdi);
++      if (VerifyMethodHandles) {
++        verify_argslots(_masm, rdi_stack_move, rax_argslot, true,
++                        "copied argument(s) must fall within current frame");
+       }
+ 
+-      // copy from rax_argslot[0...] down to new_rsp[1...]
+-      // pseudo-code:
+-      //   rbx = old_rsp+1
+-      //   rdx = new_rsp+1
+-      //   rax = argslot
+-      //   while (rdx < rbx) *rdx++ = *rax++
+-      Label loop;
+-      __ bind(loop);
+-      __ movptr(rdi, Address(rax_argslot, 0));
+-      __ movptr(Address(rdx_newarg, 0), rdi);
+-      __ addptr(rax_argslot, wordSize);
+-      __ addptr(rdx_newarg, wordSize);
+-      __ cmpptr(rdx_newarg, rbx_oldarg);
+-      __ jccb(Assembler::less, loop);
+-
+-      __ pop(rdi);              // restore temp
++      // 'insert_location' is always the bottom of the argument list
++      Address insert_location = __ argument_address(constant(0));
++      copy_arg_slots(_masm, rdi_stack_move, rax_argslot, insert_location, rbx_temp, rdx_temp);
+ 
+       __ load_heap_oop(rcx_recv, rcx_mh_vmtarget);
+       __ jump_to_method_handle_entry(rcx_recv, rdx_temp);
+@@ -1032,21 +1522,17 @@
+   case _adapter_drop_args:
+     {
+       // 'argslot' is the position of the first argument to nuke
+-      __ movl(rax_argslot, rcx_amh_vmargslot);
++      load_vmargslot(_masm, rax_argslot, rcx_amh_vmargslot);
+       __ lea(rax_argslot, __ argument_address(rax_argslot));
+ 
+-      __ push(rdi);             // need a temp
+       // (must do previous push after argslot address is taken)
+ 
+       // 'stack_move' is number of words to drop
+-      Register rdi_stack_move = rdi;
+-      __ movl2ptr(rdi_stack_move, rcx_amh_conversion);
+-      __ sarptr(rdi_stack_move, CONV_STACK_MOVE_SHIFT);
++      Register rdi_stack_move = rdi_temp;
++      load_stack_move(_masm, rdi_stack_move, rcx_recv, false);
+       remove_arg_slots(_masm, rdi_stack_move,
+                        rax_argslot, rbx_temp, rdx_temp);
+ 
+-      __ pop(rdi);              // restore temp
+-
+       __ load_heap_oop(rcx_recv, rcx_mh_vmtarget);
+       __ jump_to_method_handle_entry(rcx_recv, rdx_temp);
+     }
+@@ -1069,20 +1555,21 @@
+       int length_constant = get_ek_adapter_opt_spread_info(ek);
+ 
+       // find the address of the array argument
+-      __ movl(rax_argslot, rcx_amh_vmargslot);
++      load_vmargslot(_masm, rax_argslot, rcx_amh_vmargslot);
+       __ lea(rax_argslot, __ argument_address(rax_argslot));
+ 
+-      // grab some temps
+-      { __ push(rsi); __ push(rdi); }
+-      // (preceding pushes must be done after argslot address is taken!)
+-#define UNPUSH_RSI_RDI \
+-      { __ pop(rdi); __ pop(rsi); }
++      // grab another temp
++      Register rsi_temp = rsi;
++      { if (rsi_temp == saved_last_sp)  __ push(saved_last_sp); }
++      // (preceding push must be done after argslot address is taken!)
++#define UNPUSH_RSI \
++      { if (rsi_temp == saved_last_sp)  __ pop(saved_last_sp); }
+ 
+       // arx_argslot points both to the array and to the first output arg
+       vmarg = Address(rax_argslot, 0);
+ 
+       // Get the array value.
+-      Register  rsi_array       = rsi;
++      Register  rsi_array       = rsi_temp;
+       Register  rdx_array_klass = rdx_temp;
+       BasicType elem_type       = T_OBJECT;
+       int       length_offset   = arrayOopDesc::length_offset_in_bytes();
+@@ -1099,10 +1586,10 @@
+       // Check the array type.
+       Register rbx_klass = rbx_temp;
+       __ load_heap_oop(rbx_klass, rcx_amh_argument); // this is a Class object!
+-      __ load_heap_oop(rbx_klass, Address(rbx_klass, java_lang_Class::klass_offset_in_bytes()));
++      load_klass_from_Class(_masm, rbx_klass);
+ 
+       Label ok_array_klass, bad_array_klass, bad_array_length;
+-      __ check_klass_subtype(rdx_array_klass, rbx_klass, rdi, ok_array_klass);
++      __ check_klass_subtype(rdx_array_klass, rbx_klass, rdi_temp, ok_array_klass);
+       // If we get here, the type check failed!
+       __ jmp(bad_array_klass);
+       __ bind(ok_array_klass);
+@@ -1126,14 +1613,14 @@
+         // Form a pointer to the end of the affected region.
+         __ lea(rdx_argslot_limit, Address(rax_argslot, Interpreter::stackElementSize));
+         // 'stack_move' is negative number of words to insert
+-        Register rdi_stack_move = rdi;
+-        __ movl2ptr(rdi_stack_move, rcx_amh_conversion);
+-        __ sarptr(rdi_stack_move, CONV_STACK_MOVE_SHIFT);
++        Register rdi_stack_move = rdi_temp;
++        load_stack_move(_masm, rdi_stack_move, rcx_recv, true);
+         Register rsi_temp = rsi_array;  // spill this
+         insert_arg_slots(_masm, rdi_stack_move, -1,
+                          rax_argslot, rbx_temp, rsi_temp);
+-        // reload the array (since rsi was killed)
+-        __ movptr(rsi_array, vmarg);
++        // reload the array since rsi was killed
++        // reload from rdx_argslot_limit since rax_argslot is now decremented
++        __ movptr(rsi_array, Address(rdx_argslot_limit, -Interpreter::stackElementSize));
+       } else if (length_constant > 1) {
+         int arg_mask = 0;
+         int new_slots = (length_constant - 1);
+@@ -1153,63 +1640,73 @@
+       // Copy from the array to the new slots.
+       // Note: Stack change code preserves integrity of rax_argslot pointer.
+       // So even after slot insertions, rax_argslot still points to first argument.
++      // Beware:  Arguments that are shallow on the stack are deep in the array,
++      // and vice versa.  So a downward-growing stack (the usual) has to be copied
++      // elementwise in reverse order from the source array.
+       if (length_constant == -1) {
+         // [rax_argslot, rdx_argslot_limit) is the area we are inserting into.
++        // Array element [0] goes at rdx_argslot_limit[-wordSize].
+         Register rsi_source = rsi_array;
+         __ lea(rsi_source, Address(rsi_array, elem0_offset));
++        Register rdx_fill_ptr = rdx_argslot_limit;
+         Label loop;
+-        __ bind(loop);
++        __ BIND(loop);
+         __ movptr(rbx_temp, Address(rsi_source, 0));
+-        __ movptr(Address(rax_argslot, 0), rbx_temp);
++        __ addptr(rdx_fill_ptr, -Interpreter::stackElementSize);
++        __ movptr(Address(rdx_fill_ptr, 0), rbx_temp);
+         __ addptr(rsi_source, type2aelembytes(elem_type));
+-        __ addptr(rax_argslot, Interpreter::stackElementSize);
+-        __ cmpptr(rax_argslot, rdx_argslot_limit);
+-        __ jccb(Assembler::less, loop);
++        __ cmpptr(rdx_fill_ptr, rax_argslot);
++        __ jccb(Assembler::greater, loop);
+       } else if (length_constant == 0) {
+         __ bind(skip_array_check);
+         // nothing to copy
+       } else {
+         int elem_offset = elem0_offset;
+-        int slot_offset = 0;
++        int slot_offset = length_constant * Interpreter::stackElementSize;
+         for (int index = 0; index < length_constant; index++) {
+           __ movptr(rbx_temp, Address(rsi_array, elem_offset));
++          slot_offset -= Interpreter::stackElementSize;  // fill backward
+           __ movptr(Address(rax_argslot, slot_offset), rbx_temp);
+           elem_offset += type2aelembytes(elem_type);
+-           slot_offset += Interpreter::stackElementSize;
+         }
+       }
+ 
+       // Arguments are spread.  Move to next method handle.
+-      UNPUSH_RSI_RDI;
++      UNPUSH_RSI;
+       __ load_heap_oop(rcx_recv, rcx_mh_vmtarget);
+       __ jump_to_method_handle_entry(rcx_recv, rdx_temp);
+ 
+       __ bind(bad_array_klass);
+-      UNPUSH_RSI_RDI;
++      UNPUSH_RSI;
+       assert(!vmarg.uses(rarg2_required), "must be different registers");
+-      __ movptr(rarg2_required, Address(rdx_array_klass, java_mirror_offset));  // required type
+-      __ movptr(rarg1_actual,   vmarg);                                         // bad array
+-      __ movl(  rarg0_code,     (int) Bytecodes::_aaload);                      // who is complaining?
++      __ load_heap_oop( rarg2_required, Address(rdx_array_klass, java_mirror_offset));  // required type
++      __ movptr(        rarg1_actual,   vmarg);                                         // bad array
++      __ movl(          rarg0_code,     (int) Bytecodes::_aaload);                      // who is complaining?
+       __ jump(ExternalAddress(from_interpreted_entry(_raise_exception)));
+ 
+       __ bind(bad_array_length);
+-      UNPUSH_RSI_RDI;
++      UNPUSH_RSI;
+       assert(!vmarg.uses(rarg2_required), "must be different registers");
+-      __ mov   (rarg2_required, rcx_recv);                       // AMH requiring a certain length
+-      __ movptr(rarg1_actual,   vmarg);                          // bad array
+-      __ movl(  rarg0_code,     (int) Bytecodes::_arraylength);  // who is complaining?
++      __ mov(    rarg2_required, rcx_recv);                       // AMH requiring a certain length
++      __ movptr( rarg1_actual,   vmarg);                          // bad array
++      __ movl(   rarg0_code,     (int) Bytecodes::_arraylength);  // who is complaining?
+       __ jump(ExternalAddress(from_interpreted_entry(_raise_exception)));
+ 
+-#undef UNPUSH_RSI_RDI
++#undef UNPUSH_RSI
+     }
+     break;
+ 
+   case _adapter_flyby:
++    __ unimplemented(entry_name(ek)); // %%% FIXME: NYI
++    break;
++
+   case _adapter_ricochet:
+     __ unimplemented(entry_name(ek)); // %%% FIXME: NYI
+     break;
+ 
+-  default:  ShouldNotReachHere();
++  default:
++    DEBUG_ONLY(tty->print_cr("bad ek=%d (%s)", (int)ek, entry_name(ek)));
++    ShouldNotReachHere();
+   }
+   __ hlt();
+ 
+diff --git a/src/cpu/x86/vm/methodHandles_x86.hpp b/src/cpu/x86/vm/methodHandles_x86.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/cpu/x86/vm/methodHandles_x86.hpp
+@@ -0,0 +1,240 @@
++/*
++ * Copyright 2011 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ *
++ */
++
++// Platform-specific definitions for method handles.
++// These definitions are inlined into class MethodHandles.
++
++public:
++
++// The stack just after the recursive call from a ricochet adapter
++// looks something like this.  Offsets are marked in words, not bytes.
++// (...lower memory addresses)
++// rsp:     [ return pc                 ]   always the global AdapterMethodHandleBlob
++// rsp+1:   [ recursive arg N           ]
++// rsp+2:   [ recursive arg N-1         ]
++// ...
++// rsp+N:   [ recursive arg 1           ]
++// rsp+N+1: [ recursive method handle   ]
++// ...
++// rsi:     [ sub-continuation pc       ]   clean-up logic after recursive call runs here
++// rsi+1:   [ sub-continuation arg      ]   arguments depend on sub-continuation
++// ...
++// rbp-x:   [ magic number              ]   0xFEED03E (present in debug build only)
++// rbp-x:   [ saved args base address   ]   <-- (struct RicochetFrame)
++// rbp-x:   [ saved arg types oop       ]   a MethodType describing the saved arguments
++// rbp-x:   [ saved target              ]   a MethodHandle which we intend to invoke
++// rbp-3:   [ flags                     ]   a few bits to help describe the format
++// rbp-2:   [ self rsi/r13              ]   last_sp (actual TOS of adapter frame)
++// rbp-1:   [ saved rsi/r13             ]   sender_sp (actual TOS of original caller frame)
++// rbp+0:   [ saved rbp                 ]   (for original caller of AMH)
++// rbp+1:   [ return pc                 ]   (back to original caller of AMH)
++// rbp+2:   [ transformed adapter arg M ]   <-- (nominal TOS of original caller)
++// rbp+3:   [ transformed adapter arg M-1]
++// ...
++// rbp+M+1: [ transformed adapter arg 1]
++// rbp+M+2: [ transformed adapter method handle]
++// ...      [ optional padding]
++// (higher memory addresses...)
++//
++// The arguments originally passed by the original caller
++// are lost, and arbitrary amounts of stack motion might have
++// happened due to argument transformation.
++// (This is done by C2I/I2C adapters and non-direct method handles.)
++// This is why there is an unpredictable amount of memory between
++// the nominal and actual TOS of the caller.
++// The ricochet adapter itself may also perform transformations before
++// the recursive call.
++//
++// The following register conventions are significant at this point:
++// rsp       the thread stack, as always; preserved by caller
++// rsi/r13   actual TOS of recursive frame (contents of [rbp-2])
++// rcx       recursive method handle (contents of [rsp+N+1])
++// rbp       preserved by caller (not used by caller)
++// Unless otherwise specified, all registers can be blown by the call.
++//
++// If this frame must be walked, the transformed adapter arguments,
++// including any embedded oops, will be found via the saved arguments
++// base address, size, and descriptor.  The saved argument base
++// address typically points at last transformed adapter argument,
++// in [rbp+2], and the saved argument size is typically M+1.
++// The descriptor must match the referenced arguments.
++//
++// It is possible for the saved arguments to be a subsequence
++// of the transformed adapter arguments.  In this case,
++// any arguments not included in the subsequence may be trashed,
++// and must be re-established by the ricochet clean-up logic,
++// after the recursive call.  That is why there is an explicit
++// save arguments base address field in the RicochetFrame.
++//
++// When the recursive callee returns, AdapterMethodHandleBlob will
++// load the "self rsi" (at [rbp-2]) into rsp, thus popping all the
++// recursive arguments.  The blob will then return again, into the
++// sub-continuation, which will perform any adapter-specific
++// transformations, such as merging the recursive return value
++// into the saved argument list.  At that point, the original
++// rsi, rbp, and rsp will be reloaded, the ricochet frame will
++// disappear, and the final target of the adapter method handle
++// be invoked on the transformed argument list.
++//
++// Note that sub-continuations can be stacked, if one returns
++// to the next.  For example, one sub-continuation can extract
++// a return value into a waiting slot in the transformed argument
++// list, while another can extract the target method handle,
++// or do some other task.
++
++class RicochetFrame {
++  friend class MethodHandles;
++ public:
++  enum {
++    _is_adapter_frame = (1 << 0)   // note: this flag is always set (non-oop bit!)
++  };
++ private:
++  intptr_t* _saved_args_base;    // base of pushed arguments block
++  oopDesc*  _saved_arg_types;    // types of pushed arguments (does not include target)
++  oopDesc*  _saved_target;       // target method handle
++  intptr_t  _flags;              // should coincide with interpreter frame method
++  intptr_t* _last_sp;            // should coincide with interpreter last_sp
++  intptr_t* _sender_sp;          // should coincide with interpreter sender_sp
++  intptr_t* _sender_link;        // *must* coincide with frame::link_offset
++  address   _sender_pc;          // *must* coincide with frame::return_addr_offset
++
++ public:
++  intptr_t* saved_args_base() const             { return _saved_args_base; }
++  oop       saved_arg_types() const             { return _saved_arg_types; }
++  oop       saved_target() const                { return _saved_target; }
++  intptr_t  flags() const                       { return _flags; }
++  intptr_t* last_sp() const                     { return _last_sp; }
++  intptr_t* sender_sp() const                   { return _sender_sp; }
++  intptr_t* sender_link() const                 { return _sender_link; }
++  address   sender_pc() const                   { return _sender_pc; }
++
++  // GC interface
++  oop*  saved_arg_types_addr()                  { return (oop*)&_saved_arg_types; }
++  oop*  saved_target_addr()                     { return (oop*)&_saved_target; }
++
++  // Compiler/assembler interface.
++  static int saved_args_base_offset_in_bytes()  { return offset_of(RicochetFrame, _saved_args_base); }
++  static int saved_arg_types_offset_in_bytes()  { return offset_of(RicochetFrame, _saved_arg_types); }
++  static int saved_target_offset_in_bytes()     { return offset_of(RicochetFrame, _saved_target); }
++  static int flags_offset_in_bytes()            { return offset_of(RicochetFrame, _flags); }
++  static int last_sp_offset_in_bytes()          { return offset_of(RicochetFrame, _last_sp); }
++  static int sender_sp_offset_in_bytes()        { return offset_of(RicochetFrame, _sender_sp); }
++  static int sender_link_offset_in_bytes()      { return offset_of(RicochetFrame, _sender_link); }
++  static int sender_pc_offset_in_bytes()        { return offset_of(RicochetFrame, _sender_pc); }
++
++#ifdef ASSERT
++  int magic_number() const                      { return *(int*)((address)this + magic_number_offset_in_bytes()); };
++  static int magic_number_offset_in_bytes()             { return -wordSize; }
++#endif //ASSERT
++
++  // Given an AMHF, where do we find the native frame?
++  static int frame_size_in_bytes()              { return sender_link_offset_in_bytes(); }
++
++  DEBUG_ONLY(enum { MAGIC_NUMBER_VALUE = 0xFEED03E });
++  static void verify_offsets() NOT_DEBUG_RETURN;
++  void verify() const NOT_DEBUG_RETURN; // check for MAGIC_NUMBER, etc.
++  void zap_arguments() NOT_DEBUG_RETURN;
++
++  static void start_ricochet_frame(MacroAssembler* _masm,
++                                   Address saved_args_base,
++                                   Register saved_target,
++                                   Register temp_reg);
++  static void save_last_sp(MacroAssembler* _masm);
++  static void do_recursive_call(MacroAssembler* _masm,
++                                Register rcx_target);
++  static void end_ricochet_frame(MacroAssembler* _masm,
++                                 Register saved_target);
++  static void generate_ricochet_blob(MacroAssembler* _masm,
++                                     // output params:
++                                     int& frame_size_in_words, int& bounce_offset);
++  static Address struct_address(int offset = 0) {
++    // The RicochetFrame is found by subtracting a constant offset from rbp.
++    return Address(rbp, - sender_link_offset_in_bytes() + offset);
++  }
++
++
++  static RicochetFrame* from_frame(frame& fr) {
++    address bp = (address) fr.fp();
++    RicochetFrame* rf = (RicochetFrame*)(bp - sender_link_offset_in_bytes());
++    rf->verify();
++    return rf;
++  }
++
++  static void verify_clean(MacroAssembler* _masm, bool allow_subcon = false) NOT_DEBUG_RETURN;
++};
++
++// Additional helper methods for MethodHandles code generation:
++public:
++  static void load_klass_from_Class(MacroAssembler* _masm, Register klass_reg);
++
++  static void load_stack_move(MacroAssembler* _masm,
++                              Register rdi_stack_move,
++                              Register rcx_amh,
++                              bool might_be_negative);
++
++  static void insert_arg_slots(MacroAssembler* _masm,
++                               RegisterOrConstant arg_slots,
++                               int arg_mask,
++                               Register rax_argslot,
++                               Register rbx_temp, Register rdx_temp);
++
++  static void remove_arg_slots(MacroAssembler* _masm,
++                               RegisterOrConstant arg_slots,
++                               Register rax_argslot,
++                               Register rbx_temp, Register rdx_temp);
++
++  static void copy_arg_slots(MacroAssembler* _masm,
++                             RegisterOrConstant arg_slots,
++                             Register rax_argslot,
++                             Address insert_location,
++                             Register rbx_temp, Register rdx_temp);
++
++  static void verify_argslot(MacroAssembler* _masm, Register argslot_reg,
++                             const char* error_message) NOT_DEBUG_RETURN;
++
++  static void verify_argslots(MacroAssembler* _masm,
++                              RegisterOrConstant argslot_count,
++                              Register argslot_reg,
++                              bool negate_argslot,
++                              const char* error_message) NOT_DEBUG_RETURN;
++
++  static void verify_stack_move(MacroAssembler* _masm,
++                                RegisterOrConstant arg_slots,
++                                int direction) NOT_DEBUG_RETURN;
++
++  static void verify_klass(MacroAssembler* _masm,
++                           Register obj, KlassHandle klass,
++                           const char* error_message = "wrong klass") NOT_DEBUG_RETURN;
++
++  static void verify_method_handle(MacroAssembler* _masm, Register mh_reg) {
++    verify_klass(_masm, mh_reg, SystemDictionaryHandles::MethodHandle_klass(),
++                 "reference is a MH");
++  }
++
++  static void trace_method_handle(MacroAssembler* _masm, const char* adaptername) PRODUCT_RETURN;
++
++  static Register saved_last_sp_register() {
++    // Should be in sharedRuntime, not here.
++    return LP64_ONLY(r13) NOT_LP64(rsi);
++  }
+diff --git a/src/cpu/x86/vm/sharedRuntime_x86_32.cpp b/src/cpu/x86/vm/sharedRuntime_x86_32.cpp
+--- a/src/cpu/x86/vm/sharedRuntime_x86_32.cpp
++++ b/src/cpu/x86/vm/sharedRuntime_x86_32.cpp
+@@ -54,6 +54,7 @@
+ RuntimeStub*       SharedRuntime::_resolve_opt_virtual_call_blob;
+ RuntimeStub*       SharedRuntime::_resolve_virtual_call_blob;
+ RuntimeStub*       SharedRuntime::_resolve_static_call_blob;
++RicochetBlob*      SharedRuntime::_ricochet_blob;
+ 
+ const int StackAlignmentInSlots = StackAlignmentInBytes / VMRegImpl::stack_slot_size;
+ 
+@@ -2253,6 +2254,25 @@
+   return 0;
+ }
+ 
++//----------------------------generate_ricochet_blob---------------------------
++void SharedRuntime::generate_ricochet_blob() {
++  if (!EnableInvokeDynamic)  return;  // leave it as a null
++
++  // allocate space for the code
++  ResourceMark rm;
++  // setup code generation tools
++  CodeBuffer   buffer("ricochet_blob", 128, 128);
++  MacroAssembler* masm = new MacroAssembler(&buffer);
++
++  int frame_size_in_words = -1, bounce_offset = -1;
++  MethodHandles::RicochetFrame::generate_ricochet_blob(masm, frame_size_in_words, bounce_offset);
++
++  // -------------
++  // make sure all code is generated
++  masm->flush();
++
++  _ricochet_blob = RicochetBlob::create(&buffer, bounce_offset, frame_size_in_words);
++}
+ 
+ //------------------------------generate_deopt_blob----------------------------
+ void SharedRuntime::generate_deopt_blob() {
+@@ -2996,6 +3016,8 @@
+     generate_handler_blob(CAST_FROM_FN_PTR(address,
+                    SafepointSynchronize::handle_polling_page_exception), true);
+ 
++  generate_ricochet_blob();
++
+   generate_deopt_blob();
+ #ifdef COMPILER2
+   generate_uncommon_trap_blob();
+diff --git a/src/cpu/x86/vm/sharedRuntime_x86_64.cpp b/src/cpu/x86/vm/sharedRuntime_x86_64.cpp
+--- a/src/cpu/x86/vm/sharedRuntime_x86_64.cpp
++++ b/src/cpu/x86/vm/sharedRuntime_x86_64.cpp
+@@ -54,6 +54,7 @@
+ RuntimeStub*       SharedRuntime::_resolve_opt_virtual_call_blob;
+ RuntimeStub*       SharedRuntime::_resolve_virtual_call_blob;
+ RuntimeStub*       SharedRuntime::_resolve_static_call_blob;
++RicochetBlob*      SharedRuntime::_ricochet_blob;
+ 
+ const int StackAlignmentInSlots = StackAlignmentInBytes / VMRegImpl::stack_slot_size;
+ 
+@@ -2530,6 +2531,26 @@
+ }
+ 
+ 
++//----------------------------generate_ricochet_blob---------------------------
++void SharedRuntime::generate_ricochet_blob() {
++  if (!EnableInvokeDynamic)  return;  // leave it as a null
++
++  // allocate space for the code
++  ResourceMark rm;
++  // setup code generation tools
++  CodeBuffer   buffer("ricochet_blob", 128, 128);
++  MacroAssembler* masm = new MacroAssembler(&buffer);
++
++  int frame_size_in_words = -1, bounce_offset = -1;
++  MethodHandles::RicochetFrame::generate_ricochet_blob(masm, frame_size_in_words, bounce_offset);
++
++  // -------------
++  // make sure all code is generated
++  masm->flush();
++
++  _ricochet_blob = RicochetBlob::create(&buffer, bounce_offset, frame_size_in_words);
++}
++
+ //------------------------------generate_deopt_blob----------------------------
+ void SharedRuntime::generate_deopt_blob() {
+   // Allocate space for the code
+@@ -3205,6 +3226,8 @@
+     generate_handler_blob(CAST_FROM_FN_PTR(address,
+                    SafepointSynchronize::handle_polling_page_exception), true);
+ 
++  generate_ricochet_blob();
++
+   generate_deopt_blob();
+ 
+ #ifdef COMPILER2
+diff --git a/src/cpu/zero/vm/methodHandles_zero.hpp b/src/cpu/zero/vm/methodHandles_zero.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/cpu/zero/vm/methodHandles_zero.hpp
+@@ -0,0 +1,26 @@
++/*
++ * Copyright 2011 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ *
++ */
++
++// Platform-specific definitions for method handles.
++// These definitions are inlined into class MethodHandles.
+diff --git a/src/share/vm/classfile/javaClasses.cpp b/src/share/vm/classfile/javaClasses.cpp
+--- a/src/share/vm/classfile/javaClasses.cpp
++++ b/src/share/vm/classfile/javaClasses.cpp
+@@ -2502,6 +2502,11 @@
+   return mh->int_field(_vmargslot_offset);
+ }
+ 
++void java_lang_invoke_BoundMethodHandle::set_vmargslot(oop mh, int argslot) {
++  assert(is_instance(mh), "BMH only");
++  return mh->int_field_put(_vmargslot_offset, argslot);
++}
++
+ oop java_lang_invoke_BoundMethodHandle::argument(oop mh) {
+   assert(is_instance(mh), "BMH only");
+   return mh->obj_field(_argument_offset);
+diff --git a/src/share/vm/classfile/javaClasses.hpp b/src/share/vm/classfile/javaClasses.hpp
+--- a/src/share/vm/classfile/javaClasses.hpp
++++ b/src/share/vm/classfile/javaClasses.hpp
+@@ -919,6 +919,12 @@
+     return obj != NULL && is_subclass(obj->klass());
+   }
+ 
++  // Relevant integer constants (keep these in synch. with MethodHandleNatives.Constants):
++  enum {
++    ARG_SLOT_PUSH_SHIFT  = BytesPerShort * BitsPerByte,
++    ARG_SLOT_MASK        = right_n_bits(ARG_SLOT_PUSH_SHIFT)
++  };
++
+   static int argument_offset_in_bytes()         { return _argument_offset; }
+   static int vmargslot_offset_in_bytes()        { return _vmargslot_offset; }
+ };
+diff --git a/src/share/vm/code/codeBlob.cpp b/src/share/vm/code/codeBlob.cpp
+--- a/src/share/vm/code/codeBlob.cpp
++++ b/src/share/vm/code/codeBlob.cpp
+@@ -152,6 +152,32 @@
+ }
+ 
+ 
++void CodeBlob::trace_new_stub(CodeBlob* stub, const char* name1, const char* name2) {
++  // Do not hold the CodeCache lock during name formatting.
++  assert(!CodeCache_lock->owned_by_self(), "release CodeCache before registering the stub");
++
++  if (stub != NULL) {
++    char stub_id[256];
++    assert(strlen(name1) + strlen(name2) < sizeof(stub_id), "");
++    jio_snprintf(stub_id, sizeof(stub_id), "%s%s", name1, name2);
++    if (PrintStubCode) {
++      tty->print_cr("Decoding %s " INTPTR_FORMAT, stub_id, (intptr_t) stub);
++      Disassembler::decode(stub->code_begin(), stub->code_end());
++    }
++    Forte::register_stub(stub_id, stub->code_begin(), stub->code_end());
++
++    if (JvmtiExport::should_post_dynamic_code_generated()) {
++      const char* stub_name = name2;
++      if (name2[0] == '\0')  stub_name = name1;
++      JvmtiExport::post_dynamic_code_generated(stub_name, stub->code_begin(), stub->code_end());
++    }
++  }
++
++  // Track memory usage statistic after releasing CodeCache_lock
++  MemoryService::track_code_cache_memory_usage();
++}
++
++
+ void CodeBlob::flush() {
+   if (_oop_maps) {
+     FREE_C_HEAP_ARRAY(unsigned char, _oop_maps);
+@@ -312,23 +338,7 @@
+     stub = new (size) RuntimeStub(stub_name, cb, size, frame_complete, frame_size, oop_maps, caller_must_gc_arguments);
+   }
+ 
+-  // Do not hold the CodeCache lock during name formatting.
+-  if (stub != NULL) {
+-    char stub_id[256];
+-    jio_snprintf(stub_id, sizeof(stub_id), "RuntimeStub - %s", stub_name);
+-    if (PrintStubCode) {
+-      tty->print_cr("Decoding %s " INTPTR_FORMAT, stub_id, stub);
+-      Disassembler::decode(stub->code_begin(), stub->code_end());
+-    }
+-    Forte::register_stub(stub_id, stub->code_begin(), stub->code_end());
+-
+-    if (JvmtiExport::should_post_dynamic_code_generated()) {
+-      JvmtiExport::post_dynamic_code_generated(stub_name, stub->code_begin(), stub->code_end());
+-    }
+-  }
+-
+-  // Track memory usage statistic after releasing CodeCache_lock
+-  MemoryService::track_code_cache_memory_usage();
++  trace_new_stub(stub, "RuntimeStub - ", stub_name);
+ 
+   return stub;
+ }
+@@ -340,6 +350,47 @@
+   return p;
+ }
+ 
++// operator new shared by all singletons:
++void* SingletonBlob::operator new(size_t s, unsigned size) {
++  void* p = CodeCache::allocate(size);
++  if (!p) fatal("Initial size of CodeCache is too small");
++  return p;
++}
++
++
++//----------------------------------------------------------------------------------------------------
++// Implementation of RicochetBlob
++
++RicochetBlob::RicochetBlob(
++  CodeBuffer* cb,
++  int         size,
++  int         bounce_offset,
++  int         frame_size
++)
++: SingletonBlob("RicochetBlob", cb, sizeof(RicochetBlob), size, frame_size, (OopMapSet*) NULL)
++{
++  _bounce_offset = bounce_offset;
++}
++
++
++RicochetBlob* RicochetBlob::create(
++  CodeBuffer* cb,
++  int         bounce_offset,
++  int         frame_size)
++{
++  RicochetBlob* blob = NULL;
++  ThreadInVMfromUnknown __tiv;  // get to VM state in case we block on CodeCache_lock
++  {
++    MutexLockerEx mu(CodeCache_lock, Mutex::_no_safepoint_check_flag);
++    unsigned int size = allocation_size(cb, sizeof(RicochetBlob));
++    blob = new (size) RicochetBlob(cb, size, bounce_offset, frame_size);
++  }
++
++  trace_new_stub(blob, "RicochetBlob");
++
++  return blob;
++}
++
+ 
+ //----------------------------------------------------------------------------------------------------
+ // Implementation of DeoptimizationBlob
+@@ -400,20 +451,12 @@
+       JvmtiExport::post_dynamic_code_generated("DeoptimizationBlob", blob->code_begin(), blob->code_end());
+     }
+   }
+-
+-  // Track memory usage statistic after releasing CodeCache_lock
+-  MemoryService::track_code_cache_memory_usage();
++  trace_new_stub(blob, "DeoptimizationBlob");
+ 
+   return blob;
+ }
+ 
+ 
+-void* DeoptimizationBlob::operator new(size_t s, unsigned size) {
+-  void* p = CodeCache::allocate(size);
+-  if (!p) fatal("Initial size of CodeCache is too small");
+-  return p;
+-}
+-
+ //----------------------------------------------------------------------------------------------------
+ // Implementation of UncommonTrapBlob
+ 
+@@ -441,33 +484,12 @@
+     blob = new (size) UncommonTrapBlob(cb, size, oop_maps, frame_size);
+   }
+ 
+-  // Do not hold the CodeCache lock during name formatting.
+-  if (blob != NULL) {
+-    char blob_id[256];
+-    jio_snprintf(blob_id, sizeof(blob_id), "UncommonTrapBlob@" PTR_FORMAT, blob->code_begin());
+-    if (PrintStubCode) {
+-      tty->print_cr("Decoding %s " INTPTR_FORMAT, blob_id, blob);
+-      Disassembler::decode(blob->code_begin(), blob->code_end());
+-    }
+-    Forte::register_stub(blob_id, blob->code_begin(), blob->code_end());
+-
+-    if (JvmtiExport::should_post_dynamic_code_generated()) {
+-      JvmtiExport::post_dynamic_code_generated("UncommonTrapBlob", blob->code_begin(), blob->code_end());
+-    }
+-  }
+-
+-  // Track memory usage statistic after releasing CodeCache_lock
+-  MemoryService::track_code_cache_memory_usage();
++  trace_new_stub(blob, "UncommonTrapBlob");
+ 
+   return blob;
+ }
+ 
+ 
+-void* UncommonTrapBlob::operator new(size_t s, unsigned size) {
+-  void* p = CodeCache::allocate(size);
+-  if (!p) fatal("Initial size of CodeCache is too small");
+-  return p;
+-}
+ #endif // COMPILER2
+ 
+ 
+@@ -498,33 +520,12 @@
+     blob = new (size) ExceptionBlob(cb, size, oop_maps, frame_size);
+   }
+ 
+-  // We do not need to hold the CodeCache lock during name formatting
+-  if (blob != NULL) {
+-    char blob_id[256];
+-    jio_snprintf(blob_id, sizeof(blob_id), "ExceptionBlob@" PTR_FORMAT, blob->code_begin());
+-    if (PrintStubCode) {
+-      tty->print_cr("Decoding %s " INTPTR_FORMAT, blob_id, blob);
+-      Disassembler::decode(blob->code_begin(), blob->code_end());
+-    }
+-    Forte::register_stub(blob_id, blob->code_begin(), blob->code_end());
+-
+-    if (JvmtiExport::should_post_dynamic_code_generated()) {
+-      JvmtiExport::post_dynamic_code_generated("ExceptionBlob", blob->code_begin(), blob->code_end());
+-    }
+-  }
+-
+-  // Track memory usage statistic after releasing CodeCache_lock
+-  MemoryService::track_code_cache_memory_usage();
++  trace_new_stub(blob, "ExceptionBlob");
+ 
+   return blob;
+ }
+ 
+ 
+-void* ExceptionBlob::operator new(size_t s, unsigned size) {
+-  void* p = CodeCache::allocate(size);
+-  if (!p) fatal("Initial size of CodeCache is too small");
+-  return p;
+-}
+ #endif // COMPILER2
+ 
+ 
+@@ -554,35 +555,12 @@
+     blob = new (size) SafepointBlob(cb, size, oop_maps, frame_size);
+   }
+ 
+-  // We do not need to hold the CodeCache lock during name formatting.
+-  if (blob != NULL) {
+-    char blob_id[256];
+-    jio_snprintf(blob_id, sizeof(blob_id), "SafepointBlob@" PTR_FORMAT, blob->code_begin());
+-    if (PrintStubCode) {
+-      tty->print_cr("Decoding %s " INTPTR_FORMAT, blob_id, blob);
+-      Disassembler::decode(blob->code_begin(), blob->code_end());
+-    }
+-    Forte::register_stub(blob_id, blob->code_begin(), blob->code_end());
+-
+-    if (JvmtiExport::should_post_dynamic_code_generated()) {
+-      JvmtiExport::post_dynamic_code_generated("SafepointBlob", blob->code_begin(), blob->code_end());
+-    }
+-  }
+-
+-  // Track memory usage statistic after releasing CodeCache_lock
+-  MemoryService::track_code_cache_memory_usage();
++  trace_new_stub(blob, "SafepointBlob");
+ 
+   return blob;
+ }
+ 
+ 
+-void* SafepointBlob::operator new(size_t s, unsigned size) {
+-  void* p = CodeCache::allocate(size);
+-  if (!p) fatal("Initial size of CodeCache is too small");
+-  return p;
+-}
+-
+-
+ //----------------------------------------------------------------------------------------------------
+ // Verification and printing
+ 
+diff --git a/src/share/vm/code/codeBlob.hpp b/src/share/vm/code/codeBlob.hpp
+--- a/src/share/vm/code/codeBlob.hpp
++++ b/src/share/vm/code/codeBlob.hpp
+@@ -35,6 +35,7 @@
+ // Suptypes are:
+ //   nmethod            : Compiled Java methods (include method that calls to native code)
+ //   RuntimeStub        : Call to VM runtime methods
++//   RicochetBlob       : Used for blocking MethodHandle adapters
+ //   DeoptimizationBlob : Used for deoptimizatation
+ //   ExceptionBlob      : Used for stack unrolling
+ //   SafepointBlob      : Used to handle illegal instruction exceptions
+@@ -95,12 +96,13 @@
+   void flush();
+ 
+   // Typing
+-  virtual bool is_buffer_blob() const                 { return false; }
+-  virtual bool is_nmethod() const                     { return false; }
+-  virtual bool is_runtime_stub() const                { return false; }
+-  virtual bool is_deoptimization_stub() const         { return false; }
+-  virtual bool is_uncommon_trap_stub() const          { return false; }
+-  virtual bool is_exception_stub() const              { return false; }
++  virtual bool is_buffer_blob() const            { return false; }
++  virtual bool is_nmethod() const                { return false; }
++  virtual bool is_runtime_stub() const           { return false; }
++  virtual bool is_ricochet_stub() const          { return false; }
++  virtual bool is_deoptimization_stub() const    { return false; }
++  virtual bool is_uncommon_trap_stub() const     { return false; }
++  virtual bool is_exception_stub() const         { return false; }
+   virtual bool is_safepoint_stub() const              { return false; }
+   virtual bool is_adapter_blob() const                { return false; }
+   virtual bool is_method_handles_adapter_blob() const { return false; }
+@@ -182,6 +184,9 @@
+   virtual void print_on(outputStream* st) const;
+   virtual void print_value_on(outputStream* st) const;
+ 
++  // Deal with Disassembler, VTune, Forte, JvmtiExport, MemoryService.
++  static void trace_new_stub(CodeBlob* blob, const char* name1, const char* name2 = "");
++
+   // Print the comment associated with offset on stream, if there is one
+   virtual void print_block_comment(outputStream* stream, address block_begin) {
+     intptr_t offset = (intptr_t)(block_begin - code_begin());
+@@ -318,7 +323,11 @@
+ 
+ class SingletonBlob: public CodeBlob {
+   friend class VMStructs;
+-  public:
++
++ protected:
++  void* operator new(size_t s, unsigned size);
++
++ public:
+    SingletonBlob(
+      const char* name,
+      CodeBuffer* cb,
+@@ -341,6 +350,45 @@
+ 
+ 
+ //----------------------------------------------------------------------------------------------------
++// RicochetBlob
++// Holds an arbitrary argument list indefinitely while Java code executes recursively.
++
++class RicochetBlob: public SingletonBlob {
++  friend class VMStructs;
++ private:
++
++  int _bounce_offset;
++
++  // Creation support
++  RicochetBlob(
++    CodeBuffer* cb,
++    int         size,
++    int         bounce_offset,
++    int         frame_size
++  );
++
++ public:
++  // Creation
++  static RicochetBlob* create(
++    CodeBuffer* cb,
++    int         bounce_offset,
++    int         frame_size
++  );
++
++  // Typing
++  bool is_ricochet_stub() const { return true; }
++
++  // GC for args
++  void preserve_callee_argument_oops(frame fr, const RegisterMap *reg_map, OopClosure* f) { /* Nothing to do */ }
++
++  address bounce_addr() const           { return code_begin() + _bounce_offset; }
++
++  // Iteration
++  void oops_do(OopClosure* f) {}
++};
++
++
++//----------------------------------------------------------------------------------------------------
+ // DeoptimizationBlob
+ 
+ class DeoptimizationBlob: public SingletonBlob {
+@@ -363,8 +411,6 @@
+     int         frame_size
+   );
+ 
+-  void* operator new(size_t s, unsigned size);
+-
+  public:
+   // Creation
+   static DeoptimizationBlob* create(
+@@ -378,7 +424,6 @@
+ 
+   // Typing
+   bool is_deoptimization_stub() const { return true; }
+-  const DeoptimizationBlob *as_deoptimization_stub() const { return this; }
+   bool exception_address_is_unpack_entry(address pc) const {
+     address unpack_pc = unpack();
+     return (pc == unpack_pc || (pc + frame::pc_return_offset) == unpack_pc);
+@@ -426,8 +471,6 @@
+     int         frame_size
+   );
+ 
+-  void* operator new(size_t s, unsigned size);
+-
+  public:
+   // Creation
+   static UncommonTrapBlob* create(
+@@ -458,8 +501,6 @@
+     int         frame_size
+   );
+ 
+-  void* operator new(size_t s, unsigned size);
+-
+  public:
+   // Creation
+   static ExceptionBlob* create(
+@@ -491,8 +532,6 @@
+     int         frame_size
+   );
+ 
+-  void* operator new(size_t s, unsigned size);
+-
+  public:
+   // Creation
+   static SafepointBlob* create(
+diff --git a/src/share/vm/prims/methodHandleWalk.cpp b/src/share/vm/prims/methodHandleWalk.cpp
+--- a/src/share/vm/prims/methodHandleWalk.cpp
++++ b/src/share/vm/prims/methodHandleWalk.cpp
+@@ -59,7 +59,7 @@
+   if (java_lang_invoke_BoundMethodHandle::is_instance(mh())) {
+     if (!is_adapter())          // keep AMH and BMH separate in this model
+       _is_bound = true;
+-    _arg_slot = BoundMethodHandle_vmargslot();
++    _arg_slot = BoundMethodHandle_vmargslot() & java_lang_invoke_BoundMethodHandle::ARG_SLOT_MASK;
+     oop target = MethodHandle_vmtarget_oop();
+     if (!is_bound() || java_lang_invoke_MethodHandle::is_instance(target)) {
+       _arg_type = compute_bound_arg_type(target, NULL, _arg_slot, CHECK);
+diff --git a/src/share/vm/prims/methodHandles.cpp b/src/share/vm/prims/methodHandles.cpp
+--- a/src/share/vm/prims/methodHandles.cpp
++++ b/src/share/vm/prims/methodHandles.cpp
+@@ -42,6 +42,7 @@
+ MethodHandleEntry* MethodHandles::_entries[MethodHandles::_EK_LIMIT] = {NULL};
+ const char*        MethodHandles::_entry_names[_EK_LIMIT+1] = {
+   "raise_exception",
++  "invokegeneric",
+   "invokestatic",               // how a MH emulates invokestatic
+   "invokespecial",              // ditto for the other invokes...
+   "invokevirtual",
+@@ -83,6 +84,10 @@
+   "adapter_prim_to_prim/f2d",
+   "adapter_ref_to_prim/unboxi",
+   "adapter_ref_to_prim/unboxl",
++  "adapter/filter",
++  "adapter_collect/2",
++  "adapter_collect/3",
++  "adapter_collect/more",
+   "adapter_spread_args/0",
+   "adapter_spread_args/1",
+   "adapter_spread_args/more",
+@@ -334,8 +339,17 @@
+ 
+ 
+ int MethodHandles::decode_MethodHandle_stack_pushes(oop mh) {
+-  if (mh->klass() == SystemDictionary::DirectMethodHandle_klass())
++  int cached_pushes = 0;
++  if (java_lang_invoke_BoundMethodHandle::is_instance(mh)) {
++    cached_pushes = (java_lang_invoke_BoundMethodHandle::vmargslot(mh)
++                     >> java_lang_invoke_BoundMethodHandle::ARG_SLOT_PUSH_SHIFT);
++    NOT_DEBUG(return cached_pushes);
++  } else {
++    assert(mh->klass() == SystemDictionary::DirectMethodHandle_klass(), "MH=DMH+BMH+AMH");
+     return 0;                   // no push/pop
++  }
++#ifdef ASSERT
++  // Fall through to test the details of a BMH/AMH chain.
+   int this_vmslots = java_lang_invoke_MethodHandle::vmslots(mh);
+   int last_vmslots = 0;
+   oop last_mh = mh;
+@@ -355,10 +369,22 @@
+   // If I am called with fewer VM slots than my ultimate callee,
+   // it must be that I push the additionally needed slots.
+   // Likewise if am called with more VM slots, I will pop them.
+-  return (last_vmslots - this_vmslots);
++  int pushed_slots = (last_vmslots - this_vmslots);
++  assert(pushed_slots == cached_pushes,
++         "pushed slots must be written in high half of vmargslot of BMH/AMH");
++  return pushed_slots;
++#endif //ASSERT
+ }
+ 
+ 
++// stack walking support
++
++void MethodHandles::oops_ricochet_frame_do(frame& f, const RegisterMap* reg_map) {
++  // Walk a live ricochet frame.
++  RicochetFrame* rf = RicochetFrame::from_frame(f);
++  Unimplemented();
++}
++
+ // MemberName support
+ 
+ // import java_lang_invoke_MemberName.*
+@@ -1532,7 +1558,10 @@
+   int receiver_pos = m->size_of_parameters() - 1;
+ 
+   // Verify MH.vmargslot, which should point at the bound receiver.
+-  verify_vmargslot(mh, -1, java_lang_invoke_BoundMethodHandle::vmargslot(mh()), CHECK);
++  int argslot = java_lang_invoke_BoundMethodHandle::vmargslot(mh());
++  assert((argslot >> java_lang_invoke_BoundMethodHandle::ARG_SLOT_PUSH_SHIFT) == 1, "vmslot push count");
++  argslot -= (1 << java_lang_invoke_BoundMethodHandle::ARG_SLOT_PUSH_SHIFT);
++  verify_vmargslot(mh, -1, argslot, CHECK);
+   //verify_vmslots(mh, CHECK);
+ 
+   // Verify vmslots.
+@@ -1566,6 +1595,10 @@
+   if (m->is_abstract()) { THROW(vmSymbols::java_lang_AbstractMethodError()); }
+ 
+   java_lang_invoke_MethodHandle::init_vmslots(mh());
++  int vmargslot = m->size_of_parameters() - 1;
++  assert(java_lang_invoke_BoundMethodHandle::vmargslot(mh()) == vmargslot, "");
++  vmargslot += (1<<java_lang_invoke_BoundMethodHandle::ARG_SLOT_PUSH_SHIFT);
++  java_lang_invoke_BoundMethodHandle::set_vmargslot(mh(), vmargslot);
+ 
+   if (VerifyMethodHandles) {
+     verify_BoundMethodHandle_with_receiver(mh, m, CHECK);
+@@ -1644,14 +1677,9 @@
+     DEBUG_ONLY(int this_pushes = decode_MethodHandle_stack_pushes(mh()));
+     if (direct_to_method) {
+       assert(this_pushes == slots_pushed, "BMH pushes one or two stack slots");
+-      assert(slots_pushed <= MethodHandlePushLimit, "");
+     } else {
+       int target_pushes = decode_MethodHandle_stack_pushes(target());
+       assert(this_pushes == slots_pushed + target_pushes, "BMH stack motion must be correct");
+-      // do not blow the stack; use a Java-based adapter if this limit is exceeded
+-      // FIXME
+-      // if (slots_pushed + target_pushes > MethodHandlePushLimit)
+-      //   err = "too many bound parameters";
+     }
+   }
+ 
+@@ -1674,10 +1702,12 @@
+   }
+ 
+   java_lang_invoke_MethodHandle::init_vmslots(mh());
++  int argslot = java_lang_invoke_BoundMethodHandle::vmargslot(mh());
++  assert((argslot >> java_lang_invoke_BoundMethodHandle::ARG_SLOT_PUSH_SHIFT) == 0, "no pushes yet");
+ 
+   if (VerifyMethodHandles) {
+     int insert_after = argnum - 1;
+-    verify_vmargslot(mh, insert_after, java_lang_invoke_BoundMethodHandle::vmargslot(mh()), CHECK);
++    verify_vmargslot(mh, insert_after, argslot, CHECK);
+     verify_vmslots(mh, CHECK);
+   }
+ 
+@@ -1717,6 +1747,11 @@
+   if (!direct_to_method)
+     java_lang_invoke_BoundMethodHandle::set_vmtarget(mh(), target());
+ 
++  int target_pushes = decode_MethodHandle_stack_pushes(target());
++  int vmargslot_field = argslot + ((target_pushes + slots_pushed)
++                                   << java_lang_invoke_BoundMethodHandle::ARG_SLOT_PUSH_SHIFT);
++  java_lang_invoke_BoundMethodHandle::set_vmargslot(mh(), vmargslot_field);
++
+   if (VerifyMethodHandles) {
+     verify_BoundMethodHandle(mh, target, argnum, direct_to_method, CHECK);
+   }
+@@ -1750,6 +1785,9 @@
+   jint conversion = java_lang_invoke_AdapterMethodHandle::conversion(mh());
+   int  argslot    = java_lang_invoke_AdapterMethodHandle::vmargslot(mh());
+ 
++  int  total_pushes = argslot >> java_lang_invoke_BoundMethodHandle::ARG_SLOT_PUSH_SHIFT;
++  argslot &= java_lang_invoke_BoundMethodHandle::ARG_SLOT_MASK;
++
+   verify_vmargslot(mh, argnum, argslot, CHECK);
+   verify_vmslots(mh, CHECK);
+ 
+@@ -1777,7 +1815,6 @@
+     switch (ek) {
+     case _adapter_check_cast:     // target type of cast
+     case _adapter_ref_to_prim:    // wrapper type from which to unbox
+-    case _adapter_prim_to_ref:    // wrapper type to box into
+     case _adapter_collect_args:   // array type to collect into
+     case _adapter_spread_args:    // array type to spread from
+       if (!java_lang_Class::is_instance(argument())
+@@ -1792,6 +1829,7 @@
+         }
+       }
+       break;
++    case _adapter_prim_to_ref:    // boxer MH to use
+     case _adapter_flyby:
+     case _adapter_ricochet:
+       if (!java_lang_invoke_MethodHandle::is_instance(argument()))
+@@ -1828,10 +1866,10 @@
+       }
+       break;
+     case _adapter_prim_to_ref:
+-      if (!is_java_primitive(src) || dest != T_OBJECT
+-          || argument() != Klass::cast(SystemDictionary::box_klass(src))->java_mirror()) {
++      if (!is_java_primitive(src) || dest != T_OBJECT) {
+         err = "adapter requires primitive src conversion subfield"; break;
+       }
++      // FIXME: verify that the argument is an MH of type (src) => dest
+       break;
+     case _adapter_swap_args:
+     case _adapter_rot_args:
+@@ -1950,23 +1988,23 @@
+   }
+ 
+   if (err == NULL) {
+-    // Make sure this adapter does not push too deeply.
++    // Make sure this adapter's stack pushing is accurately recorded.
+     int slots_pushed = stack_move / stack_move_unit();
+     int this_vmslots = java_lang_invoke_MethodHandle::vmslots(mh());
+     int target_vmslots = java_lang_invoke_MethodHandle::vmslots(target());
++    int target_pushes = decode_MethodHandle_stack_pushes(target());
+     if (slots_pushed != (target_vmslots - this_vmslots)) {
+       err = "stack_move inconsistent with previous and current MethodType vmslots";
+-    } else if (slots_pushed > 0)  {
+-      // verify stack_move against MethodHandlePushLimit
+-      int target_pushes = decode_MethodHandle_stack_pushes(target());
+-      // do not blow the stack; use a Java-based adapter if this limit is exceeded
+-      if (slots_pushed + target_pushes > MethodHandlePushLimit) {
+-        err = "adapter pushes too many parameters";
++    } else {
++      if (slots_pushed + target_pushes != total_pushes) {
++        if (total_pushes == 0)
++          err = "adapter push count not initialized";
++        else
++          err = "adapter push count is wrong";
+       }
+     }
+ 
+     // While we're at it, check that the stack motion decoder works:
+-    DEBUG_ONLY(int target_pushes = decode_MethodHandle_stack_pushes(target()));
+     DEBUG_ONLY(int this_pushes = decode_MethodHandle_stack_pushes(mh()));
+     assert(this_pushes == slots_pushed + target_pushes, "AMH stack motion must be correct");
+   }
+@@ -2035,17 +2073,27 @@
+   }
+   java_lang_invoke_AdapterMethodHandle::set_vmtarget(mh(), target());
+ 
+-  if (VerifyMethodHandles) {
+-    verify_AdapterMethodHandle(mh, argnum, CHECK);
+-  }
+-
+   int stack_move = adapter_conversion_stack_move(conversion);
+   BasicType src  = adapter_conversion_src_type(conversion);
+   BasicType dest = adapter_conversion_dest_type(conversion);
+   int vminfo     = adapter_conversion_vminfo(conversion); // should be zero
+ 
++  int slots_pushed = stack_move / stack_move_unit();
++  int target_pushes = decode_MethodHandle_stack_pushes(target());
++  int vmargslot_field = argslot + ((target_pushes + slots_pushed)
++                                   << java_lang_invoke_BoundMethodHandle::ARG_SLOT_PUSH_SHIFT);
++  java_lang_invoke_BoundMethodHandle::set_vmargslot(mh(), vmargslot_field);
++
++  if (VerifyMethodHandles) {
++    verify_AdapterMethodHandle(mh, argnum, CHECK);
++  }
++
+   const char* err = NULL;
+ 
++  if ((adapter_conversion_ops_supported_mask() & (1 << conv_op)) == 0) {
++    err = "adapter not yet implemented in the JVM";
++  }
++
+   // Now it's time to finish the case analysis and pick a MethodHandleEntry.
+   switch (ek_orig) {
+   case _adapter_retype_only:
+@@ -2111,7 +2159,20 @@
+     break;
+ 
+   case _adapter_prim_to_ref:
+-    goto throw_not_impl;        // allocates, hence could block
++    {
++      switch (type2size[src]) {
++      case 1:
++        ek_opt = _adapter_opt_filter_1;
++        break;
++      case 2:
++        ek_opt = _adapter_opt_collect_2;
++        break;
++      default:
++        assert(false, "");
++        break;
++      }
++    }
++    break;
+ 
+   case _adapter_swap_args:
+   case _adapter_rot_args:
+@@ -2143,7 +2204,6 @@
+   case _adapter_spread_args:
+     {
+       // vminfo will be the required length of the array
+-      int slots_pushed = stack_move / stack_move_unit();
+       int array_size   = slots_pushed + 1;
+       assert(array_size >= 0, "");
+       vminfo = array_size;
+@@ -2167,8 +2227,8 @@
+     // and fall through:
+ 
+   throw_not_impl:
+-    // FIXME: these adapters are NYI
+-    err = "adapter not yet implemented in the JVM";
++    if (err == NULL)
++      err = "unknown adapter type";
+     break;
+   }
+ 
+@@ -2382,6 +2442,8 @@
+     template(java_lang_invoke_MemberName,MN_SEARCH_SUPERCLASSES) \
+     template(java_lang_invoke_MemberName,MN_SEARCH_INTERFACES) \
+     template(java_lang_invoke_MemberName,VM_INDEX_UNINITIALIZED) \
++    template(java_lang_invoke_BoundMethodHandle,ARG_SLOT_PUSH_SHIFT) \
++    template(java_lang_invoke_BoundMethodHandle,ARG_SLOT_MASK) \
+     template(java_lang_invoke_AdapterMethodHandle,OP_RETYPE_ONLY) \
+     template(java_lang_invoke_AdapterMethodHandle,OP_RETYPE_RAW) \
+     template(java_lang_invoke_AdapterMethodHandle,OP_CHECK_CAST) \
+diff --git a/src/share/vm/prims/methodHandles.hpp b/src/share/vm/prims/methodHandles.hpp
+--- a/src/share/vm/prims/methodHandles.hpp
++++ b/src/share/vm/prims/methodHandles.hpp
+@@ -42,6 +42,7 @@
+  public:
+   enum EntryKind {
+     _raise_exception,           // stub for error generation from other stubs
++    _invokegeneric_mh,          // how MH.invokeGeneric repairs the argument list
+     _invokestatic_mh,           // how a MH emulates invokestatic
+     _invokespecial_mh,          // ditto for the other invokes...
+     _invokevirtual_mh,
+@@ -93,6 +94,12 @@
+     _adapter_opt_unboxi,
+     _adapter_opt_unboxl,
+ 
++    // blocking filter/collect conversions:
++    _adapter_opt_filter_1,   // filter one argument, or box a single-word value
++    _adapter_opt_collect_2,  // combine 2 arguments, or box a double or long
++    _adapter_opt_collect_3,  // combine 3 arguments into one
++    _adapter_opt_collect_more, // combine 4 or more arguments into one
++
+     // spreading (array length cases 0, 1, >=2)
+     _adapter_opt_spread_0,
+     _adapter_opt_spread_1,
+@@ -234,6 +241,9 @@
+     return frame::interpreter_frame_expression_stack_direction() * Interpreter::stackElementWords;
+   }
+ 
++  // Adapter frame traversal.
++  static void oops_ricochet_frame_do(frame& f, const RegisterMap* reg_map);
++
+   enum { CONV_VMINFO_SIGN_FLAG = 0x80 };
+   // Shift values for prim-to-prim conversions.
+   static int adapter_prim_to_prim_subword_vminfo(BasicType dest) {
+@@ -277,6 +287,7 @@
+   // The result is *not* reported as a multiple of stack_move_unit();
+   // It is a signed net number of pushes (a difference in vmslots).
+   // To compare with a stack_move value, first multiply by stack_move_unit().
++  // This value is cached in the high 16 bits of vmargslot.
+   static int decode_MethodHandle_stack_pushes(oop mh);
+ 
+  public:
+@@ -448,26 +459,30 @@
+     return same_basic_type_for_arguments(src, dst, raw, true);
+   }
+ 
+-  enum {                        // arg_mask values
++  enum {                        // arg_mask values, used only for TaggedStackInterpreter
+     _INSERT_NO_MASK   = -1,
+     _INSERT_REF_MASK  = 0,
+     _INSERT_INT_MASK  = 1,
+     _INSERT_LONG_MASK = 3
+   };
+-  static void insert_arg_slots(MacroAssembler* _masm,
+-                               RegisterOrConstant arg_slots,
+-                               int arg_mask,
+-                               Register argslot_reg,
+-                               Register temp_reg, Register temp2_reg, Register temp3_reg = noreg);
+ 
+-  static void remove_arg_slots(MacroAssembler* _masm,
+-                               RegisterOrConstant arg_slots,
+-                               Register argslot_reg,
+-                               Register temp_reg, Register temp2_reg, Register temp3_reg = noreg);
++ static Symbol* convert_to_signature(oop type_str, bool polymorphic, TRAPS);
+ 
+-  static void trace_method_handle(MacroAssembler* _masm, const char* adaptername) PRODUCT_RETURN;
+-
+-  static Symbol* convert_to_signature(oop type_str, bool polymorphic, TRAPS);
++#ifdef TARGET_ARCH_x86
++# include "methodHandles_x86.hpp"
++#endif
++#ifdef TARGET_ARCH_sparc
++# include "methodHandles_sparc.hpp"
++#endif
++#ifdef TARGET_ARCH_zero
++# include "methodHandles_zero.hpp"
++#endif
++#ifdef TARGET_ARCH_arm
++# include "methodHandles_arm.hpp"
++#endif
++#ifdef TARGET_ARCH_ppc
++# include "methodHandles_ppc.hpp"
++#endif
+ };
+ 
+ 
+diff --git a/src/share/vm/runtime/frame.cpp b/src/share/vm/runtime/frame.cpp
+--- a/src/share/vm/runtime/frame.cpp
++++ b/src/share/vm/runtime/frame.cpp
+@@ -33,6 +33,7 @@
+ #include "oops/methodOop.hpp"
+ #include "oops/oop.inline.hpp"
+ #include "oops/oop.inline2.hpp"
++#include "prims/methodHandles.hpp"
+ #include "runtime/frame.inline.hpp"
+ #include "runtime/handles.inline.hpp"
+ #include "runtime/javaCalls.hpp"
+@@ -986,6 +987,9 @@
+     if (reg_map->include_argument_oops()) {
+       _cb->preserve_callee_argument_oops(*this, reg_map, f);
+     }
++  } else if (_cb == SharedRuntime::ricochet_blob()) {
++    assert(pc() == ((RicochetBlob*)_cb)->bounce_addr(), "the only continuation point");
++    MethodHandles::oops_ricochet_frame_do(*this, reg_map);
+   }
+   // In cases where perm gen is collected, GC will want to mark
+   // oops referenced from nmethods active on thread stacks so as to
+diff --git a/src/share/vm/runtime/sharedRuntime.hpp b/src/share/vm/runtime/sharedRuntime.hpp
+--- a/src/share/vm/runtime/sharedRuntime.hpp
++++ b/src/share/vm/runtime/sharedRuntime.hpp
+@@ -58,6 +58,8 @@
+   static RuntimeStub* _resolve_virtual_call_blob;
+   static RuntimeStub* _resolve_static_call_blob;
+ 
++  static RicochetBlob* _ricochet_blob;
++
+   static SafepointBlob* _polling_page_safepoint_handler_blob;
+   static SafepointBlob* _polling_page_return_handler_blob;
+ #ifdef COMPILER2
+@@ -213,6 +215,13 @@
+     return _resolve_static_call_blob->entry_point();
+   }
+ 
++  static RicochetBlob* ricochet_blob() {
++    assert(!EnableInvokeDynamic || _ricochet_blob != NULL, "oops");
++    return _ricochet_blob;
++  }
++
++  static void generate_ricochet_blob();
++
+   static SafepointBlob* polling_page_return_handler_blob()     { return _polling_page_return_handler_blob; }
+   static SafepointBlob* polling_page_safepoint_handler_blob()  { return _polling_page_safepoint_handler_blob; }
+ 

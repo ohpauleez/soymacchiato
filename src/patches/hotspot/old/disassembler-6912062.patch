@@ -1,0 +1,1003 @@
+pushed to jdk7
+6912062: disassembler plugin needs to produce symbolic information in product mode
+Summary: More informative disassembly in product mode.  Also, a more consistent CompileCommand syntax.
+Reviewed-by: never
+
+diff --git a/src/share/vm/code/codeBlob.hpp b/src/share/vm/code/codeBlob.hpp
+--- a/src/share/vm/code/codeBlob.hpp
++++ b/src/share/vm/code/codeBlob.hpp
+@@ -204,7 +204,8 @@
+   virtual void print_value_on(outputStream* st) const PRODUCT_RETURN;
+ 
+   // Print the comment associated with offset on stream, if there is one
+-  void print_block_comment(outputStream* stream, intptr_t offset) {
++  virtual void print_block_comment(outputStream* stream, address block_begin) {
++    intptr_t offset = (intptr_t)(block_begin - instructions_begin());
+     _comments.print_block_comment(stream, offset);
+   }
+ 
+diff --git a/src/share/vm/code/nmethod.cpp b/src/share/vm/code/nmethod.cpp
+--- a/src/share/vm/code/nmethod.cpp
++++ b/src/share/vm/code/nmethod.cpp
+@@ -56,13 +56,13 @@
+ #endif
+ 
+ bool nmethod::is_compiled_by_c1() const {
++  if (compiler() == NULL || method() == NULL)  return false;  // can happen during debug printing
+   if (is_native_method()) return false;
+-  assert(compiler() != NULL, "must be");
+   return compiler()->is_c1();
+ }
+ bool nmethod::is_compiled_by_c2() const {
++  if (compiler() == NULL || method() == NULL)  return false;  // can happen during debug printing
+   if (is_native_method()) return false;
+-  assert(compiler() != NULL, "must be");
+   return compiler()->is_c2();
+ }
+ 
+@@ -2399,6 +2399,107 @@
+   return NULL;
+ }
+ 
++void nmethod::print_nmethod_labels(outputStream* stream, address block_begin) {
++  if (block_begin == entry_point())             stream->print_cr("[Entry Point]");
++  if (block_begin == verified_entry_point())    stream->print_cr("[Verified Entry Point]");
++  if (block_begin == exception_begin())         stream->print_cr("[Exception Handler]");
++  if (block_begin == stub_begin())              stream->print_cr("[Stub Code]");
++  if (block_begin == consts_begin())            stream->print_cr("[Constants]");
++  if (block_begin == entry_point()) {
++    methodHandle m = method();
++    if (m.not_null()) {
++      stream->print("  # ");
++      m->print_value_on(stream);
++      stream->cr();
++    }
++    if (m.not_null() && !is_osr_method()) {
++      ResourceMark rm;
++      int sizeargs = m->size_of_parameters();
++      BasicType* sig_bt = NEW_RESOURCE_ARRAY(BasicType, sizeargs);
++      VMRegPair* regs   = NEW_RESOURCE_ARRAY(VMRegPair, sizeargs);
++      {
++        int sig_index = 0;
++        if (!m->is_static())
++          sig_bt[sig_index++] = T_OBJECT; // 'this'
++        for (SignatureStream ss(m->signature()); !ss.at_return_type(); ss.next()) {
++          BasicType t = ss.type();
++          sig_bt[sig_index++] = t;
++          if (type2size[t] == 2) {
++            sig_bt[sig_index++] = T_VOID;
++          } else {
++            assert(type2size[t] == 1, "size is 1 or 2");
++          }
++        }
++        assert(sig_index == sizeargs, "");
++      }
++      const char* spname = "sp"; // make arch-specific?
++      intptr_t out_preserve = SharedRuntime::java_calling_convention(sig_bt, regs, sizeargs, false);
++      int stack_slot_offset = this->frame_size() * wordSize;
++      int tab1 = 14, tab2 = 24;
++      int sig_index = 0;
++      int arg_index = (m->is_static() ? 0 : -1);
++      bool did_old_sp = false;
++      for (SignatureStream ss(m->signature()); !ss.at_return_type(); ) {
++        bool at_this = (arg_index == -1);
++        bool at_old_sp = false;
++        BasicType t = (at_this ? T_OBJECT : ss.type());
++        assert(t == sig_bt[sig_index], "sigs in sync");
++        if (at_this)
++          stream->print("  # this: ");
++        else
++          stream->print("  # parm%d: ", arg_index);
++        stream->move_to(tab1);
++        VMReg fst = regs[sig_index].first();
++        VMReg snd = regs[sig_index].second();
++        if (fst->is_reg()) {
++          stream->print("%s", fst->name());
++          if (snd->is_valid())  {
++            stream->print(":%s", snd->name());
++          }
++        } else if (fst->is_stack()) {
++          int offset = fst->reg2stack() * VMRegImpl::stack_slot_size + stack_slot_offset;
++          if (offset == stack_slot_offset)  at_old_sp = true;
++          stream->print("[%s+0x%x]", spname, offset);
++        } else {
++          stream->print("reg%d:%d??", (int)(intptr_t)fst, (int)(intptr_t)snd);
++        }
++        stream->print(" ");
++        stream->move_to(tab2);
++        stream->print("= ");
++        if (at_this) {
++          m->method_holder()->print_value_on(stream);
++        } else {
++          bool did_name = false;
++          if (!at_this && ss.is_object()) {
++            symbolOop name = ss.as_symbol_or_null();
++            if (name != NULL) {
++              name->print_value_on(stream);
++              did_name = true;
++            }
++          }
++          if (!did_name)
++            stream->print("%s", type2name(t));
++        }
++        if (at_old_sp) {
++          stream->print("  (%s of caller)", spname);
++          did_old_sp = true;
++        }
++        stream->cr();
++        sig_index += type2size[t];
++        arg_index += 1;
++        if (!at_this)  ss.next();
++      }
++      if (!did_old_sp) {
++        stream->print("  # ");
++        stream->move_to(tab1);
++        stream->print("[%s+0x%x]", spname, stack_slot_offset);
++        stream->print("  (%s of caller)", spname);
++        stream->cr();
++      }
++    }
++  }
++}
++
+ void nmethod::print_code_comment_on(outputStream* st, int column, u_char* begin, u_char* end) {
+   // First, find an oopmap in (begin, end].
+   // We use the odd half-closed interval so that oop maps and scope descs
+diff --git a/src/share/vm/code/nmethod.hpp b/src/share/vm/code/nmethod.hpp
+--- a/src/share/vm/code/nmethod.hpp
++++ b/src/share/vm/code/nmethod.hpp
+@@ -576,6 +576,13 @@
+   void log_new_nmethod() const;
+   void log_state_change() const;
+ 
++  // Prints block-level comments, including nmethod specific block labels:
++  virtual void print_block_comment(outputStream* stream, address block_begin) {
++    print_nmethod_labels(stream, block_begin);
++    CodeBlob::print_block_comment(stream, block_begin);
++  }
++  void print_nmethod_labels(outputStream* stream, address block_begin);
++
+   // Prints a comment for one native instruction (reloc info, pc desc)
+   void print_code_comment_on(outputStream* st, int column, address begin, address end);
+   static void print_statistics()                  PRODUCT_RETURN;
+diff --git a/src/share/vm/compiler/compilerOracle.cpp b/src/share/vm/compiler/compilerOracle.cpp
+--- a/src/share/vm/compiler/compilerOracle.cpp
++++ b/src/share/vm/compiler/compilerOracle.cpp
+@@ -392,18 +392,18 @@
+ };
+ 
+ static MethodMatcher::Mode check_mode(char name[], const char*& error_msg) {
+-  if (strcmp(name, "*") == 0) return MethodMatcher::Any;
+-
+   int match = MethodMatcher::Exact;
+-  if (name[0] == '*') {
++  while (name[0] == '*') {
+     match |= MethodMatcher::Suffix;
+     strcpy(name, name + 1);
+   }
+ 
++  if (strcmp(name, "*") == 0) return MethodMatcher::Any;
++
+   size_t len = strlen(name);
+-  if (len > 0 && name[len - 1] == '*') {
++  while (len > 0 && name[len - 1] == '*') {
+     match |= MethodMatcher::Prefix;
+-    name[len - 1] = '\0';
++    name[--len] = '\0';
+   }
+ 
+   if (strstr(name, "*") != NULL) {
+@@ -610,6 +610,14 @@
+   CompilerOracle::parse_from_string(CompileCommand, CompilerOracle::parse_from_line);
+   CompilerOracle::parse_from_string(CompileOnly, CompilerOracle::parse_compile_only);
+   CompilerOracle::parse_from_file();
++  if (lists[PrintCommand] != NULL) {
++    if (PrintAssembly) {
++      warning("CompileCommand and/or .hotspot_compiler file contains 'print' commands, but PrintAssembly is also enabled");
++    } else if (FLAG_IS_DEFAULT(DebugNonSafepoints)) {
++      warning("printing of assembly code is enabled; turning on DebugNonSafepoints to gain additional output");
++      DebugNonSafepoints = true;
++    }
++  }
+ }
+ 
+ 
+diff --git a/src/share/vm/compiler/disassembler.cpp b/src/share/vm/compiler/disassembler.cpp
+--- a/src/share/vm/compiler/disassembler.cpp
++++ b/src/share/vm/compiler/disassembler.cpp
+@@ -151,8 +151,10 @@
+     outputStream* st = output();
+     if (_print_bytes && pc > pc0)
+       print_insn_bytes(pc0, pc);
+-    if (_nm != NULL)
++    if (_nm != NULL) {
+       _nm->print_code_comment_on(st, COMMENT_COLUMN, pc0, pc);
++      // this calls reloc_string_for which calls oop::print_value_on
++    }
+ 
+     // Output pc bucket ticks if we have any
+     if (total_ticks() != 0) {
+@@ -273,8 +275,15 @@
+     oop obj;
+     if (_nm != NULL
+         && (obj = _nm->embeddedOop_at(cur_insn())) != NULL
+-        && (address) obj == adr) {
++        && (address) obj == adr
++        && Universe::heap()->is_in(obj)
++        && Universe::heap()->is_in(obj->klass())) {
++      julong c = st->count();
+       obj->print_value_on(st);
++      if (st->count() == c) {
++        // No output.  (Can happen in product builds.)
++        st->print("(a %s)", Klass::cast(obj->klass())->external_name());
++      }
+       return;
+     }
+   }
+@@ -286,17 +295,9 @@
+ void decode_env::print_insn_labels() {
+   address p = cur_insn();
+   outputStream* st = output();
+-  nmethod* nm = _nm;
+-  if (nm != NULL) {
+-    if (p == nm->entry_point())             st->print_cr("[Entry Point]");
+-    if (p == nm->verified_entry_point())    st->print_cr("[Verified Entry Point]");
+-    if (p == nm->exception_begin())         st->print_cr("[Exception Handler]");
+-    if (p == nm->stub_begin())              st->print_cr("[Stub Code]");
+-    if (p == nm->consts_begin())            st->print_cr("[Constants]");
+-  }
+   CodeBlob* cb = _code;
+   if (cb != NULL) {
+-    cb->print_block_comment(st, (intptr_t)(p - cb->instructions_begin()));
++    cb->print_block_comment(st, p);
+   }
+   if (_print_pc) {
+     st->print("  " INTPTR_FORMAT ": ", (intptr_t) p);
+diff --git a/src/share/vm/includeDB_core b/src/share/vm/includeDB_core
+--- a/src/share/vm/includeDB_core
++++ b/src/share/vm/includeDB_core
+@@ -1525,6 +1525,7 @@
+ disassembler.cpp                        fprofiler.hpp
+ disassembler.cpp                        handles.inline.hpp
+ disassembler.cpp                        hpi.hpp
++disassembler.cpp                        javaClasses.hpp
+ disassembler.cpp                        stubCodeGenerator.hpp
+ disassembler.cpp                        stubRoutines.hpp
+ 
+diff --git a/src/share/vm/memory/genCollectedHeap.cpp b/src/share/vm/memory/genCollectedHeap.cpp
+--- a/src/share/vm/memory/genCollectedHeap.cpp
++++ b/src/share/vm/memory/genCollectedHeap.cpp
+@@ -925,6 +925,8 @@
+   guarantee(VerifyBeforeGC   ||
+             VerifyDuringGC   ||
+             VerifyBeforeExit ||
++            PrintAssembly    ||
++            tty->count() != 0 ||   // already printing
+             VerifyAfterGC, "too expensive");
+   #endif
+   // This might be sped up with a cache of the last generation that
+diff --git a/src/share/vm/oops/arrayKlassKlass.cpp b/src/share/vm/oops/arrayKlassKlass.cpp
+--- a/src/share/vm/oops/arrayKlassKlass.cpp
++++ b/src/share/vm/oops/arrayKlassKlass.cpp
+@@ -159,7 +159,7 @@
+   assert(obj->is_klass(), "must be klass");
+   klassKlass::oop_print_on(obj, st);
+ }
+-
++#endif //PRODUCT
+ 
+ void arrayKlassKlass::oop_print_value_on(oop obj, outputStream* st) {
+   assert(obj->is_klass(), "must be klass");
+@@ -168,7 +168,6 @@
+     st->print("[]");
+   }
+ }
+-#endif
+ 
+ 
+ const char* arrayKlassKlass::internal_name() const {
+diff --git a/src/share/vm/oops/arrayKlassKlass.hpp b/src/share/vm/oops/arrayKlassKlass.hpp
+--- a/src/share/vm/oops/arrayKlassKlass.hpp
++++ b/src/share/vm/oops/arrayKlassKlass.hpp
+@@ -55,14 +55,13 @@
+   int oop_oop_iterate(oop obj, OopClosure* blk);
+   int oop_oop_iterate_m(oop obj, OopClosure* blk, MemRegion mr);
+ 
+-#ifndef PRODUCT
+  public:
+   // Printing
++  void oop_print_value_on(oop obj, outputStream* st);
++#ifndef PRODUCT
+   void oop_print_on(oop obj, outputStream* st);
+-  void oop_print_value_on(oop obj, outputStream* st);
+-#endif
++#endif //PRODUCT
+ 
+- public:
+   // Verification
+   const char* internal_name() const;
+   void oop_verify_on(oop obj, outputStream* st);
+diff --git a/src/share/vm/oops/compiledICHolderKlass.cpp b/src/share/vm/oops/compiledICHolderKlass.cpp
+--- a/src/share/vm/oops/compiledICHolderKlass.cpp
++++ b/src/share/vm/oops/compiledICHolderKlass.cpp
+@@ -166,12 +166,12 @@
+   st->print(" - klass:  "); c->holder_klass()->print_value_on(st); st->cr();
+ }
+ 
++#endif //PRODUCT
+ 
+ void compiledICHolderKlass::oop_print_value_on(oop obj, outputStream* st) {
+   assert(obj->is_compiledICHolder(), "must be compiledICHolder");
+   Klass::oop_print_value_on(obj, st);
+ }
+-#endif
+ 
+ const char* compiledICHolderKlass::internal_name() const {
+   return "{compiledICHolder}";
+diff --git a/src/share/vm/oops/compiledICHolderKlass.hpp b/src/share/vm/oops/compiledICHolderKlass.hpp
+--- a/src/share/vm/oops/compiledICHolderKlass.hpp
++++ b/src/share/vm/oops/compiledICHolderKlass.hpp
+@@ -68,14 +68,13 @@
+   int  oop_oop_iterate(oop obj, OopClosure* blk);
+   int  oop_oop_iterate_m(oop obj, OopClosure* blk, MemRegion mr);
+ 
+-#ifndef PRODUCT
+  public:
+   // Printing
++  void oop_print_value_on(oop obj, outputStream* st);
++#ifndef PRODUCT
+   void oop_print_on      (oop obj, outputStream* st);
+-  void oop_print_value_on(oop obj, outputStream* st);
+-#endif
++#endif //PRODUCT
+ 
+- public:
+   // Verification
+   const char* internal_name() const;
+   void oop_verify_on(oop obj, outputStream* st);
+diff --git a/src/share/vm/oops/constMethodKlass.cpp b/src/share/vm/oops/constMethodKlass.cpp
+--- a/src/share/vm/oops/constMethodKlass.cpp
++++ b/src/share/vm/oops/constMethodKlass.cpp
+@@ -216,6 +216,7 @@
+   }
+ }
+ 
++#endif //PRODUCT
+ 
+ // Short version of printing constMethodOop - just print the name of the
+ // method it belongs to.
+@@ -226,8 +227,6 @@
+   m->method()->print_value_on(st);
+ }
+ 
+-#endif // PRODUCT
+-
+ const char* constMethodKlass::internal_name() const {
+   return "{constMethod}";
+ }
+diff --git a/src/share/vm/oops/constMethodKlass.hpp b/src/share/vm/oops/constMethodKlass.hpp
+--- a/src/share/vm/oops/constMethodKlass.hpp
++++ b/src/share/vm/oops/constMethodKlass.hpp
+@@ -77,15 +77,13 @@
+   int oop_oop_iterate(oop obj, OopClosure* blk);
+   int oop_oop_iterate_m(oop obj, OopClosure* blk, MemRegion mr);
+ 
+-#ifndef PRODUCT
+  public:
+   // Printing
++  void oop_print_value_on(oop obj, outputStream* st);
++#ifndef PRODUCT
+   void oop_print_on      (oop obj, outputStream* st);
+-  void oop_print_value_on(oop obj, outputStream* st);
++#endif //PRODUCT
+ 
+-#endif
+-
+- public:
+   // Verify operations
+   const char* internal_name() const;
+   void oop_verify_on(oop obj, outputStream* st);
+diff --git a/src/share/vm/oops/constantPoolKlass.cpp b/src/share/vm/oops/constantPoolKlass.cpp
+--- a/src/share/vm/oops/constantPoolKlass.cpp
++++ b/src/share/vm/oops/constantPoolKlass.cpp
+@@ -387,8 +387,18 @@
+   cp->set_cache(cache());
+ }
+ 
++#endif
+ 
+-#endif
++void constantPoolKlass::oop_print_value_on(oop obj, outputStream* st) {
++  assert(obj->is_constantPool(), "must be constantPool");
++  constantPoolOop cp = constantPoolOop(obj);
++  st->print("constant pool [%d]", cp->length());
++  if (cp->has_pseudo_string()) st->print("/pseudo_string");
++  if (cp->has_invokedynamic()) st->print("/invokedynamic");
++  cp->print_address_on(st);
++  st->print(" for ");
++  cp->pool_holder()->print_value_on(st);
++}
+ 
+ const char* constantPoolKlass::internal_name() const {
+   return "{constant pool}";
+diff --git a/src/share/vm/oops/constantPoolKlass.hpp b/src/share/vm/oops/constantPoolKlass.hpp
+--- a/src/share/vm/oops/constantPoolKlass.hpp
++++ b/src/share/vm/oops/constantPoolKlass.hpp
+@@ -65,9 +65,10 @@
+   juint alloc_size() const              { return _alloc_size; }
+   void set_alloc_size(juint n)          { _alloc_size = n; }
+ 
+-#ifndef PRODUCT
+  public:
+   // Printing
++  void oop_print_value_on(oop obj, outputStream* st);
++#ifndef PRODUCT
+   void oop_print_on(oop obj, outputStream* st);
+ #endif
+ 
+diff --git a/src/share/vm/oops/cpCacheKlass.cpp b/src/share/vm/oops/cpCacheKlass.cpp
+--- a/src/share/vm/oops/cpCacheKlass.cpp
++++ b/src/share/vm/oops/cpCacheKlass.cpp
+@@ -261,6 +261,15 @@
+ 
+ #endif
+ 
++void constantPoolCacheKlass::oop_print_value_on(oop obj, outputStream* st) {
++  assert(obj->is_constantPoolCache(), "obj must be constant pool cache");
++  constantPoolCacheOop cache = (constantPoolCacheOop)obj;
++  st->print("cache [%d]", cache->length());
++  cache->print_address_on(st);
++  st->print(" for ");
++  cache->constant_pool()->print_value_on(st);
++}
++
+ void constantPoolCacheKlass::oop_verify_on(oop obj, outputStream* st) {
+   guarantee(obj->is_constantPoolCache(), "obj must be constant pool cache");
+   constantPoolCacheOop cache = (constantPoolCacheOop)obj;
+diff --git a/src/share/vm/oops/cpCacheKlass.hpp b/src/share/vm/oops/cpCacheKlass.hpp
+--- a/src/share/vm/oops/cpCacheKlass.hpp
++++ b/src/share/vm/oops/cpCacheKlass.hpp
+@@ -61,9 +61,10 @@
+   juint alloc_size() const              { return _alloc_size; }
+   void set_alloc_size(juint n)          { _alloc_size = n; }
+ 
+-#ifndef PRODUCT
+  public:
+   // Printing
++  void oop_print_value_on(oop obj, outputStream* st);
++#ifndef PRODUCT
+   void oop_print_on(oop obj, outputStream* st);
+ #endif
+ 
+diff --git a/src/share/vm/oops/instanceKlass.cpp b/src/share/vm/oops/instanceKlass.cpp
+--- a/src/share/vm/oops/instanceKlass.cpp
++++ b/src/share/vm/oops/instanceKlass.cpp
+@@ -2268,6 +2268,8 @@
+   }
+ }
+ 
++#endif //PRODUCT
++
+ void instanceKlass::oop_print_value_on(oop obj, outputStream* st) {
+   st->print("a ");
+   name()->print_value_on(st);
+@@ -2299,8 +2301,6 @@
+   }
+ }
+ 
+-#endif // ndef PRODUCT
+-
+ const char* instanceKlass::internal_name() const {
+   return external_name();
+ }
+diff --git a/src/share/vm/oops/instanceKlass.hpp b/src/share/vm/oops/instanceKlass.hpp
+--- a/src/share/vm/oops/instanceKlass.hpp
++++ b/src/share/vm/oops/instanceKlass.hpp
+@@ -839,17 +839,16 @@
+   // JVMTI support
+   jint jvmti_class_status() const;
+ 
+-#ifndef PRODUCT
+  public:
+   // Printing
++  void oop_print_value_on(oop obj, outputStream* st);
++#ifndef PRODUCT
+   void oop_print_on      (oop obj, outputStream* st);
+-  void oop_print_value_on(oop obj, outputStream* st);
+ 
+   void print_dependent_nmethods(bool verbose = false);
+   bool is_dependent_nmethod(nmethod* nm);
+ #endif
+ 
+- public:
+   // Verification
+   const char* internal_name() const;
+   void oop_verify_on(oop obj, outputStream* st);
+diff --git a/src/share/vm/oops/instanceKlassKlass.cpp b/src/share/vm/oops/instanceKlassKlass.cpp
+--- a/src/share/vm/oops/instanceKlassKlass.cpp
++++ b/src/share/vm/oops/instanceKlassKlass.cpp
+@@ -638,6 +638,7 @@
+   st->cr();
+ }
+ 
++#endif //PRODUCT
+ 
+ void instanceKlassKlass::oop_print_value_on(oop obj, outputStream* st) {
+   assert(obj->is_klass(), "must be klass");
+@@ -645,8 +646,6 @@
+   ik->name()->print_value_on(st);
+ }
+ 
+-#endif // PRODUCT
+-
+ const char* instanceKlassKlass::internal_name() const {
+   return "{instance class}";
+ }
+diff --git a/src/share/vm/oops/instanceKlassKlass.hpp b/src/share/vm/oops/instanceKlassKlass.hpp
+--- a/src/share/vm/oops/instanceKlassKlass.hpp
++++ b/src/share/vm/oops/instanceKlassKlass.hpp
+@@ -69,14 +69,13 @@
+   // Apply closure to the InstanceKlass oops that are outside the java heap.
+   inline void iterate_c_heap_oops(instanceKlass* ik, OopClosure* closure);
+ 
+-#ifndef PRODUCT
+  public:
+   // Printing
++  void oop_print_value_on(oop obj, outputStream* st);
++#ifndef PRODUCT
+   void oop_print_on(oop obj, outputStream* st);
+-  void oop_print_value_on(oop obj, outputStream* st);
+ #endif
+ 
+- public:
+   // Verification
+   const char* internal_name() const;
+   void oop_verify_on(oop obj, outputStream* st);
+diff --git a/src/share/vm/oops/klass.cpp b/src/share/vm/oops/klass.cpp
+--- a/src/share/vm/oops/klass.cpp
++++ b/src/share/vm/oops/klass.cpp
+@@ -541,6 +541,7 @@
+   st->cr();
+ }
+ 
++#endif //PRODUCT
+ 
+ void Klass::oop_print_value_on(oop obj, outputStream* st) {
+   // print title
+@@ -549,8 +550,6 @@
+   obj->print_address_on(st);
+ }
+ 
+-#endif
+-
+ // Verification
+ 
+ void Klass::oop_verify_on(oop obj, outputStream* st) {
+diff --git a/src/share/vm/oops/klass.hpp b/src/share/vm/oops/klass.hpp
+--- a/src/share/vm/oops/klass.hpp
++++ b/src/share/vm/oops/klass.hpp
+@@ -776,14 +776,13 @@
+   // JVMTI support
+   virtual jint jvmti_class_status() const;
+ 
+-#ifndef PRODUCT
+  public:
+   // Printing
++  virtual void oop_print_value_on(oop obj, outputStream* st);
++#ifndef PRODUCT
+   virtual void oop_print_on      (oop obj, outputStream* st);
+-  virtual void oop_print_value_on(oop obj, outputStream* st);
+-#endif
++#endif //PRODUCT
+ 
+- public:
+   // Verification
+   virtual const char* internal_name() const = 0;
+   virtual void oop_verify_on(oop obj, outputStream* st);
+diff --git a/src/share/vm/oops/klassKlass.cpp b/src/share/vm/oops/klassKlass.cpp
+--- a/src/share/vm/oops/klassKlass.cpp
++++ b/src/share/vm/oops/klassKlass.cpp
+@@ -202,13 +202,12 @@
+   Klass::oop_print_on(obj, st);
+ }
+ 
++#endif //PRODUCT
+ 
+ void klassKlass::oop_print_value_on(oop obj, outputStream* st) {
+   Klass::oop_print_value_on(obj, st);
+ }
+ 
+-#endif
+-
+ const char* klassKlass::internal_name() const {
+   return "{other class}";
+ }
+diff --git a/src/share/vm/oops/klassKlass.hpp b/src/share/vm/oops/klassKlass.hpp
+--- a/src/share/vm/oops/klassKlass.hpp
++++ b/src/share/vm/oops/klassKlass.hpp
+@@ -67,14 +67,13 @@
+   juint alloc_size() const              { return _alloc_size; }
+   void set_alloc_size(juint n)          { _alloc_size = n; }
+ 
+-#ifndef PRODUCT
+  public:
+   // Printing
++  void oop_print_value_on(oop obj, outputStream* st);
++#ifndef PRODUCT
+   void oop_print_on      (oop obj, outputStream* st);
+-  void oop_print_value_on(oop obj, outputStream* st);
+-#endif
++#endif //PRODUCT
+ 
+- public:
+   // Verification
+   const char* internal_name() const;
+   void oop_verify_on(oop obj, outputStream* st);
+diff --git a/src/share/vm/oops/methodDataKlass.cpp b/src/share/vm/oops/methodDataKlass.cpp
+--- a/src/share/vm/oops/methodDataKlass.cpp
++++ b/src/share/vm/oops/methodDataKlass.cpp
+@@ -214,6 +214,8 @@
+   m->print_data_on(st);
+ }
+ 
++#endif //PRODUCT
++
+ void methodDataKlass::oop_print_value_on(oop obj, outputStream* st) {
+   assert(obj->is_methodData(), "should be method data");
+   methodDataOop m = methodDataOop(obj);
+@@ -221,8 +223,6 @@
+   m->method()->print_value_on(st);
+ }
+ 
+-#endif // !PRODUCT
+-
+ const char* methodDataKlass::internal_name() const {
+   return "{method data}";
+ }
+diff --git a/src/share/vm/oops/methodDataKlass.hpp b/src/share/vm/oops/methodDataKlass.hpp
+--- a/src/share/vm/oops/methodDataKlass.hpp
++++ b/src/share/vm/oops/methodDataKlass.hpp
+@@ -71,14 +71,13 @@
+   int oop_oop_iterate(oop obj, OopClosure* blk);
+   int oop_oop_iterate_m(oop obj, OopClosure* blk, MemRegion mr);
+ 
+-#ifndef PRODUCT
+  public:
+   // Printing
++  void oop_print_value_on(oop obj, outputStream* st);
++#ifndef PRODUCT
+   void oop_print_on      (oop obj, outputStream* st);
+-  void oop_print_value_on(oop obj, outputStream* st);
+-#endif // !PRODUCT
++#endif //PRODUCT
+ 
+- public:
+   // Verify operations
+   const char* internal_name() const;
+   void oop_verify_on(oop obj, outputStream* st);
+diff --git a/src/share/vm/oops/methodKlass.cpp b/src/share/vm/oops/methodKlass.cpp
+--- a/src/share/vm/oops/methodKlass.cpp
++++ b/src/share/vm/oops/methodKlass.cpp
+@@ -308,6 +308,7 @@
+   }
+ }
+ 
++#endif //PRODUCT
+ 
+ void methodKlass::oop_print_value_on(oop obj, outputStream* st) {
+   assert(obj->is_method(), "must be method");
+@@ -323,8 +324,6 @@
+   if (WizardMode && m->code() != NULL) st->print(" ((nmethod*)%p)", m->code());
+ }
+ 
+-#endif // PRODUCT
+-
+ const char* methodKlass::internal_name() const {
+   return "{method}";
+ }
+diff --git a/src/share/vm/oops/methodKlass.hpp b/src/share/vm/oops/methodKlass.hpp
+--- a/src/share/vm/oops/methodKlass.hpp
++++ b/src/share/vm/oops/methodKlass.hpp
+@@ -68,14 +68,13 @@
+   int oop_oop_iterate(oop obj, OopClosure* blk);
+   int oop_oop_iterate_m(oop obj, OopClosure* blk, MemRegion mr);
+ 
+-#ifndef PRODUCT
+  public:
+   // Printing
++  void oop_print_value_on(oop obj, outputStream* st);
++#ifndef PRODUCT
+   void oop_print_on      (oop obj, outputStream* st);
+-  void oop_print_value_on(oop obj, outputStream* st);
+-#endif
++#endif //PRODUCT
+ 
+- public:
+   // Verify operations
+   const char* internal_name() const;
+   void oop_verify_on(oop obj, outputStream* st);
+diff --git a/src/share/vm/oops/objArrayKlass.cpp b/src/share/vm/oops/objArrayKlass.cpp
+--- a/src/share/vm/oops/objArrayKlass.cpp
++++ b/src/share/vm/oops/objArrayKlass.cpp
+@@ -499,6 +499,8 @@
+   }
+ }
+ 
++#endif //PRODUCT
++
+ static int max_objArray_print_length = 4;
+ 
+ void objArrayKlass::oop_print_value_on(oop obj, outputStream* st) {
+@@ -508,7 +510,7 @@
+   int len = objArrayOop(obj)->length();
+   st->print("[%d] ", len);
+   obj->print_address_on(st);
+-  if (PrintOopAddress || PrintMiscellaneous && (WizardMode || Verbose)) {
++  if (NOT_PRODUCT(PrintOopAddress ||) PrintMiscellaneous && (WizardMode || Verbose)) {
+     st->print("{");
+     for (int i = 0; i < len; i++) {
+       if (i > max_objArray_print_length) {
+@@ -520,8 +522,6 @@
+   }
+ }
+ 
+-#endif // PRODUCT
+-
+ const char* objArrayKlass::internal_name() const {
+   return external_name();
+ }
+diff --git a/src/share/vm/oops/objArrayKlass.hpp b/src/share/vm/oops/objArrayKlass.hpp
+--- a/src/share/vm/oops/objArrayKlass.hpp
++++ b/src/share/vm/oops/objArrayKlass.hpp
+@@ -119,14 +119,13 @@
+  private:
+    static klassOop array_klass_impl   (objArrayKlassHandle this_oop, bool or_null, int n, TRAPS);
+ 
+-#ifndef PRODUCT
+  public:
+   // Printing
++  void oop_print_value_on(oop obj, outputStream* st);
++#ifndef PRODUCT
+   void oop_print_on      (oop obj, outputStream* st);
+-  void oop_print_value_on(oop obj, outputStream* st);
+-#endif
++#endif //PRODUCT
+ 
+- public:
+   // Verification
+   const char* internal_name() const;
+   void oop_verify_on(oop obj, outputStream* st);
+diff --git a/src/share/vm/oops/objArrayKlassKlass.cpp b/src/share/vm/oops/objArrayKlassKlass.cpp
+--- a/src/share/vm/oops/objArrayKlassKlass.cpp
++++ b/src/share/vm/oops/objArrayKlassKlass.cpp
+@@ -278,6 +278,7 @@
+   st->cr();
+ }
+ 
++#endif //PRODUCT
+ 
+ void objArrayKlassKlass::oop_print_value_on(oop obj, outputStream* st) {
+   assert(obj->is_klass(), "must be klass");
+@@ -287,8 +288,6 @@
+   st->print("[]");
+ }
+ 
+-#endif
+-
+ const char* objArrayKlassKlass::internal_name() const {
+   return "{object array class}";
+ }
+diff --git a/src/share/vm/oops/objArrayKlassKlass.hpp b/src/share/vm/oops/objArrayKlassKlass.hpp
+--- a/src/share/vm/oops/objArrayKlassKlass.hpp
++++ b/src/share/vm/oops/objArrayKlassKlass.hpp
+@@ -64,14 +64,13 @@
+   // helpers
+   static klassOop allocate_objArray_klass_impl(objArrayKlassKlassHandle this_oop, int n, KlassHandle element_klass, TRAPS);
+ 
+-#ifndef PRODUCT
+  public:
+   // Printing
++  void oop_print_value_on(oop obj, outputStream* st);
++#ifndef PRODUCT
+   void oop_print_on(oop obj, outputStream* st);
+-  void oop_print_value_on(oop obj, outputStream* st);
+-#endif
++#endif //PRODUCT
+ 
+- public:
+   // Verification
+   const char* internal_name() const;
+   void oop_verify_on(oop obj, outputStream* st);
+diff --git a/src/share/vm/oops/oop.cpp b/src/share/vm/oops/oop.cpp
+--- a/src/share/vm/oops/oop.cpp
++++ b/src/share/vm/oops/oop.cpp
+@@ -31,14 +31,13 @@
+ 
+ #ifdef PRODUCT
+ void oopDesc::print_on(outputStream* st) const {}
+-void oopDesc::print_value_on(outputStream* st) const {}
+ void oopDesc::print_address_on(outputStream* st) const {}
+-char* oopDesc::print_value_string() { return NULL; }
+ char* oopDesc::print_string() { return NULL; }
+ void oopDesc::print()         {}
+-void oopDesc::print_value()   {}
+ void oopDesc::print_address() {}
+-#else
++
++#else //PRODUCT
++
+ void oopDesc::print_on(outputStream* st) const {
+   if (this == NULL) {
+     st->print_cr("NULL");
+@@ -47,22 +46,6 @@
+   }
+ }
+ 
+-void oopDesc::print_value_on(outputStream* st) const {
+-  oop obj = oop(this);
+-  if (this == NULL) {
+-    st->print("NULL");
+-  } else if (java_lang_String::is_instance(obj)) {
+-    java_lang_String::print(obj, st);
+-    if (PrintOopAddress) print_address_on(st);
+-#ifdef ASSERT
+-  } else if (!Universe::heap()->is_in(obj) || !Universe::heap()->is_in(klass())) {
+-    st->print("### BAD OOP %p ###", (address)obj);
+-#endif
+-  } else {
+-    blueprint()->oop_print_value_on(obj, st);
+-  }
+-}
+-
+ void oopDesc::print_address_on(outputStream* st) const {
+   if (PrintOopAddress) {
+     st->print("{"INTPTR_FORMAT"}", this);
+@@ -71,23 +54,47 @@
+ 
+ void oopDesc::print()         { print_on(tty);         }
+ 
+-void oopDesc::print_value()   { print_value_on(tty);   }
+-
+ void oopDesc::print_address() { print_address_on(tty); }
+ 
+ char* oopDesc::print_string() {
+-  stringStream* st = new stringStream();
+-  print_on(st);
+-  return st->as_string();
++  stringStream st;
++  print_on(&st);
++  return st.as_string();
++}
++
++#endif // PRODUCT
++
++// The print_value functions are present in all builds, to support the disassembler.
++
++void oopDesc::print_value() {
++  print_value_on(tty);
+ }
+ 
+ char* oopDesc::print_value_string() {
+-  stringStream* st = new stringStream();
+-  print_value_on(st);
+-  return st->as_string();
++  char buf[100];
++  stringStream st(buf, sizeof(buf));
++  print_value_on(&st);
++  return st.as_string();
+ }
+ 
+-#endif // PRODUCT
++void oopDesc::print_value_on(outputStream* st) const {
++  oop obj = oop(this);
++  if (this == NULL) {
++    st->print("NULL");
++  } else if (java_lang_String::is_instance(obj)) {
++    java_lang_String::print(obj, st);
++#ifndef PRODUCT
++    if (PrintOopAddress) print_address_on(st);
++#endif //PRODUCT
++#ifdef ASSERT
++  } else if (!Universe::heap()->is_in(obj) || !Universe::heap()->is_in(klass())) {
++    st->print("### BAD OOP %p ###", (address)obj);
++#endif //ASSERT
++  } else {
++    blueprint()->oop_print_value_on(obj, st);
++  }
++}
++
+ 
+ void oopDesc::verify_on(outputStream* st) {
+   if (this != NULL) {
+diff --git a/src/share/vm/oops/symbolKlass.cpp b/src/share/vm/oops/symbolKlass.cpp
+--- a/src/share/vm/oops/symbolKlass.cpp
++++ b/src/share/vm/oops/symbolKlass.cpp
+@@ -213,6 +213,8 @@
+   st->print("'");
+ }
+ 
++#endif //PRODUCT
++
+ void symbolKlass::oop_print_value_on(oop obj, outputStream* st) {
+   symbolOop sym = symbolOop(obj);
+   st->print("'");
+@@ -222,8 +224,6 @@
+   st->print("'");
+ }
+ 
+-#endif //PRODUCT
+-
+ const char* symbolKlass::internal_name() const {
+   return "{symbol}";
+ }
+diff --git a/src/share/vm/oops/symbolKlass.hpp b/src/share/vm/oops/symbolKlass.hpp
+--- a/src/share/vm/oops/symbolKlass.hpp
++++ b/src/share/vm/oops/symbolKlass.hpp
+@@ -65,10 +65,10 @@
+   int  oop_oop_iterate(oop obj, OopClosure* blk);
+   int  oop_oop_iterate_m(oop obj, OopClosure* blk, MemRegion mr);
+ 
+-#ifndef PRODUCT
+   // Printing
+   void oop_print_value_on(oop obj, outputStream* st);
++#ifndef PRODUCT
+   void oop_print_on(oop obj, outputStream* st);
+-#endif
++#endif //PRODUCT
+   const char* internal_name() const;
+ };
+diff --git a/src/share/vm/oops/typeArrayKlassKlass.cpp b/src/share/vm/oops/typeArrayKlassKlass.cpp
+--- a/src/share/vm/oops/typeArrayKlassKlass.cpp
++++ b/src/share/vm/oops/typeArrayKlassKlass.cpp
+@@ -45,6 +45,7 @@
+   Klass:: oop_print_on(obj, st);
+ }
+ 
++#endif //PRODUCT
+ 
+ void typeArrayKlassKlass::oop_print_value_on(oop obj, outputStream* st) {
+   assert(obj->is_klass(), "must be klass");
+@@ -63,8 +64,6 @@
+   st->print("}");
+ }
+ 
+-#endif
+-
+ const char* typeArrayKlassKlass::internal_name() const {
+   return "{type array class}";
+ }
+diff --git a/src/share/vm/oops/typeArrayKlassKlass.hpp b/src/share/vm/oops/typeArrayKlassKlass.hpp
+--- a/src/share/vm/oops/typeArrayKlassKlass.hpp
++++ b/src/share/vm/oops/typeArrayKlassKlass.hpp
+@@ -47,12 +47,12 @@
+   static int header_size() { return oopDesc::header_size() + sizeof(typeArrayKlassKlass)/HeapWordSize; }
+   int object_size() const  { return align_object_size(header_size()); }
+ 
+-#ifndef PRODUCT
+  public:
+   // Printing
++  void oop_print_value_on(oop obj, outputStream* st);
++#ifndef PRODUCT
+   void oop_print_on(oop obj, outputStream* st);
+-  void oop_print_value_on(oop obj, outputStream* st);
+-#endif
+- public:
++#endif //PRODUCT
++
+   const char* internal_name() const;
+ };
+diff --git a/src/share/vm/runtime/arguments.cpp b/src/share/vm/runtime/arguments.cpp
+--- a/src/share/vm/runtime/arguments.cpp
++++ b/src/share/vm/runtime/arguments.cpp
+@@ -2784,6 +2784,11 @@
+   }
+ #endif
+ 
++  if (PrintAssembly && FLAG_IS_DEFAULT(DebugNonSafepoints)) {
++    warning("PrintAssembly is enabled; turning on DebugNonSafepoints to gain additional output");
++    DebugNonSafepoints = true;
++  }
++
+   if (PrintCommandLineFlags) {
+     CommandLineFlags::printSetFlags();
+   }

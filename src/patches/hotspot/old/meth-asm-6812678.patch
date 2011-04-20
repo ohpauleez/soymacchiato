@@ -1,0 +1,1178 @@
+6812678: macro assembler needs delayed binding of a few constants (for 6655638)
+Summary: minor assembler enhancements preparing for method handles
+Reviewed-by: kvn
+
+diff --git a/src/cpu/sparc/vm/assembler_sparc.cpp b/src/cpu/sparc/vm/assembler_sparc.cpp
+--- a/src/cpu/sparc/vm/assembler_sparc.cpp
++++ b/src/cpu/sparc/vm/assembler_sparc.cpp
+@@ -2615,6 +2615,29 @@
+   }
+ }
+ 
++RegisterConstant MacroAssembler::delayed_value(intptr_t* delayed_value_addr,
++                                               Register tmp,
++                                               int offset) {
++  intptr_t value = *delayed_value_addr;
++  if (value != 0)
++    return RegisterConstant(value + offset);
++
++  // load indirectly to solve generation ordering problem
++  Address a(tmp, (address) delayed_value_addr);
++  load_ptr_contents(a, tmp);
++
++#ifdef ASSERT
++  tst(tmp);
++  breakpoint_trap(zero, xcc);
++#endif
++
++  if (offset != 0)
++    add(tmp, offset, tmp);
++
++  return RegisterConstant(tmp);
++}
++
++
+ void MacroAssembler::biased_locking_enter(Register obj_reg, Register mark_reg,
+                                           Register temp_reg,
+                                           Label& done, Label* slow_case,
+@@ -4057,6 +4080,24 @@
+   card_table_write(bs->byte_map_base, tmp, store_addr);
+ }
+ 
++// Loading values by size and signed-ness
++void MacroAssembler::load_sized_value(Register s1, RegisterConstant s2, Register d,
++                                      int size_in_bytes, bool is_signed) {
++  switch (size_in_bytes ^ (is_signed ? -1 : 0)) {
++  case ~8:  // fall through:
++  case  8:  ld_long( s1, s2, d ); break;
++  case ~4:  ldsw(    s1, s2, d ); break;
++  case  4:  lduw(    s1, s2, d ); break;
++  case ~2:  ldsh(    s1, s2, d ); break;
++  case  2:  lduh(    s1, s2, d ); break;
++  case ~1:  ldsb(    s1, s2, d ); break;
++  case  1:  ldub(    s1, s2, d ); break;
++  default:  ShouldNotReachHere();
++  }
++}
++
++
++
+ void MacroAssembler::load_klass(Register src_oop, Register klass) {
+   // The number of bytes in this code is used by
+   // MachCallDynamicJavaNode::ret_addr_offset()
+diff --git a/src/cpu/sparc/vm/assembler_sparc.hpp b/src/cpu/sparc/vm/assembler_sparc.hpp
+--- a/src/cpu/sparc/vm/assembler_sparc.hpp
++++ b/src/cpu/sparc/vm/assembler_sparc.hpp
+@@ -384,6 +384,12 @@
+ 
+   inline bool is_simm13(int offset = 0);  // check disp+offset for overflow
+ 
++  Address plus_disp(int disp) const {     // bump disp by a small amount
++    Address a = (*this);
++    a._disp += disp;
++    return a;
++  }
++
+   Address split_disp() const {            // deal with disp overflow
+     Address a = (*this);
+     int hi_disp = _disp & ~0x3ff;
+@@ -1082,6 +1088,7 @@
+   inline void add(    Register s1, Register s2, Register d );
+   inline void add(    Register s1, int simm13a, Register d, relocInfo::relocType rtype = relocInfo::none);
+   inline void add(    Register s1, int simm13a, Register d, RelocationHolder const& rspec);
++  inline void add(    Register s1, RegisterConstant s2, Register d, int offset = 0);
+   inline void add(    const Address&  a,              Register d, int offset = 0);
+ 
+   void addcc(  Register s1, Register s2, Register d ) { emit_long( op(arith_op) | rd(d) | op3(add_op3  | cc_bit_op3) | rs1(s1) | rs2(s2) ); }
+@@ -1298,6 +1305,16 @@
+   inline void ld(   const Address& a, Register d, int offset = 0 );
+   inline void ldd(  const Address& a, Register d, int offset = 0 );
+ 
++  inline void ldub(  Register s1, RegisterConstant s2, Register d );
++  inline void ldsb(  Register s1, RegisterConstant s2, Register d );
++  inline void lduh(  Register s1, RegisterConstant s2, Register d );
++  inline void ldsh(  Register s1, RegisterConstant s2, Register d );
++  inline void lduw(  Register s1, RegisterConstant s2, Register d );
++  inline void ldsw(  Register s1, RegisterConstant s2, Register d );
++  inline void ldx(   Register s1, RegisterConstant s2, Register d );
++  inline void ld(    Register s1, RegisterConstant s2, Register d );
++  inline void ldd(   Register s1, RegisterConstant s2, Register d );
++
+   // pp 177
+ 
+   void ldsba(  Register s1, Register s2, int ia, Register d ) {             emit_long( op(ldst_op) | rd(d) | op3(ldsb_op3 | alt_bit_op3) | rs1(s1) | imm_asi(ia) | rs2(s2) ); }
+@@ -1518,6 +1535,13 @@
+   inline void st(   Register d, const Address& a, int offset = 0 );
+   inline void std(  Register d, const Address& a, int offset = 0 );
+ 
++  inline void stb(  Register d, Register s1, RegisterConstant s2 );
++  inline void sth(  Register d, Register s1, RegisterConstant s2 );
++  inline void stw(  Register d, Register s1, RegisterConstant s2 );
++  inline void stx(  Register d, Register s1, RegisterConstant s2 );
++  inline void std(  Register d, Register s1, RegisterConstant s2 );
++  inline void st(   Register d, Register s1, RegisterConstant s2 );
++
+   // pp 177
+ 
+   void stba(  Register d, Register s1, Register s2, int ia ) {             emit_long( op(ldst_op) | rd(d) | op3(stb_op3 | alt_bit_op3) | rs1(s1) | imm_asi(ia) | rs2(s2) ); }
+@@ -1940,20 +1964,28 @@
+   // st_ptr will perform st for 32 bit VM's and stx for 64 bit VM's
+   inline void ld_ptr(   Register s1, Register s2, Register d );
+   inline void ld_ptr(   Register s1, int simm13a, Register d);
++  inline void ld_ptr(   Register s1, RegisterConstant s2, Register d );
+   inline void ld_ptr(  const Address& a, Register d, int offset = 0 );
+   inline void st_ptr(  Register d, Register s1, Register s2 );
+   inline void st_ptr(  Register d, Register s1, int simm13a);
++  inline void st_ptr(  Register d, Register s1, RegisterConstant s2 );
+   inline void st_ptr(  Register d, const Address& a, int offset = 0 );
+ 
+   // ld_long will perform ld for 32 bit VM's and ldx for 64 bit VM's
+   // st_long will perform st for 32 bit VM's and stx for 64 bit VM's
+   inline void ld_long( Register s1, Register s2, Register d );
+   inline void ld_long( Register s1, int simm13a, Register d );
++  inline void ld_long( Register s1, RegisterConstant s2, Register d );
+   inline void ld_long( const Address& a, Register d, int offset = 0 );
+   inline void st_long( Register d, Register s1, Register s2 );
+   inline void st_long( Register d, Register s1, int simm13a );
++  inline void st_long( Register d, Register s1, RegisterConstant s2 );
+   inline void st_long( Register d, const Address& a, int offset = 0 );
+ 
++  // Loading values by size and signed-ness
++  void load_sized_value(Register s1, RegisterConstant s2, Register d,
++                        int size_in_bytes, bool is_signed);
++
+   // --------------------------------------------------
+ 
+  public:
+@@ -2281,6 +2313,8 @@
+   // stack overflow + shadow pages.  Clobbers tsp and scratch registers.
+   void bang_stack_size(Register Rsize, Register Rtsp, Register Rscratch);
+ 
++  virtual RegisterConstant delayed_value(intptr_t* delayed_value_addr, Register tmp, int offset);
++
+   void verify_tlab();
+ 
+   Condition negate_condition(Condition cond);
+diff --git a/src/cpu/sparc/vm/assembler_sparc.inline.hpp b/src/cpu/sparc/vm/assembler_sparc.inline.hpp
+--- a/src/cpu/sparc/vm/assembler_sparc.inline.hpp
++++ b/src/cpu/sparc/vm/assembler_sparc.inline.hpp
+@@ -143,6 +143,49 @@
+ inline void Assembler::ld(  Register s1, int simm13a, Register d) { lduw( s1, simm13a, d); }
+ #endif
+ 
++inline void Assembler::ldub(  Register s1, RegisterConstant s2, Register d) {
++  if (s2.is_register())  ldsb(s1, s2.as_register(), d);
++  else                   ldsb(s1, s2.as_constant(), d);
++}
++inline void Assembler::ldsb(  Register s1, RegisterConstant s2, Register d) {
++  if (s2.is_register())  ldsb(s1, s2.as_register(), d);
++  else                   ldsb(s1, s2.as_constant(), d);
++}
++inline void Assembler::lduh(  Register s1, RegisterConstant s2, Register d) {
++  if (s2.is_register())  ldsh(s1, s2.as_register(), d);
++  else                   ldsh(s1, s2.as_constant(), d);
++}
++inline void Assembler::ldsh(  Register s1, RegisterConstant s2, Register d) {
++  if (s2.is_register())  ldsh(s1, s2.as_register(), d);
++  else                   ldsh(s1, s2.as_constant(), d);
++}
++inline void Assembler::lduw(  Register s1, RegisterConstant s2, Register d) {
++  if (s2.is_register())  ldsw(s1, s2.as_register(), d);
++  else                   ldsw(s1, s2.as_constant(), d);
++}
++inline void Assembler::ldsw(  Register s1, RegisterConstant s2, Register d) {
++  if (s2.is_register())  ldsw(s1, s2.as_register(), d);
++  else                   ldsw(s1, s2.as_constant(), d);
++}
++inline void Assembler::ldx(   Register s1, RegisterConstant s2, Register d) {
++  if (s2.is_register())  ldx(s1, s2.as_register(), d);
++  else                   ldx(s1, s2.as_constant(), d);
++}
++inline void Assembler::ld(    Register s1, RegisterConstant s2, Register d) {
++  if (s2.is_register())  ld(s1, s2.as_register(), d);
++  else                   ld(s1, s2.as_constant(), d);
++}
++inline void Assembler::ldd(   Register s1, RegisterConstant s2, Register d) {
++  if (s2.is_register())  ldd(s1, s2.as_register(), d);
++  else                   ldd(s1, s2.as_constant(), d);
++}
++
++// form effective addresses this way:
++inline void Assembler::add(   Register s1, RegisterConstant s2, Register d, int offset) {
++  if (s2.is_register())  add(s1, s2.as_register(), d);
++  else                 { add(s1, s2.as_constant() + offset, d); offset = 0; }
++  if (offset != 0)       add(d,  offset,                    d);
++}
+ 
+ inline void Assembler::ld(   const Address& a, Register d, int offset ) { relocate(a.rspec(offset)); ld(   a.base(), a.disp() + offset, d ); }
+ inline void Assembler::ldsb( const Address& a, Register d, int offset ) { relocate(a.rspec(offset)); ldsb( a.base(), a.disp() + offset, d ); }
+@@ -200,6 +243,27 @@
+ inline void Assembler::st(  Register d, Register s1, Register s2) { stw(d, s1, s2); }
+ inline void Assembler::st(  Register d, Register s1, int simm13a) { stw(d, s1, simm13a); }
+ 
++inline void Assembler::stb(  Register d, Register s1, RegisterConstant s2) {
++  if (s2.is_register())  stb(d, s1, s2.as_register());
++  else                   stb(d, s1, s2.as_constant());
++}
++inline void Assembler::sth(  Register d, Register s1, RegisterConstant s2) {
++  if (s2.is_register())  sth(d, s1, s2.as_register());
++  else                   sth(d, s1, s2.as_constant());
++}
++inline void Assembler::stx(  Register d, Register s1, RegisterConstant s2) {
++  if (s2.is_register())  stx(d, s1, s2.as_register());
++  else                   stx(d, s1, s2.as_constant());
++}
++inline void Assembler::std( Register d, Register s1, RegisterConstant s2) {
++  if (s2.is_register())  std(d, s1, s2.as_register());
++  else                   std(d, s1, s2.as_constant());
++}
++inline void Assembler::st(  Register d, Register s1, RegisterConstant s2) {
++  if (s2.is_register())  st(d, s1, s2.as_register());
++  else                   st(d, s1, s2.as_constant());
++}
++
+ inline void Assembler::stb( Register d, const Address& a, int offset) { relocate(a.rspec(offset)); stb( d, a.base(), a.disp() + offset); }
+ inline void Assembler::sth( Register d, const Address& a, int offset) { relocate(a.rspec(offset)); sth( d, a.base(), a.disp() + offset); }
+ inline void Assembler::stw( Register d, const Address& a, int offset) { relocate(a.rspec(offset)); stw( d, a.base(), a.disp() + offset); }
+@@ -244,6 +308,14 @@
+ #endif
+ }
+ 
++inline void MacroAssembler::ld_ptr( Register s1, RegisterConstant s2, Register d ) {
++#ifdef _LP64
++  Assembler::ldx( s1, s2, d);
++#else
++  Assembler::ld(  s1, s2, d);
++#endif
++}
++
+ inline void MacroAssembler::ld_ptr( const Address& a, Register d, int offset ) {
+ #ifdef _LP64
+   Assembler::ldx(  a, d, offset );
+@@ -268,6 +340,14 @@
+ #endif
+ }
+ 
++inline void MacroAssembler::st_ptr( Register d, Register s1, RegisterConstant s2 ) {
++#ifdef _LP64
++  Assembler::stx( d, s1, s2);
++#else
++  Assembler::st( d, s1, s2);
++#endif
++}
++
+ inline void MacroAssembler::st_ptr(  Register d, const Address& a, int offset) {
+ #ifdef _LP64
+   Assembler::stx(  d, a, offset);
+@@ -293,6 +373,14 @@
+ #endif
+ }
+ 
++inline void MacroAssembler::ld_long( Register s1, RegisterConstant s2, Register d ) {
++#ifdef _LP64
++  Assembler::ldx(s1, s2, d);
++#else
++  Assembler::ldd(s1, s2, d);
++#endif
++}
++
+ inline void MacroAssembler::ld_long( const Address& a, Register d, int offset ) {
+ #ifdef _LP64
+   Assembler::ldx(a, d, offset );
+@@ -317,6 +405,14 @@
+ #endif
+ }
+ 
++inline void MacroAssembler::st_long( Register d, Register s1, RegisterConstant s2 ) {
++#ifdef _LP64
++  Assembler::stx(d, s1, s2);
++#else
++  Assembler::std(d, s1, s2);
++#endif
++}
++
+ inline void MacroAssembler::st_long( Register d, const Address& a, int offset ) {
+ #ifdef _LP64
+   Assembler::stx(d, a, offset);
+diff --git a/src/cpu/x86/vm/assembler_x86.cpp b/src/cpu/x86/vm/assembler_x86.cpp
+--- a/src/cpu/x86/vm/assembler_x86.cpp
++++ b/src/cpu/x86/vm/assembler_x86.cpp
+@@ -6197,8 +6197,11 @@
+   return off;
+ }
+ 
+-// word => int32 which seems bad for 64bit
+-int MacroAssembler::load_signed_word(Register dst, Address src) {
++// Note: load_signed_short used to be called load_signed_word.
++// Although the 'w' in x86 opcodes refers to the term "word" in the assembler
++// manual, which means 16 bits, that usage is found nowhere in HotSpot code.
++// The term "word" in HotSpot means a 32- or 64-bit machine word.
++int MacroAssembler::load_signed_short(Register dst, Address src) {
+   int off;
+   if (LP64_ONLY(true ||) VM_Version::is_P6()) {
+     // This is dubious to me since it seems safe to do a signed 16 => 64 bit
+@@ -6207,7 +6210,7 @@
+     off = offset();
+     movswl(dst, src); // movsxw
+   } else {
+-    off = load_unsigned_word(dst, src);
++    off = load_unsigned_short(dst, src);
+     shll(dst, 16);
+     sarl(dst, 16);
+   }
+@@ -6229,7 +6232,8 @@
+   return off;
+ }
+ 
+-int MacroAssembler::load_unsigned_word(Register dst, Address src) {
++// Note: load_unsigned_short used to be called load_unsigned_word.
++int MacroAssembler::load_unsigned_short(Register dst, Address src) {
+   // According to Intel Doc. AP-526, "Zero-Extension of Short", p.16,
+   // and "3.9 Partial Register Penalties", p. 22).
+   int off;
+@@ -6244,6 +6248,28 @@
+   return off;
+ }
+ 
++void MacroAssembler::load_sized_value(Register dst, Address src,
++                                      int size_in_bytes, bool is_signed) {
++  switch (size_in_bytes ^ (is_signed ? -1 : 0)) {
++#ifndef _LP64
++  // For case 8, caller is responsible for manually loading
++  // the second word into another register.
++  case ~8:  // fall through:
++  case  8:  movl(                dst, src ); break;
++#else
++  case ~8:  // fall through:
++  case  8:  movq(                dst, src ); break;
++#endif
++  case ~4:  // fall through:
++  case  4:  movl(                dst, src ); break;
++  case ~2:  load_signed_short(   dst, src ); break;
++  case  2:  load_unsigned_short( dst, src ); break;
++  case ~1:  load_signed_byte(    dst, src ); break;
++  case  1:  load_unsigned_byte(  dst, src ); break;
++  default:  ShouldNotReachHere();
++  }
++}
++
+ void MacroAssembler::mov32(AddressLiteral dst, Register src) {
+   if (reachable(dst)) {
+     movl(as_Address(dst), src);
+@@ -7094,6 +7120,31 @@
+ }
+ 
+ 
++RegisterConstant MacroAssembler::delayed_value(intptr_t* delayed_value_addr,
++                                               Register tmp,
++                                               int offset) {
++  intptr_t value = *delayed_value_addr;
++  if (value != 0)
++    return RegisterConstant(value + offset);
++
++  // load indirectly to solve generation ordering problem
++  movptr(tmp, ExternalAddress((address) delayed_value_addr));
++
++#ifdef ASSERT
++  Label L;
++  testl(tmp, tmp);
++  jccb(Assembler::notZero, L);
++  hlt();
++  bind(L);
++#endif
++
++  if (offset != 0)
++    addptr(tmp, offset);
++
++  return RegisterConstant(tmp);
++}
++
++
+ void MacroAssembler::verify_oop_addr(Address addr, const char* s) {
+   if (!VerifyOops) return;
+ 
+diff --git a/src/cpu/x86/vm/assembler_x86.hpp b/src/cpu/x86/vm/assembler_x86.hpp
+--- a/src/cpu/x86/vm/assembler_x86.hpp
++++ b/src/cpu/x86/vm/assembler_x86.hpp
+@@ -153,6 +153,21 @@
+     times_8  =  3,
+     times_ptr = LP64_ONLY(times_8) NOT_LP64(times_4)
+   };
++  static ScaleFactor times(int size) {
++    assert(size >= 1 && size <= 8 && is_power_of_2(size), "bad scale size");
++    if (size == 8)  return times_8;
++    if (size == 4)  return times_4;
++    if (size == 2)  return times_2;
++    return times_1;
++  }
++  static int scale_size(ScaleFactor scale) {
++    assert(scale != no_scale, "");
++    assert(((1 << (int)times_1) == 1 &&
++            (1 << (int)times_2) == 2 &&
++            (1 << (int)times_4) == 4 &&
++            (1 << (int)times_8) == 8), "");
++    return (1 << (int)scale);
++  }
+ 
+  private:
+   Register         _base;
+@@ -197,6 +212,22 @@
+            "inconsistent address");
+   }
+ 
++  Address(Register base, RegisterConstant index, ScaleFactor scale = times_1, int disp = 0)
++    : _base (base),
++      _index(index.register_or_noreg()),
++      _scale(scale),
++      _disp (disp + (index.constant_or_zero() * scale_size(scale))) {
++    if (!index.is_register())  scale = Address::no_scale;
++    assert(!_index->is_valid() == (scale == Address::no_scale),
++           "inconsistent address");
++  }
++
++  Address plus_disp(int disp) const {
++    Address a = (*this);
++    a._disp += disp;
++    return a;
++  }
++
+   // The following two overloads are used in connection with the
+   // ByteSize type (see sizes.hpp).  They simplify the use of
+   // ByteSize'd arguments in assembly code. Note that their equivalent
+@@ -224,6 +255,17 @@
+     assert(!index->is_valid() == (scale == Address::no_scale),
+            "inconsistent address");
+   }
++
++  Address(Register base, RegisterConstant index, ScaleFactor scale, ByteSize disp)
++    : _base (base),
++      _index(index.register_or_noreg()),
++      _scale(scale),
++      _disp (in_bytes(disp) + (index.constant_or_zero() * scale_size(scale))) {
++    if (!index.is_register())  scale = Address::no_scale;
++    assert(!_index->is_valid() == (scale == Address::no_scale),
++           "inconsistent address");
++  }
++
+ #endif // ASSERT
+ 
+   // accessors
+@@ -240,7 +282,6 @@
+ 
+   static Address make_array(ArrayAddress);
+ 
+-
+  private:
+   bool base_needs_rex() const {
+     return _base != noreg && _base->encoding() >= 8;
+@@ -1393,17 +1434,20 @@
+ 
+   // The following 4 methods return the offset of the appropriate move instruction
+ 
+-  // Support for fast byte/word loading with zero extension (depending on particular CPU)
++  // Support for fast byte/short loading with zero extension (depending on particular CPU)
+   int load_unsigned_byte(Register dst, Address src);
+-  int load_unsigned_word(Register dst, Address src);
++  int load_unsigned_short(Register dst, Address src);
+ 
+-  // Support for fast byte/word loading with sign extension (depending on particular CPU)
++  // Support for fast byte/short loading with sign extension (depending on particular CPU)
+   int load_signed_byte(Register dst, Address src);
+-  int load_signed_word(Register dst, Address src);
++  int load_signed_short(Register dst, Address src);
+ 
+   // Support for sign-extension (hi:lo = extend_sign(lo))
+   void extend_sign(Register hi, Register lo);
+ 
++  // Loading values by size and signed-ness
++  void load_sized_value(Register dst, Address src, int size_in_bytes, bool is_signed);
++
+   // Support for inc/dec with optimal instruction selection depending on value
+ 
+   void increment(Register reg, int value = 1) { LP64_ONLY(incrementq(reg, value)) NOT_LP64(incrementl(reg, value)) ; }
+@@ -1763,6 +1807,10 @@
+   // stack overflow + shadow pages.  Also, clobbers tmp
+   void bang_stack_size(Register size, Register tmp);
+ 
++  virtual RegisterConstant delayed_value(intptr_t* delayed_value_addr,
++                                         Register tmp,
++                                         int offset);
++
+   // Support for serializing memory accesses between threads
+   void serialize_memory(Register thread, Register tmp);
+ 
+diff --git a/src/cpu/x86/vm/c1_LIRAssembler_x86.cpp b/src/cpu/x86/vm/c1_LIRAssembler_x86.cpp
+--- a/src/cpu/x86/vm/c1_LIRAssembler_x86.cpp
++++ b/src/cpu/x86/vm/c1_LIRAssembler_x86.cpp
+@@ -554,8 +554,8 @@
+   __ jcc (Assembler::zero, noLoop);
+ 
+   // compare first characters
+-  __ load_unsigned_word(rcx, Address(rdi, 0));
+-  __ load_unsigned_word(rbx, Address(rsi, 0));
++  __ load_unsigned_short(rcx, Address(rdi, 0));
++  __ load_unsigned_short(rbx, Address(rsi, 0));
+   __ subl(rcx, rbx);
+   __ jcc(Assembler::notZero, haveResult);
+   // starting loop
+@@ -574,8 +574,8 @@
+   Label loop;
+   __ align(wordSize);
+   __ bind(loop);
+-  __ load_unsigned_word(rcx, Address(rdi, rax, Address::times_2, 0));
+-  __ load_unsigned_word(rbx, Address(rsi, rax, Address::times_2, 0));
++  __ load_unsigned_short(rcx, Address(rdi, rax, Address::times_2, 0));
++  __ load_unsigned_short(rbx, Address(rsi, rax, Address::times_2, 0));
+   __ subl(rcx, rbx);
+   __ jcc(Assembler::notZero, haveResult);
+   __ increment(rax);
+diff --git a/src/cpu/x86/vm/cppInterpreter_x86.cpp b/src/cpu/x86/vm/cppInterpreter_x86.cpp
+--- a/src/cpu/x86/vm/cppInterpreter_x86.cpp
++++ b/src/cpu/x86/vm/cppInterpreter_x86.cpp
+@@ -513,7 +513,7 @@
+     // compute full expression stack limit
+ 
+     const Address size_of_stack    (rbx, methodOopDesc::max_stack_offset());
+-    __ load_unsigned_word(rdx, size_of_stack);                            // get size of expression stack in words
++    __ load_unsigned_short(rdx, size_of_stack);                           // get size of expression stack in words
+     __ negptr(rdx);                                                       // so we can subtract in next step
+     // Allocate expression stack
+     __ lea(rsp, Address(rsp, rdx, Address::times_ptr));
+@@ -659,7 +659,7 @@
+     // Always give one monitor to allow us to start interp if sync method.
+     // Any additional monitors need a check when moving the expression stack
+     const int one_monitor = frame::interpreter_frame_monitor_size() * wordSize;
+-  __ load_unsigned_word(rax, size_of_stack);                            // get size of expression stack in words
++  __ load_unsigned_short(rax, size_of_stack);                           // get size of expression stack in words
+   __ lea(rax, Address(noreg, rax, Interpreter::stackElementScale(), one_monitor));
+   __ lea(rax, Address(rax, rdx, Interpreter::stackElementScale(), overhead_size));
+ 
+@@ -863,13 +863,13 @@
+     __ bind(notByte);
+     __ cmpl(rdx, stos);
+     __ jcc(Assembler::notEqual, notShort);
+-    __ load_signed_word(rax, field_address);
++    __ load_signed_short(rax, field_address);
+     __ jmp(xreturn_path);
+ 
+     __ bind(notShort);
+     __ cmpl(rdx, ctos);
+     __ jcc(Assembler::notEqual, notChar);
+-    __ load_unsigned_word(rax, field_address);
++    __ load_unsigned_short(rax, field_address);
+     __ jmp(xreturn_path);
+ 
+     __ bind(notChar);
+@@ -937,7 +937,7 @@
+   const Register locals = rdi;
+ 
+   // get parameter size (always needed)
+-  __ load_unsigned_word(rcx, size_of_parameters);
++  __ load_unsigned_short(rcx, size_of_parameters);
+ 
+   // rbx: methodOop
+   // rcx: size of parameters
+@@ -1062,7 +1062,7 @@
+   // allocate space for parameters
+   __ movptr(method, STATE(_method));
+   __ verify_oop(method);
+-  __ load_unsigned_word(t, Address(method, methodOopDesc::size_of_parameters_offset()));
++  __ load_unsigned_short(t, Address(method, methodOopDesc::size_of_parameters_offset()));
+   __ shll(t, 2);
+ #ifdef _LP64
+   __ subptr(rsp, t);
+@@ -1659,11 +1659,11 @@
+   // const Address monitor(rbp, frame::interpreter_frame_initial_sp_offset * wordSize - (int)sizeof(BasicObjectLock));
+ 
+   // get parameter size (always needed)
+-  __ load_unsigned_word(rcx, size_of_parameters);
++  __ load_unsigned_short(rcx, size_of_parameters);
+ 
+   // rbx: methodOop
+   // rcx: size of parameters
+-  __ load_unsigned_word(rdx, size_of_locals);                      // get size of locals in words
++  __ load_unsigned_short(rdx, size_of_locals);                     // get size of locals in words
+ 
+   __ subptr(rdx, rcx);                                             // rdx = no. of additional locals
+ 
+@@ -1949,7 +1949,7 @@
+   __ movptr(rbx, STATE(_result._to_call._callee));
+ 
+   // callee left args on top of expression stack, remove them
+-  __ load_unsigned_word(rcx, Address(rbx, methodOopDesc::size_of_parameters_offset()));
++  __ load_unsigned_short(rcx, Address(rbx, methodOopDesc::size_of_parameters_offset()));
+   __ lea(rsp, Address(rsp, rcx, Address::times_ptr));
+ 
+   __ movl(rcx, Address(rbx, methodOopDesc::result_index_offset()));
+@@ -2119,7 +2119,7 @@
+   // Make it look like call_stub calling conventions
+ 
+   // Get (potential) receiver
+-  __ load_unsigned_word(rcx, size_of_parameters);                     // get size of parameters in words
++  __ load_unsigned_short(rcx, size_of_parameters);                   // get size of parameters in words
+ 
+   ExternalAddress recursive(CAST_FROM_FN_PTR(address, RecursiveInterpreterActivation));
+   __ pushptr(recursive.addr());                                      // make it look good in the debugger
+diff --git a/src/cpu/x86/vm/interp_masm_x86_32.cpp b/src/cpu/x86/vm/interp_masm_x86_32.cpp
+--- a/src/cpu/x86/vm/interp_masm_x86_32.cpp
++++ b/src/cpu/x86/vm/interp_masm_x86_32.cpp
+@@ -192,7 +192,7 @@
+ void InterpreterMacroAssembler::get_cache_and_index_at_bcp(Register cache, Register index, int bcp_offset) {
+   assert(bcp_offset > 0, "bcp is still pointing to start of bytecode");
+   assert(cache != index, "must use different registers");
+-  load_unsigned_word(index, Address(rsi, bcp_offset));
++  load_unsigned_short(index, Address(rsi, bcp_offset));
+   movptr(cache, Address(rbp, frame::interpreter_frame_cache_offset * wordSize));
+   assert(sizeof(ConstantPoolCacheEntry) == 4*wordSize, "adjust code below");
+   shlptr(index, 2); // convert from field index to ConstantPoolCacheEntry index
+@@ -202,7 +202,7 @@
+ void InterpreterMacroAssembler::get_cache_entry_pointer_at_bcp(Register cache, Register tmp, int bcp_offset) {
+   assert(bcp_offset > 0, "bcp is still pointing to start of bytecode");
+   assert(cache != tmp, "must use different register");
+-  load_unsigned_word(tmp, Address(rsi, bcp_offset));
++  load_unsigned_short(tmp, Address(rsi, bcp_offset));
+   assert(sizeof(ConstantPoolCacheEntry) == 4*wordSize, "adjust code below");
+                                // convert from field index to ConstantPoolCacheEntry index
+                                // and from word offset to byte offset
+@@ -1031,7 +1031,7 @@
+ 
+   // If the mdp is valid, it will point to a DataLayout header which is
+   // consistent with the bcp.  The converse is highly probable also.
+-  load_unsigned_word(rdx, Address(rcx, in_bytes(DataLayout::bci_offset())));
++  load_unsigned_short(rdx, Address(rcx, in_bytes(DataLayout::bci_offset())));
+   addptr(rdx, Address(rbx, methodOopDesc::const_offset()));
+   lea(rdx, Address(rdx, constMethodOopDesc::codes_offset()));
+   cmpptr(rdx, rsi);
+diff --git a/src/cpu/x86/vm/interp_masm_x86_64.cpp b/src/cpu/x86/vm/interp_masm_x86_64.cpp
+--- a/src/cpu/x86/vm/interp_masm_x86_64.cpp
++++ b/src/cpu/x86/vm/interp_masm_x86_64.cpp
+@@ -190,7 +190,7 @@
+                                                            int bcp_offset) {
+   assert(bcp_offset > 0, "bcp is still pointing to start of bytecode");
+   assert(cache != index, "must use different registers");
+-  load_unsigned_word(index, Address(r13, bcp_offset));
++  load_unsigned_short(index, Address(r13, bcp_offset));
+   movptr(cache, Address(rbp, frame::interpreter_frame_cache_offset * wordSize));
+   assert(sizeof(ConstantPoolCacheEntry) == 4 * wordSize, "adjust code below");
+   // convert from field index to ConstantPoolCacheEntry index
+@@ -203,7 +203,7 @@
+                                                                int bcp_offset) {
+   assert(bcp_offset > 0, "bcp is still pointing to start of bytecode");
+   assert(cache != tmp, "must use different register");
+-  load_unsigned_word(tmp, Address(r13, bcp_offset));
++  load_unsigned_short(tmp, Address(r13, bcp_offset));
+   assert(sizeof(ConstantPoolCacheEntry) == 4 * wordSize, "adjust code below");
+   // convert from field index to ConstantPoolCacheEntry index
+   // and from word offset to byte offset
+@@ -1063,8 +1063,8 @@
+ 
+   // If the mdp is valid, it will point to a DataLayout header which is
+   // consistent with the bcp.  The converse is highly probable also.
+-  load_unsigned_word(c_rarg2,
+-                     Address(c_rarg3, in_bytes(DataLayout::bci_offset())));
++  load_unsigned_short(c_rarg2,
++                      Address(c_rarg3, in_bytes(DataLayout::bci_offset())));
+   addptr(c_rarg2, Address(rbx, methodOopDesc::const_offset()));
+   lea(c_rarg2, Address(c_rarg2, constMethodOopDesc::codes_offset()));
+   cmpptr(c_rarg2, r13);
+diff --git a/src/cpu/x86/vm/templateInterpreter_x86_32.cpp b/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
+--- a/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
++++ b/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
+@@ -662,13 +662,13 @@
+     __ bind(notByte);
+     __ cmpl(rdx, stos);
+     __ jcc(Assembler::notEqual, notShort);
+-    __ load_signed_word(rax, field_address);
++    __ load_signed_short(rax, field_address);
+     __ jmp(xreturn_path);
+ 
+     __ bind(notShort);
+     __ cmpl(rdx, ctos);
+     __ jcc(Assembler::notEqual, notChar);
+-    __ load_unsigned_word(rax, field_address);
++    __ load_unsigned_short(rax, field_address);
+     __ jmp(xreturn_path);
+ 
+     __ bind(notChar);
+@@ -723,7 +723,7 @@
+   const Address access_flags      (rbx, methodOopDesc::access_flags_offset());
+ 
+   // get parameter size (always needed)
+-  __ load_unsigned_word(rcx, size_of_parameters);
++  __ load_unsigned_short(rcx, size_of_parameters);
+ 
+   // native calls don't need the stack size check since they have no expression stack
+   // and the arguments are already on the stack and we only add a handful of words
+@@ -838,7 +838,7 @@
+   // allocate space for parameters
+   __ get_method(method);
+   __ verify_oop(method);
+-  __ load_unsigned_word(t, Address(method, methodOopDesc::size_of_parameters_offset()));
++  __ load_unsigned_short(t, Address(method, methodOopDesc::size_of_parameters_offset()));
+   __ shlptr(t, Interpreter::logStackElementSize());
+   __ addptr(t, 2*wordSize);     // allocate two more slots for JNIEnv and possible mirror
+   __ subptr(rsp, t);
+@@ -1155,14 +1155,14 @@
+   const Address access_flags      (rbx, methodOopDesc::access_flags_offset());
+ 
+   // get parameter size (always needed)
+-  __ load_unsigned_word(rcx, size_of_parameters);
++  __ load_unsigned_short(rcx, size_of_parameters);
+ 
+   // rbx,: methodOop
+   // rcx: size of parameters
+ 
+   // rsi: sender_sp (could differ from sp+wordSize if we were called via c2i )
+ 
+-  __ load_unsigned_word(rdx, size_of_locals);       // get size of locals in words
++  __ load_unsigned_short(rdx, size_of_locals);       // get size of locals in words
+   __ subl(rdx, rcx);                                // rdx = no. of additional locals
+ 
+   // see if we've got enough room on the stack for locals plus overhead.
+@@ -1558,7 +1558,7 @@
+     // Compute size of arguments for saving when returning to deoptimized caller
+     __ get_method(rax);
+     __ verify_oop(rax);
+-    __ load_unsigned_word(rax, Address(rax, in_bytes(methodOopDesc::size_of_parameters_offset())));
++    __ load_unsigned_short(rax, Address(rax, in_bytes(methodOopDesc::size_of_parameters_offset())));
+     __ shlptr(rax, Interpreter::logStackElementSize());
+     __ restore_locals();
+     __ subptr(rdi, rax);
+diff --git a/src/cpu/x86/vm/templateInterpreter_x86_64.cpp b/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
+--- a/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
++++ b/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
+@@ -650,7 +650,7 @@
+     __ cmpl(rdx, stos);
+     __ jcc(Assembler::notEqual, notShort);
+     // stos
+-    __ load_signed_word(rax, field_address);
++    __ load_signed_short(rax, field_address);
+     __ jmp(xreturn_path);
+ 
+     __ bind(notShort);
+@@ -662,7 +662,7 @@
+     __ bind(okay);
+ #endif
+     // ctos
+-    __ load_unsigned_word(rax, field_address);
++    __ load_unsigned_short(rax, field_address);
+ 
+     __ bind(xreturn_path);
+ 
+@@ -702,7 +702,7 @@
+   const Address access_flags      (rbx, methodOopDesc::access_flags_offset());
+ 
+   // get parameter size (always needed)
+-  __ load_unsigned_word(rcx, size_of_parameters);
++  __ load_unsigned_short(rcx, size_of_parameters);
+ 
+   // native calls don't need the stack size check since they have no
+   // expression stack and the arguments are already on the stack and
+@@ -819,9 +819,9 @@
+   // allocate space for parameters
+   __ get_method(method);
+   __ verify_oop(method);
+-  __ load_unsigned_word(t,
+-                        Address(method,
+-                                methodOopDesc::size_of_parameters_offset()));
++  __ load_unsigned_short(t,
++                         Address(method,
++                                 methodOopDesc::size_of_parameters_offset()));
+   __ shll(t, Interpreter::logStackElementSize());
+ 
+   __ subptr(rsp, t);
+@@ -1165,13 +1165,13 @@
+   const Address access_flags(rbx, methodOopDesc::access_flags_offset());
+ 
+   // get parameter size (always needed)
+-  __ load_unsigned_word(rcx, size_of_parameters);
++  __ load_unsigned_short(rcx, size_of_parameters);
+ 
+   // rbx: methodOop
+   // rcx: size of parameters
+   // r13: sender_sp (could differ from sp+wordSize if we were called via c2i )
+ 
+-  __ load_unsigned_word(rdx, size_of_locals); // get size of locals in words
++  __ load_unsigned_short(rdx, size_of_locals); // get size of locals in words
+   __ subl(rdx, rcx); // rdx = no. of additional locals
+ 
+   // YYY
+@@ -1583,7 +1583,7 @@
+     // Compute size of arguments for saving when returning to
+     // deoptimized caller
+     __ get_method(rax);
+-    __ load_unsigned_word(rax, Address(rax, in_bytes(methodOopDesc::
++    __ load_unsigned_short(rax, Address(rax, in_bytes(methodOopDesc::
+                                                 size_of_parameters_offset())));
+     __ shll(rax, Interpreter::logStackElementSize());
+     __ restore_locals(); // XXX do we need this?
+diff --git a/src/cpu/x86/vm/templateTable_x86_32.cpp b/src/cpu/x86/vm/templateTable_x86_32.cpp
+--- a/src/cpu/x86/vm/templateTable_x86_32.cpp
++++ b/src/cpu/x86/vm/templateTable_x86_32.cpp
+@@ -296,7 +296,7 @@
+ 
+ void TemplateTable::sipush() {
+   transition(vtos, itos);
+-  __ load_unsigned_word(rax, at_bcp(1));
++  __ load_unsigned_short(rax, at_bcp(1));
+   __ bswapl(rax);
+   __ sarl(rax, 16);
+ }
+@@ -662,7 +662,7 @@
+   index_check(rdx, rax);  // kills rbx,
+   // rax,: index
+   // can do better code for P5 - may want to improve this at some point
+-  __ load_unsigned_word(rbx, Address(rdx, rax, Address::times_2, arrayOopDesc::base_offset_in_bytes(T_CHAR)));
++  __ load_unsigned_short(rbx, Address(rdx, rax, Address::times_2, arrayOopDesc::base_offset_in_bytes(T_CHAR)));
+   __ mov(rax, rbx);
+ }
+ 
+@@ -677,7 +677,7 @@
+   // rdx: array
+   index_check(rdx, rax);
+   // rax,: index
+-  __ load_unsigned_word(rbx, Address(rdx, rax, Address::times_2, arrayOopDesc::base_offset_in_bytes(T_CHAR)));
++  __ load_unsigned_short(rbx, Address(rdx, rax, Address::times_2, arrayOopDesc::base_offset_in_bytes(T_CHAR)));
+   __ mov(rax, rbx);
+ }
+ 
+@@ -687,7 +687,7 @@
+   index_check(rdx, rax);  // kills rbx,
+   // rax,: index
+   // can do better code for P5 - may want to improve this at some point
+-  __ load_signed_word(rbx, Address(rdx, rax, Address::times_2, arrayOopDesc::base_offset_in_bytes(T_SHORT)));
++  __ load_signed_short(rbx, Address(rdx, rax, Address::times_2, arrayOopDesc::base_offset_in_bytes(T_SHORT)));
+   __ mov(rax, rbx);
+ }
+ 
+@@ -2310,7 +2310,7 @@
+   __ cmpl(flags, ctos );
+   __ jcc(Assembler::notEqual, notChar);
+ 
+-  __ load_unsigned_word(rax, lo );
++  __ load_unsigned_short(rax, lo );
+   __ push(ctos);
+   if (!is_static) {
+     patch_bytecode(Bytecodes::_fast_cgetfield, rcx, rbx);
+@@ -2322,7 +2322,7 @@
+   __ cmpl(flags, stos );
+   __ jcc(Assembler::notEqual, notShort);
+ 
+-  __ load_signed_word(rax, lo );
++  __ load_signed_short(rax, lo );
+   __ push(stos);
+   if (!is_static) {
+     patch_bytecode(Bytecodes::_fast_sgetfield, rcx, rbx);
+@@ -2830,8 +2830,8 @@
+   // access field
+   switch (bytecode()) {
+     case Bytecodes::_fast_bgetfield: __ movsbl(rax, lo );                 break;
+-    case Bytecodes::_fast_sgetfield: __ load_signed_word(rax, lo );       break;
+-    case Bytecodes::_fast_cgetfield: __ load_unsigned_word(rax, lo );     break;
++    case Bytecodes::_fast_sgetfield: __ load_signed_short(rax, lo );      break;
++    case Bytecodes::_fast_cgetfield: __ load_unsigned_short(rax, lo );    break;
+     case Bytecodes::_fast_igetfield: __ movl(rax, lo);                    break;
+     case Bytecodes::_fast_lgetfield: __ stop("should not be rewritten");  break;
+     case Bytecodes::_fast_fgetfield: __ fld_s(lo);                        break;
+diff --git a/src/cpu/x86/vm/templateTable_x86_64.cpp b/src/cpu/x86/vm/templateTable_x86_64.cpp
+--- a/src/cpu/x86/vm/templateTable_x86_64.cpp
++++ b/src/cpu/x86/vm/templateTable_x86_64.cpp
+@@ -307,7 +307,7 @@
+ 
+ void TemplateTable::sipush() {
+   transition(vtos, itos);
+-  __ load_unsigned_word(rax, at_bcp(1));
++  __ load_unsigned_short(rax, at_bcp(1));
+   __ bswapl(rax);
+   __ sarl(rax, 16);
+ }
+@@ -645,10 +645,10 @@
+   // eax: index
+   // rdx: array
+   index_check(rdx, rax); // kills rbx
+-  __ load_unsigned_word(rax,
+-                        Address(rdx, rax,
+-                                Address::times_2,
+-                                arrayOopDesc::base_offset_in_bytes(T_CHAR)));
++  __ load_unsigned_short(rax,
++                         Address(rdx, rax,
++                                 Address::times_2,
++                                 arrayOopDesc::base_offset_in_bytes(T_CHAR)));
+ }
+ 
+ // iload followed by caload frequent pair
+@@ -663,10 +663,10 @@
+   // rdx: array
+   __ pop_ptr(rdx);
+   index_check(rdx, rax); // kills rbx
+-  __ load_unsigned_word(rax,
+-                        Address(rdx, rax,
+-                                Address::times_2,
+-                                arrayOopDesc::base_offset_in_bytes(T_CHAR)));
++  __ load_unsigned_short(rax,
++                         Address(rdx, rax,
++                                 Address::times_2,
++                                 arrayOopDesc::base_offset_in_bytes(T_CHAR)));
+ }
+ 
+ void TemplateTable::saload() {
+@@ -675,10 +675,10 @@
+   // eax: index
+   // rdx: array
+   index_check(rdx, rax); // kills rbx
+-  __ load_signed_word(rax,
+-                      Address(rdx, rax,
+-                              Address::times_2,
+-                              arrayOopDesc::base_offset_in_bytes(T_SHORT)));
++  __ load_signed_short(rax,
++                       Address(rdx, rax,
++                               Address::times_2,
++                               arrayOopDesc::base_offset_in_bytes(T_SHORT)));
+ }
+ 
+ void TemplateTable::iload(int n) {
+@@ -2276,7 +2276,7 @@
+   __ cmpl(flags, ctos);
+   __ jcc(Assembler::notEqual, notChar);
+   // ctos
+-  __ load_unsigned_word(rax, field);
++  __ load_unsigned_short(rax, field);
+   __ push(ctos);
+   // Rewrite bytecode to be faster
+   if (!is_static) {
+@@ -2288,7 +2288,7 @@
+   __ cmpl(flags, stos);
+   __ jcc(Assembler::notEqual, notShort);
+   // stos
+-  __ load_signed_word(rax, field);
++  __ load_signed_short(rax, field);
+   __ push(stos);
+   // Rewrite bytecode to be faster
+   if (!is_static) {
+@@ -2751,10 +2751,10 @@
+     __ movsbl(rax, field);
+     break;
+   case Bytecodes::_fast_sgetfield:
+-    __ load_signed_word(rax, field);
++    __ load_signed_short(rax, field);
+     break;
+   case Bytecodes::_fast_cgetfield:
+-    __ load_unsigned_word(rax, field);
++    __ load_unsigned_short(rax, field);
+     break;
+   case Bytecodes::_fast_fgetfield:
+     __ movflt(xmm0, field);
+diff --git a/src/cpu/x86/vm/x86_32.ad b/src/cpu/x86/vm/x86_32.ad
+--- a/src/cpu/x86/vm/x86_32.ad
++++ b/src/cpu/x86/vm/x86_32.ad
+@@ -3751,8 +3751,8 @@
+     masm.jcc(Assembler::zero, LENGTH_DIFF_LABEL);
+ 
+     // Load first characters
+-    masm.load_unsigned_word(rcx, Address(rbx, 0));
+-    masm.load_unsigned_word(rdi, Address(rax, 0));
++    masm.load_unsigned_short(rcx, Address(rbx, 0));
++    masm.load_unsigned_short(rdi, Address(rax, 0));
+ 
+     // Compare first characters
+     masm.subl(rcx, rdi);
+@@ -3782,8 +3782,8 @@
+ 
+     // Compare the rest of the characters
+     masm.bind(WHILE_HEAD_LABEL);
+-    masm.load_unsigned_word(rcx, Address(rbx, rsi, Address::times_2, 0));
+-    masm.load_unsigned_word(rdi, Address(rax, rsi, Address::times_2, 0));
++    masm.load_unsigned_short(rcx, Address(rbx, rsi, Address::times_2, 0));
++    masm.load_unsigned_short(rdi, Address(rax, rsi, Address::times_2, 0));
+     masm.subl(rcx, rdi);
+     masm.jcc(Assembler::notZero, POP_LABEL);
+     masm.incrementl(rsi);
+@@ -3840,8 +3840,8 @@
+     masm.jcc(Assembler::zero, COMPARE_LOOP_HDR);
+ 
+     // Compare 2-byte "tail" at end of arrays
+-    masm.load_unsigned_word(tmp1Reg, Address(ary1Reg, resultReg, Address::times_4, base_offset));
+-    masm.load_unsigned_word(tmp2Reg, Address(ary2Reg, resultReg, Address::times_4, base_offset));
++    masm.load_unsigned_short(tmp1Reg, Address(ary1Reg, resultReg, Address::times_4, base_offset));
++    masm.load_unsigned_short(tmp2Reg, Address(ary2Reg, resultReg, Address::times_4, base_offset));
+     masm.cmpl(tmp1Reg, tmp2Reg);
+     masm.jcc(Assembler::notEqual, FALSE_LABEL);
+     masm.testl(resultReg, resultReg);
+diff --git a/src/cpu/x86/vm/x86_64.ad b/src/cpu/x86/vm/x86_64.ad
+--- a/src/cpu/x86/vm/x86_64.ad
++++ b/src/cpu/x86/vm/x86_64.ad
+@@ -3765,8 +3765,8 @@
+     masm.jcc(Assembler::zero, LENGTH_DIFF_LABEL);
+ 
+     // Load first characters
+-    masm.load_unsigned_word(rcx, Address(rbx, 0));
+-    masm.load_unsigned_word(rdi, Address(rax, 0));
++    masm.load_unsigned_short(rcx, Address(rbx, 0));
++    masm.load_unsigned_short(rdi, Address(rax, 0));
+ 
+     // Compare first characters
+     masm.subl(rcx, rdi);
+@@ -3796,8 +3796,8 @@
+ 
+     // Compare the rest of the characters
+     masm.bind(WHILE_HEAD_LABEL);
+-    masm.load_unsigned_word(rcx, Address(rbx, rsi, Address::times_2, 0));
+-    masm.load_unsigned_word(rdi, Address(rax, rsi, Address::times_2, 0));
++    masm.load_unsigned_short(rcx, Address(rbx, rsi, Address::times_2, 0));
++    masm.load_unsigned_short(rdi, Address(rax, rsi, Address::times_2, 0));
+     masm.subl(rcx, rdi);
+     masm.jcc(Assembler::notZero, POP_LABEL);
+     masm.increment(rsi);
+@@ -3854,8 +3854,8 @@
+     masm.jcc(Assembler::zero, COMPARE_LOOP_HDR);
+ 
+     // Compare 2-byte "tail" at end of arrays
+-    masm.load_unsigned_word(tmp1Reg, Address(ary1Reg, resultReg, Address::times_4, base_offset));
+-    masm.load_unsigned_word(tmp2Reg, Address(ary2Reg, resultReg, Address::times_4, base_offset));
++    masm.load_unsigned_short(tmp1Reg, Address(ary1Reg, resultReg, Address::times_4, base_offset));
++    masm.load_unsigned_short(tmp2Reg, Address(ary2Reg, resultReg, Address::times_4, base_offset));
+     masm.cmpl(tmp1Reg, tmp2Reg);
+     masm.jcc(Assembler::notEqual, FALSE_LABEL);
+     masm.testl(resultReg, resultReg);
+diff --git a/src/share/vm/asm/assembler.cpp b/src/share/vm/asm/assembler.cpp
+--- a/src/share/vm/asm/assembler.cpp
++++ b/src/share/vm/asm/assembler.cpp
+@@ -239,6 +239,78 @@
+   }
+ }
+ 
++struct DelayedConstant {
++  typedef void (*value_fn_t)();
++  BasicType type;
++  intptr_t value;
++  value_fn_t value_fn;
++  // This limit of 20 is generous for initial uses.
++  // The limit needs to be large enough to store the field offsets
++  // into classes which do not have statically fixed layouts.
++  // (Initial use is for method handle object offsets.)
++  // Look for uses of "delayed_value" in the source code
++  // and make sure this number is generous enough to handle all of them.
++  enum { DC_LIMIT = 20 };
++  static DelayedConstant delayed_constants[DC_LIMIT];
++  static DelayedConstant* add(BasicType type, value_fn_t value_fn);
++  bool match(BasicType t, value_fn_t cfn) {
++    return type == t && value_fn == cfn;
++  }
++  static void update_all();
++};
++
++DelayedConstant DelayedConstant::delayed_constants[DC_LIMIT];
++// Default C structure initialization rules have the following effect here:
++// = { { (BasicType)0, (intptr_t)NULL }, ... };
++
++DelayedConstant* DelayedConstant::add(BasicType type,
++                                      DelayedConstant::value_fn_t cfn) {
++  for (int i = 0; i < DC_LIMIT; i++) {
++    DelayedConstant* dcon = &delayed_constants[i];
++    if (dcon->match(type, cfn))
++      return dcon;
++    if (dcon->value_fn == NULL) {
++      // (cmpxchg not because this is multi-threaded but because I'm paranoid)
++      if (Atomic::cmpxchg_ptr(CAST_FROM_FN_PTR(void*, cfn), &dcon->value_fn, NULL) == NULL) {
++        dcon->type = type;
++        return dcon;
++      }
++    }
++  }
++  // If this assert is hit (in pre-integration testing!) then re-evaluate
++  // the comment on the definition of DC_LIMIT.
++  guarantee(false, "too many delayed constants");
++  return NULL;
++}
++
++void DelayedConstant::update_all() {
++  for (int i = 0; i < DC_LIMIT; i++) {
++    DelayedConstant* dcon = &delayed_constants[i];
++    if (dcon->value_fn != NULL && dcon->value == 0) {
++      typedef int     (*int_fn_t)();
++      typedef address (*address_fn_t)();
++      switch (dcon->type) {
++      case T_INT:     dcon->value = (intptr_t) ((int_fn_t)    dcon->value_fn)(); break;
++      case T_ADDRESS: dcon->value = (intptr_t) ((address_fn_t)dcon->value_fn)(); break;
++      }
++    }
++  }
++}
++
++intptr_t* AbstractAssembler::delayed_value_addr(int(*value_fn)()) {
++  DelayedConstant* dcon = DelayedConstant::add(T_INT, (DelayedConstant::value_fn_t) value_fn);
++  return &dcon->value;
++}
++intptr_t* AbstractAssembler::delayed_value_addr(address(*value_fn)()) {
++  DelayedConstant* dcon = DelayedConstant::add(T_ADDRESS, (DelayedConstant::value_fn_t) value_fn);
++  return &dcon->value;
++}
++void AbstractAssembler::update_delayed_values() {
++  DelayedConstant::update_all();
++}
++
++
++
+ 
+ void AbstractAssembler::block_comment(const char* comment) {
+   if (sect() == CodeBuffer::SECT_INSTS) {
+diff --git a/src/share/vm/asm/assembler.hpp b/src/share/vm/asm/assembler.hpp
+--- a/src/share/vm/asm/assembler.hpp
++++ b/src/share/vm/asm/assembler.hpp
+@@ -140,6 +140,29 @@
+   }
+ };
+ 
++// A union type for code which has to assemble both constant and
++// non-constant operands, when the distinction cannot be made
++// statically.
++class RegisterConstant VALUE_OBJ_CLASS_SPEC {
++ private:
++  Register _r;
++  intptr_t _c;
++
++ public:
++  RegisterConstant(): _r(noreg), _c(0) {}
++  RegisterConstant(Register r): _r(r), _c(0) {}
++  RegisterConstant(intptr_t c): _r(noreg), _c(c) {}
++
++  Register as_register() const { assert(is_register(),""); return _r; }
++  intptr_t as_constant() const { assert(is_constant(),""); return _c; }
++
++  Register register_or_noreg() const { return _r; }
++  intptr_t constant_or_zero() const  { return _c; }
++
++  bool is_register() const { return _r != noreg; }
++  bool is_constant() const { return _r == noreg; }
++};
++
+ 
+ // The Abstract Assembler: Pure assembler doing NO optimizations on the
+ // instruction level; i.e., what you write is what you get.
+@@ -280,6 +303,26 @@
+   inline address address_constant(Label& L);
+   inline address address_table_constant(GrowableArray<Label*> label);
+ 
++  // Bootstrapping aid to cope with delayed determination of constants.
++  // Returns a static address which will eventually contain the constant.
++  // The value zero (NULL) stands instead of a constant which is still uncomputed.
++  // Thus, the eventual value of the constant must not be zero.
++  // This is fine, since this is designed for embedding object field
++  // offsets in code which must be generated before the object class is loaded.
++  // Field offsets are never zero, since an object's header (mark word)
++  // is located at offset zero.
++  RegisterConstant delayed_value(int(*value_fn)(), Register tmp, int offset = 0) {
++    return delayed_value(delayed_value_addr(value_fn), tmp, offset);
++  }
++  RegisterConstant delayed_value(address(*value_fn)(), Register tmp, int offset = 0) {
++    return delayed_value(delayed_value_addr(value_fn), tmp, offset);
++  }
++  virtual RegisterConstant delayed_value(intptr_t* delayed_value_addr, Register tmp, int offset) = 0;
++  // Last overloading is platform-dependent; look in assembler_<arch>.cpp.
++  static intptr_t* delayed_value_addr(int(*constant_fn)());
++  static intptr_t* delayed_value_addr(address(*constant_fn)());
++  static void update_delayed_values();
++
+   // Bang stack to trigger StackOverflowError at a safe location
+   // implementation delegates to machine-specific bang_stack_with_offset
+   void generate_stack_overflow_check( int frame_size_in_bytes );

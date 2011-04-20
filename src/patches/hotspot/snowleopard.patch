@@ -1,0 +1,66 @@
+Patches required to avoid new GCC 4.2 warnings about "long int" vs. "int".
+Note that GCC 4.2 builds (x86_32) crash quickly, at least on Mac.
+Build on affected systems with these settings: CC=gcc-4.0 CXX=g++-4.0 
+
+diff --git a/src/share/vm/utilities/globalDefinitions.hpp b/src/share/vm/utilities/globalDefinitions.hpp
+--- a/src/share/vm/utilities/globalDefinitions.hpp
++++ b/src/share/vm/utilities/globalDefinitions.hpp
+@@ -1125,9 +1125,18 @@
+ #define SSIZE_FORMAT_W(width)   INT64_FORMAT_W(width)
+ #define SIZE_FORMAT_W(width)    UINT64_FORMAT_W(width)
+ #else
++#ifndef FORMATL32_MODIFIER
+ #define UINTX_FORMAT_W(width)   UINT32_FORMAT_W(width)
+ #define SSIZE_FORMAT_W(width)   INT32_FORMAT_W(width)
+ #define SIZE_FORMAT_W(width)    UINT32_FORMAT_W(width)
++#else   //FORMATL32_MODIFIER
++// A few ILP32 platforms also need to define FORMATL32_MODIFIER as "l".
++#define INTL32_FORMAT_W(width)   "%" #width FORMATL32_MODIFIER "d"
++#define UINTL32_FORMAT_W(width)  "%" #width FORMATL32_MODIFIER "u"
++#define UINTX_FORMAT_W(width)   UINTL32_FORMAT_W(width)
++#define SSIZE_FORMAT_W(width)   INTL32_FORMAT_W(width)
++#define SIZE_FORMAT_W(width)    UINTL32_FORMAT_W(width)
++#endif  //FORMATL32_MODIFIER
+ #endif // _LP64
+ 
+ // Format pointers and size_t (or size_t-like integer types) which change size
+@@ -1146,11 +1155,23 @@
+ #define SIZE_FORMAT   UINT64_FORMAT
+ #define SSIZE_FORMAT  INT64_FORMAT
+ #else   // !_LP64
++#ifndef FORMATL32_MODIFIER
+ #define PTR_FORMAT    PTR32_FORMAT
+ #define UINTX_FORMAT  UINT32_FORMAT
+ #define INTX_FORMAT   INT32_FORMAT
+ #define SIZE_FORMAT   UINT32_FORMAT
+ #define SSIZE_FORMAT  INT32_FORMAT
++#else   //FORMATL32_MODIFIER
++// A few ILP32 platforms also need to define FORMATL32_MODIFIER as "l".
++#define INTL32_FORMAT  "%" FORMATL32_MODIFIER "d"
++#define UINTL32_FORMAT "%" FORMATL32_MODIFIER "u"
++#define PTRL32_FORMAT  "0x%08" FORMATL32_MODIFIER "x"
++#define PTR_FORMAT    PTRL32_FORMAT
++#define UINTX_FORMAT  UINTL32_FORMAT
++#define INTX_FORMAT   INTL32_FORMAT
++#define SIZE_FORMAT   UINTL32_FORMAT
++#define SSIZE_FORMAT  INTL32_FORMAT
++#endif  //FORMATL32_MODIFIER
+ #endif  // _LP64
+ 
+ #define INTPTR_FORMAT PTR_FORMAT
+diff --git a/src/share/vm/utilities/globalDefinitions_gcc.hpp b/src/share/vm/utilities/globalDefinitions_gcc.hpp
+--- a/src/share/vm/utilities/globalDefinitions_gcc.hpp
++++ b/src/share/vm/utilities/globalDefinitions_gcc.hpp
+@@ -280,6 +280,12 @@
+ #define FORMAT64_MODIFIER "ll"
+ #endif // _LP64
+ 
++#if (__GNUC__ == 4) && (__GNUC_MINOR__ >= 2)
++// GCC 4.2 complains about printf("%d", (intptr_t)10).
++// This occurs with intptr_t and intx types, which are typedefs of "long int".
++#define FORMATL32_MODIFIER "l"
++#endif //__GNUC__ >= 4.2
++
+ // HACK: gcc warns about applying offsetof() to non-POD object or calculating
+ //       offset directly when base address is NULL. Use 16 to get around the
+ //       warning. gcc-3.4 has an option -Wno-invalid-offsetof to suppress

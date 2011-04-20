@@ -1,0 +1,1370 @@
+7013730: JSR 292 reflective operations should report errors with standard exception types
+Summary: remove NoAccessException, replace it by ReflectiveOperationException subtypes; adjust javadoc of exceptions
+Reviewed-by: twisti
+
+diff --git a/src/share/classes/java/dyn/CallSite.java b/src/share/classes/java/dyn/CallSite.java
+--- a/src/share/classes/java/dyn/CallSite.java
++++ b/src/share/classes/java/dyn/CallSite.java
+@@ -227,7 +227,7 @@
+         try {
+             GET_TARGET = MethodHandles.Lookup.IMPL_LOOKUP.
+                 findVirtual(CallSite.class, "getTarget", MethodType.methodType(MethodHandle.class));
+-        } catch (NoAccessException ignore) {
++        } catch (ReflectiveOperationException ignore) {
+             throw new InternalError();
+         }
+     }
+diff --git a/src/share/classes/java/dyn/Linkage.java b/src/share/classes/java/dyn/Linkage.java
+--- a/src/share/classes/java/dyn/Linkage.java
++++ b/src/share/classes/java/dyn/Linkage.java
+@@ -88,7 +88,7 @@
+         MethodHandle bootstrapMethod;
+         try {
+             bootstrapMethod = lookup.findStatic(runtime, name, BOOTSTRAP_METHOD_TYPE);
+-        } catch (NoAccessException ex) {
++        } catch (ReflectiveOperationException ex) {
+             throw new IllegalArgumentException("no such bootstrap method in "+runtime+": "+name, ex);
+         }
+         MethodHandleImpl.registerBootstrap(IMPL_TOKEN, callerClass, bootstrapMethod);
+diff --git a/src/share/classes/java/dyn/MethodHandles.java b/src/share/classes/java/dyn/MethodHandles.java
+--- a/src/share/classes/java/dyn/MethodHandles.java
++++ b/src/share/classes/java/dyn/MethodHandles.java
+@@ -226,9 +226,14 @@
+      * the containing class is not accessible to the lookup class, or
+      * because the desired class member is missing, or because the
+      * desired class member is not accessible to the lookup class.
+-     * It can also fail if a security manager is installed and refuses
+-     * access.  In any of these cases, an exception will be
+-     * thrown from the attempted lookup.
++     * In any of these cases, a {@code ReflectiveOperationException} will be
++     * thrown from the attempted lookup.  The exact class will be one of
++     * the following:
++     * <ul>
++     * <li>NoSuchMethodException &mdash; if a method is requested but does not exist
++     * <li>NoSuchFieldException &mdash; if a field is requested but does not exist
++     * <li>IllegalAccessException &mdash; if the member exists but an access check fails
++     * </ul>
+      * <p>
+      * In general, the conditions under which a method handle may be
+      * looked up for a method {@code M} are exactly equivalent to the conditions
+@@ -511,10 +516,12 @@
+          * @param name the name of the method
+          * @param type the type of the method
+          * @return the desired method handle
+-         * @exception NoAccessException if the method does not exist or access checking fails
++         * @throws NoSuchMethodException if the method does not exist
++         * @throws IllegalAccessException if access checking fails, or if the method is not {@code static}
++         * @throws NullPointerException if any argument is null
+          */
+         public
+-        MethodHandle findStatic(Class<?> refc, String name, MethodType type) throws NoAccessException {
++        MethodHandle findStatic(Class<?> refc, String name, MethodType type) throws NoSuchMethodException, IllegalAccessException {
+             MemberName method = resolveOrFail(refc, name, type, true);
+             checkMethod(refc, method, true);
+             return MethodHandleImpl.findMethod(IMPL_TOKEN, method, false, lookupClassOrNull());
+@@ -549,9 +556,11 @@
+          * @param name the name of the method
+          * @param type the type of the method, with the receiver argument omitted
+          * @return the desired method handle
+-         * @exception NoAccessException if the method does not exist or access checking fails
++         * @throws NoSuchMethodException if the method does not exist
++         * @throws IllegalAccessException if access checking fails, or if the method is {@code static}
++         * @throws NullPointerException if any argument is null
+          */
+-        public MethodHandle findVirtual(Class<?> refc, String name, MethodType type) throws NoAccessException {
++        public MethodHandle findVirtual(Class<?> refc, String name, MethodType type) throws NoSuchMethodException, IllegalAccessException {
+             MemberName method = resolveOrFail(refc, name, type, false);
+             checkMethod(refc, method, false);
+             MethodHandle mh = MethodHandleImpl.findMethod(IMPL_TOKEN, method, true, lookupClassOrNull());
+@@ -576,9 +585,11 @@
+          * @param refc the class or interface from which the method is accessed
+          * @param type the type of the method, with the receiver argument omitted, and a void return type
+          * @return the desired method handle
+-         * @exception NoAccessException if the method does not exist or access checking fails
++         * @throws NoSuchMethodException if the constructor does not exist
++         * @throws IllegalAccessException if access checking fails
++         * @throws NullPointerException if any argument is null
+          */
+-        public MethodHandle findConstructor(Class<?> refc, MethodType type) throws NoAccessException {
++        public MethodHandle findConstructor(Class<?> refc, MethodType type) throws NoSuchMethodException, IllegalAccessException {
+             String name = "<init>";
+             MemberName ctor = resolveOrFail(refc, name, type, false, false, lookupClassOrNull());
+             assert(ctor.isConstructor());
+@@ -629,10 +640,12 @@
+          * @param type the type of the method, with the receiver argument omitted
+          * @param specialCaller the proposed calling class to perform the {@code invokespecial}
+          * @return the desired method handle
+-         * @exception NoAccessException if the method does not exist or access checking fails
++         * @throws NoSuchMethodException if the method does not exist
++         * @throws IllegalAccessException if access checking fails
++         * @throws NullPointerException if any argument is null
+          */
+         public MethodHandle findSpecial(Class<?> refc, String name, MethodType type,
+-                                        Class<?> specialCaller) throws NoAccessException {
++                                        Class<?> specialCaller) throws NoSuchMethodException, IllegalAccessException {
+             checkSpecialCaller(specialCaller);
+             MemberName method = resolveOrFail(refc, name, type, false, false, specialCaller);
+             checkMethod(refc, method, false);
+@@ -651,9 +664,11 @@
+          * @param name the field's name
+          * @param type the field's type
+          * @return a method handle which can load values from the field
+-         * @exception NoAccessException if access checking fails
++         * @throws NoSuchFieldException if the field does not exist
++         * @throws IllegalAccessException if access checking fails, or if the field is {@code static}
++         * @throws NullPointerException if any argument is null
+          */
+-        public MethodHandle findGetter(Class<?> refc, String name, Class<?> type) throws NoAccessException {
++        public MethodHandle findGetter(Class<?> refc, String name, Class<?> type) throws NoSuchFieldException, IllegalAccessException {
+             return makeAccessor(refc, name, type, false, false);
+         }
+ 
+@@ -668,9 +683,11 @@
+          * @param name the field's name
+          * @param type the field's type
+          * @return a method handle which can store values into the field
+-         * @exception NoAccessException if access checking fails
++         * @throws NoSuchFieldException if the field does not exist
++         * @throws IllegalAccessException if access checking fails, or if the field is {@code static}
++         * @throws NullPointerException if any argument is null
+          */
+-        public MethodHandle findSetter(Class<?> refc, String name, Class<?> type) throws NoAccessException {
++        public MethodHandle findSetter(Class<?> refc, String name, Class<?> type) throws NoSuchFieldException, IllegalAccessException {
+             return makeAccessor(refc, name, type, false, true);
+         }
+ 
+@@ -684,9 +701,11 @@
+          * @param name the field's name
+          * @param type the field's type
+          * @return a method handle which can load values from the field
+-         * @exception NoAccessException if access checking fails
++         * @throws NoSuchFieldException if the field does not exist
++         * @throws IllegalAccessException if access checking fails, or if the field is not {@code static}
++         * @throws NullPointerException if any argument is null
+          */
+-        public MethodHandle findStaticGetter(Class<?> refc, String name, Class<?> type) throws NoAccessException {
++        public MethodHandle findStaticGetter(Class<?> refc, String name, Class<?> type) throws NoSuchFieldException, IllegalAccessException {
+             return makeAccessor(refc, name, type, true, false);
+         }
+ 
+@@ -700,9 +719,11 @@
+          * @param name the field's name
+          * @param type the field's type
+          * @return a method handle which can store values into the field
+-         * @exception NoAccessException if access checking fails
++         * @throws NoSuchFieldException if the field does not exist
++         * @throws IllegalAccessException if access checking fails, or if the field is not {@code static}
++         * @throws NullPointerException if any argument is null
+          */
+-        public MethodHandle findStaticSetter(Class<?> refc, String name, Class<?> type) throws NoAccessException {
++        public MethodHandle findStaticSetter(Class<?> refc, String name, Class<?> type) throws NoSuchFieldException, IllegalAccessException {
+             return makeAccessor(refc, name, type, true, true);
+         }
+ 
+@@ -741,16 +762,18 @@
+          * @param name the name of the method
+          * @param type the type of the method, with the receiver argument omitted
+          * @return the desired method handle
+-         * @exception NoAccessException if the method does not exist or access checking fails
++         * @throws NoSuchMethodException if the method does not exist
++         * @throws IllegalAccessException if access checking fails
++         * @throws NullPointerException if any argument is null
+          */
+-        public MethodHandle bind(Object receiver, String name, MethodType type) throws NoAccessException {
++        public MethodHandle bind(Object receiver, String name, MethodType type) throws NoSuchMethodException, IllegalAccessException {
+             Class<? extends Object> refc = receiver.getClass(); // may get NPE
+             MemberName method = resolveOrFail(refc, name, type, false);
+             checkMethod(refc, method, false);
+             MethodHandle dmh = MethodHandleImpl.findMethod(IMPL_TOKEN, method, true, lookupClassOrNull());
+             MethodHandle bmh = MethodHandleImpl.bindReceiver(IMPL_TOKEN, dmh, receiver);
+             if (bmh == null)
+-                throw newNoAccessException(method, lookupClass());
++                throw newNoAccessException(method, this);
+             if (dmh.type().parameterCount() == 0)
+                 return dmh;  // bound the trailing parameter; no varargs possible
+             return fixVarargs(bmh, dmh);
+@@ -772,9 +795,10 @@
+          * the method's variable arity modifier bit ({@code 0x0080}) is set.
+          * @param m the reflected method
+          * @return a method handle which can invoke the reflected method
+-         * @exception NoAccessException if access checking fails
++         * @throws IllegalAccessException if access checking fails
++         * @throws NullPointerException if the argument is null
+          */
+-        public MethodHandle unreflect(Method m) throws NoAccessException {
++        public MethodHandle unreflect(Method m) throws IllegalAccessException {
+             MemberName method = new MemberName(m);
+             assert(method.isMethod());
+             if (!m.isAccessible())  checkMethod(method.getDeclaringClass(), method, method.isStatic());
+@@ -799,9 +823,10 @@
+          * @param m the reflected method
+          * @param specialCaller the class nominally calling the method
+          * @return a method handle which can invoke the reflected method
+-         * @exception NoAccessException if access checking fails
++         * @throws IllegalAccessException if access checking fails
++         * @throws NullPointerException if any argument is null
+          */
+-        public MethodHandle unreflectSpecial(Method m, Class<?> specialCaller) throws NoAccessException {
++        public MethodHandle unreflectSpecial(Method m, Class<?> specialCaller) throws IllegalAccessException {
+             checkSpecialCaller(specialCaller);
+             MemberName method = new MemberName(m);
+             assert(method.isMethod());
+@@ -827,9 +852,10 @@
+          * the constructor's variable arity modifier bit ({@code 0x0080}) is set.
+          * @param c the reflected constructor
+          * @return a method handle which can invoke the reflected constructor
+-         * @exception NoAccessException if access checking fails
++         * @throws IllegalAccessException if access checking fails
++         * @throws NullPointerException if the argument is null
+          */
+-        public MethodHandle unreflectConstructor(Constructor c) throws NoAccessException {
++        public MethodHandle unreflectConstructor(Constructor c) throws IllegalAccessException {
+             MemberName ctor = new MemberName(c);
+             assert(ctor.isConstructor());
+             if (!c.isAccessible())  checkAccess(c.getDeclaringClass(), ctor);
+@@ -849,9 +875,10 @@
+          * access checking is performed immediately on behalf of the lookup class.
+          * @param f the reflected field
+          * @return a method handle which can load values from the reflected field
+-         * @exception NoAccessException if access checking fails
++         * @throws IllegalAccessException if access checking fails
++         * @throws NullPointerException if the argument is null
+          */
+-        public MethodHandle unreflectGetter(Field f) throws NoAccessException {
++        public MethodHandle unreflectGetter(Field f) throws IllegalAccessException {
+             return makeAccessor(f.getDeclaringClass(), new MemberName(f), f.isAccessible(), false);
+         }
+ 
+@@ -866,40 +893,47 @@
+          * access checking is performed immediately on behalf of the lookup class.
+          * @param f the reflected field
+          * @return a method handle which can store values into the reflected field
+-         * @exception NoAccessException if access checking fails
++         * @throws IllegalAccessException if access checking fails
++         * @throws NullPointerException if the argument is null
+          */
+-        public MethodHandle unreflectSetter(Field f) throws NoAccessException {
++        public MethodHandle unreflectSetter(Field f) throws IllegalAccessException {
+             return makeAccessor(f.getDeclaringClass(), new MemberName(f), f.isAccessible(), true);
+         }
+ 
+         /// Helper methods, all package-private.
+ 
+-        MemberName resolveOrFail(Class<?> refc, String name, Class<?> type, boolean isStatic) throws NoAccessException {
++        MemberName resolveOrFail(Class<?> refc, String name, Class<?> type, boolean isStatic) throws NoSuchFieldException, IllegalAccessException {
+             checkSymbolicClass(refc);  // do this before attempting to resolve
++            name.getClass(); type.getClass();  // NPE
+             int mods = (isStatic ? Modifier.STATIC : 0);
+-            return IMPL_NAMES.resolveOrFail(new MemberName(refc, name, type, mods), true, lookupClassOrNull());
++            return IMPL_NAMES.resolveOrFail(new MemberName(refc, name, type, mods), true, lookupClassOrNull(),
++                                            NoSuchFieldException.class);
+         }
+ 
+-        MemberName resolveOrFail(Class<?> refc, String name, MethodType type, boolean isStatic) throws NoAccessException {
++        MemberName resolveOrFail(Class<?> refc, String name, MethodType type, boolean isStatic) throws NoSuchMethodException, IllegalAccessException {
+             checkSymbolicClass(refc);  // do this before attempting to resolve
++            name.getClass(); type.getClass();  // NPE
+             int mods = (isStatic ? Modifier.STATIC : 0);
+-            return IMPL_NAMES.resolveOrFail(new MemberName(refc, name, type, mods), true, lookupClassOrNull());
++            return IMPL_NAMES.resolveOrFail(new MemberName(refc, name, type, mods), true, lookupClassOrNull(),
++                                            NoSuchMethodException.class);
+         }
+ 
+         MemberName resolveOrFail(Class<?> refc, String name, MethodType type, boolean isStatic,
+-                                 boolean searchSupers, Class<?> specialCaller) throws NoAccessException {
++                                 boolean searchSupers, Class<?> specialCaller) throws NoSuchMethodException, IllegalAccessException {
+             checkSymbolicClass(refc);  // do this before attempting to resolve
++            name.getClass(); type.getClass();  // NPE
+             int mods = (isStatic ? Modifier.STATIC : 0);
+-            return IMPL_NAMES.resolveOrFail(new MemberName(refc, name, type, mods), searchSupers, specialCaller);
++            return IMPL_NAMES.resolveOrFail(new MemberName(refc, name, type, mods), searchSupers, specialCaller,
++                                            NoSuchMethodException.class);
+         }
+ 
+-        void checkSymbolicClass(Class<?> refc) throws NoAccessException {
++        void checkSymbolicClass(Class<?> refc) throws IllegalAccessException {
+             Class<?> caller = lookupClassOrNull();
+             if (caller != null && !VerifyAccess.isClassAccessible(refc, caller))
+-                throw newNoAccessException("symbolic reference class is not public", new MemberName(refc), caller);
++                throw newNoAccessException("symbolic reference class is not public", new MemberName(refc), this);
+         }
+ 
+-        void checkMethod(Class<?> refc, MemberName m, boolean wantStatic) throws NoAccessException {
++        void checkMethod(Class<?> refc, MemberName m, boolean wantStatic) throws IllegalAccessException {
+             String message;
+             if (m.isConstructor())
+                 message = "expected a method, not a constructor";
+@@ -909,10 +943,10 @@
+                 message = wantStatic ? "expected a static method" : "expected a non-static method";
+             else
+                 { checkAccess(refc, m); return; }
+-            throw newNoAccessException(message, m, lookupClass());
++            throw newNoAccessException(message, m, this);
+         }
+ 
+-        void checkAccess(Class<?> refc, MemberName m) throws NoAccessException {
++        void checkAccess(Class<?> refc, MemberName m) throws IllegalAccessException {
+             int allowedModes = this.allowedModes;
+             if (allowedModes == TRUSTED)  return;
+             int mods = m.getModifiers();
+@@ -927,22 +961,25 @@
+                 && VerifyAccess.isSamePackage(m.getDeclaringClass(), lookupClass()))
+                 // Protected members can also be checked as if they were package-private.
+                 return;
+-            throw newNoAccessException(accessFailedMessage(refc, m), m, lookupClass());
++            throw newNoAccessException(accessFailedMessage(refc, m), m, this);
+         }
+ 
+         String accessFailedMessage(Class<?> refc, MemberName m) {
+             Class<?> defc = m.getDeclaringClass();
+             int mods = m.getModifiers();
+-            if (!VerifyAccess.isClassAccessible(defc, lookupClass()))
++            // check the class first:
++            boolean classOK = (Modifier.isPublic(defc.getModifiers()) &&
++                               (defc == refc ||
++                                Modifier.isPublic(refc.getModifiers())));
++            if (!classOK && (allowedModes & PACKAGE) != 0) {
++                classOK = (VerifyAccess.isClassAccessible(defc, lookupClass()) &&
++                           (defc == refc ||
++                            VerifyAccess.isClassAccessible(refc, lookupClass())));
++            }
++            if (!classOK)
+                 return "class is not public";
+-            if (refc != defc && !VerifyAccess.isClassAccessible(refc, lookupClass()))
+-                return "symbolic reference "+refc.getName()+" is not public";
+             if (Modifier.isPublic(mods))
+                 return "access to public member failed";  // (how?)
+-            else if (allowedModes == PUBLIC)
+-                return "member is not public";
+-            else if (allowedModes == 0)
+-                return "attempted member access through a non-public class";
+             if (Modifier.isPrivate(mods))
+                 return "member is private";
+             if (Modifier.isProtected(mods))
+@@ -952,17 +989,17 @@
+ 
+         private static final boolean ALLOW_NESTMATE_ACCESS = false;
+ 
+-        void checkSpecialCaller(Class<?> specialCaller) throws NoAccessException {
++        void checkSpecialCaller(Class<?> specialCaller) throws IllegalAccessException {
+             if (allowedModes == TRUSTED)  return;
+             if ((allowedModes & PRIVATE) == 0
+                 || (specialCaller != lookupClass()
+                     && !(ALLOW_NESTMATE_ACCESS &&
+                          VerifyAccess.isSamePackageMember(specialCaller, lookupClass()))))
+                 throw newNoAccessException("no private access for invokespecial",
+-                                           new MemberName(specialCaller), lookupClass());
++                                           new MemberName(specialCaller), this);
+         }
+ 
+-        MethodHandle restrictProtectedReceiver(MemberName method, MethodHandle mh) throws NoAccessException {
++        MethodHandle restrictProtectedReceiver(MemberName method, MethodHandle mh) throws IllegalAccessException {
+             // The accessing class only has the right to use a protected member
+             // on itself or a subclass.  Enforce that restriction, from JVMS 5.4.4, etc.
+             if (!method.isProtected() || method.isStatic()
+@@ -974,7 +1011,7 @@
+             else
+                 return restrictReceiver(method, mh, lookupClass());
+         }
+-        MethodHandle restrictReceiver(MemberName method, MethodHandle mh, Class<?> caller) throws NoAccessException {
++        MethodHandle restrictReceiver(MemberName method, MethodHandle mh, Class<?> caller) throws IllegalAccessException {
+             assert(!method.isStatic());
+             Class<?> defc = method.getDeclaringClass();  // receiver type of mh is too wide
+             if (defc.isInterface() || !defc.isAssignableFrom(caller)) {
+@@ -988,18 +1025,18 @@
+         }
+ 
+         MethodHandle makeAccessor(Class<?> refc, String name, Class<?> type,
+-                                  boolean isStatic, boolean isSetter) throws NoAccessException {
++                                  boolean isStatic, boolean isSetter) throws NoSuchFieldException, IllegalAccessException {
+             MemberName field = resolveOrFail(refc, name, type, isStatic);
+             if (isStatic != field.isStatic())
+                 throw newNoAccessException(isStatic
+                                            ? "expected a static field"
+                                            : "expected a non-static field",
+-                                           field, lookupClass());
++                                           field, this);
+             return makeAccessor(refc, field, false, isSetter);
+         }
+ 
+         MethodHandle makeAccessor(Class<?> refc, MemberName field,
+-                                  boolean trusted, boolean isSetter) throws NoAccessException {
++                                  boolean trusted, boolean isSetter) throws IllegalAccessException {
+             assert(field.isField());
+             if (trusted)
+                 return MethodHandleImpl.accessField(IMPL_TOKEN, field, isSetter, lookupClassOrNull());
+diff --git a/src/share/classes/java/dyn/NoAccessException.java b/src/share/classes/java/dyn/NoAccessException.java
+deleted file mode 100644
+--- a/src/share/classes/java/dyn/NoAccessException.java
++++ /dev/null
+@@ -1,79 +0,0 @@
+-/*
+- * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+- *
+- * This code is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License version 2 only, as
+- * published by the Free Software Foundation.  Oracle designates this
+- * particular file as subject to the "Classpath" exception as provided
+- * by Oracle in the LICENSE file that accompanied this code.
+- *
+- * This code is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+- * version 2 for more details (a copy is included in the LICENSE file that
+- * accompanied this code).
+- *
+- * You should have received a copy of the GNU General Public License version
+- * 2 along with this work; if not, write to the Free Software Foundation,
+- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+- *
+- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+- * or visit www.oracle.com if you need additional information or have any
+- * questions.
+- */
+-
+-package java.dyn;
+-
+-/**
+- * Thrown to indicate that a caller has attempted to create a method handle
+- * which accesses a field, method, or class to which the caller does not have access.
+- * This unchecked exception is analogous to {@link IllegalAccessException},
+- * which is a checked exception thrown when reflective invocation fails
+- * because of an access check.  With method handles, this same access
+- * checking is performed by the {@link MethodHandles.Lookup lookup object}
+- * on behalf of the method handle creator,
+- * at the time of creation.
+- * @author John Rose, JSR 292 EG
+- * @since 1.7
+- */
+-public class NoAccessException extends ReflectiveOperationException {
+-    private static final long serialVersionUID = 292L;
+-
+-    /**
+-     * Constructs a {@code NoAccessException} with no detail message.
+-     */
+-    public NoAccessException() {
+-        super();
+-    }
+-
+-    /**
+-     * Constructs a {@code NoAccessException} with the specified
+-     * detail message.
+-     *
+-     * @param s the detail message
+-     */
+-    public NoAccessException(String s) {
+-        super(s);
+-    }
+-
+-    /**
+-     * Constructs a {@code NoAccessException} with the specified cause.
+-     *
+-     * @param cause the underlying cause of the exception
+-     */
+-    public NoAccessException(Throwable cause) {
+-        super(cause);
+-    }
+-
+-    /**
+-     * Constructs a {@code NoAccessException} with the specified
+-     * detail message and cause.
+-     *
+-     * @param s the detail message
+-     * @param cause the underlying cause of the exception
+-     */
+-    public NoAccessException(String s, Throwable cause) {
+-        super(s, cause);
+-    }
+-}
+diff --git a/src/share/classes/sun/dyn/CallSiteImpl.java b/src/share/classes/sun/dyn/CallSiteImpl.java
+--- a/src/share/classes/sun/dyn/CallSiteImpl.java
++++ b/src/share/classes/sun/dyn/CallSiteImpl.java
+@@ -129,7 +129,7 @@
+                 MethodType.methodType(void.class,
+                                       String.class, MethodType.class,
+                                       MemberName.class, int.class));
+-        } catch (NoAccessException ex) {
++        } catch (ReflectiveOperationException ex) {
+             throw uncaughtException(ex);
+         }
+     }
+diff --git a/src/share/classes/sun/dyn/FilterGeneric.java b/src/share/classes/sun/dyn/FilterGeneric.java
+--- a/src/share/classes/sun/dyn/FilterGeneric.java
++++ b/src/share/classes/sun/dyn/FilterGeneric.java
+@@ -187,7 +187,7 @@
+             MethodHandle entryPoint = null;
+             try {
+                 entryPoint = MethodHandleImpl.IMPL_LOOKUP.findSpecial(acls, iname, entryType, acls);
+-            } catch (NoAccessException ex) {
++            } catch (ReflectiveOperationException ex) {
+             }
+             if (entryPoint == null)  continue;
+             Constructor<? extends Adapter> ctor = null;
+diff --git a/src/share/classes/sun/dyn/FilterOneArgument.java b/src/share/classes/sun/dyn/FilterOneArgument.java
+--- a/src/share/classes/sun/dyn/FilterOneArgument.java
++++ b/src/share/classes/sun/dyn/FilterOneArgument.java
+@@ -56,7 +56,7 @@
+             INVOKE =
+                 MethodHandleImpl.IMPL_LOOKUP.findVirtual(FilterOneArgument.class, "invoke",
+                                                          MethodType.genericMethodType(1));
+-        } catch (NoAccessException ex) {
++        } catch (ReflectiveOperationException ex) {
+             throw uncaughtException(ex);
+         }
+     }
+diff --git a/src/share/classes/sun/dyn/FromGeneric.java b/src/share/classes/sun/dyn/FromGeneric.java
+--- a/src/share/classes/sun/dyn/FromGeneric.java
++++ b/src/share/classes/sun/dyn/FromGeneric.java
+@@ -204,7 +204,7 @@
+             MethodHandle entryPoint = null;
+             try {
+                 entryPoint = MethodHandleImpl.IMPL_LOOKUP.findSpecial(acls, iname, entryType, acls);
+-            } catch (NoAccessException ex) {
++            } catch (ReflectiveOperationException ex) {
+             }
+             if (entryPoint == null)  continue;
+             Constructor<? extends Adapter> ctor = null;
+diff --git a/src/share/classes/sun/dyn/InvokeGeneric.java b/src/share/classes/sun/dyn/InvokeGeneric.java
+--- a/src/share/classes/sun/dyn/InvokeGeneric.java
++++ b/src/share/classes/sun/dyn/InvokeGeneric.java
+@@ -44,7 +44,7 @@
+     /** Compute and cache information for this adapter, so that it can
+      *  call out to targets of the erasure-family of the given erased type.
+      */
+-    private InvokeGeneric(MethodType erasedCallerType) throws NoAccessException {
++    private InvokeGeneric(MethodType erasedCallerType) throws ReflectiveOperationException {
+         this.erasedCallerType = erasedCallerType;
+         this.initialInvoker = makeInitialInvoker();
+         assert initialInvoker.type().equals(erasedCallerType
+@@ -64,14 +64,14 @@
+             try {
+                 InvokeGeneric gen = new InvokeGeneric(form.erasedType());
+                 form.genericInvoker = genericInvoker = gen.initialInvoker;
+-            } catch (NoAccessException ex) {
++            } catch (ReflectiveOperationException ex) {
+                 throw new RuntimeException(ex);
+             }
+         }
+         return genericInvoker;
+     }
+ 
+-    private MethodHandle makeInitialInvoker() throws NoAccessException {
++    private MethodHandle makeInitialInvoker() throws ReflectiveOperationException {
+         // postDispatch = #(MH'; MT, MH; A...){MH'(MT, MH; A)}
+         MethodHandle postDispatch = makePostDispatchInvoker();
+         MethodHandle invoker;
+@@ -95,7 +95,7 @@
+         return MethodHandles.dropArguments(targetInvoker, 1, EXTRA_ARGS);
+     }
+ 
+-    private MethodHandle dispatcher(String dispatchName) throws NoAccessException {
++    private MethodHandle dispatcher(String dispatchName) throws ReflectiveOperationException {
+         return lookup().bind(this, dispatchName,
+                              MethodType.methodType(MethodHandle.class,
+                                                    MethodType.class, MethodHandle.class));
+diff --git a/src/share/classes/sun/dyn/Invokers.java b/src/share/classes/sun/dyn/Invokers.java
+--- a/src/share/classes/sun/dyn/Invokers.java
++++ b/src/share/classes/sun/dyn/Invokers.java
+@@ -69,7 +69,7 @@
+         if (invoker != null)  return invoker;
+         try {
+             invoker = MethodHandleImpl.IMPL_LOOKUP.findVirtual(MethodHandle.class, "invokeExact", targetType);
+-        } catch (NoAccessException ex) {
++        } catch (ReflectiveOperationException ex) {
+             throw new InternalError("JVM cannot find invoker for "+targetType);
+         }
+         assert(invokerType(targetType) == invoker.type());
+@@ -128,7 +128,7 @@
+                 THROW_UCS = MethodHandleImpl.IMPL_LOOKUP
+                     .findStatic(CallSite.class, "uninitializedCallSite",
+                                 MethodType.methodType(Empty.class));
+-            } catch (NoAccessException ex) {
++            } catch (ReflectiveOperationException ex) {
+                 throw new RuntimeException(ex);
+             }
+         }
+diff --git a/src/share/classes/sun/dyn/MemberName.java b/src/share/classes/sun/dyn/MemberName.java
+--- a/src/share/classes/sun/dyn/MemberName.java
++++ b/src/share/classes/sun/dyn/MemberName.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -451,8 +451,6 @@
+             return type.toString();  // class java.lang.String
+         // else it is a field, method, or constructor
+         StringBuilder buf = new StringBuilder();
+-        if (!isResolved())
+-            buf.append("*.");
+         if (getDeclaringClass() != null) {
+             buf.append(getName(clazz));
+             buf.append('.');
+@@ -512,14 +510,24 @@
+     public static RuntimeException newIllegalArgumentException(String message) {
+         return new IllegalArgumentException(message);
+     }
+-    public static NoAccessException newNoAccessException(MemberName name, Class<?> lookupClass) {
+-        return newNoAccessException("cannot access", name, lookupClass);
++    public static IllegalAccessException newNoAccessException(MemberName name, Object from) {
++        return newNoAccessException("cannot access", name, from);
+     }
+-    public static NoAccessException newNoAccessException(String message,
+-            MemberName name, Class<?> lookupClass) {
++    public static IllegalAccessException newNoAccessException(String message,
++            MemberName name, Object from) {
+         message += ": " + name;
+-        if (lookupClass != null)  message += ", from " + lookupClass.getName();
+-        return new NoAccessException(message);
++        if (from != null)  message += ", from " + from;
++        return new IllegalAccessException(message);
++    }
++    public static ReflectiveOperationException newNoAccessException(MemberName name) {
++        if (name.isResolved())
++            return new IllegalAccessException(name.toString());
++        else if (name.isConstructor())
++            return new NoSuchMethodException(name.toString());
++        else if (name.isMethod())
++            return new NoSuchMethodException(name.toString());
++        else
++            return new NoSuchFieldException(name.toString());
+     }
+     public static Error uncaughtException(Exception ex) {
+         Error err = new InternalError("uncaught exception");
+@@ -643,14 +651,20 @@
+         /** Produce a resolved version of the given member.
+          *  Super types are searched (for inherited members) if {@code searchSupers} is true.
+          *  Access checking is performed on behalf of the given {@code lookupClass}.
+-         *  If lookup fails or access is not permitted, a {@linkplain NoAccessException} is thrown.
++         *  If lookup fails or access is not permitted, a {@linkplain ReflectiveOperationException} is thrown.
+          *  Otherwise a fresh copy of the given member is returned, with modifier bits filled in.
+          */
+-        public MemberName resolveOrFail(MemberName m, boolean searchSupers, Class<?> lookupClass) throws NoAccessException {
++        public
++        <NoSuchMemberException extends ReflectiveOperationException>
++        MemberName resolveOrFail(MemberName m, boolean searchSupers, Class<?> lookupClass,
++                                 Class<NoSuchMemberException> nsmClass)
++                throws IllegalAccessException, NoSuchMemberException {
+             MemberName result = resolveOrNull(m, searchSupers, lookupClass);
+             if (result != null)
+                 return result;
+-            throw newNoAccessException(m, lookupClass);
++            ReflectiveOperationException ex = newNoAccessException(m);
++            if (ex instanceof IllegalAccessException)  throw (IllegalAccessException) ex;
++            throw nsmClass.cast(ex);
+         }
+         /** Return a list of all methods defined by the given class.
+          *  Super types are searched (for inherited members) if {@code searchSupers} is true.
+diff --git a/src/share/classes/sun/dyn/MethodHandleImpl.java b/src/share/classes/sun/dyn/MethodHandleImpl.java
+--- a/src/share/classes/sun/dyn/MethodHandleImpl.java
++++ b/src/share/classes/sun/dyn/MethodHandleImpl.java
+@@ -30,7 +30,6 @@
+ import java.util.logging.Level;
+ import java.util.logging.Logger;
+ import sun.dyn.util.VerifyType;
+-import java.dyn.NoAccessException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collections;
+@@ -167,11 +166,11 @@
+      * @param doDispatch whether the method handle will test the receiver type
+      * @param lookupClass access-check relative to this class
+      * @return a direct handle to the matching method
+-     * @throws NoAccessException if the given method cannot be accessed by the lookup class
++     * @throws IllegalAccessException if the given method cannot be accessed by the lookup class
+      */
+     public static
+     MethodHandle findMethod(Access token, MemberName method,
+-            boolean doDispatch, Class<?> lookupClass) throws NoAccessException {
++                            boolean doDispatch, Class<?> lookupClass) throws IllegalAccessException {
+         Access.check(token);  // only trusted calls
+         MethodType mtype = method.getMethodType();
+         if (!method.isStatic()) {
+@@ -305,7 +304,7 @@
+                 MethodHandle invoke = null;
+                 try {
+                     invoke = lookup.findVirtual(AllocateObject.class, name, MethodType.genericMethodType(nargs));
+-                } catch (NoAccessException ex) {
++                } catch (ReflectiveOperationException ex) {
+                 }
+                 if (invoke == null)  break;
+                 invokes.add(invoke);
+@@ -320,7 +319,7 @@
+         static {
+             try {
+                 VARARGS_INVOKE = IMPL_LOOKUP.findVirtual(AllocateObject.class, "invoke_V", MethodType.genericMethodType(0, true));
+-            } catch (NoAccessException ex) {
++            } catch (ReflectiveOperationException ex) {
+                 throw uncaughtException(ex);
+             }
+         }
+@@ -472,7 +471,7 @@
+             MethodHandle mh;
+             try {
+                 mh = IMPL_LOOKUP.findVirtual(FieldAccessor.class, name, type);
+-            } catch (NoAccessException ex) {
++            } catch (ReflectiveOperationException ex) {
+                 throw uncaughtException(ex);
+             }
+             if (evclass != vclass || (!isStatic && ecclass != cclass)) {
+@@ -540,7 +539,7 @@
+             MethodHandle mh;
+             try {
+                 mh = IMPL_LOOKUP.findStatic(FieldAccessor.class, name, type);
+-            } catch (NoAccessException ex) {
++            } catch (ReflectiveOperationException ex) {
+                 throw uncaughtException(ex);
+             }
+             if (caclass != null) {
+@@ -1012,7 +1011,7 @@
+                 MethodHandle invoke = null;
+                 try {
+                     invoke = lookup.findVirtual(GuardWithTest.class, name, MethodType.genericMethodType(nargs));
+-                } catch (NoAccessException ex) {
++                } catch (ReflectiveOperationException ex) {
+                 }
+                 if (invoke == null)  break;
+                 invokes.add(invoke);
+@@ -1027,7 +1026,7 @@
+         static {
+             try {
+                 VARARGS_INVOKE = IMPL_LOOKUP.findVirtual(GuardWithTest.class, "invoke_V", MethodType.genericMethodType(0, true));
+-            } catch (NoAccessException ex) {
++            } catch (ReflectiveOperationException ex) {
+                 throw uncaughtException(ex);
+             }
+         }
+@@ -1148,7 +1147,7 @@
+                 MethodHandle invoke = null;
+                 try {
+                     invoke = lookup.findVirtual(GuardWithCatch.class, name, MethodType.genericMethodType(nargs));
+-                } catch (NoAccessException ex) {
++                } catch (ReflectiveOperationException ex) {
+                 }
+                 if (invoke == null)  break;
+                 invokes.add(invoke);
+@@ -1163,7 +1162,7 @@
+         static {
+             try {
+                 VARARGS_INVOKE = IMPL_LOOKUP.findVirtual(GuardWithCatch.class, "invoke_V", MethodType.genericMethodType(0, true));
+-            } catch (NoAccessException ex) {
++            } catch (ReflectiveOperationException ex) {
+                 throw uncaughtException(ex);
+             }
+         }
+@@ -1210,7 +1209,7 @@
+             THROW_EXCEPTION
+             = IMPL_LOOKUP.findStatic(MethodHandleImpl.class, "throwException",
+                     MethodType.methodType(Empty.class, Throwable.class));
+-        } catch (NoAccessException ex) {
++        } catch (ReflectiveOperationException ex) {
+             throw new RuntimeException(ex);
+         }
+     }
+diff --git a/src/share/classes/sun/dyn/MethodHandleNatives.java b/src/share/classes/sun/dyn/MethodHandleNatives.java
+--- a/src/share/classes/sun/dyn/MethodHandleNatives.java
++++ b/src/share/classes/sun/dyn/MethodHandleNatives.java
+@@ -350,7 +350,7 @@
+             case REF_invokeInterface:   return lookup.findVirtual(      defc, name, (MethodType) type );
+             }
+             throw new IllegalArgumentException("bad MethodHandle constant "+name+" : "+type);
+-        } catch (NoAccessException ex) {
++        } catch (ReflectiveOperationException ex) {
+             Error err = new IncompatibleClassChangeError();
+             err.initCause(ex);
+             throw err;
+diff --git a/src/share/classes/sun/dyn/SpreadGeneric.java b/src/share/classes/sun/dyn/SpreadGeneric.java
+--- a/src/share/classes/sun/dyn/SpreadGeneric.java
++++ b/src/share/classes/sun/dyn/SpreadGeneric.java
+@@ -167,7 +167,7 @@
+             MethodHandle entryPoint = null;
+             try {
+                 entryPoint = MethodHandleImpl.IMPL_LOOKUP.findSpecial(acls, iname, entryType, acls);
+-            } catch (NoAccessException ex) {
++            } catch (ReflectiveOperationException ex) {
+             }
+             if (entryPoint == null)  continue;
+             Constructor<? extends Adapter> ctor = null;
+diff --git a/src/share/classes/sun/dyn/ToGeneric.java b/src/share/classes/sun/dyn/ToGeneric.java
+--- a/src/share/classes/sun/dyn/ToGeneric.java
++++ b/src/share/classes/sun/dyn/ToGeneric.java
+@@ -285,7 +285,7 @@
+                 try {
+                     entryPoint = MethodHandleImpl.IMPL_LOOKUP.
+                                     findSpecial(acls, iname, entryPointType, acls);
+-                } catch (NoAccessException ex) {
++                } catch (ReflectiveOperationException ex) {
+                 }
+                 if (entryPoint == null)  continue;
+                 Constructor<? extends Adapter> ctor = null;
+diff --git a/src/share/classes/sun/dyn/util/ValueConversions.java b/src/share/classes/sun/dyn/util/ValueConversions.java
+--- a/src/share/classes/sun/dyn/util/ValueConversions.java
++++ b/src/share/classes/sun/dyn/util/ValueConversions.java
+@@ -153,7 +153,7 @@
+             try {
+                 // actually, type is wrong; the Java method takes Object
+                 mh = IMPL_LOOKUP.findStatic(ValueConversions.class, name, type.erase());
+-            } catch (NoAccessException ex) {
++            } catch (ReflectiveOperationException ex) {
+                 mh = null;
+             }
+         } else {
+@@ -289,7 +289,7 @@
+         if (exact) {
+             try {
+                 mh = IMPL_LOOKUP.findStatic(ValueConversions.class, name, type);
+-            } catch (NoAccessException ex) {
++            } catch (ReflectiveOperationException ex) {
+                 mh = null;
+             }
+         } else {
+@@ -408,7 +408,7 @@
+         if (exact) {
+             try {
+                 mh = IMPL_LOOKUP.findStatic(ValueConversions.class, name, type);
+-            } catch (NoAccessException ex) {
++            } catch (ReflectiveOperationException ex) {
+                 mh = null;
+             }
+         } else {
+@@ -492,7 +492,7 @@
+             case INT: case LONG: case FLOAT: case DOUBLE:
+                 try {
+                     mh = IMPL_LOOKUP.findStatic(ValueConversions.class, "zero"+wrap.simpleName(), type);
+-                } catch (NoAccessException ex) {
++                } catch (ReflectiveOperationException ex) {
+                     mh = null;
+                 }
+                 break;
+@@ -654,7 +654,7 @@
+             type = type.appendParameterTypes(wrap.primitiveType());
+         try {
+             mh = IMPL_LOOKUP.findStatic(ValueConversions.class, "identity", type);
+-        } catch (NoAccessException ex) {
++        } catch (ReflectiveOperationException ex) {
+             mh = null;
+         }
+         if (mh == null && wrap == Wrapper.VOID) {
+@@ -723,7 +723,7 @@
+             MethodHandle array = null;
+             try {
+                 array = lookup.findStatic(ValueConversions.class, name, type);
+-            } catch (NoAccessException ex) {
++            } catch (ReflectiveOperationException ex) {
+             }
+             if (array == null)  break;
+             arrays.add(array);
+@@ -784,7 +784,7 @@
+             MethodHandle array = null;
+             try {
+                 array = lookup.findStatic(ValueConversions.class, name, type);
+-            } catch (NoAccessException ex) {
++            } catch (ReflectiveOperationException ex) {
+             }
+             if (array == null)  break;
+             arrays.add(array);
+diff --git a/src/share/classes/sun/dyn/util/VerifyAccess.java b/src/share/classes/sun/dyn/util/VerifyAccess.java
+--- a/src/share/classes/sun/dyn/util/VerifyAccess.java
++++ b/src/share/classes/sun/dyn/util/VerifyAccess.java
+@@ -25,7 +25,6 @@
+ 
+ package sun.dyn.util;
+ 
+-import java.dyn.NoAccessException;
+ import java.lang.reflect.Modifier;
+ import sun.dyn.MemberName;
+ import sun.dyn.MethodHandleImpl;
+@@ -139,6 +138,8 @@
+      * <li>C is public.
+      * <li>C and D are members of the same runtime package.
+      * </ul>
++     * @param refc the symbolic reference class to which access is being checked (C)
++     * @param lookupClass the class performing the lookup (D)
+      */
+     public static boolean isClassAccessible(Class<?> refc, Class<?> lookupClass) {
+         int mods = refc.getModifiers();
+diff --git a/test/java/dyn/InvokeGenericTest.java b/test/java/dyn/InvokeGenericTest.java
+--- a/test/java/dyn/InvokeGenericTest.java
++++ b/test/java/dyn/InvokeGenericTest.java
+@@ -338,7 +338,7 @@
+                 = LOOKUP.findStatic(LOOKUP.lookupClass(),
+                                     "collector",
+                                     methodType(Object.class, Object[].class));
+-        } catch (NoAccessException ex) {
++        } catch (ReflectiveOperationException ex) {
+             throw new RuntimeException(ex);
+         }
+     }
+diff --git a/test/java/dyn/JavaDocExamplesTest.java b/test/java/dyn/JavaDocExamplesTest.java
+--- a/test/java/dyn/JavaDocExamplesTest.java
++++ b/test/java/dyn/JavaDocExamplesTest.java
+@@ -74,7 +74,7 @@
+ // static final private MethodHandle HASHCODE_1 = LOOKUP.findVirtual(Object.class,
+ //     "hashCode", methodType(int.class));
+ 
+-// form required if NoAccessException is intercepted:
++// form required if ReflectiveOperationException is intercepted:
+ static final private MethodHandle CONCAT_2, HASHCODE_2;
+ static {
+   try {
+@@ -82,7 +82,7 @@
+       "concat", methodType(String.class, String.class));
+     HASHCODE_2 = LOOKUP.findVirtual(Object.class,
+       "hashCode", methodType(int.class));
+-   } catch (NoAccessException ex) {
++   } catch (ReflectiveOperationException ex) {
+      throw new RuntimeException(ex);
+    }
+ }
+diff --git a/test/java/dyn/MethodHandlesTest.java b/test/java/dyn/MethodHandlesTest.java
+--- a/test/java/dyn/MethodHandlesTest.java
++++ b/test/java/dyn/MethodHandlesTest.java
+@@ -496,8 +496,12 @@
+         try {
+             if (verbosity >= 4)  System.out.println("lookup via "+lookup+" of "+defc+" "+name+type);
+             target = lookup.in(defc).findStatic(defc, name, type);
+-        } catch (NoAccessException ex) {
++        } catch (ReflectiveOperationException ex) {
+             noAccess = ex;
++            if (name.contains("bogus"))
++                assertTrue(noAccess instanceof NoSuchMethodException);
++            else
++                assertTrue(noAccess instanceof IllegalAccessException);
+         }
+         if (verbosity >= 3)
+             System.out.println("findStatic "+lookup+": "+defc.getName()+"."+name+"/"+type+" => "+target
+@@ -566,8 +570,12 @@
+         try {
+             if (verbosity >= 4)  System.out.println("lookup via "+lookup+" of "+defc+" "+name+type);
+             target = lookup.in(defc).findVirtual(defc, methodName, type);
+-        } catch (NoAccessException ex) {
++        } catch (ReflectiveOperationException ex) {
+             noAccess = ex;
++            if (name.contains("bogus"))
++                assertTrue(noAccess instanceof NoSuchMethodException);
++            else
++                assertTrue(noAccess instanceof IllegalAccessException);
+         }
+         if (verbosity >= 3)
+             System.out.println("findVirtual "+lookup+": "+defc.getName()+"."+name+"/"+type+" => "+target
+@@ -596,11 +604,12 @@
+         testFindSpecial(SubExample.class, Example.class, void.class, "v0");
+         testFindSpecial(SubExample.class, Example.class, void.class, "pkg_v0");
+         // Do some negative testing:
++        testFindSpecial(false, EXAMPLE, SubExample.class, Example.class, void.class, "bogus");
++        testFindSpecial(false, PRIVATE, SubExample.class, Example.class, void.class, "bogus");
+         for (Lookup lookup : new Lookup[]{ PRIVATE, EXAMPLE, PACKAGE, PUBLIC }) {
+             testFindSpecial(false, lookup, Object.class, Example.class, void.class, "v0");
+             testFindSpecial(false, lookup, SubExample.class, Example.class, void.class, "<init>", int.class);
+             testFindSpecial(false, lookup, SubExample.class, Example.class, void.class, "s0");
+-            testFindSpecial(false, lookup, SubExample.class, Example.class, void.class, "bogus");
+         }
+     }
+ 
+@@ -621,8 +630,12 @@
+             if (verbosity >= 4)  System.out.println("lookup via "+lookup+" of "+defc+" "+name+type);
+             if (verbosity >= 5)  System.out.println("  lookup => "+lookup.in(specialCaller));
+             target = lookup.in(specialCaller).findSpecial(defc, name, type, specialCaller);
+-        } catch (NoAccessException ex) {
++        } catch (ReflectiveOperationException ex) {
+             noAccess = ex;
++            if (name.contains("bogus"))
++                assertTrue(noAccess instanceof NoSuchMethodException);
++            else
++                assertTrue(noAccess instanceof IllegalAccessException);
+         }
+         if (verbosity >= 3)
+             System.out.println("findSpecial from "+specialCaller.getName()+" to "+defc.getName()+"."+name+"/"+type+" => "+target
+@@ -677,8 +690,12 @@
+         try {
+             if (verbosity >= 4)  System.out.println("lookup via "+lookup+" of "+defc+" "+name+type);
+             target = lookup.in(defc).bind(receiver, methodName, type);
+-        } catch (NoAccessException ex) {
++        } catch (ReflectiveOperationException ex) {
+             noAccess = ex;
++            if (name.contains("bogus"))
++                assertTrue(noAccess instanceof NoSuchMethodException);
++            else
++                assertTrue(noAccess instanceof IllegalAccessException);
+         }
+         if (verbosity >= 3)
+             System.out.println("bind "+receiver+"."+name+"/"+type+" => "+target
+@@ -736,14 +753,9 @@
+                                    Class<?> defc, Class<?> rcvc, Class<?> ret, String name, Class<?>... params) throws Throwable {
+         countTest(positive);
+         MethodType type = MethodType.methodType(ret, params);
+-        Method rmethod = null;
++        Method rmethod = defc.getDeclaredMethod(name, params);
+         MethodHandle target = null;
+         Exception noAccess = null;
+-        try {
+-            rmethod = defc.getDeclaredMethod(name, params);
+-        } catch (NoSuchMethodException ex) {
+-            throw new NoAccessException(ex);
+-        }
+         boolean isStatic = (rcvc == null);
+         boolean isSpecial = (specialCaller != null);
+         try {
+@@ -752,8 +764,12 @@
+                 target = lookup.in(specialCaller).unreflectSpecial(rmethod, specialCaller);
+             else
+                 target = lookup.in(defc).unreflect(rmethod);
+-        } catch (NoAccessException ex) {
++        } catch (ReflectiveOperationException ex) {
+             noAccess = ex;
++            if (name.contains("bogus"))
++                assertTrue(noAccess instanceof NoSuchMethodException);
++            else
++                assertTrue(noAccess instanceof IllegalAccessException);
+         }
+         if (verbosity >= 3)
+             System.out.println("unreflect"+(isSpecial?"Special":"")+" "+defc.getName()+"."+name+"/"+type
+@@ -862,25 +878,28 @@
+                     if (type == float.class) {
+                         float v = 'F';
+                         if (isStatic)  v++;
+-                        assert(value.equals(v));
++                        assertTrue(value.equals(v));
+                     }
+-                    assert(name.equals(field.getName()));
+-                    assert(type.equals(field.getType()));
+-                    assert(isStatic == (Modifier.isStatic(field.getModifiers())));
++                    assertTrue(name.equals(field.getName()));
++                    assertTrue(type.equals(field.getType()));
++                    assertTrue(isStatic == (Modifier.isStatic(field.getModifiers())));
+                     cases.add(new Object[]{ field, value });
+                 }
+             }
++            cases.add(new Object[]{ new Object[]{ false, HasFields.class, "bogus_fD", double.class }, Error.class });
++            cases.add(new Object[]{ new Object[]{ true,  HasFields.class, "bogus_sL", Object.class }, Error.class });
+             CASES = cases.toArray(new Object[0][]);
+         }
+     }
+ 
+-    static final int TEST_UNREFLECT = 1, TEST_FIND_FIELD = 2, TEST_FIND_STATIC_FIELD = 3;
++    static final int TEST_UNREFLECT = 1, TEST_FIND_FIELD = 2, TEST_FIND_STATIC = 3, TEST_SETTER = 0x10;
+     static boolean testModeMatches(int testMode, boolean isStatic) {
+         switch (testMode) {
+-        case TEST_FIND_STATIC_FIELD:    return isStatic;
++        case TEST_FIND_STATIC:          return isStatic;
+         case TEST_FIND_FIELD:           return !isStatic;
+-        default:                        return true;  // unreflect matches both
++        case TEST_UNREFLECT:            return true;  // unreflect matches both
+         }
++        throw new InternalError("testMode="+testMode);
+     }
+ 
+     @Test
+@@ -896,54 +915,161 @@
+     @Test
+     public void testFindStaticGetter() throws Throwable {
+         startTest("findStaticGetter");
+-        testGetter(TEST_FIND_STATIC_FIELD);
++        testGetter(TEST_FIND_STATIC);
+     }
+     public void testGetter(int testMode) throws Throwable {
+         Lookup lookup = PRIVATE;  // FIXME: test more lookups than this one
+         for (Object[] c : HasFields.CASES) {
+-            Field f = (Field)c[0];
+-            Object value = c[1];
+-            Class<?> type = f.getType();
+-            testGetter(lookup, f, type, value, testMode);
++            boolean positive = (c[1] != Error.class);
++            testGetter(positive, lookup, c[0], c[1], testMode);
++        }
++        testGetter(true, lookup,
++                   new Object[]{ true,  System.class, "out", java.io.PrintStream.class },
++                   System.out, testMode);
++        for (int isStaticN = 0; isStaticN <= 1; isStaticN++) {
++            testGetter(false, lookup,
++                       new Object[]{ (isStaticN != 0), System.class, "bogus", char.class },
++                       null, testMode);
+         }
+     }
+-    public void testGetter(MethodHandles.Lookup lookup,
+-            Field f, Class<?> type, Object value, int testMode) throws Throwable {
+-        boolean isStatic = Modifier.isStatic(f.getModifiers());
+-        Class<?> fclass = f.getDeclaringClass();
+-        String   fname  = f.getName();
+-        Class<?> ftype  = f.getType();
++    public void testGetter(boolean positive, MethodHandles.Lookup lookup,
++                           Object fieldRef, Object value, int testMode) throws Throwable {
++        testAccessor(positive, lookup, fieldRef, value, testMode);
++    }
++
++    public void testAccessor(boolean positive, MethodHandles.Lookup lookup,
++                             Object fieldRef, Object value, int testMode0) throws Throwable {
++        boolean isGetter = ((testMode0 & TEST_SETTER) == 0);
++        int testMode = testMode0 & ~TEST_SETTER;
++        boolean isStatic;
++        Class<?> fclass;
++        String   fname;
++        Class<?> ftype;
++        Field f = (fieldRef instanceof Field ? (Field)fieldRef : null);
++        if (f != null) {
++            isStatic = Modifier.isStatic(f.getModifiers());
++            fclass   = f.getDeclaringClass();
++            fname    = f.getName();
++            ftype    = f.getType();
++        } else {
++            Object[] scnt = (Object[]) fieldRef;
++            isStatic = (Boolean)  scnt[0];
++            fclass   = (Class<?>) scnt[1];
++            fname    = (String)   scnt[2];
++            ftype    = (Class<?>) scnt[3];
++            try {
++                f = fclass.getDeclaredField(fname);
++            } catch (ReflectiveOperationException ex) {
++                f = null;
++            }
++        }
+         if (!testModeMatches(testMode, isStatic))  return;
+-        countTest(true);
+-        MethodType expType = MethodType.methodType(type, HasFields.class);
++        if (f == null && testMode == TEST_UNREFLECT)  return;
++        countTest(positive);
++        MethodType expType;
++        if (isGetter)
++            expType = MethodType.methodType(ftype, HasFields.class);
++        else
++            expType = MethodType.methodType(void.class, HasFields.class, ftype);
+         if (isStatic)  expType = expType.dropParameterTypes(0, 1);
+-        MethodHandle mh = lookup.unreflectGetter(f);
++        Exception noAccess = null;
++        MethodHandle mh;
++        try {
++            switch (testMode0) {
++            case TEST_UNREFLECT:   mh = lookup.unreflectGetter(f);                      break;
++            case TEST_FIND_FIELD:  mh = lookup.findGetter(fclass, fname, ftype);        break;
++            case TEST_FIND_STATIC: mh = lookup.findStaticGetter(fclass, fname, ftype);  break;
++            case TEST_SETTER|
++                 TEST_UNREFLECT:   mh = lookup.unreflectSetter(f);                      break;
++            case TEST_SETTER|
++                 TEST_FIND_FIELD:  mh = lookup.findSetter(fclass, fname, ftype);        break;
++            case TEST_SETTER|
++                 TEST_FIND_STATIC: mh = lookup.findStaticSetter(fclass, fname, ftype);  break;
++            default:
++                throw new InternalError("testMode="+testMode);
++            }
++        } catch (ReflectiveOperationException ex) {
++            mh = null;
++            noAccess = ex;
++            if (fname.contains("bogus"))
++                assertTrue(noAccess instanceof NoSuchFieldException);
++            else
++                assertTrue(noAccess instanceof IllegalAccessException);
++        }
++        if (verbosity >= 3)
++            System.out.println("find"+(isStatic?"Static":"")+(isGetter?"Getter":"Setter")+" "+fclass.getName()+"."+fname+"/"+ftype
++                               +" => "+mh
++                               +(noAccess == null ? "" : " !! "+noAccess));
++        if (positive && noAccess != null)  throw new RuntimeException(noAccess);
++        assertEquals(positive ? "positive test" : "negative test erroneously passed", positive, mh != null);
++        if (!positive)  return; // negative test failed as expected
++        assertEquals((isStatic ? 0 : 1)+(isGetter ? 0 : 1), mh.type().parameterCount());
++
++
+         assertSame(mh.type(), expType);
+         assertNameStringContains(mh, fname);
+         HasFields fields = new HasFields();
+         Object sawValue;
+-        Class<?> rtype = type;
+-        if (type != int.class)  rtype = Object.class;
+-        mh = MethodHandles.convertArguments(mh, mh.type().generic().changeReturnType(rtype));
+-        Object expValue = value;
+-        for (int i = 0; i <= 1; i++) {
+-            if (isStatic) {
+-                if (type == int.class)
+-                    sawValue = (int) mh.invokeExact();  // do these exactly
+-                else
+-                    sawValue = mh.invokeExact();
+-            } else {
+-                if (type == int.class)
+-                    sawValue = (int) mh.invokeExact((Object) fields);
+-                else
+-                    sawValue = mh.invokeExact((Object) fields);
++        Class<?> vtype = ftype;
++        if (ftype != int.class)  vtype = Object.class;
++        if (isGetter) {
++            mh = MethodHandles.convertArguments(mh, mh.type().generic()
++                                                .changeReturnType(vtype));
++        } else {
++            int last = mh.type().parameterCount() - 1;
++            mh = MethodHandles.convertArguments(mh, mh.type().generic()
++                                                .changeReturnType(void.class)
++                                                .changeParameterType(last, vtype));
++        }
++        if (f != null && f.getDeclaringClass() == HasFields.class) {
++            assertEquals(f.get(fields), value);  // clean to start with
++        }
++        if (isGetter) {
++            Object expValue = value;
++            for (int i = 0; i <= 1; i++) {
++                if (isStatic) {
++                    if (ftype == int.class)
++                        sawValue = (int) mh.invokeExact();  // do these exactly
++                    else
++                        sawValue = mh.invokeExact();
++                } else {
++                    if (ftype == int.class)
++                        sawValue = (int) mh.invokeExact((Object) fields);
++                    else
++                        sawValue = mh.invokeExact((Object) fields);
++                }
++                assertEquals(sawValue, expValue);
++                if (f != null && f.getDeclaringClass() == HasFields.class
++                    && !Modifier.isFinal(f.getModifiers())) {
++                    Object random = randomArg(ftype);
++                    f.set(fields, random);
++                    expValue = random;
++                } else {
++                    break;
++                }
+             }
+-            assertEquals(sawValue, expValue);
+-            Object random = randomArg(type);
+-            f.set(fields, random);
+-            expValue = random;
++        } else {
++            for (int i = 0; i <= 1; i++) {
++                Object putValue = randomArg(ftype);
++                if (isStatic) {
++                    if (ftype == int.class)
++                        mh.invokeExact((int)putValue);  // do these exactly
++                    else
++                        mh.invokeExact(putValue);
++                } else {
++                    if (ftype == int.class)
++                        mh.invokeExact((Object) fields, (int)putValue);
++                    else
++                        mh.invokeExact((Object) fields, putValue);
++                }
++                if (f != null && f.getDeclaringClass() == HasFields.class) {
++                    assertEquals(f.get(fields), putValue);
++                }
++            }
+         }
+-        f.set(fields, value);  // put it back
++        if (f != null && f.getDeclaringClass() == HasFields.class) {
++            f.set(fields, value);  // put it back
++        }
+     }
+ 
+ 
+@@ -960,61 +1086,24 @@
+     @Test
+     public void testFindStaticSetter() throws Throwable {
+         startTest("findStaticSetter");
+-        testSetter(TEST_FIND_STATIC_FIELD);
++        testSetter(TEST_FIND_STATIC);
+     }
+     public void testSetter(int testMode) throws Throwable {
+         Lookup lookup = PRIVATE;  // FIXME: test more lookups than this one
+         startTest("unreflectSetter");
+         for (Object[] c : HasFields.CASES) {
+-            Field f = (Field)c[0];
+-            Object value = c[1];
+-            Class<?> type = f.getType();
+-            testSetter(lookup, f, type, value, testMode);
++            boolean positive = (c[1] != Error.class);
++            testSetter(positive, lookup, c[0], c[1], testMode);
++        }
++        for (int isStaticN = 0; isStaticN <= 1; isStaticN++) {
++            testSetter(false, lookup,
++                       new Object[]{ (isStaticN != 0), System.class, "bogus", char.class },
++                       null, testMode);
+         }
+     }
+-    public void testSetter(MethodHandles.Lookup lookup,
+-            Field f, Class<?> type, Object value, int testMode) throws Throwable {
+-        boolean isStatic = Modifier.isStatic(f.getModifiers());
+-        Class<?> fclass = f.getDeclaringClass();
+-        String   fname  = f.getName();
+-        Class<?> ftype  = f.getType();
+-        if (!testModeMatches(testMode, isStatic))  return;
+-        countTest(true);
+-        MethodType expType = MethodType.methodType(void.class, HasFields.class, type);
+-        if (isStatic)  expType = expType.dropParameterTypes(0, 1);
+-        MethodHandle mh;
+-        if (testMode == TEST_UNREFLECT)
+-            mh = lookup.unreflectSetter(f);
+-        else if (testMode == TEST_FIND_FIELD)
+-            mh = lookup.findSetter(fclass, fname, ftype);
+-        else if (testMode == TEST_FIND_STATIC_FIELD)
+-            mh = lookup.findStaticSetter(fclass, fname, ftype);
+-        else  throw new InternalError();
+-        assertSame(mh.type(), expType);
+-        assertNameStringContains(mh, fname);
+-        HasFields fields = new HasFields();
+-        Object sawValue;
+-        Class<?> vtype = type;
+-        if (type != int.class)  vtype = Object.class;
+-        int last = mh.type().parameterCount() - 1;
+-        mh = MethodHandles.convertArguments(mh, mh.type().generic().changeReturnType(void.class).changeParameterType(last, vtype));
+-        assertEquals(f.get(fields), value);  // clean to start with
+-        for (int i = 0; i <= 1; i++) {
+-            Object putValue = randomArg(type);
+-            if (isStatic) {
+-                if (type == int.class)
+-                    mh.invokeExact((int)putValue);  // do these exactly
+-                else
+-                    mh.invokeExact(putValue);
+-            } else {
+-                if (type == int.class)
+-                    mh.invokeExact((Object) fields, (int)putValue);
+-                else
+-                    mh.invokeExact((Object) fields, putValue);
+-            }
+-            assertEquals(f.get(fields), putValue);
+-        }
+-        f.set(fields, value);  // put it back
++    public void testSetter(boolean positive, MethodHandles.Lookup lookup,
++                           Object fieldRef, Object value, int testMode) throws Throwable {
++        testAccessor(positive, lookup, fieldRef, value, testMode | TEST_SETTER);
+     }
+ 
+     @Test
+@@ -1323,7 +1412,7 @@
+                 types[i] = args[i].getClass();
+         }
+         int inargs = args.length, outargs = reorder.length;
+-        assert(inargs == types.length);
++        assertTrue(inargs == types.length);
+         if (verbosity >= 3)
+             System.out.println("permuteArguments "+Arrays.toString(reorder));
+         Object[] permArgs = new Object[outargs];
+@@ -2219,12 +2308,13 @@
+             MethodHandle array = null;
+             try {
+                 array = lookup.findStatic(ValueConversions.class, name, type);
+-            } catch (NoAccessException ex) {
++            } catch (ReflectiveOperationException ex) {
++                // break from loop!
+             }
+             if (array == null)  break;
+             arrays.add(array);
+         }
+-        assert(arrays.size() == 11);  // current number of methods
++        assertTrue(arrays.size() == 11);  // current number of methods
+         return arrays.toArray(new MethodHandle[0]);
+     }
+     static final MethodHandle[] ARRAYS = makeArrays();
+@@ -2280,12 +2370,13 @@
+             MethodHandle list = null;
+             try {
+                 list = lookup.findStatic(ValueConversions.class, name, type);
+-            } catch (NoAccessException ex) {
++            } catch (ReflectiveOperationException ex) {
++                // break from loop!
+             }
+             if (list == null)  break;
+             lists.add(list);
+         }
+-        assert(lists.size() == 11);  // current number of methods
++        assertTrue(lists.size() == 11);  // current number of methods
+         return lists.toArray(new MethodHandle[0]);
+     }
+     static final MethodHandle[] LISTS = makeLists();

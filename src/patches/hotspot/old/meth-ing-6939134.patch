@@ -1,0 +1,1406 @@
+6939134: JSR 292 adjustments to method handle invocation
+Summary: split MethodHandle.invoke into invokeExact and invokeGeneric; also clean up JVM-to-Java interfaces
+Reviewed-by: twisti
+
+The JSR 292 EG has decided to split MethodHandle.invoke into two
+methods, invokeExact and invokeGeneric.  The EG has also decided to
+simplify the process of CallSite bootstrapping.  These changes require
+updates to the toolchain and JVM.
+
+This bug is the first part of a two part change.  This change updates
+the CallSite API.  It renames MH.invoke to invokeExact and introduces
+invokeGeneric as a separately recognized operation, but does not give
+the two operations distinct semantics.  A following bug will give
+invokeGeneric its distinct semantics.
+
+Changes to be done in this part include:
+- Recognize signature-polymorphic methods MH.invoke* and InDy.* via special IDs vmIntrinsics::_invoke*.
+- Make the vmSymbols::SID visible through the ciSymbol API.
+- Adding some mode bits to the key of SymbolPropertyTable (to distinguish invokeExact/invokeGeneric).
+- Improve the debug printing code for methodOop (notably, to show intrinsic ID).
+- Remove unused arguments and dead code.
+Specific changes to the private interface between the JVM and Java code:
+- Move misc. upcalls to a single implementation-private interface class, MethodHandleNatives.
+- Reduce the VM's entanglement with CallSite by removing some hardwired fields from CS.
+- Pass more information to the Java code when bootstrapping a CallSite.
+- Obtain MethodHandleNatives.CONV_OP_IMPLEMENTED_MASK from the JVM, which knows the correct mask.
+- Use only the JVM to store bootstrap methods, not a Java-level hash table.
+- Adjust access checks (under VerifyMethodHandles) for Direct MHs and MemberNames, to reduce test failures in debug mode.
+
+diff --git a/src/cpu/sparc/vm/methodHandles_sparc.cpp b/src/cpu/sparc/vm/methodHandles_sparc.cpp
+--- a/src/cpu/sparc/vm/methodHandles_sparc.cpp
++++ b/src/cpu/sparc/vm/methodHandles_sparc.cpp
+@@ -288,6 +288,21 @@
+ }
+ #endif // PRODUCT
+ 
++// which conversion op types are implemented here?
++int MethodHandles::adapter_conversion_ops_supported_mask() {
++  return ((1<<sun_dyn_AdapterMethodHandle::OP_RETYPE_ONLY)
++         |(1<<sun_dyn_AdapterMethodHandle::OP_RETYPE_RAW)
++         |(1<<sun_dyn_AdapterMethodHandle::OP_CHECK_CAST)
++         |(1<<sun_dyn_AdapterMethodHandle::OP_PRIM_TO_PRIM)
++         |(1<<sun_dyn_AdapterMethodHandle::OP_REF_TO_PRIM)
++         |(1<<sun_dyn_AdapterMethodHandle::OP_SWAP_ARGS)
++         |(1<<sun_dyn_AdapterMethodHandle::OP_ROT_ARGS)
++         |(1<<sun_dyn_AdapterMethodHandle::OP_DUP_ARGS)
++         |(1<<sun_dyn_AdapterMethodHandle::OP_DROP_ARGS)
++         //|(1<<sun_dyn_AdapterMethodHandle::OP_SPREAD_ARGS) //BUG!
++         );
++  // FIXME: MethodHandlesTest gets a crash if we enable OP_SPREAD_ARGS.
++}
+ 
+ //------------------------------------------------------------------------------
+ // MethodHandles::generate_method_handle_stub
+diff --git a/src/cpu/x86/vm/methodHandles_x86.cpp b/src/cpu/x86/vm/methodHandles_x86.cpp
+--- a/src/cpu/x86/vm/methodHandles_x86.cpp
++++ b/src/cpu/x86/vm/methodHandles_x86.cpp
+@@ -262,6 +262,22 @@
+ }
+ #endif //PRODUCT
+ 
++// which conversion op types are implemented here?
++int MethodHandles::adapter_conversion_ops_supported_mask() {
++  return ((1<<sun_dyn_AdapterMethodHandle::OP_RETYPE_ONLY)
++         |(1<<sun_dyn_AdapterMethodHandle::OP_RETYPE_RAW)
++         |(1<<sun_dyn_AdapterMethodHandle::OP_CHECK_CAST)
++         |(1<<sun_dyn_AdapterMethodHandle::OP_PRIM_TO_PRIM)
++         |(1<<sun_dyn_AdapterMethodHandle::OP_REF_TO_PRIM)
++         |(1<<sun_dyn_AdapterMethodHandle::OP_SWAP_ARGS)
++         |(1<<sun_dyn_AdapterMethodHandle::OP_ROT_ARGS)
++         |(1<<sun_dyn_AdapterMethodHandle::OP_DUP_ARGS)
++         |(1<<sun_dyn_AdapterMethodHandle::OP_DROP_ARGS)
++         //|(1<<sun_dyn_AdapterMethodHandle::OP_SPREAD_ARGS) //BUG!
++         );
++  // FIXME: MethodHandlesTest gets a crash if we enable OP_SPREAD_ARGS.
++}
++
+ // Generate an "entry" field for a method handle.
+ // This determines how the method handle will respond to calls.
+ void MethodHandles::generate_method_handle_stub(MacroAssembler* _masm, MethodHandles::EntryKind ek) {
+diff --git a/src/share/vm/c1/c1_LIR.hpp b/src/share/vm/c1/c1_LIR.hpp
+--- a/src/share/vm/c1/c1_LIR.hpp
++++ b/src/share/vm/c1/c1_LIR.hpp
+@@ -1062,7 +1062,7 @@
+       is_invokedynamic()  // An invokedynamic is always a MethodHandle call site.
+       ||
+       (method()->holder()->name() == ciSymbol::java_dyn_MethodHandle() &&
+-       method()->name()           == ciSymbol::invoke_name());
++       methodOopDesc::is_method_handle_invoke_name(method()->name()->sid()));
+   }
+ 
+   intptr_t vtable_offset() const {
+diff --git a/src/share/vm/ci/ciEnv.cpp b/src/share/vm/ci/ciEnv.cpp
+--- a/src/share/vm/ci/ciEnv.cpp
++++ b/src/share/vm/ci/ciEnv.cpp
+@@ -732,26 +732,29 @@
+ // ciEnv::get_fake_invokedynamic_method_impl
+ ciMethod* ciEnv::get_fake_invokedynamic_method_impl(constantPoolHandle cpool,
+                                                     int index, Bytecodes::Code bc) {
++  // Compare the following logic with InterpreterRuntime::resolve_invokedynamic.
+   assert(bc == Bytecodes::_invokedynamic, "must be invokedynamic");
+ 
+-  // Get the CallSite from the constant pool cache.
+-  ConstantPoolCacheEntry* cpc_entry = cpool->cache()->secondary_entry_at(index);
+-  assert(cpc_entry != NULL && cpc_entry->is_secondary_entry(), "sanity");
+-  Handle call_site = cpc_entry->f1();
++  bool is_resolved = cpool->cache()->main_entry_at(index)->is_resolved(bc);
++  if (is_resolved && (oop) cpool->cache()->secondary_entry_at(index)->f1() == NULL)
++    // FIXME: code generation could allow for null (unlinked) call site
++    is_resolved = false;
+ 
+-  // Call site might not be linked yet.
+-  if (call_site.is_null()) {
++  // Call site might not be resolved yet.  We could create a real invoker method from the
++  // compiler, but it is simpler to stop the code path here with an unlinked method.
++  if (!is_resolved) {
+     ciInstanceKlass* mh_klass = get_object(SystemDictionary::MethodHandle_klass())->as_instance_klass();
+-    ciSymbol*       sig_sym   = get_object(cpool->signature_ref_at(index))->as_symbol();
+-    return get_unloaded_method(mh_klass, ciSymbol::invoke_name(), sig_sym);
++    ciSymbol*        sig_sym  = get_object(cpool->signature_ref_at(index))->as_symbol();
++    return get_unloaded_method(mh_klass, ciSymbol::invokeExact_name(), sig_sym);
+   }
+ 
+-  // Get the methodOop from the CallSite.
+-  methodOop method_oop = (methodOop) java_dyn_CallSite::vmmethod(call_site());
+-  assert(method_oop != NULL, "sanity");
+-  assert(method_oop->is_method_handle_invoke(), "consistent");
++  // Get the invoker methodOop from the constant pool.
++  intptr_t f2_value = cpool->cache()->main_entry_at(index)->f2();
++  methodOop signature_invoker = methodOop(f2_value);
++  assert(signature_invoker != NULL && signature_invoker->is_method() && signature_invoker->is_method_handle_invoke(),
++         "correct result from LinkResolver::resolve_invokedynamic");
+ 
+-  return get_object(method_oop)->as_method();
++  return get_object(signature_invoker)->as_method();
+ }
+ 
+ 
+diff --git a/src/share/vm/ci/ciObjectFactory.cpp b/src/share/vm/ci/ciObjectFactory.cpp
+--- a/src/share/vm/ci/ciObjectFactory.cpp
++++ b/src/share/vm/ci/ciObjectFactory.cpp
+@@ -103,7 +103,7 @@
+     for (i = vmSymbols::FIRST_SID; i < vmSymbols::SID_LIMIT; i++) {
+       symbolHandle sym_handle = vmSymbolHandles::symbol_handle_at((vmSymbols::SID) i);
+       assert(vmSymbols::find_sid(sym_handle()) == i, "1-1 mapping");
+-      ciSymbol* sym = new (_arena) ciSymbol(sym_handle);
++      ciSymbol* sym = new (_arena) ciSymbol(sym_handle, (vmSymbols::SID) i);
+       init_ident_of(sym);
+       _shared_ci_symbols[i] = sym;
+     }
+@@ -273,7 +273,8 @@
+ 
+   if (o->is_symbol()) {
+     symbolHandle h_o(THREAD, (symbolOop)o);
+-    return new (arena()) ciSymbol(h_o);
++    assert(vmSymbols::find_sid(h_o()) == vmSymbols::NO_SID, "");
++    return new (arena()) ciSymbol(h_o, vmSymbols::NO_SID);
+   } else if (o->is_klass()) {
+     KlassHandle h_k(THREAD, (klassOop)o);
+     Klass* k = ((klassOop)o)->klass_part();
+diff --git a/src/share/vm/ci/ciSymbol.cpp b/src/share/vm/ci/ciSymbol.cpp
+--- a/src/share/vm/ci/ciSymbol.cpp
++++ b/src/share/vm/ci/ciSymbol.cpp
+@@ -29,7 +29,17 @@
+ // ciSymbol::ciSymbol
+ //
+ // Preallocated handle variant.  Used with handles from vmSymboHandles.
+-ciSymbol::ciSymbol(symbolHandle h_s) : ciObject(h_s) {
++ciSymbol::ciSymbol(symbolHandle h_s, vmSymbols::SID sid)
++  : ciObject(h_s), _sid(sid)
++{
++  assert(sid_ok(), "must be in vmSymbols");
++}
++
++// Normal case for non-famous symbols.
++ciSymbol::ciSymbol(symbolOop s)
++  : ciObject(s), _sid(vmSymbols::NO_SID)
++{
++  assert(sid_ok(), "must not be in vmSymbols");
+ }
+ 
+ // ciSymbol
+diff --git a/src/share/vm/ci/ciSymbol.hpp b/src/share/vm/ci/ciSymbol.hpp
+--- a/src/share/vm/ci/ciSymbol.hpp
++++ b/src/share/vm/ci/ciSymbol.hpp
+@@ -36,8 +36,11 @@
+   friend class ciObjArrayKlass;
+ 
+ private:
+-  ciSymbol(symbolOop s) : ciObject(s) {}
+-  ciSymbol(symbolHandle s);   // for use with vmSymbolHandles
++  const vmSymbols::SID _sid;
++  DEBUG_ONLY( bool sid_ok() { return vmSymbols::find_sid(get_symbolOop()) == _sid; } )
++
++  ciSymbol(symbolOop s);  // normal case, for symbols not mentioned in vmSymbols
++  ciSymbol(symbolHandle s, vmSymbols::SID sid);   // for use with vmSymbolHandles
+ 
+   symbolOop get_symbolOop() const { return (symbolOop)get_oop(); }
+ 
+@@ -52,6 +55,9 @@
+   static ciSymbol* make_impl(const char* s);
+ 
+ public:
++  // The enumeration ID from vmSymbols, or vmSymbols::NO_SID if none.
++  vmSymbols::SID sid() const { return _sid; }
++
+   // The text of the symbol as a null-terminated utf8 string.
+   const char* as_utf8();
+   int         utf8_length();
+diff --git a/src/share/vm/classfile/classFileParser.cpp b/src/share/vm/classfile/classFileParser.cpp
+--- a/src/share/vm/classfile/classFileParser.cpp
++++ b/src/share/vm/classfile/classFileParser.cpp
+@@ -1837,7 +1837,8 @@
+     _has_vanilla_constructor = true;
+   }
+ 
+-  if (EnableMethodHandles && m->is_method_handle_invoke()) {
++  if (EnableMethodHandles && (m->is_method_handle_invoke() ||
++                              m->is_method_handle_adapter())) {
+     THROW_MSG_(vmSymbols::java_lang_VirtualMachineError(),
+                "Method handle invokers must be defined internally to the VM", nullHandle);
+   }
+diff --git a/src/share/vm/classfile/dictionary.cpp b/src/share/vm/classfile/dictionary.cpp
+--- a/src/share/vm/classfile/dictionary.cpp
++++ b/src/share/vm/classfile/dictionary.cpp
+@@ -561,10 +561,11 @@
+ 
+ 
+ SymbolPropertyEntry* SymbolPropertyTable::find_entry(int index, unsigned int hash,
+-                                                     symbolHandle sym) {
+-  assert(index == index_for(sym), "incorrect index?");
++                                                     symbolHandle sym,
++                                                     intptr_t sym_mode) {
++  assert(index == index_for(sym, sym_mode), "incorrect index?");
+   for (SymbolPropertyEntry* p = bucket(index); p != NULL; p = p->next()) {
+-    if (p->hash() == hash && p->symbol() == sym()) {
++    if (p->hash() == hash && p->symbol() == sym() && p->symbol_mode() == sym_mode) {
+       return p;
+     }
+   }
+@@ -573,12 +574,12 @@
+ 
+ 
+ SymbolPropertyEntry* SymbolPropertyTable::add_entry(int index, unsigned int hash,
+-                                                    symbolHandle sym) {
++                                                    symbolHandle sym, intptr_t sym_mode) {
+   assert_locked_or_safepoint(SystemDictionary_lock);
+-  assert(index == index_for(sym), "incorrect index?");
+-  assert(find_entry(index, hash, sym) == NULL, "no double entry");
++  assert(index == index_for(sym, sym_mode), "incorrect index?");
++  assert(find_entry(index, hash, sym, sym_mode) == NULL, "no double entry");
+ 
+-  SymbolPropertyEntry* p = new_entry(hash, sym());
++  SymbolPropertyEntry* p = new_entry(hash, sym(), sym_mode);
+   Hashtable::add_entry(index, p);
+   return p;
+ }
+diff --git a/src/share/vm/classfile/dictionary.hpp b/src/share/vm/classfile/dictionary.hpp
+--- a/src/share/vm/classfile/dictionary.hpp
++++ b/src/share/vm/classfile/dictionary.hpp
+@@ -223,12 +223,16 @@
+ class SymbolPropertyEntry : public HashtableEntry {
+   friend class VMStructs;
+  private:
++  intptr_t _symbol_mode;  // secondary key
+   oop     _property_oop;
+   address _property_data;
+ 
+  public:
+   symbolOop symbol() const          { return (symbolOop) literal(); }
+ 
++  intptr_t symbol_mode() const      { return _symbol_mode; }
++  void set_symbol_mode(intptr_t m)  { _symbol_mode = m; }
++
+   oop      property_oop() const     { return _property_oop; }
+   void set_property_oop(oop p)      { _property_oop = p; }
+ 
+@@ -248,6 +252,7 @@
+ 
+   void print_on(outputStream* st) const {
+     symbol()->print_value_on(st);
++    st->print("/mode="INTX_FORMAT, symbol_mode());
+     st->print(" -> ");
+     bool printed = false;
+     if (property_oop() != NULL) {
+@@ -285,8 +290,9 @@
+     ShouldNotReachHere();
+   }
+ 
+-  SymbolPropertyEntry* new_entry(unsigned int hash, symbolOop symbol) {
++  SymbolPropertyEntry* new_entry(unsigned int hash, symbolOop symbol, intptr_t symbol_mode) {
+     SymbolPropertyEntry* entry = (SymbolPropertyEntry*) Hashtable::new_entry(hash, symbol);
++    entry->set_symbol_mode(symbol_mode);
+     entry->set_property_oop(NULL);
+     entry->set_property_data(NULL);
+     return entry;
+@@ -300,16 +306,20 @@
+     Hashtable::free_entry(entry);
+   }
+ 
+-  unsigned int compute_hash(symbolHandle sym) {
++  unsigned int compute_hash(symbolHandle sym, intptr_t symbol_mode) {
+     // Use the regular identity_hash.
+-    return Hashtable::compute_hash(sym);
++    return Hashtable::compute_hash(sym) ^ symbol_mode;
++  }
++
++  int index_for(symbolHandle name, intptr_t symbol_mode) {
++    return hash_to_index(compute_hash(name, symbol_mode));
+   }
+ 
+   // need not be locked; no state change
+-  SymbolPropertyEntry* find_entry(int index, unsigned int hash, symbolHandle name);
++  SymbolPropertyEntry* find_entry(int index, unsigned int hash, symbolHandle name, intptr_t name_mode);
+ 
+   // must be done under SystemDictionary_lock
+-  SymbolPropertyEntry* add_entry(int index, unsigned int hash, symbolHandle name);
++  SymbolPropertyEntry* add_entry(int index, unsigned int hash, symbolHandle name, intptr_t name_mode);
+ 
+   // GC support
+   void oops_do(OopClosure* f);
+diff --git a/src/share/vm/classfile/javaClasses.cpp b/src/share/vm/classfile/javaClasses.cpp
+--- a/src/share/vm/classfile/javaClasses.cpp
++++ b/src/share/vm/classfile/javaClasses.cpp
+@@ -2446,24 +2446,20 @@
+ 
+ // Support for java_dyn_CallSite
+ 
+-int java_dyn_CallSite::_type_offset;
+ int java_dyn_CallSite::_target_offset;
+-int java_dyn_CallSite::_vmmethod_offset;
++int java_dyn_CallSite::_caller_method_offset;
++int java_dyn_CallSite::_caller_bci_offset;
+ 
+ void java_dyn_CallSite::compute_offsets() {
+   if (!EnableInvokeDynamic)  return;
+   klassOop k = SystemDictionary::CallSite_klass();
+   if (k != NULL) {
+-    compute_offset(_type_offset,   k, vmSymbols::type_name(),   vmSymbols::java_dyn_MethodType_signature(), true);
+-    compute_offset(_target_offset, k, vmSymbols::target_name(), vmSymbols::java_dyn_MethodHandle_signature(), true);
+-    compute_offset(_vmmethod_offset, k, vmSymbols::vmmethod_name(), vmSymbols::object_signature(), true);
++    compute_offset(_target_offset, k, vmSymbols::target_name(), vmSymbols::java_dyn_MethodHandle_signature());
++    compute_offset(_caller_method_offset, k, vmSymbols::vmmethod_name(), vmSymbols::sun_dyn_MemberName_signature());
++    compute_offset(_caller_bci_offset, k, vmSymbols::vmindex_name(), vmSymbols::int_signature());
+   }
+ }
+ 
+-oop java_dyn_CallSite::type(oop site) {
+-  return site->obj_field(_type_offset);
+-}
+-
+ oop java_dyn_CallSite::target(oop site) {
+   return site->obj_field(_target_offset);
+ }
+@@ -2472,12 +2468,20 @@
+   site->obj_field_put(_target_offset, target);
+ }
+ 
+-oop java_dyn_CallSite::vmmethod(oop site) {
+-  return site->obj_field(_vmmethod_offset);
++oop java_dyn_CallSite::caller_method(oop site) {
++  return site->obj_field(_caller_method_offset);
+ }
+ 
+-void java_dyn_CallSite::set_vmmethod(oop site, oop ref) {
+-  site->obj_field_put(_vmmethod_offset, ref);
++void java_dyn_CallSite::set_caller_method(oop site, oop ref) {
++  site->obj_field_put(_caller_method_offset, ref);
++}
++
++jint java_dyn_CallSite::caller_bci(oop site) {
++  return site->int_field(_caller_bci_offset);
++}
++
++void java_dyn_CallSite::set_caller_bci(oop site, jint bci) {
++  site->int_field_put(_caller_bci_offset, bci);
+ }
+ 
+ 
+diff --git a/src/share/vm/classfile/javaClasses.hpp b/src/share/vm/classfile/javaClasses.hpp
+--- a/src/share/vm/classfile/javaClasses.hpp
++++ b/src/share/vm/classfile/javaClasses.hpp
+@@ -1068,21 +1068,22 @@
+   friend class JavaClasses;
+ 
+ private:
+-  static int _type_offset;
+   static int _target_offset;
+-  static int _vmmethod_offset;
++  static int _caller_method_offset;
++  static int _caller_bci_offset;
+ 
+   static void compute_offsets();
+ 
+ public:
+   // Accessors
+-  static oop            type(oop site);
+-
+   static oop            target(oop site);
+   static void       set_target(oop site, oop target);
+ 
+-  static oop            vmmethod(oop site);
+-  static void       set_vmmethod(oop site, oop ref);
++  static oop            caller_method(oop site);
++  static void       set_caller_method(oop site, oop ref);
++
++  static jint           caller_bci(oop site);
++  static void       set_caller_bci(oop site, jint bci);
+ 
+   // Testers
+   static bool is_subclass(klassOop klass) {
+@@ -1094,8 +1095,8 @@
+ 
+   // Accessors for code generation:
+   static int target_offset_in_bytes()           { return _target_offset; }
+-  static int type_offset_in_bytes()             { return _type_offset; }
+-  static int vmmethod_offset_in_bytes()         { return _vmmethod_offset; }
++  static int caller_method_offset_in_bytes()    { return _caller_method_offset; }
++  static int caller_bci_offset_in_bytes()       { return _caller_bci_offset; }
+ };
+ 
+ 
+diff --git a/src/share/vm/classfile/systemDictionary.cpp b/src/share/vm/classfile/systemDictionary.cpp
+--- a/src/share/vm/classfile/systemDictionary.cpp
++++ b/src/share/vm/classfile/systemDictionary.cpp
+@@ -2341,7 +2341,8 @@
+ }
+ 
+ 
+-methodOop SystemDictionary::find_method_handle_invoke(symbolHandle signature,
++methodOop SystemDictionary::find_method_handle_invoke(symbolHandle name,
++                                                      symbolHandle signature,
+                                                       Handle class_loader,
+                                                       Handle protection_domain,
+                                                       TRAPS) {
+@@ -2352,26 +2353,28 @@
+     // create this side table lazily
+     _invoke_method_table = new SymbolPropertyTable(_invoke_method_size);
+   }
+-  unsigned int hash  = invoke_method_table()->compute_hash(signature);
++  vmSymbols::SID name_id = vmSymbols::find_sid(name());
++  assert(name_id != vmSymbols::NO_SID, "must be a known name");
++  unsigned int hash  = invoke_method_table()->compute_hash(signature, name_id);
+   int          index = invoke_method_table()->hash_to_index(hash);
+-  SymbolPropertyEntry* spe = invoke_method_table()->find_entry(index, hash, signature);
++  SymbolPropertyEntry* spe = invoke_method_table()->find_entry(index, hash, signature, name_id);
+   if (spe == NULL || spe->property_oop() == NULL) {
+     // Must create lots of stuff here, but outside of the SystemDictionary lock.
+     if (THREAD->is_Compiler_thread())
+       return NULL;              // do not attempt from within compiler
+-    Handle mt = compute_method_handle_type(signature(),
+-                                           class_loader, protection_domain,
+-                                           CHECK_NULL);
++    Handle mt = find_method_handle_type(signature(),
++                                        class_loader, protection_domain,
++                                        CHECK_NULL);
+     KlassHandle  mh_klass = SystemDictionaryHandles::MethodHandle_klass();
+-    methodHandle m = methodOopDesc::make_invoke_method(mh_klass, signature,
++    methodHandle m = methodOopDesc::make_invoke_method(mh_klass, name, signature,
+                                                        mt, CHECK_NULL);
+     // Now grab the lock.  We might have to throw away the new method,
+     // if a racing thread has managed to install one at the same time.
+     {
+       MutexLocker ml(SystemDictionary_lock, Thread::current());
+-      spe = invoke_method_table()->find_entry(index, hash, signature);
++      spe = invoke_method_table()->find_entry(index, hash, signature, name_id);
+       if (spe == NULL)
+-        spe = invoke_method_table()->add_entry(index, hash, signature);
++        spe = invoke_method_table()->add_entry(index, hash, signature, name_id);
+       if (spe->property_oop() == NULL)
+         spe->set_property_oop(m());
+     }
+@@ -2385,10 +2388,10 @@
+ // signature, as interpreted relative to the given class loader.
+ // Because of class loader constraints, all method handle usage must be
+ // consistent with this loader.
+-Handle SystemDictionary::compute_method_handle_type(symbolHandle signature,
+-                                                    Handle class_loader,
+-                                                    Handle protection_domain,
+-                                                    TRAPS) {
++Handle SystemDictionary::find_method_handle_type(symbolHandle signature,
++                                                 Handle class_loader,
++                                                 Handle protection_domain,
++                                                 TRAPS) {
+   Handle empty;
+   int npts = ArgumentCount(signature()).size();
+   objArrayHandle pts = oopFactory::new_objArray(SystemDictionary::Class_klass(), npts, CHECK_(empty));
+@@ -2413,16 +2416,14 @@
+   }
+   assert(arg == npts, "");
+ 
+-  // call MethodType java.dyn.MethodType::makeImpl(Class rt, Class[] pts, false, true)
+-  bool varargs = false, trusted = true;
++  // call sun.dyn.MethodHandleNatives::findMethodType(Class rt, Class[] pts) -> MethodType
+   JavaCallArguments args(Handle(THREAD, rt()));
+   args.push_oop(pts());
+-  args.push_int(false);
+-  args.push_int(trusted);
+   JavaValue result(T_OBJECT);
+   JavaCalls::call_static(&result,
+-                         SystemDictionary::MethodType_klass(),
+-                         vmSymbols::makeImpl_name(), vmSymbols::makeImpl_signature(),
++                         SystemDictionary::MethodHandleNatives_klass(),
++                         vmSymbols::findMethodHandleType_name(),
++                         vmSymbols::findMethodHandleType_signature(),
+                          &args, CHECK_(empty));
+   return Handle(THREAD, (oop) result.get_jobject());
+ }
+@@ -2430,29 +2431,34 @@
+ 
+ // Ask Java code to find or construct a java.dyn.CallSite for the given
+ // name and signature, as interpreted relative to the given class loader.
+-Handle SystemDictionary::make_dynamic_call_site(KlassHandle caller,
+-                                                int caller_method_idnum,
++Handle SystemDictionary::make_dynamic_call_site(Handle bootstrap_method,
++                                                symbolHandle name,
++                                                methodHandle signature_invoker,
++                                                Handle info,
++                                                methodHandle caller_method,
+                                                 int caller_bci,
+-                                                symbolHandle name,
+-                                                methodHandle mh_invdyn,
+                                                 TRAPS) {
+   Handle empty;
+-  // call java.dyn.CallSite::makeSite(caller, name, mtype, cmid, cbci)
++  Handle caller_mname = MethodHandles::new_MemberName(CHECK_(empty));
++  MethodHandles::init_MemberName(caller_mname(), caller_method());
++
++  // call sun.dyn.MethodHandleNatives::makeDynamicCallSite(bootm, name, mtype, info, caller_mname, caller_pos)
+   oop name_str_oop = StringTable::intern(name(), CHECK_(empty)); // not a handle!
+-  JavaCallArguments args(Handle(THREAD, caller->java_mirror()));
++  JavaCallArguments args(Handle(THREAD, bootstrap_method()));
+   args.push_oop(name_str_oop);
+-  args.push_oop(mh_invdyn->method_handle_type());
+-  args.push_int(caller_method_idnum);
++  args.push_oop(signature_invoker->method_handle_type());
++  args.push_oop(info());
++  args.push_oop(caller_mname());
+   args.push_int(caller_bci);
+   JavaValue result(T_OBJECT);
+   JavaCalls::call_static(&result,
+-                         SystemDictionary::CallSite_klass(),
+-                         vmSymbols::makeSite_name(), vmSymbols::makeSite_signature(),
++                         SystemDictionary::MethodHandleNatives_klass(),
++                         vmSymbols::makeDynamicCallSite_name(),
++                         vmSymbols::makeDynamicCallSite_signature(),
+                          &args, CHECK_(empty));
+   oop call_site_oop = (oop) result.get_jobject();
+   assert(call_site_oop->is_oop()
+          /*&& java_dyn_CallSite::is_instance(call_site_oop)*/, "must be sane");
+-  java_dyn_CallSite::set_vmmethod(call_site_oop, mh_invdyn());
+   if (TraceMethodHandles) {
+ #ifndef PRODUCT
+     tty->print_cr("Linked invokedynamic bci=%d site="INTPTR_FORMAT":", caller_bci, call_site_oop);
+@@ -2463,9 +2469,7 @@
+   return call_site_oop;
+ }
+ 
+-Handle SystemDictionary::find_bootstrap_method(KlassHandle caller,
+-                                               KlassHandle search_bootstrap_klass,
+-                                               TRAPS) {
++Handle SystemDictionary::find_bootstrap_method(KlassHandle caller, TRAPS) {
+   Handle empty;
+   if (!caller->oop_is_instance())  return empty;
+ 
+@@ -2476,57 +2480,12 @@
+     if (TraceMethodHandles) {
+       tty->print_cr("bootstrap method for "PTR_FORMAT" cached as "PTR_FORMAT":", ik(), boot_method_oop);
+     }
+-    NOT_PRODUCT(if (!boot_method_oop->is_oop()) { tty->print_cr("*** boot MH of "PTR_FORMAT" = "PTR_FORMAT, ik(), boot_method_oop); ik()->print(); });
+     assert(boot_method_oop->is_oop()
+            && java_dyn_MethodHandle::is_instance(boot_method_oop), "must be sane");
+     return Handle(THREAD, boot_method_oop);
+   }
+-  boot_method_oop = NULL;  // GC safety
+ 
+-  // call java.dyn.Linkage::findBootstrapMethod(caller, sbk)
+-  JavaCallArguments args(Handle(THREAD, ik->java_mirror()));
+-  if (search_bootstrap_klass.is_null())
+-    args.push_oop(Handle());
+-  else
+-    args.push_oop(search_bootstrap_klass->java_mirror());
+-  JavaValue result(T_OBJECT);
+-  JavaCalls::call_static(&result,
+-                         SystemDictionary::Linkage_klass(),
+-                         vmSymbols::findBootstrapMethod_name(),
+-                         vmSymbols::findBootstrapMethod_signature(),
+-                         &args, CHECK_(empty));
+-  boot_method_oop = (oop) result.get_jobject();
+-
+-  if (boot_method_oop != NULL) {
+-    if (TraceMethodHandles) {
+-#ifndef PRODUCT
+-      tty->print_cr("--------");
+-      tty->print_cr("bootstrap method for "PTR_FORMAT" computed as "PTR_FORMAT":", ik(), boot_method_oop);
+-      ik()->print();
+-      boot_method_oop->print();
+-      tty->print_cr("========");
+-#endif //PRODUCT
+-    }
+-    assert(boot_method_oop->is_oop()
+-           && java_dyn_MethodHandle::is_instance(boot_method_oop), "must be sane");
+-    // probably no race conditions, but let's be careful:
+-    if (Atomic::cmpxchg_ptr(boot_method_oop, ik->adr_bootstrap_method(), NULL) == NULL)
+-      ik->set_bootstrap_method(boot_method_oop);
+-    else
+-      boot_method_oop = ik->bootstrap_method();
+-  } else {
+-    if (TraceMethodHandles) {
+-#ifndef PRODUCT
+-      tty->print_cr("--------");
+-      tty->print_cr("bootstrap method for "PTR_FORMAT" computed as NULL:", ik());
+-      ik()->print();
+-      tty->print_cr("========");
+-#endif //PRODUCT
+-    }
+-    boot_method_oop = ik->bootstrap_method();
+-  }
+-
+-  return Handle(THREAD, boot_method_oop);
++  return empty;
+ }
+ 
+ // Since the identity hash code for symbols changes when the symbols are
+diff --git a/src/share/vm/classfile/systemDictionary.hpp b/src/share/vm/classfile/systemDictionary.hpp
+--- a/src/share/vm/classfile/systemDictionary.hpp
++++ b/src/share/vm/classfile/systemDictionary.hpp
+@@ -136,6 +136,7 @@
+   template(MethodHandle_klass,           java_dyn_MethodHandle,          Opt) \
+   template(MemberName_klass,             sun_dyn_MemberName,             Opt) \
+   template(MethodHandleImpl_klass,       sun_dyn_MethodHandleImpl,       Opt) \
++  template(MethodHandleNatives_klass,    sun_dyn_MethodHandleNatives,    Opt) \
+   template(AdapterMethodHandle_klass,    sun_dyn_AdapterMethodHandle,    Opt) \
+   template(BoundMethodHandle_klass,      sun_dyn_BoundMethodHandle,      Opt) \
+   template(DirectMethodHandle_klass,     sun_dyn_DirectMethodHandle,     Opt) \
+@@ -463,29 +464,29 @@
+ 
+   // JSR 292
+   // find the java.dyn.MethodHandles::invoke method for a given signature
+-  static methodOop find_method_handle_invoke(symbolHandle signature,
++  static methodOop find_method_handle_invoke(symbolHandle name,
++                                             symbolHandle signature,
+                                              Handle class_loader,
+                                              Handle protection_domain,
+                                              TRAPS);
+-  // ask Java to compute the java.dyn.MethodType object for a given signature
+-  static Handle    compute_method_handle_type(symbolHandle signature,
+-                                              Handle class_loader,
+-                                              Handle protection_domain,
+-                                              TRAPS);
++  // ask Java to compute a java.dyn.MethodType object for a given signature
++  static Handle    find_method_handle_type(symbolHandle signature,
++                                           Handle class_loader,
++                                           Handle protection_domain,
++                                           TRAPS);
+   // ask Java to create a dynamic call site, while linking an invokedynamic op
+-  static Handle    make_dynamic_call_site(KlassHandle caller,
+-                                          int caller_method_idnum,
++  static Handle    make_dynamic_call_site(Handle bootstrap_method,
++                                          // Callee information:
++                                          symbolHandle name,
++                                          methodHandle signature_invoker,
++                                          Handle info,
++                                          // Caller information:
++                                          methodHandle caller_method,
+                                           int caller_bci,
+-                                          symbolHandle name,
+-                                          methodHandle mh_invoke,
+                                           TRAPS);
+ 
+   // coordinate with Java about bootstrap methods
+-  static Handle    find_bootstrap_method(KlassHandle caller,
+-                                         // This argument is non-null only when a
+-                                         // classfile attribute has been found:
+-                                         KlassHandle search_bootstrap_klass,
+-                                         TRAPS);
++  static Handle    find_bootstrap_method(KlassHandle caller, TRAPS);
+ 
+   // Utility for printing loader "name" as part of tracing constraints
+   static const char* loader_name(oop loader) {
+diff --git a/src/share/vm/classfile/vmSymbols.hpp b/src/share/vm/classfile/vmSymbols.hpp
+--- a/src/share/vm/classfile/vmSymbols.hpp
++++ b/src/share/vm/classfile/vmSymbols.hpp
+@@ -137,6 +137,7 @@
+   template(java_lang_CloneNotSupportedException,      "java/lang/CloneNotSupportedException")     \
+   template(java_lang_IllegalAccessException,          "java/lang/IllegalAccessException")         \
+   template(java_lang_IllegalArgumentException,        "java/lang/IllegalArgumentException")       \
++  template(java_lang_IllegalStateException,           "java/lang/IllegalStateException")          \
+   template(java_lang_IllegalMonitorStateException,    "java/lang/IllegalMonitorStateException")   \
+   template(java_lang_IllegalThreadStateException,     "java/lang/IllegalThreadStateException")    \
+   template(java_lang_IndexOutOfBoundsException,       "java/lang/IndexOutOfBoundsException")      \
+@@ -201,6 +202,11 @@
+   template(newField_signature,                        "(Lsun/reflect/FieldInfo;)Ljava/lang/reflect/Field;") \
+   template(newMethod_name,                            "newMethod")                                \
+   template(newMethod_signature,                       "(Lsun/reflect/MethodInfo;)Ljava/lang/reflect/Method;") \
++  /* the following two names must be in order: */                                                 \
++  template(invokeExact_name,                          "invokeExact")                              \
++  template(invokeGeneric_name,                        "invokeGeneric")                            \
++  template(invokeVarargs_name,                        "invokeVarargs")                            \
++  template(star_name,                                 "*") /*not really a name*/                  \
+   template(invoke_name,                               "invoke")                                   \
+   template(override_name,                             "override")                                 \
+   template(parameterTypes_name,                       "parameterTypes")                           \
+@@ -231,16 +237,17 @@
+   template(java_dyn_MethodTypeForm,                   "java/dyn/MethodTypeForm")                  \
+   template(java_dyn_MethodTypeForm_signature,         "Ljava/dyn/MethodTypeForm;")                \
+   template(sun_dyn_MemberName,                        "sun/dyn/MemberName")                       \
++  template(sun_dyn_MemberName_signature,              "Lsun/dyn/MemberName;")                     \
+   template(sun_dyn_MethodHandleImpl,                  "sun/dyn/MethodHandleImpl")                 \
++  template(sun_dyn_MethodHandleNatives,               "sun/dyn/MethodHandleNatives")              \
+   template(sun_dyn_AdapterMethodHandle,               "sun/dyn/AdapterMethodHandle")              \
+   template(sun_dyn_BoundMethodHandle,                 "sun/dyn/BoundMethodHandle")                \
+   template(sun_dyn_DirectMethodHandle,                "sun/dyn/DirectMethodHandle")               \
+-  template(makeImpl_name,                             "makeImpl") /*MethodType::makeImpl*/        \
+-  template(makeImpl_signature,    "(Ljava/lang/Class;[Ljava/lang/Class;ZZ)Ljava/dyn/MethodType;") \
+-  template(makeSite_name,                             "makeSite") /*CallSite::makeSite*/          \
+-  template(makeSite_signature,    "(Ljava/lang/Class;Ljava/lang/String;Ljava/dyn/MethodType;II)Ljava/dyn/CallSite;") \
+-  template(findBootstrapMethod_name,                  "findBootstrapMethod")                      \
+-  template(findBootstrapMethod_signature, "(Ljava/lang/Class;Ljava/lang/Class;)Ljava/dyn/MethodHandle;") \
++  /* internal up-calls made only by the JVM, via class sun.dyn.MethodHandleNatives: */            \
++  template(findMethodHandleType_name,                 "findMethodHandleType")                     \
++  template(findMethodHandleType_signature, "(Ljava/lang/Class;[Ljava/lang/Class;)Ljava/dyn/MethodType;") \
++  template(makeDynamicCallSite_name,                  "makeDynamicCallSite")                      \
++  template(makeDynamicCallSite_signature, "(Ljava/dyn/MethodHandle;Ljava/lang/String;Ljava/dyn/MethodType;Ljava/lang/Object;Lsun/dyn/MemberName;I)Ljava/dyn/CallSite;") \
+   NOT_LP64(  do_alias(machine_word_signature,         int_signature)  )                           \
+   LP64_ONLY( do_alias(machine_word_signature,         long_signature) )                           \
+                                                                                                   \
+@@ -406,8 +413,9 @@
+   template(void_classloader_signature,                "()Ljava/lang/ClassLoader;")                                \
+   template(void_object_signature,                     "()Ljava/lang/Object;")                                     \
+   template(void_class_signature,                      "()Ljava/lang/Class;")                                      \
+-  template(void_string_signature,                     "()Ljava/lang/String;")                                      \
+-  template(object_array_object_object_signature,      "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;")\
++  template(void_string_signature,                     "()Ljava/lang/String;")                                     \
++  template(object_array_object_signature,             "([Ljava/lang/Object;)Ljava/lang/Object;")                  \
++  template(object_object_array_object_signature,      "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;")\
+   template(exception_void_signature,                  "(Ljava/lang/Exception;)V")                                 \
+   template(protectiondomain_signature,                "[Ljava/security/ProtectionDomain;")                        \
+   template(accesscontrolcontext_signature,            "Ljava/security/AccessControlContext;")                     \
+@@ -857,11 +865,15 @@
+   do_intrinsic(_Object_init,              java_lang_Object, object_initializer_name, void_method_signature,        F_R)   \
+   /*    (symbol object_initializer_name defined above) */                                                                 \
+                                                                                                                           \
+-  do_intrinsic(_invoke,                   java_lang_reflect_Method, invoke_name, object_array_object_object_signature, F_R) \
++  do_intrinsic(_invoke,                   java_lang_reflect_Method, invoke_name, object_object_array_object_signature, F_R) \
+   /*   (symbols invoke_name and invoke_signature defined above) */                                                      \
+   do_intrinsic(_checkSpreadArgument,      sun_dyn_MethodHandleImpl, checkSpreadArgument_name, checkSpreadArgument_signature, F_S) \
+    do_name(    checkSpreadArgument_name,       "checkSpreadArgument")                                                   \
+    do_name(    checkSpreadArgument_signature,  "(Ljava/lang/Object;I)V")                                                \
++  do_intrinsic(_invokeExact,              java_dyn_MethodHandle, invokeExact_name,   object_array_object_signature, F_RN) \
++  do_intrinsic(_invokeGeneric,            java_dyn_MethodHandle, invokeGeneric_name, object_array_object_signature, F_RN) \
++  do_intrinsic(_invokeVarargs,            java_dyn_MethodHandle, invokeVarargs_name, object_array_object_signature, F_R)  \
++  do_intrinsic(_invokeDynamic,            java_dyn_InvokeDynamic, star_name,         object_array_object_signature, F_SN) \
+                                                                                                                         \
+   /* unboxing methods: */                                                                                               \
+   do_intrinsic(_booleanValue,             java_lang_Boolean,      booleanValue_name, void_boolean_signature, F_R)       \
+diff --git a/src/share/vm/includeDB_core b/src/share/vm/includeDB_core
+--- a/src/share/vm/includeDB_core
++++ b/src/share/vm/includeDB_core
+@@ -2867,6 +2867,7 @@
+ methodHandles.hpp                       globals.hpp
+ methodHandles.hpp                       interfaceSupport.hpp
+ methodHandles.hpp                       javaClasses.hpp
++methodHandles.hpp                       no_precompiled_headers
+ methodHandles.hpp                       vmSymbols.hpp
+ 
+ methodHandles.cpp                       allocation.inline.hpp
+@@ -2930,6 +2931,7 @@
+ methodOop.cpp                           jvmtiExport.hpp
+ methodOop.cpp                           klassOop.hpp
+ methodOop.cpp                           methodDataOop.hpp
++methodOop.cpp                           methodHandleWalk.hpp
+ methodOop.cpp                           methodOop.hpp
+ methodOop.cpp                           nativeLookup.hpp
+ methodOop.cpp                           oop.inline.hpp
+@@ -4075,6 +4077,7 @@
+ systemDictionary.cpp                    klass.inline.hpp
+ systemDictionary.cpp                    loaderConstraints.hpp
+ systemDictionary.cpp                    methodDataOop.hpp
++systemDictionary.cpp                    methodHandles.hpp
+ systemDictionary.cpp                    mutexLocker.hpp
+ systemDictionary.cpp                    objArrayKlass.hpp
+ systemDictionary.cpp                    oop.inline.hpp
+diff --git a/src/share/vm/interpreter/interpreterRuntime.cpp b/src/share/vm/interpreter/interpreterRuntime.cpp
+--- a/src/share/vm/interpreter/interpreterRuntime.cpp
++++ b/src/share/vm/interpreter/interpreterRuntime.cpp
+@@ -691,24 +691,21 @@
+ 
+   methodHandle caller_method(thread, method(thread));
+ 
+-  // first determine if there is a bootstrap method
+-  {
+-    KlassHandle caller_klass(thread, caller_method->method_holder());
+-    Handle bootm = SystemDictionary::find_bootstrap_method(caller_klass, KlassHandle(), CHECK);
+-    if (bootm.is_null()) {
+-      // If there is no bootstrap method, throw IncompatibleClassChangeError.
+-      // This is a valid generic error type for resolution (JLS 12.3.3).
+-      char buf[200];
+-      jio_snprintf(buf, sizeof(buf), "Class %s has not declared a bootstrap method for invokedynamic",
+-                   (Klass::cast(caller_klass()))->external_name());
+-      THROW_MSG(vmSymbols::java_lang_IncompatibleClassChangeError(), buf);
+-    }
+-  }
++  // first find the bootstrap method
++  KlassHandle caller_klass(thread, caller_method->method_holder());
++  Handle bootm = SystemDictionary::find_bootstrap_method(caller_klass, CHECK);
+ 
+   constantPoolHandle pool(thread, caller_method->constants());
+   pool->set_invokedynamic();    // mark header to flag active call sites
+ 
+-  int site_index = four_byte_index(thread);
++  int caller_bci = 0;
++  int site_index = 0;
++  { address caller_bcp = bcp(thread);
++    caller_bci = caller_method->bci_from(caller_bcp);
++    site_index = Bytes::get_native_u4(caller_bcp+1);
++  }
++  assert(site_index == four_byte_index(thread), "");
++  assert(constantPoolCacheOopDesc::is_secondary_index(site_index), "proper format");
+   // there is a second CPC entries that is of interest; it caches signature info:
+   int main_index = pool->cache()->secondary_entry_at(site_index)->main_entry_index();
+ 
+@@ -732,23 +729,32 @@
+   // The method (f2 entry) of the main entry is the MH.invoke for the
+   // invokedynamic target call signature.
+   intptr_t f2_value = pool->cache()->entry_at(main_index)->f2();
+-  methodHandle mh_invdyn(THREAD, (methodOop) f2_value);
+-  assert(mh_invdyn.not_null() && mh_invdyn->is_method() && mh_invdyn->is_method_handle_invoke(),
++  methodHandle signature_invoker(THREAD, (methodOop) f2_value);
++  assert(signature_invoker.not_null() && signature_invoker->is_method() && signature_invoker->is_method_handle_invoke(),
+          "correct result from LinkResolver::resolve_invokedynamic");
+ 
+   symbolHandle call_site_name(THREAD, pool->name_ref_at(site_index));
++
++  Handle info;  // NYI: Other metadata from a new kind of CP entry.  (Annotations?)
++
++  // this is the index which gets stored on the CallSite object (as "callerPosition"):
++  int call_site_position = constantPoolCacheOopDesc::decode_secondary_index(site_index);
++
+   Handle call_site
+-    = SystemDictionary::make_dynamic_call_site(caller_method->method_holder(),
+-                                               caller_method->method_idnum(),
+-                                               caller_method->bci_from(bcp(thread)),
++    = SystemDictionary::make_dynamic_call_site(bootm,
++                                               // Callee information:
+                                                call_site_name,
+-                                               mh_invdyn,
++                                               signature_invoker,
++                                               info,
++                                               // Caller information:
++                                               caller_method,
++                                               caller_bci,
+                                                CHECK);
+ 
+   // In the secondary entry, the f1 field is the call site, and the f2 (index)
+-  // field is some data about the invoke site.
+-  int extra_data = 0;
+-  pool->cache()->secondary_entry_at(site_index)->set_dynamic_call(call_site(), extra_data);
++  // field is some data about the invoke site.  Currently, it is just the BCI.
++  // Later, it might be changed to help manage inlining dependencies.
++  pool->cache()->secondary_entry_at(site_index)->set_dynamic_call(call_site, signature_invoker);
+ }
+ IRT_END
+ 
+diff --git a/src/share/vm/interpreter/linkResolver.cpp b/src/share/vm/interpreter/linkResolver.cpp
+--- a/src/share/vm/interpreter/linkResolver.cpp
++++ b/src/share/vm/interpreter/linkResolver.cpp
+@@ -138,6 +138,15 @@
+ 
+ void LinkResolver::lookup_method_in_klasses(methodHandle& result, KlassHandle klass, symbolHandle name, symbolHandle signature, TRAPS) {
+   methodOop result_oop = klass->uncached_lookup_method(name(), signature());
++  if (EnableMethodHandles && result_oop != NULL) {
++    switch (result_oop->intrinsic_id()) {
++    case vmIntrinsics::_invokeExact:
++    case vmIntrinsics::_invokeGeneric:
++    case vmIntrinsics::_invokeDynamic:
++      // Do not link directly to these.  The VM must produce a synthetic one using lookup_implicit_method.
++      return;
++    }
++  }
+   result = methodHandle(THREAD, result_oop);
+ }
+ 
+@@ -165,8 +174,10 @@
+ 
+ void LinkResolver::lookup_implicit_method(methodHandle& result, KlassHandle klass, symbolHandle name, symbolHandle signature, TRAPS) {
+   if (EnableMethodHandles && MethodHandles::enabled() &&
+-      name == vmSymbolHandles::invoke_name() && klass() == SystemDictionary::MethodHandle_klass()) {
+-    methodOop result_oop = SystemDictionary::find_method_handle_invoke(signature,
++      klass() == SystemDictionary::MethodHandle_klass() &&
++      methodOopDesc::is_method_handle_invoke_name(name())) {
++    methodOop result_oop = SystemDictionary::find_method_handle_invoke(name,
++                                                                       signature,
+                                                                        Handle(),
+                                                                        Handle(),
+                                                                        CHECK);
+@@ -239,7 +250,7 @@
+   // The class is java.dyn.MethodHandle
+   resolved_klass = SystemDictionaryHandles::MethodHandle_klass();
+ 
+-  symbolHandle method_name = vmSymbolHandles::invoke_name();
++  symbolHandle method_name = vmSymbolHandles::invokeExact_name();
+ 
+   symbolHandle method_signature(THREAD, pool->signature_ref_at(index));
+   KlassHandle  current_klass   (THREAD, pool->pool_holder());
+@@ -1041,10 +1052,10 @@
+ 
+   // At this point, we only need the signature, and can ignore the name.
+   symbolHandle method_signature(THREAD, pool->signature_ref_at(raw_index));  // raw_index works directly
+-  symbolHandle method_name = vmSymbolHandles::invoke_name();
++  symbolHandle method_name = vmSymbolHandles::invokeExact_name();
+   KlassHandle resolved_klass = SystemDictionaryHandles::MethodHandle_klass();
+ 
+-  // JSR 292:  this must be an implicitly generated method MethodHandle.invoke(*...)
++  // JSR 292:  this must be an implicitly generated method MethodHandle.invokeExact(*...)
+   // The extra MH receiver will be inserted into the stack on every call.
+   methodHandle resolved_method;
+   lookup_implicit_method(resolved_method, resolved_klass, method_name, method_signature, CHECK);
+diff --git a/src/share/vm/memory/universe.cpp b/src/share/vm/memory/universe.cpp
+--- a/src/share/vm/memory/universe.cpp
++++ b/src/share/vm/memory/universe.cpp
+@@ -1045,7 +1045,7 @@
+   k = SystemDictionary::resolve_or_fail(vmSymbolHandles::java_lang_reflect_Method(), true, CHECK_false);
+   k_h = instanceKlassHandle(THREAD, k);
+   k_h->link_class(CHECK_false);
+-  m = k_h->find_method(vmSymbols::invoke_name(), vmSymbols::object_array_object_object_signature());
++  m = k_h->find_method(vmSymbols::invoke_name(), vmSymbols::object_object_array_object_signature());
+   if (m == NULL || m->is_static()) {
+     THROW_MSG_(vmSymbols::java_lang_NoSuchMethodException(),
+       "java.lang.reflect.Method.invoke", false);
+diff --git a/src/share/vm/oops/cpCacheOop.cpp b/src/share/vm/oops/cpCacheOop.cpp
+--- a/src/share/vm/oops/cpCacheOop.cpp
++++ b/src/share/vm/oops/cpCacheOop.cpp
+@@ -218,18 +218,19 @@
+ }
+ 
+ 
+-void ConstantPoolCacheEntry::set_dynamic_call(Handle call_site, int extra_data) {
+-  methodOop method = (methodOop) java_dyn_CallSite::vmmethod(call_site());
+-  assert(method->is_method(), "must be initialized properly");
+-  int param_size = method->size_of_parameters();
++void ConstantPoolCacheEntry::set_dynamic_call(Handle call_site,
++                                              methodHandle signature_invoker) {
++  int param_size = signature_invoker->size_of_parameters();
+   assert(param_size >= 1, "method argument size must include MH.this");
+   param_size -= 1;              // do not count MH.this; it is not stacked for invokedynamic
+   if (Atomic::cmpxchg_ptr(call_site(), &_f1, NULL) == NULL) {
+     // racing threads might be trying to install their own favorites
+     set_f1(call_site());
+   }
+-  set_f2(extra_data);
+-  set_flags(as_flags(as_TosState(method->result_type()), method->is_final_method(), false, false, false, true) | param_size);
++  //set_f2(0);
++  bool is_final = true;
++  assert(signature_invoker->is_final_method(), "is_final");
++  set_flags(as_flags(as_TosState(signature_invoker->result_type()), is_final, false, false, false, true) | param_size);
+   // do not do set_bytecode on a secondary CP cache entry
+   //set_bytecode_1(Bytecodes::_invokedynamic);
+ }
+diff --git a/src/share/vm/oops/cpCacheOop.hpp b/src/share/vm/oops/cpCacheOop.hpp
+--- a/src/share/vm/oops/cpCacheOop.hpp
++++ b/src/share/vm/oops/cpCacheOop.hpp
+@@ -181,7 +181,7 @@
+ 
+   void set_dynamic_call(
+     Handle call_site,                            // Resolved java.dyn.CallSite (f1)
+-    int extra_data                               // (f2)
++    methodHandle signature_invoker               // determines signature information
+   );
+ 
+   void set_parameter_size(int value) {
+diff --git a/src/share/vm/oops/methodKlass.cpp b/src/share/vm/oops/methodKlass.cpp
+--- a/src/share/vm/oops/methodKlass.cpp
++++ b/src/share/vm/oops/methodKlass.cpp
+@@ -236,8 +236,10 @@
+   assert(obj->is_method(), "must be method");
+   Klass::oop_print_on(obj, st);
+   methodOop m = methodOop(obj);
++  // get the effect of PrintOopAddress, always, for methods:
++  st->print   (" - this oop:          "INTPTR_FORMAT, (intptr_t)m);
+   st->print   (" - method holder:     ");    m->method_holder()->print_value_on(st); st->cr();
+-  st->print   (" - constants:         " INTPTR_FORMAT, " ", (address)m->constants());
++  st->print   (" - constants:         "INTPTR_FORMAT" ", (address)m->constants());
+   m->constants()->print_value_on(st); st->cr();
+   st->print   (" - access:            0x%x  ", m->access_flags().as_int()); m->access_flags().print_on(st); st->cr();
+   st->print   (" - name:              ");    m->name()->print_value_on(st); st->cr();
+@@ -246,6 +248,10 @@
+   st->print_cr(" - max locals:        %d",   m->max_locals());
+   st->print_cr(" - size of params:    %d",   m->size_of_parameters());
+   st->print_cr(" - method size:       %d",   m->method_size());
++  if (m->intrinsic_id() != vmIntrinsics::_none)
++    st->print_cr(" - intrinsic id:      %d %s", m->intrinsic_id(), vmIntrinsics::name_at(m->intrinsic_id()));
++  if (m->highest_tier_compile() != CompLevel_none)
++    st->print_cr(" - highest tier:      %d", m->highest_tier_compile());
+   st->print_cr(" - vtable index:      %d",   m->_vtable_index);
+   st->print_cr(" - i2i entry:         " INTPTR_FORMAT, m->interpreter_entry());
+   st->print_cr(" - adapter:           " INTPTR_FORMAT, m->adapter());
+diff --git a/src/share/vm/oops/methodOop.cpp b/src/share/vm/oops/methodOop.cpp
+--- a/src/share/vm/oops/methodOop.cpp
++++ b/src/share/vm/oops/methodOop.cpp
+@@ -807,9 +807,19 @@
+   return false;
+ }
+ 
++bool methodOopDesc::is_method_handle_invoke_name(vmSymbols::SID name_sid) {
++  switch (name_sid) {
++  case vmSymbols::VM_SYMBOL_ENUM_NAME(invoke_name):  // FIXME: remove this transitional form
++  case vmSymbols::VM_SYMBOL_ENUM_NAME(invokeExact_name):
++  case vmSymbols::VM_SYMBOL_ENUM_NAME(invokeGeneric_name):
++    return true;
++  }
++  return false;
++}
++
+ // Constant pool structure for invoke methods:
+ enum {
+-  _imcp_invoke_name = 1,        // utf8: 'invoke'
++  _imcp_invoke_name = 1,        // utf8: 'invokeExact' or 'invokeGeneric'
+   _imcp_invoke_signature,       // utf8: (variable symbolOop)
+   _imcp_method_type_value,      // string: (variable java/dyn/MethodType, sic)
+   _imcp_limit
+@@ -839,14 +849,15 @@
+ //
+ // Tests if this method is an internal adapter frame from the
+ // MethodHandleCompiler.
++// Must be consistent with MethodHandleCompiler::get_method_oop().
+ bool methodOopDesc::is_method_handle_adapter() const {
+-  return ((name() == vmSymbols::invoke_name() &&
+-           method_holder() == SystemDictionary::MethodHandle_klass())
+-          ||
+-          method_holder() == SystemDictionary::InvokeDynamic_klass());
++  return (is_method_handle_invoke_name(name()) &&
++          is_synthetic() &&
++          MethodHandleCompiler::klass_is_method_handle_adapter_holder(method_holder()));
+ }
+ 
+ methodHandle methodOopDesc::make_invoke_method(KlassHandle holder,
++                                               symbolHandle name,
+                                                symbolHandle signature,
+                                                Handle method_type, TRAPS) {
+   methodHandle empty;
+@@ -865,7 +876,7 @@
+     constantPoolOop cp_oop = oopFactory::new_constantPool(_imcp_limit, IsSafeConc, CHECK_(empty));
+     cp = constantPoolHandle(THREAD, cp_oop);
+   }
+-  cp->symbol_at_put(_imcp_invoke_name,       vmSymbols::invoke_name());
++  cp->symbol_at_put(_imcp_invoke_name,       name());
+   cp->symbol_at_put(_imcp_invoke_signature,  signature());
+   cp->string_at_put(_imcp_method_type_value, vmSymbols::void_signature());
+   cp->set_pool_holder(holder());
+@@ -882,7 +893,7 @@
+   m->set_constants(cp());
+   m->set_name_index(_imcp_invoke_name);
+   m->set_signature_index(_imcp_invoke_signature);
+-  assert(m->name() == vmSymbols::invoke_name(), "");
++  assert(is_method_handle_invoke_name(m->name()), "");
+   assert(m->signature() == signature(), "");
+ #ifdef CC_INTERP
+   ResultTypeFinder rtf(signature());
+@@ -1033,6 +1044,24 @@
+       id = vmIntrinsics::find_id(klass_id, name_id, sig_id, flags);
+       break;
+     }
++    break;
++
++  // Signature-polymorphic methods: MethodHandle.invoke*, InvokeDynamic.*.
++  case vmSymbols::VM_SYMBOL_ENUM_NAME(java_dyn_MethodHandle):
++    if (is_static() || !is_native())  break;
++    switch (name_id) {
++    case vmSymbols::VM_SYMBOL_ENUM_NAME(invokeGeneric_name):
++      id = vmIntrinsics::_invokeGeneric; break;
++    default:
++      if (is_method_handle_invoke_name(name()))
++        id = vmIntrinsics::_invokeExact;
++      break;
++    }
++    break;
++  case vmSymbols::VM_SYMBOL_ENUM_NAME(java_dyn_InvokeDynamic):
++    if (!is_static() || !is_native())  break;
++    id = vmIntrinsics::_invokeDynamic;
++    break;
+   }
+ 
+   if (id != vmIntrinsics::_none) {
+diff --git a/src/share/vm/oops/methodOop.hpp b/src/share/vm/oops/methodOop.hpp
+--- a/src/share/vm/oops/methodOop.hpp
++++ b/src/share/vm/oops/methodOop.hpp
+@@ -525,11 +525,16 @@
+ 
+   // JSR 292 support
+   bool is_method_handle_invoke() const              { return access_flags().is_method_handle_invoke(); }
++  static bool is_method_handle_invoke_name(vmSymbols::SID name_sid);
++  static bool is_method_handle_invoke_name(symbolOop name) {
++    return is_method_handle_invoke_name(vmSymbols::find_sid(name));
++  }
+   // Tests if this method is an internal adapter frame from the
+   // MethodHandleCompiler.
+   bool is_method_handle_adapter() const;
+   static methodHandle make_invoke_method(KlassHandle holder,
+-                                         symbolHandle signature,
++                                         symbolHandle name, //invokeExact or invokeGeneric
++                                         symbolHandle signature, //anything at all
+                                          Handle method_type,
+                                          TRAPS);
+   // these operate only on invoke methods:
+diff --git a/src/share/vm/opto/bytecodeInfo.cpp b/src/share/vm/opto/bytecodeInfo.cpp
+--- a/src/share/vm/opto/bytecodeInfo.cpp
++++ b/src/share/vm/opto/bytecodeInfo.cpp
+@@ -477,12 +477,7 @@
+   }
+   int new_depth_adjust = 0;
+   if (caller_jvms->method() != NULL) {
+-    if ((caller_jvms->method()->name() == ciSymbol::invoke_name() &&
+-         caller_jvms->method()->holder()->name() == ciSymbol::java_dyn_MethodHandle())
+-        || caller_jvms->method()->holder()->name() == ciSymbol::java_dyn_InvokeDynamic())
+-      /* @@@ FIXME:
+     if (caller_jvms->method()->is_method_handle_adapter())
+-      */
+       new_depth_adjust -= 1;  // don't count actions in MH or indy adapter frames
+     else if (callee_method->is_method_handle_invoke()) {
+       new_depth_adjust -= 1;  // don't count method handle calls from java.dyn implem
+diff --git a/src/share/vm/prims/methodHandleWalk.cpp b/src/share/vm/prims/methodHandleWalk.cpp
+--- a/src/share/vm/prims/methodHandleWalk.cpp
++++ b/src/share/vm/prims/methodHandleWalk.cpp
+@@ -1173,9 +1173,9 @@
+   // has no receiver, normal MH calls do.
+   int flags_bits;
+   if (for_invokedynamic())
+-    flags_bits = (/*JVM_MH_INVOKE_BITS |*/ JVM_ACC_PUBLIC | JVM_ACC_FINAL | JVM_ACC_STATIC);
++    flags_bits = (/*JVM_MH_INVOKE_BITS |*/ JVM_ACC_PUBLIC | JVM_ACC_FINAL | JVM_ACC_SYNTHETIC | JVM_ACC_STATIC);
+   else
+-    flags_bits = (/*JVM_MH_INVOKE_BITS |*/ JVM_ACC_PUBLIC | JVM_ACC_FINAL);
++    flags_bits = (/*JVM_MH_INVOKE_BITS |*/ JVM_ACC_PUBLIC | JVM_ACC_FINAL | JVM_ACC_SYNTHETIC);
+ 
+   bool is_conc_safe = true;
+   methodOop m_oop = oopFactory::new_method(bytecode_length(),
+@@ -1217,6 +1217,7 @@
+   }
+ #endif //PRODUCT
+ 
++  assert(m->is_method_handle_adapter(), "must be recognized as an adapter");
+   return m;
+ }
+ 
+diff --git a/src/share/vm/prims/methodHandles.cpp b/src/share/vm/prims/methodHandles.cpp
+--- a/src/share/vm/prims/methodHandles.cpp
++++ b/src/share/vm/prims/methodHandles.cpp
+@@ -366,6 +366,13 @@
+   VM_INDEX_UNINITIALIZED = sun_dyn_MemberName::VM_INDEX_UNINITIALIZED
+ };
+ 
++Handle MethodHandles::new_MemberName(TRAPS) {
++  Handle empty;
++  instanceKlassHandle k(THREAD, SystemDictionary::MemberName_klass());
++  if (!k->is_initialized())  k->initialize(CHECK_(empty));
++  return Handle(THREAD, k->allocate_instance(THREAD));
++}
++
+ void MethodHandles::init_MemberName(oop mname_oop, oop target_oop) {
+   if (target_oop->klass() == SystemDictionary::reflect_Field_klass()) {
+     oop clazz = java_lang_reflect_Field::clazz(target_oop); // fd.field_holder()
+@@ -394,16 +401,18 @@
+   sun_dyn_MemberName::set_vmtarget(mname_oop, vmtarget);
+   sun_dyn_MemberName::set_vmindex(mname_oop,  vmindex);
+   sun_dyn_MemberName::set_flags(mname_oop,    flags);
++  sun_dyn_MemberName::set_clazz(mname_oop,    Klass::cast(m->method_holder())->java_mirror());
+ }
+ 
+ void MethodHandles::init_MemberName(oop mname_oop, klassOop field_holder, AccessFlags mods, int offset) {
+   int flags = (IS_FIELD | (jushort)( mods.as_short() & JVM_RECOGNIZED_FIELD_MODIFIERS ));
+   oop vmtarget = field_holder;
+-  int vmindex  = offset;  // implies no info yet
++  int vmindex  = offset;  // determines the field uniquely when combined with static bit
+   assert(vmindex != VM_INDEX_UNINITIALIZED, "bad alias on vmindex");
+   sun_dyn_MemberName::set_vmtarget(mname_oop, vmtarget);
+   sun_dyn_MemberName::set_vmindex(mname_oop,  vmindex);
+   sun_dyn_MemberName::set_flags(mname_oop,    flags);
++  sun_dyn_MemberName::set_clazz(mname_oop,    Klass::cast(field_holder)->java_mirror());
+ }
+ 
+ 
+@@ -467,7 +476,7 @@
+   name_str = NULL;  // safety
+ 
+   // convert the external string or reflective type to an internal signature
+-  bool force_signature = (name() == vmSymbols::invoke_name());
++  bool force_signature = methodOopDesc::is_method_handle_invoke_name(name());
+   symbolHandle type; {
+     symbolOop type_sym = NULL;
+     if (java_dyn_MethodType::is_instance(type_str)) {
+@@ -775,6 +784,20 @@
+ }
+ 
+ 
++// Decode this java.lang.Class object into an instanceKlass, if possible.
++// Throw IAE if not
++instanceKlassHandle MethodHandles::resolve_instance_klass(oop java_mirror_oop, TRAPS) {
++  instanceKlassHandle empty;
++  klassOop caller = NULL;
++  if (java_lang_Class::is_instance(java_mirror_oop)) {
++    caller = java_lang_Class::as_klassOop(java_mirror_oop);
++  }
++  if (caller == NULL || !Klass::cast(caller)->oop_is_instance()) {
++    THROW_MSG_(vmSymbols::java_lang_IllegalArgumentException(), "not a class", empty);
++  }
++  return instanceKlassHandle(THREAD, caller);
++}
++
+ 
+ 
+ // Decode the vmtarget field of a method handle.
+@@ -2115,31 +2138,26 @@
+     KlassHandle caller(THREAD, java_lang_Class::as_klassOop(JNIHandles::resolve_non_null(caller_jh)));
+     // If this were a bytecode, the first access check would be against
+     // the "reference class" mentioned in the CONSTANT_Methodref.
+-    // For that class, we use the defining class of m,
+-    // or a more specific receiver limit if available.
+-    klassOop reference_klass = m->method_holder();  // OK approximation
+-    if (receiver_limit != NULL && receiver_limit != reference_klass) {
+-      if (!Klass::cast(receiver_limit)->is_subtype_of(reference_klass))
+-        THROW_MSG(vmSymbols::java_lang_InternalError(), "receiver limit out of bounds");  // Java code bug
+-      reference_klass = receiver_limit;
+-    }
+-    // Emulate LinkResolver::check_klass_accessability.
+-    if (!Reflection::verify_class_access(caller->as_klassOop(),
+-                                         reference_klass,
+-                                         true)) {
+-      THROW_MSG(vmSymbols::java_lang_InternalError(), Klass::cast(m->method_holder())->external_name());
+-    }
++    // We don't know at this point which class that was, and if we
++    // check against m.method_holder we might get the wrong answer.
++    // So we just make sure to handle this check when the resolution
++    // happens, when we call resolve_MemberName.
++    //
++    // (A public class can inherit public members from private supers,
++    // and it would be wrong to check access against the private super
++    // if the original symbolic reference was against the public class.)
++    //
+     // If there were a bytecode, the next step would be to lookup the method
+     // in the reference class, then then check the method's access bits.
+     // Emulate LinkResolver::check_method_accessability.
+     klassOop resolved_klass = m->method_holder();
+     if (!Reflection::verify_field_access(caller->as_klassOop(),
+-                                         resolved_klass, reference_klass,
++                                         resolved_klass, resolved_klass,
+                                          m->access_flags(),
+                                          true)) {
+       // %%% following cutout belongs in Reflection::verify_field_access?
+       bool same_pm = Reflection::is_same_package_member(caller->as_klassOop(),
+-                                                        reference_klass, THREAD);
++                                                        resolved_klass, THREAD);
+       if (!same_pm) {
+         THROW_MSG(vmSymbols::java_lang_InternalError(), m->name_and_sig_as_C_string());
+       }
+@@ -2244,6 +2262,8 @@
+   case MethodHandles::GC_JVM_STACK_MOVE_UNIT:
+     // return number of words per slot, signed according to stack direction
+     return MethodHandles::stack_move_unit();
++  case MethodHandles::GC_CONV_OP_IMPLEMENTED_MASK:
++    return MethodHandles::adapter_conversion_ops_supported_mask();
+   }
+   return 0;
+ }
+@@ -2342,7 +2362,22 @@
+ JVM_ENTRY(void, MHI_resolve_Mem(JNIEnv *env, jobject igcls, jobject mname_jh, jclass caller_jh)) {
+   if (mname_jh == NULL) { THROW(vmSymbols::java_lang_InternalError()); }
+   Handle mname(THREAD, JNIHandles::resolve_non_null(mname_jh));
+-  // %%% take caller into account!
++
++  // The trusted Java code that calls this method should already have performed
++  // access checks on behalf of the given caller.  But, we can verify this.
++  if (VerifyMethodHandles && caller_jh != NULL) {
++    klassOop reference_klass = java_lang_Class::as_klassOop(sun_dyn_MemberName::clazz(mname()));
++    if (reference_klass != NULL) {
++      // Emulate LinkResolver::check_klass_accessability.
++      klassOop caller = java_lang_Class::as_klassOop(JNIHandles::resolve_non_null(caller_jh));
++      if (!Reflection::verify_class_access(caller,
++                                           reference_klass,
++                                           true)) {
++        THROW_MSG(vmSymbols::java_lang_InternalError(), Klass::cast(reference_klass)->external_name());
++      }
++    }
++  }
++
+   MethodHandles::resolve_MemberName(mname, CHECK);
+ }
+ JVM_END
+@@ -2387,12 +2422,48 @@
+ }
+ JVM_END
+ 
++JVM_ENTRY(void, MHI_registerBootstrap(JNIEnv *env, jobject igcls, jclass caller_jh, jobject bsm_jh)) {
++  instanceKlassHandle ik = MethodHandles::resolve_instance_klass(caller_jh, THREAD);
++  ik->link_class(CHECK);
++  if (!java_dyn_MethodHandle::is_instance(JNIHandles::resolve(bsm_jh))) {
++    THROW_MSG(vmSymbols::java_lang_IllegalArgumentException(), "method handle");
++  }
++  const char* err = NULL;
++  if (ik->is_initialized() || ik->is_in_error_state()) {
++    err = "too late: class is already initialized";
++  } else {
++    ObjectLocker ol(ik, THREAD);  // note:  this should be a recursive lock
++    if (ik->is_not_initialized() ||
++        (ik->is_being_initialized() && ik->is_reentrant_initialization(THREAD))) {
++      if (ik->bootstrap_method() != NULL) {
++        err = "class is already equipped with a bootstrap method";
++      } else {
++        ik->set_bootstrap_method(JNIHandles::resolve_non_null(bsm_jh));
++        err = NULL;
++      }
++    } else {
++      err = "class is already initialized";
++      if (ik->is_being_initialized())
++        err = "class is already being initialized in a different thread";
++    }
++  }
++  if (err != NULL) {
++    THROW_MSG(vmSymbols::java_lang_IllegalStateException(), err);
++  }
++}
++JVM_END
+ 
+-JVM_ENTRY(void, MH_linkCallSite(JNIEnv *env, jobject igcls, jobject site_jh, jobject target_jh)) {
++JVM_ENTRY(jobject, MHI_getBootstrap(JNIEnv *env, jobject igcls, jclass caller_jh)) {
++  instanceKlassHandle ik = MethodHandles::resolve_instance_klass(caller_jh, THREAD);
++  return JNIHandles::make_local(THREAD, ik->bootstrap_method());
++}
++JVM_END
++
++JVM_ENTRY(void, MHI_setCallSiteTarget(JNIEnv *env, jobject igcls, jobject site_jh, jobject target_jh)) {
+   // No special action required, yet.
+   oop site_oop = JNIHandles::resolve(site_jh);
+-  if (site_oop == NULL || site_oop->klass() != SystemDictionary::CallSite_klass())
+-    THROW_MSG(vmSymbols::java_lang_IllegalArgumentException(), "call site");
++  if (!java_dyn_CallSite::is_instance(site_oop))
++    THROW_MSG(vmSymbols::java_lang_IllegalArgumentException(), "not a CallSite");
+   java_dyn_CallSite::set_target(site_oop, JNIHandles::resolve(target_jh));
+ }
+ JVM_END
+@@ -2442,7 +2513,9 @@
+ 
+ // More entry points specifically for EnableInvokeDynamic.
+ static JNINativeMethod methods2[] = {
+-  {CC"linkCallSite",            CC"("CST MH")V",                FN_PTR(MH_linkCallSite)}
++  {CC"registerBootstrap",       CC"("CLS MH")V",                FN_PTR(MHI_registerBootstrap)},
++  {CC"getBootstrap",            CC"("CLS")"MH,                  FN_PTR(MHI_getBootstrap)},
++  {CC"setCallSiteTarget",       CC"("CST MH")V",                FN_PTR(MHI_setCallSiteTarget)}
+ };
+ 
+ 
+diff --git a/src/share/vm/prims/methodHandles.hpp b/src/share/vm/prims/methodHandles.hpp
+--- a/src/share/vm/prims/methodHandles.hpp
++++ b/src/share/vm/prims/methodHandles.hpp
+@@ -216,6 +216,9 @@
+     return (conv >> CONV_VMINFO_SHIFT) & CONV_VMINFO_MASK;
+   }
+ 
++  // Bit mask of conversion_op values.  May vary by platform.
++  static int adapter_conversion_ops_supported_mask();
++
+   // Offset in words that the interpreter stack pointer moves when an argument is pushed.
+   // The stack_move value must always be a multiple of this.
+   static int stack_move_unit() {
+@@ -262,8 +265,9 @@
+   // working with member names
+   static void resolve_MemberName(Handle mname, TRAPS); // compute vmtarget/vmindex from name/type
+   static void expand_MemberName(Handle mname, int suppress, TRAPS);  // expand defc/name/type if missing
++  static Handle new_MemberName(TRAPS);  // must be followed by init_MemberName
+   static void init_MemberName(oop mname_oop, oop target); // compute vmtarget/vmindex from target
+-  static void init_MemberName(oop mname_oop, methodOop m, bool do_dispatch);
++  static void init_MemberName(oop mname_oop, methodOop m, bool do_dispatch = true);
+   static void init_MemberName(oop mname_oop, klassOop field_holder, AccessFlags mods, int offset);
+   static int find_MemberNames(klassOop k, symbolOop name, symbolOop sig,
+                               int mflags, klassOop caller,
+@@ -300,6 +304,7 @@
+     // format of query to getConstant:
+     GC_JVM_PUSH_LIMIT = 0,
+     GC_JVM_STACK_MOVE_UNIT = 1,
++    GC_CONV_OP_IMPLEMENTED_MASK = 2,
+ 
+     // format of result from getTarget / encode_target:
+     ETF_HANDLE_OR_METHOD_NAME = 0, // all available data (immediate MH or method)
+@@ -311,6 +316,11 @@
+   static oop encode_target(Handle mh, int format, TRAPS); // report vmtarget (to Java code)
+   static bool class_cast_needed(klassOop src, klassOop dst);
+ 
++  static instanceKlassHandle resolve_instance_klass(oop    java_mirror_oop, TRAPS);
++  static instanceKlassHandle resolve_instance_klass(jclass java_mirror_jh,  TRAPS) {
++    return resolve_instance_klass(JNIHandles::resolve(java_mirror_jh), THREAD);
++  }
++
+  private:
+   // These checkers operate on a pair of whole MethodTypes:
+   static const char* check_method_type_change(oop src_mtype, int src_beg, int src_end,
+diff --git a/src/share/vm/runtime/sharedRuntime.cpp b/src/share/vm/runtime/sharedRuntime.cpp
+--- a/src/share/vm/runtime/sharedRuntime.cpp
++++ b/src/share/vm/runtime/sharedRuntime.cpp
+@@ -1550,7 +1550,7 @@
+     methodOop actual_method = MethodHandles::decode_method(actual,
+                                                           kignore, fignore);
+     if (actual_method != NULL) {
+-      if (actual_method->name() == vmSymbols::invoke_name())
++      if (methodOopDesc::is_method_handle_invoke_name(actual_method->name()))
+         mhName = "$";
+       else
+         mhName = actual_method->signature()->as_C_string();

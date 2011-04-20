@@ -1,0 +1,193 @@
+6839839: access checking logic is wrong at three points in MethodHandles
+Summary: point fixes to access checking logic
+Reviewed-by: mr
+
+diff --git a/src/share/classes/java/dyn/MethodHandles.java b/src/share/classes/java/dyn/MethodHandles.java
+--- a/src/share/classes/java/dyn/MethodHandles.java
++++ b/src/share/classes/java/dyn/MethodHandles.java
+@@ -145,27 +145,30 @@
+             this.lookupClass = lookupClass;
+         }
+ 
++        private static final Class<?> PUBLIC_ONLY = sun.dyn.empty.Empty.class;
++
+         /** Version of lookup which is trusted minimally.
+          *  It can only be used to create method handles to
+          *  publicly accessible members.
+          */
+-        public static final Lookup PUBLIC_LOOKUP = new Lookup(null);
++        public static final Lookup PUBLIC_LOOKUP = new Lookup(PUBLIC_ONLY);
+ 
+         /** Package-private version of lookup which is trusted. */
+-        static final Lookup IMPL_LOOKUP = new Lookup(Access.class);
++        static final Lookup IMPL_LOOKUP = new Lookup(null);
+         static { MethodHandleImpl.initLookup(IMPL_TOKEN, IMPL_LOOKUP); }
+ 
+         private static void checkUnprivilegedlookupClass(Class<?> lookupClass) {
+-            if (lookupClass == null ||
+-                lookupClass == Access.class ||
+-                lookupClass.getName().startsWith("java.dyn."))
++            String name = lookupClass.getName();
++            if (name.startsWith("java.dyn.") || name.startsWith("sun.dyn."))
+                 throw newIllegalArgumentException("illegal lookupClass: "+lookupClass);
+         }
+ 
+         @Override
+         public String toString() {
++            if (lookupClass == PUBLIC_ONLY)
++                return "public";
+             if (lookupClass == null)
+-                return "public";
++                return "privileged";
+             return lookupClass.getName();
+         }
+ 
+@@ -253,8 +256,7 @@
+             MemberName method = IMPL_NAMES.resolveOrFail(new MemberName(defc, name, type), false, specialCaller);
+             checkStatic(false, method, lookupClass);
+             if (name.equals("<init>")) {
+-                if (defc != specialCaller)
+-                    throw newNoAccessException("constructor must be local to lookup class", method, lookupClass);
++                throw newNoAccessException("cannot directly invoke a constructor", method, null);
+             } else if (defc.isInterface() || !defc.isAssignableFrom(specialCaller)) {
+                 throw newNoAccessException("method must be in a superclass of lookup class", method, lookupClass);
+             }
+diff --git a/src/share/classes/sun/dyn/DirectMethodHandle.java b/src/share/classes/sun/dyn/DirectMethodHandle.java
+--- a/src/share/classes/sun/dyn/DirectMethodHandle.java
++++ b/src/share/classes/sun/dyn/DirectMethodHandle.java
+@@ -45,8 +45,6 @@
+         if (!m.isResolved())
+             throw new InternalError();
+ 
+-        // Null check and replace privilege token (as passed to JVM) with null.
+-        if (lookupClass.equals(Access.class))  lookupClass = null;
+         MethodHandleNatives.init(this, (Object) m, doDispatch, lookupClass);
+     }
+ 
+diff --git a/src/share/classes/sun/dyn/MemberName.java b/src/share/classes/sun/dyn/MemberName.java
+--- a/src/share/classes/sun/dyn/MemberName.java
++++ b/src/share/classes/sun/dyn/MemberName.java
+@@ -450,7 +450,7 @@
+             for (;;) {
+                 int bufCount = MethodHandleNatives.getMembers(defc,
+                         matchName, matchSig, matchFlags,
+-                        MethodHandleNatives.asNativeCaller(lookupClass),
++                        lookupClass,
+                         totalCount, buf);
+                 if (bufCount <= buf.length) {
+                     if (bufCount >= 0)
+@@ -487,14 +487,13 @@
+             return result;
+         }
+         boolean resolveInPlace(MemberName m, boolean searchSupers, Class<?> lookupClass) {
+-            Class<?> caller = MethodHandleNatives.asNativeCaller(lookupClass);
+-            MethodHandleNatives.resolve(m, caller);
++            MethodHandleNatives.resolve(m, lookupClass);
+             if (m.isResolved())  return true;
+             int matchFlags = m.flags | (searchSupers ? SEARCH_ALL_SUPERS : 0);
+             String matchSig = m.getSignature();
+             MemberName[] buf = { m };
+             int n = MethodHandleNatives.getMembers(m.getDeclaringClass(),
+-                    m.getName(), matchSig, matchFlags, caller, 0, buf);
++                    m.getName(), matchSig, matchFlags, lookupClass, 0, buf);
+             if (n != 1)  return false;
+             return m.isResolved();
+         }
+diff --git a/src/share/classes/sun/dyn/MethodHandleImpl.java b/src/share/classes/sun/dyn/MethodHandleImpl.java
+--- a/src/share/classes/sun/dyn/MethodHandleImpl.java
++++ b/src/share/classes/sun/dyn/MethodHandleImpl.java
+@@ -95,7 +95,7 @@
+ 
+     public static void initLookup(Access token, Lookup lookup) {
+         Access.check(token);
+-        if (IMPL_LOOKUP_INIT != null || lookup.lookupClass() != Access.class)
++        if (IMPL_LOOKUP_INIT != null || lookup.lookupClass() != null)
+             throw new InternalError();
+         IMPL_LOOKUP_INIT = lookup;
+     }
+@@ -144,19 +144,28 @@
+             boolean doDispatch, Class<?> lookupClass) {
+         Access.check(token);  // only trusted calls
+         MethodType mtype = method.getMethodType();
++        MethodType rtype = mtype;
+         if (method.isStatic()) {
+             doDispatch = false;
+         } else {
+             // adjust the advertised receiver type to be exactly the one requested
+             // (in the case of invokespecial, this will be the calling class)
+-            mtype = mtype.insertParameterType(0, method.getDeclaringClass());
++            Class<?> recvType = method.getDeclaringClass();
++            mtype = mtype.insertParameterType(0, recvType);
+             if (method.isConstructor())
+                 doDispatch = true;
++            // FIXME: JVM has trouble building MH.invoke sites for
++            // classes off the boot class path
++            rtype = mtype;
++            if (recvType.getClassLoader() != null)
++                rtype = rtype.changeParameterType(0, Object.class);
+         }
+         DirectMethodHandle mh = new DirectMethodHandle(mtype, method, doDispatch, lookupClass);
+         if (!mh.isValid())
+             throw newNoAccessException(method, lookupClass);
+-        return mh;
++        MethodHandle rmh = AdapterMethodHandle.makePairwiseConvert(token, rtype, mh);
++        if (rmh == null)  throw new InternalError();
++        return rmh;
+     }
+ 
+     public static
+@@ -189,6 +198,15 @@
+     MethodHandle bindReceiver(Access token,
+                               MethodHandle target, Object receiver) {
+         Access.check(token);
++        if (target instanceof AdapterMethodHandle) {
++            Object info = MethodHandleNatives.getTargetInfo(target);
++            if (info instanceof DirectMethodHandle) {
++                DirectMethodHandle dmh = (DirectMethodHandle) info;
++                if (receiver == null ||
++                    dmh.type().parameterType(0).isAssignableFrom(receiver.getClass()))
++                    target = dmh;
++            }
++        }
+         if (target instanceof DirectMethodHandle)
+             return new BoundMethodHandle((DirectMethodHandle)target, receiver, 0);
+         return null;   // let caller try something else
+diff --git a/src/share/classes/sun/dyn/MethodHandleNatives.java b/src/share/classes/sun/dyn/MethodHandleNatives.java
+--- a/src/share/classes/sun/dyn/MethodHandleNatives.java
++++ b/src/share/classes/sun/dyn/MethodHandleNatives.java
+@@ -47,14 +47,6 @@
+     static native int getMembers(Class<?> defc, String matchName, String matchSig,
+             int matchFlags, Class<?> caller, int skip, MemberName[] results);
+ 
+-    static Class<?> asNativeCaller(Class<?> lookupClass) {
+-        if (lookupClass == null)  // means "public only, non-privileged"
+-            return sun.dyn.empty.Empty.class;
+-        if (lookupClass == Access.class)  // means "internal, privileged"
+-            return null;    // to the JVM, null means completely privileged
+-        return lookupClass;
+-    }
+-
+     /// MethodHandle support
+ 
+     /** Initialize the method handle to adapt the call. */
+diff --git a/src/share/classes/sun/dyn/util/VerifyAccess.java b/src/share/classes/sun/dyn/util/VerifyAccess.java
+--- a/src/share/classes/sun/dyn/util/VerifyAccess.java
++++ b/src/share/classes/sun/dyn/util/VerifyAccess.java
+@@ -95,7 +95,7 @@
+     public static boolean isSamePackage(Class<?> class1, Class<?> class2) {
+         if (class1 == class2)
+             return true;
+-        if (loadersAreRelated(class1.getClassLoader(), class2.getClassLoader()))
++        if (!loadersAreRelated(class1.getClassLoader(), class2.getClassLoader()))
+             return false;
+         String name1 = class1.getName(), name2 = class2.getName();
+         int dot = name1.lastIndexOf('.');
+@@ -159,7 +159,7 @@
+      */
+     public static void checkBootstrapPrivilege(Class requestingClass, Class subjectClass,
+                                                String permissionName) {
+-        if (requestingClass == Access.class)  return;
++        if (requestingClass == null)          return;
+         if (requestingClass == subjectClass)  return;
+         SecurityManager security = System.getSecurityManager();
+         if (security == null)  return;  // open season

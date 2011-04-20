@@ -1,0 +1,1188 @@
+diff --git a/src/share/vm/ci/ciEnv.cpp b/src/share/vm/ci/ciEnv.cpp
+--- a/src/share/vm/ci/ciEnv.cpp
++++ b/src/share/vm/ci/ciEnv.cpp
+@@ -484,11 +484,16 @@
+   } else if (tag.is_double()) {
+     return ciConstant((jdouble)cpool->double_at(index));
+   } else if (tag.is_string() || tag.is_unresolved_string()) {
+-    oop string = cpool->string_at(index, THREAD);
+-    if (HAS_PENDING_EXCEPTION) {
+-      CLEAR_PENDING_EXCEPTION;
+-      record_out_of_memory_failure();
+-      return ciConstant();
++    oop string = NULL;
++    if (cpool->is_pseudo_string_at(index)) {
++      string = cpool->pseudo_string_at(index);
++    } else {
++      string = cpool->string_at(index, THREAD);
++      if (HAS_PENDING_EXCEPTION) {
++        CLEAR_PENDING_EXCEPTION;
++        record_out_of_memory_failure();
++        return ciConstant();
++      }
+     }
+     ciObject* constant = get_object(string);
+     assert (constant->is_instance(), "must be an instance, or not? ");
+diff --git a/src/share/vm/classfile/classFileParser.cpp b/src/share/vm/classfile/classFileParser.cpp
+--- a/src/share/vm/classfile/classFileParser.cpp
++++ b/src/share/vm/classfile/classFileParser.cpp
+@@ -168,9 +168,21 @@
+           // Got utf8 string, guarantee utf8_length+1 bytes, set stream position forward.
+           cfs->guarantee_more(utf8_length+1, CHECK);  // utf8 string, tag/access_flags
+           cfs->skip_u1_fast(utf8_length);
++
+           // Before storing the symbol, make sure it's legal
+           if (_need_verify) {
+             verify_legal_utf8((unsigned char*)utf8_buffer, utf8_length, CHECK);
++          }
++
++          if (AnonymousClasses && has_cp_patch_at(index)) {
++            Handle patch = clear_cp_patch_at(index);
++            guarantee_property(java_lang_String::is_instance(patch()),
++                               "Illegal utf8 patch at %d in class file %s",
++                               index, CHECK);
++            char* str = java_lang_String::as_utf8_string(patch());
++            // (could use java_lang_String::as_symbol instead, but might as well batch them)
++            utf8_buffer = (u1*) str;
++            utf8_length = (int) strlen(str);
+           }
+ 
+           unsigned int hash;
+@@ -245,7 +257,7 @@
+         int klass_ref_index = cp->klass_ref_index_at(index);
+         int name_and_type_ref_index = cp->name_and_type_ref_index_at(index);
+         check_property(valid_cp_range(klass_ref_index, length) &&
+-                       cp->tag_at(klass_ref_index).is_klass_reference(),
++                       is_klass_reference(cp, klass_ref_index),
+                        "Invalid constant pool index %u in class file %s",
+                        klass_ref_index,
+                        CHECK_(nullHandle));
+@@ -326,16 +338,46 @@
+     } // end of switch
+   } // end of for
+ 
++  if (_cp_patches != NULL) {
++    // need to treat this_class specially...
++    assert(AnonymousClasses, "");
++    int this_class_index;
++    {
++      cfs->guarantee_more(8, CHECK_(nullHandle));  // flags, this_class, super_class, infs_len
++      u1* mark = cfs->current();
++      u2 flags         = cfs->get_u2_fast();
++      this_class_index = cfs->get_u2_fast();
++      cfs->set_current(mark);  // revert to mark
++    }
++
++    for (index = 1; index < length; index++) {          // Index 0 is unused
++      if (has_cp_patch_at(index)) {
++        guarantee_property(index != this_class_index,
++                           "Illegal constant pool patch to self at %d in class file %s",
++                           index, CHECK_(nullHandle));
++        patch_constant_pool(cp, index, cp_patch_at(index), CHECK_(nullHandle));
++      }
++    }
++    // Ensure that all the patches have been used.
++    for (index = 0; index < _cp_patches->length(); index++) {
++      guarantee_property(!has_cp_patch_at(index),
++                         "Unused constant pool patch at %d in class file %s",
++                         index, CHECK_(nullHandle));
++    }
++  }
++
+   if (!_need_verify) {
+     return cp;
+   }
+ 
+   // second verification pass - checks the strings are of the right format.
++  // but not yet to the other entries
+   for (index = 1; index < length; index++) {
+     jbyte tag = cp->tag_at(index).value();
+     switch (tag) {
+       case JVM_CONSTANT_UnresolvedClass: {
+         symbolHandle class_name(THREAD, cp->unresolved_klass_at(index));
++        // check the name, even if _cp_patches will overwrite it
+         verify_legal_class_name(class_name, CHECK_(nullHandle));
+         break;
+       }
+@@ -378,6 +420,73 @@
+ }
+ 
+ 
++void ClassFileParser::patch_constant_pool(constantPoolHandle cp, int index, Handle patch, TRAPS) {
++  assert(AnonymousClasses, "");
++  BasicType patch_type = T_VOID;
++  switch (cp->tag_at(index).value()) {
++
++  case JVM_CONSTANT_UnresolvedClass :
++    // Patching a class means pre-resolving it.
++    // The name in the constant pool is ignored.
++    if (patch->klass() == SystemDictionary::class_klass()) { // %%% java_lang_Class::is_instance
++      guarantee_property(!java_lang_Class::is_primitive(patch()),
++                         "Illegal class patch at %d in class file %s",
++                         index, CHECK);
++      cp->klass_at_put(index, java_lang_Class::as_klassOop(patch()));
++    } else {
++      guarantee_property(java_lang_String::is_instance(patch()),
++                         "Illegal class patch at %d in class file %s",
++                         index, CHECK);
++      symbolHandle name = java_lang_String::as_symbol(patch(), CHECK);
++      cp->unresolved_klass_at_put(index, name());
++    }
++    break;
++
++  case JVM_CONSTANT_UnresolvedString :
++    // Patching a string means pre-resolving it.
++    // The spelling in the constant pool is ignored.
++    // The constant reference may be any object whatever.
++    // If it is not a real interned string, the constant is referred
++    // to as a "pseudo-string", and must be presented to the CP
++    // explicitly, because it may require scavenging.
++    cp->pseudo_string_at_put(index, patch());
++    break;
++
++  case JVM_CONSTANT_Integer : patch_type = T_INT;    goto patch_prim;
++  case JVM_CONSTANT_Float :   patch_type = T_FLOAT;  goto patch_prim;
++  case JVM_CONSTANT_Long :    patch_type = T_LONG;   goto patch_prim;
++  case JVM_CONSTANT_Double :  patch_type = T_DOUBLE; goto patch_prim;
++  patch_prim:
++    {
++      jvalue value;
++      BasicType value_type = java_lang_boxing_object::get_value(patch(), &value);
++      guarantee_property(value_type == patch_type,
++                         "Illegal primitive patch at %d in class file %s",
++                         index, CHECK);
++      switch (value_type) {
++      case T_INT:    cp->int_at_put(index,   value.i); break;
++      case T_FLOAT:  cp->float_at_put(index, value.f); break;
++      case T_LONG:   cp->long_at_put(index,  value.j); break;
++      case T_DOUBLE: cp->double_at_put(index, value.d); break;
++      default:       assert(false, "");
++      }
++    }
++    break;
++
++  default:
++    // %%% TODO: put method handles into CONSTANT_InterfaceMethodref, etc.
++    guarantee_property(!has_cp_patch_at(index),
++                       "Illegal unexpected patch at %d in class file %s",
++                       index, CHECK);
++    return;
++  }
++
++  // On fall-through, mark the patch as used.
++  clear_cp_patch_at(index);
++}
++
++
++
+ class NameSigHash: public ResourceObj {
+  public:
+   symbolOop     _name;       // name
+@@ -448,25 +557,32 @@
+   int index;
+   for (index = 0; index < length; index++) {
+     u2 interface_index = cfs->get_u2(CHECK_(nullHandle));
++    KlassHandle interf;
+     check_property(
+       valid_cp_range(interface_index, cp->length()) &&
+-        cp->tag_at(interface_index).is_unresolved_klass(),
++      is_klass_reference(cp, interface_index),
+       "Interface name has bad constant pool index %u in class file %s",
+       interface_index, CHECK_(nullHandle));
+-    symbolHandle unresolved_klass (THREAD, cp->klass_name_at(interface_index));
+-
+-    // Don't need to check legal name because it's checked when parsing constant pool.
+-    // But need to make sure it's not an array type.
+-    guarantee_property(unresolved_klass->byte_at(0) != JVM_SIGNATURE_ARRAY,
+-                       "Bad interface name in class file %s", CHECK_(nullHandle));
+-
+-    vmtimer->suspend();  // do not count recursive loading twice
+-    // Call resolve_super so classcircularity is checked
+-    klassOop k = SystemDictionary::resolve_super_or_fail(class_name,
+-                  unresolved_klass, class_loader, protection_domain,
+-                  false, CHECK_(nullHandle));
+-    KlassHandle interf (THREAD, k);
+-    vmtimer->resume();
++    if (cp->tag_at(interface_index).is_klass()) {
++      interf = KlassHandle(THREAD, cp->resolved_klass_at(interface_index));
++    } else {
++      symbolHandle unresolved_klass (THREAD, cp->klass_name_at(interface_index));
++
++      // Don't need to check legal name because it's checked when parsing constant pool.
++      // But need to make sure it's not an array type.
++      guarantee_property(unresolved_klass->byte_at(0) != JVM_SIGNATURE_ARRAY,
++                         "Bad interface name in class file %s", CHECK_(nullHandle));
++
++      vmtimer->suspend();  // do not count recursive loading twice
++      // Call resolve_super so classcircularity is checked
++      klassOop k = SystemDictionary::resolve_super_or_fail(class_name,
++                    unresolved_klass, class_loader, protection_domain,
++                    false, CHECK_(nullHandle));
++      interf = KlassHandle(THREAD, k);
++      vmtimer->resume();
++
++      cp->klass_at_put(interface_index, interf()); // eagerly resolve
++    }
+ 
+     if (!Klass::cast(interf())->is_interface()) {
+       THROW_MSG_(vmSymbols::java_lang_IncompatibleClassChangeError(), "Implementing class", nullHandle);
+@@ -877,8 +993,7 @@
+                          "Illegal exception table handler in class file %s", CHECK_(nullHandle));
+       if (catch_type_index != 0) {
+         guarantee_property(valid_cp_range(catch_type_index, cp->length()) &&
+-                          (cp->tag_at(catch_type_index).is_klass() ||
+-                           cp->tag_at(catch_type_index).is_unresolved_klass()),
++                           is_klass_reference(cp, catch_type_index),
+                            "Catch type in exception table has bad constant type in class file %s", CHECK_(nullHandle));
+       }
+     }
+@@ -1117,7 +1232,7 @@
+     } else if (tag == ITEM_Object) {
+       u2 class_index = u2_array[i2++] = cfs->get_u2(CHECK);
+       guarantee_property(valid_cp_range(class_index, cp->length()) &&
+-                         cp->tag_at(class_index).is_unresolved_klass(),
++                         is_klass_reference(cp, class_index),
+                          "Bad class index %u in StackMap in class file %s",
+                          class_index, CHECK);
+     } else if (tag == ITEM_Uninitialized) {
+@@ -1183,7 +1298,7 @@
+       checked_exception = cfs->get_u2_fast();
+       check_property(
+         valid_cp_range(checked_exception, cp->length()) &&
+-        cp->tag_at(checked_exception).is_klass_reference(),
++        is_klass_reference(cp, checked_exception),
+         "Exception name has bad type at constant pool %u in class file %s",
+         checked_exception, CHECK_NULL);
+     }
+@@ -1918,7 +2033,7 @@
+     check_property(
+       inner_class_info_index == 0 ||
+         (valid_cp_range(inner_class_info_index, cp_size) &&
+-        cp->tag_at(inner_class_info_index).is_klass_reference()),
++        is_klass_reference(cp, inner_class_info_index)),
+       "inner_class_info_index %u has bad constant type in class file %s",
+       inner_class_info_index, CHECK_0);
+     // Outer class index
+@@ -1926,7 +2041,7 @@
+     check_property(
+       outer_class_info_index == 0 ||
+         (valid_cp_range(outer_class_info_index, cp_size) &&
+-        cp->tag_at(outer_class_info_index).is_klass_reference()),
++        is_klass_reference(cp, outer_class_info_index)),
+       "outer_class_info_index %u has bad constant type in class file %s",
+       outer_class_info_index, CHECK_0);
+     // Inner class name
+@@ -2088,7 +2203,7 @@
+         }
+         // Validate the constant pool indices and types
+         if (!cp->is_within_bounds(class_index) ||
+-            !cp->tag_at(class_index).is_klass_reference()) {
++            !is_klass_reference(cp, class_index)) {
+           classfile_parse_error("Invalid or out-of-bounds class index in EnclosingMethod attribute in class file %s", CHECK);
+         }
+         if (method_index != 0 &&
+@@ -2349,6 +2464,7 @@
+ instanceKlassHandle ClassFileParser::parseClassFile(symbolHandle name,
+                                                     Handle class_loader,
+                                                     Handle protection_domain,
++                                                    GrowableArray<Handle>* cp_patches,
+                                                     symbolHandle& parsed_name,
+                                                     TRAPS) {
+   // So that JVMTI can cache class file in the state before retransformable agents
+@@ -2380,6 +2496,7 @@
+     }
+   }
+ 
++  _cp_patches = cp_patches;
+ 
+   instanceKlassHandle nullHandle;
+ 
+@@ -2510,14 +2627,22 @@
+                      CHECK_(nullHandle));
+     } else {
+       check_property(valid_cp_range(super_class_index, cp_size) &&
+-                     cp->tag_at(super_class_index).is_unresolved_klass(),
++                     is_klass_reference(cp, super_class_index),
+                      "Invalid superclass index %u in class file %s",
+                      super_class_index,
+                      CHECK_(nullHandle));
+       // The class name should be legal because it is checked when parsing constant pool.
+       // However, make sure it is not an array type.
+-      if (_need_verify) {
+-        guarantee_property(cp->unresolved_klass_at(super_class_index)->byte_at(0) != JVM_SIGNATURE_ARRAY,
++      bool is_array = false;
++      if (cp->tag_at(super_class_index).is_klass()) {
++        super_klass = instanceKlassHandle(THREAD, cp->resolved_klass_at(super_class_index));
++        if (_need_verify)
++          is_array = super_klass->oop_is_array();
++      } else if (_need_verify) {
++        is_array = (cp->unresolved_klass_at(super_class_index)->byte_at(0) == JVM_SIGNATURE_ARRAY);
++      }
++      if (_need_verify) {
++        guarantee_property(!is_array,
+                           "Bad superclass name in class file %s", CHECK_(nullHandle));
+       }
+     }
+@@ -2557,7 +2682,7 @@
+     objArrayHandle methods_default_annotations(THREAD, methods_default_annotations_oop);
+ 
+     // We check super class after class file is parsed and format is checked
+-    if (super_class_index > 0) {
++    if (super_class_index > 0 && super_klass.is_null()) {
+       symbolHandle sk (THREAD, cp->klass_name_at(super_class_index));
+       if (access_flags.is_interface()) {
+         // Before attempting to resolve the superclass, check for class format
+@@ -2574,6 +2699,9 @@
+                                                            CHECK_(nullHandle));
+       KlassHandle kh (THREAD, k);
+       super_klass = instanceKlassHandle(THREAD, kh());
++      cp->klass_at_put(super_class_index, super_klass()); // eagerly resolve
++    }
++    if (super_klass.not_null()) {
+       if (super_klass->is_interface()) {
+         ResourceMark rm(THREAD);
+         Exceptions::fthrow(
+@@ -3000,6 +3128,7 @@
+     this_klass->set_method_ordering(method_ordering());
+     this_klass->set_initial_method_idnum(methods->length());
+     this_klass->set_name(cp->klass_name_at(this_class_index));
++    cp->klass_at_put(this_class_index, this_klass()); // eagerly resolve
+     this_klass->set_protection_domain(protection_domain());
+     this_klass->set_fields_annotations(fields_annotations());
+     this_klass->set_methods_annotations(methods_annotations());
+diff --git a/src/share/vm/classfile/classFileParser.hpp b/src/share/vm/classfile/classFileParser.hpp
+--- a/src/share/vm/classfile/classFileParser.hpp
++++ b/src/share/vm/classfile/classFileParser.hpp
+@@ -33,6 +33,7 @@
+   u2   _major_version;
+   u2   _minor_version;
+   symbolHandle _class_name;
++  GrowableArray<Handle>* _cp_patches; // overrides for CP entries
+ 
+   bool _has_finalizer;
+   bool _has_empty_finalizer;
+@@ -203,6 +204,35 @@
+   char* skip_over_field_name(char* name, bool slash_ok, unsigned int length);
+   char* skip_over_field_signature(char* signature, bool void_ok, unsigned int length, TRAPS);
+ 
++  bool has_cp_patch_at(int index) {
++    assert(AnonymousClasses, "");
++    assert(index >= 0, "oob");
++    return (_cp_patches != NULL
++            && index < _cp_patches->length()
++            && _cp_patches->adr_at(index)->not_null());
++  }
++  Handle cp_patch_at(int index) {
++    assert(has_cp_patch_at(index), "oob");
++    return _cp_patches->at(index);
++  }
++  Handle clear_cp_patch_at(int index) {
++    Handle patch = cp_patch_at(index);
++    _cp_patches->at_put(index, Handle());
++    assert(!has_cp_patch_at(index), "");
++    return patch;
++  }
++  void patch_constant_pool(constantPoolHandle cp, int index, Handle patch, TRAPS);
++
++  // Wrapper for constantTag.is_klass_[or_]reference.
++  // In older versions of the VM, klassOops cannot sneak into early phases of
++  // constant pool construction, but in later versions they can.
++  // %%% Let's phase out the old is_klass_reference.
++  bool is_klass_reference(constantPoolHandle cp, int index) {
++    return ((LinkWellKnownClasses || AnonymousClasses)
++            ? cp->tag_at(index).is_klass_or_reference()
++            : cp->tag_at(index).is_klass_reference());
++  }
++
+  public:
+   // Constructor
+   ClassFileParser(ClassFileStream* st) { set_stream(st); }
+@@ -218,6 +248,14 @@
+                                      Handle class_loader,
+                                      Handle protection_domain,
+                                      symbolHandle& parsed_name,
++                                     TRAPS) {
++    return parseClassFile(name, class_loader, protection_domain, NULL, parsed_name, THREAD);
++  }
++  instanceKlassHandle parseClassFile(symbolHandle name,
++                                     Handle class_loader,
++                                     Handle protection_domain,
++                                     GrowableArray<Handle>* cp_patches,
++                                     symbolHandle& parsed_name,
+                                      TRAPS);
+ 
+   // Verifier checks
+diff --git a/src/share/vm/classfile/systemDictionary.cpp b/src/share/vm/classfile/systemDictionary.cpp
+--- a/src/share/vm/classfile/systemDictionary.cpp
++++ b/src/share/vm/classfile/systemDictionary.cpp
+@@ -937,6 +937,8 @@
+                                         Handle class_loader,
+                                         Handle protection_domain,
+                                         ClassFileStream* st,
++                                        KlassHandle host_klass,
++                                        GrowableArray<Handle>* cp_patches,
+                                         TRAPS) {
+   symbolHandle parsed_name;
+ 
+@@ -953,9 +955,9 @@
+   instanceKlassHandle k = ClassFileParser(st).parseClassFile(class_name,
+                                                              class_loader,
+                                                              protection_domain,
++                                                             cp_patches,
+                                                              parsed_name,
+                                                              THREAD);
+-
+ 
+   // We don't redefine the class, so we just need to clean up whether there
+   // was an error or not (don't want to modify any system dictionary
+@@ -970,6 +972,30 @@
+     MutexLocker mu(SystemDictionary_lock, THREAD);
+     placeholders()->find_and_remove(p_index, p_hash, parsed_name, class_loader, THREAD);
+     SystemDictionary_lock->notify_all();
++    }
++  }
++
++  if (host_klass.not_null() && k.not_null()) {
++    assert(AnonymousClasses, "");
++    // If it's anonymous, initialize it now, since nobody else will.
++    k->set_host_klass(host_klass());
++
++    {
++      MutexLocker mu_r(Compile_lock, THREAD);
++
++      // Add to class hierarchy, initialize vtables, and do possible
++      // deoptimizations.
++      add_to_hierarchy(k, CHECK_NULL); // No exception, but can block
++
++      // But, do not add to system dictionary.
++    }
++
++    k->eager_initialize(THREAD);
++
++    // notify jvmti
++    if (JvmtiExport::should_post_class_load()) {
++        assert(THREAD->is_Java_thread(), "thread->is_Java_thread()");
++        JvmtiExport::post_class_load((JavaThread *) THREAD, k());
+     }
+   }
+ 
+diff --git a/src/share/vm/classfile/systemDictionary.hpp b/src/share/vm/classfile/systemDictionary.hpp
+--- a/src/share/vm/classfile/systemDictionary.hpp
++++ b/src/share/vm/classfile/systemDictionary.hpp
+@@ -228,6 +228,16 @@
+                                Handle class_loader,
+                                Handle protection_domain,
+                                ClassFileStream* st,
++                               TRAPS) {
++    KlassHandle nullHandle;
++    return parse_stream(class_name, class_loader, protection_domain, st, nullHandle, NULL, THREAD);
++  }
++  static klassOop parse_stream(symbolHandle class_name,
++                               Handle class_loader,
++                               Handle protection_domain,
++                               ClassFileStream* st,
++                               KlassHandle host_klass,
++                               GrowableArray<Handle>* cp_patches,
+                                TRAPS);
+ 
+   // Resolve from stream (called by jni_DefineClass and JVM_DefineClass)
+diff --git a/src/share/vm/classfile/verifier.cpp b/src/share/vm/classfile/verifier.cpp
+--- a/src/share/vm/classfile/verifier.cpp
++++ b/src/share/vm/classfile/verifier.cpp
+@@ -1600,7 +1600,11 @@
+     types = (1 << JVM_CONSTANT_Double) | (1 << JVM_CONSTANT_Long);
+     verify_cp_type(index, cp, types, CHECK_VERIFY(this));
+   }
+-  if (tag.is_string() || tag.is_unresolved_string()) {
++  if (tag.is_string() && cp->is_pseudo_string_at(index)) {
++    current_frame->push_stack(
++      VerificationType::reference_type(
++        vmSymbols::java_lang_Object()), CHECK_VERIFY(this));
++  } else if (tag.is_string() || tag.is_unresolved_string()) {
+     current_frame->push_stack(
+       VerificationType::reference_type(
+         vmSymbols::java_lang_String()), CHECK_VERIFY(this));
+diff --git a/src/share/vm/includeDB_gc_parallel b/src/share/vm/includeDB_gc_parallel
+--- a/src/share/vm/includeDB_gc_parallel
++++ b/src/share/vm/includeDB_gc_parallel
+@@ -29,6 +29,12 @@
+ collectorPolicy.cpp                     cmsGCAdaptivePolicyCounters.hpp
+ 
+ compiledICHolderKlass.cpp               oop.pcgc.inline.hpp
++
++constantPoolKlass.cpp                   cardTableRS.hpp
++constantPoolKlass.cpp                   oop.pcgc.inline.hpp
++constantPoolKlass.cpp                   psPromotionManager.inline.hpp
++constantPoolKlass.cpp                   psScavenge.inline.hpp
++constantPoolKlass.cpp                   parOopClosures.inline.hpp
+ 
+ genCollectedHeap.cpp                    concurrentMarkSweepThread.hpp
+ genCollectedHeap.cpp                    vmCMSOperations.hpp
+diff --git a/src/share/vm/oops/constantPoolKlass.cpp b/src/share/vm/oops/constantPoolKlass.cpp
+--- a/src/share/vm/oops/constantPoolKlass.cpp
++++ b/src/share/vm/oops/constantPoolKlass.cpp
+@@ -35,6 +35,7 @@
+   c->set_tags(NULL);
+   c->set_cache(NULL);
+   c->set_pool_holder(NULL);
++  c->set_flags(0);
+   // only set to non-zero if constant pool is merged by RedefineClasses
+   c->set_orig_length(0);
+   // all fields are initialized; needed for GC
+@@ -261,10 +262,32 @@
+ 
+ void constantPoolKlass::oop_copy_contents(PSPromotionManager* pm, oop obj) {
+   assert(obj->is_constantPool(), "should be constant pool");
++  constantPoolOop cp = (constantPoolOop) obj;
++  if (AnonymousClasses && cp->has_pseudo_string() && cp->tags() != NULL) {
++    oop* base = (oop*)cp->base();
++    for (int i = 0; i < cp->length(); ++i, ++base) {
++      if (cp->tag_at(i).is_string()) {
++        if (PSScavenge::should_scavenge(base)) {
++          pm->claim_or_forward_breadth(base);
++        }
++      }
++    }
++  }
+ }
+ 
+ void constantPoolKlass::oop_push_contents(PSPromotionManager* pm, oop obj) {
+   assert(obj->is_constantPool(), "should be constant pool");
++  constantPoolOop cp = (constantPoolOop) obj;
++  if (AnonymousClasses && cp->has_pseudo_string() && cp->tags() != NULL) {
++    oop* base = (oop*)cp->base();
++    for (int i = 0; i < cp->length(); ++i, ++base) {
++      if (cp->tag_at(i).is_string()) {
++        if (PSScavenge::should_scavenge(base)) {
++          pm->claim_or_forward_depth(base);
++        }
++      }
++    }
++  }
+ }
+ #endif // SERIALGC
+ 
+@@ -278,6 +301,11 @@
+   assert(obj->is_constantPool(), "must be constantPool");
+   Klass::oop_print_on(obj, st);
+   constantPoolOop cp = constantPoolOop(obj);
++  if (cp->flags() != 0) {
++    st->print(" - flags : 0x%x", cp->flags());
++    if (cp->has_pseudo_string()) st->print(" has_pseudo_string");
++    st->cr();
++  }
+ 
+   // Temp. remove cache so we can do lookups with original indicies.
+   constantPoolCacheHandle cache (THREAD, cp->cache());
+@@ -302,7 +330,11 @@
+         break;
+       case JVM_CONSTANT_UnresolvedString :
+       case JVM_CONSTANT_String :
+-        anObj = cp->string_at(index, CATCH);
++        if (cp->is_pseudo_string_at(index)) {
++          anObj = cp->pseudo_string_at(index);
++        } else {
++          anObj = cp->string_at(index, CATCH);
++        }
+         anObj->print_value_on(st);
+         st->print(" {0x%lx}", (address)anObj);
+         break;
+@@ -382,8 +414,12 @@
+                   "should be symbol or instance");
+       }
+       if (cp->tag_at(i).is_string()) {
+-        guarantee((*base)->is_perm(),     "should be in permspace");
+-        guarantee((*base)->is_instance(), "should be instance");
++        if (!cp->has_pseudo_string()) {
++          guarantee((*base)->is_perm(),   "should be in permspace");
++          guarantee((*base)->is_instance(), "should be instance");
++        } else {
++          // can be non-perm, can be non-instance (array)
++        }
+       }
+       base++;
+     }
+diff --git a/src/share/vm/oops/constantPoolOop.cpp b/src/share/vm/oops/constantPoolOop.cpp
+--- a/src/share/vm/oops/constantPoolOop.cpp
++++ b/src/share/vm/oops/constantPoolOop.cpp
+@@ -24,6 +24,18 @@
+ 
+ # include "incls/_precompiled.incl"
+ # include "incls/_constantPoolOop.cpp.incl"
++
++void constantPoolOopDesc::set_flag_at(FlagBit fb) {
++  const int MAX_STATE_CHANGES = 2;
++  for (int i = MAX_STATE_CHANGES + 10; i > 0; i--) {
++    int oflags = _flags;
++    int nflags = oflags | (1 << (int)fb);
++    if (Atomic::cmpxchg(nflags, &_flags, oflags) == oflags)
++      return;
++  }
++  assert(false, "failed to cmpxchg flags");
++  _flags |= (1 << (int)fb);     // better than nothing
++}
+ 
+ klassOop constantPoolOopDesc::klass_at_impl(constantPoolHandle this_oop, int which, TRAPS) {
+   // A resolved constantPool entry will contain a klassOop, otherwise a symbolOop.
+@@ -333,8 +345,10 @@
+   oop entry = *(obj_at_addr(which));
+   if (entry->is_symbol()) {
+     return ((symbolOop)entry)->as_C_string();
++  } else if (java_lang_String::is_instance(entry)) {
++    return java_lang_String::as_utf8_string(entry);
+   } else {
+-    return java_lang_String::as_utf8_string(entry);
++    return (char*)"<pseudo-string>";
+   }
+ }
+ 
+@@ -382,6 +396,19 @@
+   }
+   assert(java_lang_String::is_instance(entry), "must be string");
+   return entry;
++}
++
++
++bool constantPoolOopDesc::is_pseudo_string_at(int which) {
++  oop entry = *(obj_at_addr(which));
++  if (entry->is_symbol())
++    // Not yet resolved, but it will resolve to a string.
++    return false;
++  else if (java_lang_String::is_instance(entry))
++    return false; // actually, it might be a non-interned or non-perm string
++  else
++    // truly pseudo
++    return true;
+ }
+ 
+ 
+diff --git a/src/share/vm/oops/constantPoolOop.hpp b/src/share/vm/oops/constantPoolOop.hpp
+--- a/src/share/vm/oops/constantPoolOop.hpp
++++ b/src/share/vm/oops/constantPoolOop.hpp
+@@ -41,6 +41,7 @@
+   typeArrayOop         _tags; // the tag array describing the constant pool's contents
+   constantPoolCacheOop _cache;         // the cache holding interpreter runtime information
+   klassOop             _pool_holder;   // the corresponding class
++  int                  _flags;         // a few header bits to describe contents for GC
+   int                  _length; // number of elements in the array
+   // only set to non-zero if constant pool is merged by RedefineClasses
+   int                  _orig_length;
+@@ -48,6 +49,16 @@
+   void set_tags(typeArrayOop tags)             { oop_store_without_check((oop*)&_tags, tags); }
+   void tag_at_put(int which, jbyte t)          { tags()->byte_at_put(which, t); }
+   void release_tag_at_put(int which, jbyte t)  { tags()->release_byte_at_put(which, t); }
++
++  enum FlagBit {
++    FB_has_pseudo_string = 2
++  };
++
++  int flags() const                         { return _flags; }
++  void set_flags(int f)                     { _flags = f; }
++  bool flag_at(FlagBit fb) const            { return (_flags & (1 << (int)fb)) != 0; }
++  void set_flag_at(FlagBit fb);
++  // no clear_flag_at function; they only increase
+ 
+  private:
+   intptr_t* base() const { return (intptr_t*) (((char*) this) + sizeof(constantPoolOopDesc)); }
+@@ -81,6 +92,9 @@
+ 
+  public:
+   typeArrayOop tags() const                 { return _tags; }
++
++  bool has_pseudo_string() const            { return flag_at(FB_has_pseudo_string); }
++  void set_pseudo_string()                  {    set_flag_at(FB_has_pseudo_string); }
+ 
+   // Klass holding pool
+   klassOop pool_holder() const              { return _pool_holder; }
+@@ -272,6 +286,27 @@
+     return string_at_impl(h_this, which, CHECK_NULL);
+   }
+ 
++  // A "pseudo-string" is an non-string oop that has found is way into
++  // a String entry.
++  // Under AnonymousClasses this can happen if the user patches a live
++  // object into a CONSTANT_String entry of an anonymous class.
++  // Method oops internally created for method handles may also
++  // use pseudo-strings to link themselves to related metaobjects.
++
++  bool is_pseudo_string_at(int which);
++
++  oop pseudo_string_at(int which) {
++    assert(tag_at(which).is_string(), "Corrupted constant pool");
++    return *obj_at_addr(which);
++  }
++
++  void pseudo_string_at_put(int which, oop x) {
++    assert(AnonymousClasses, "");
++    set_pseudo_string();        // mark header
++    assert(tag_at(which).is_string() || tag_at(which).is_unresolved_string(), "Corrupted constant pool");
++    string_at_put(which, x);    // this works just fine
++  }
++
+   // only called when we are sure a string entry is already resolved (via an
+   // earlier string_at call.
+   oop resolved_string_at(int which) {
+@@ -293,6 +328,7 @@
+   // UTF8 char* representation was chosen to avoid conversion of
+   // java_lang_Strings at resolved entries into symbolOops
+   // or vice versa.
++  // Caller is responsible for checking for pseudo-strings.
+   char* string_at_noresolve(int which);
+ 
+   jint name_and_type_at(int which) {
+diff --git a/src/share/vm/oops/instanceKlass.hpp b/src/share/vm/oops/instanceKlass.hpp
+--- a/src/share/vm/oops/instanceKlass.hpp
++++ b/src/share/vm/oops/instanceKlass.hpp
+@@ -147,6 +147,10 @@
+   oop             _class_loader;
+   // Protection domain.
+   oop             _protection_domain;
++  // Host class, which grants its access privileges to this class also.
++  // This is only non-null for an anonymous class (AnonymousClasses enabled).
++  // The host class is either named, or a previously loaded anonymous class.
++  klassOop        _host_klass;
+   // Class signers.
+   objArrayOop     _signers;
+   // Name of source file containing this klass, NULL if not specified.
+@@ -374,6 +378,11 @@
+   // protection domain
+   oop protection_domain()                  { return _protection_domain; }
+   void set_protection_domain(oop pd)       { oop_store((oop*) &_protection_domain, pd); }
++
++  // host class
++  oop host_klass() const                   { return _host_klass; }
++  void set_host_klass(oop host)            { oop_store((oop*) &_host_klass, host); }
++  bool is_anonymous() const                { return _host_klass != NULL; }
+ 
+   // signers
+   objArrayOop signers() const              { return _signers; }
+@@ -709,6 +718,7 @@
+   oop* adr_constants() const         { return (oop*)&this->_constants;}
+   oop* adr_class_loader() const      { return (oop*)&this->_class_loader;}
+   oop* adr_protection_domain() const { return (oop*)&this->_protection_domain;}
++  oop* adr_host_klass() const        { return (oop*)&this->_host_klass;}
+   oop* adr_signers() const           { return (oop*)&this->_signers;}
+   oop* adr_source_file_name() const  { return (oop*)&this->_source_file_name;}
+   oop* adr_source_debug_extension() const { return (oop*)&this->_source_debug_extension;}
+diff --git a/src/share/vm/oops/instanceKlassKlass.cpp b/src/share/vm/oops/instanceKlassKlass.cpp
+--- a/src/share/vm/oops/instanceKlassKlass.cpp
++++ b/src/share/vm/oops/instanceKlassKlass.cpp
+@@ -81,6 +81,7 @@
+   MarkSweep::mark_and_push(ik->adr_source_debug_extension());
+   MarkSweep::mark_and_push(ik->adr_inner_classes());
+   MarkSweep::mark_and_push(ik->adr_protection_domain());
++  MarkSweep::mark_and_push(ik->adr_host_klass());
+   MarkSweep::mark_and_push(ik->adr_signers());
+   MarkSweep::mark_and_push(ik->adr_generic_signature());
+   MarkSweep::mark_and_push(ik->adr_class_annotations());
+@@ -120,6 +121,7 @@
+   PSParallelCompact::mark_and_push(cm, ik->adr_source_debug_extension());
+   PSParallelCompact::mark_and_push(cm, ik->adr_inner_classes());
+   PSParallelCompact::mark_and_push(cm, ik->adr_protection_domain());
++  PSParallelCompact::mark_and_push(cm, ik->adr_host_klass());
+   PSParallelCompact::mark_and_push(cm, ik->adr_signers());
+   PSParallelCompact::mark_and_push(cm, ik->adr_generic_signature());
+   PSParallelCompact::mark_and_push(cm, ik->adr_class_annotations());
+@@ -159,6 +161,7 @@
+   blk->do_oop(ik->adr_constants());
+   blk->do_oop(ik->adr_class_loader());
+   blk->do_oop(ik->adr_protection_domain());
++  blk->do_oop(ik->adr_host_klass());
+   blk->do_oop(ik->adr_signers());
+   blk->do_oop(ik->adr_source_file_name());
+   blk->do_oop(ik->adr_source_debug_extension());
+@@ -211,6 +214,8 @@
+   if (mr.contains(adr)) blk->do_oop(adr);
+   adr = ik->adr_protection_domain();
+   if (mr.contains(adr)) blk->do_oop(adr);
++  adr = ik->adr_host_klass();
++  if (mr.contains(adr)) blk->do_oop(adr);
+   adr = ik->adr_signers();
+   if (mr.contains(adr)) blk->do_oop(adr);
+   adr = ik->adr_source_file_name();
+@@ -260,6 +265,7 @@
+   MarkSweep::adjust_pointer(ik->adr_constants());
+   MarkSweep::adjust_pointer(ik->adr_class_loader());
+   MarkSweep::adjust_pointer(ik->adr_protection_domain());
++  MarkSweep::adjust_pointer(ik->adr_host_klass());
+   MarkSweep::adjust_pointer(ik->adr_signers());
+   MarkSweep::adjust_pointer(ik->adr_source_file_name());
+   MarkSweep::adjust_pointer(ik->adr_source_debug_extension());
+@@ -295,6 +301,11 @@
+     pm->claim_or_forward_breadth(pd_addr);
+   }
+ 
++  oop* hk_addr = ik->adr_host_klass();
++  if (PSScavenge::should_scavenge(hk_addr)) {
++    pm->claim_or_forward_breadth(hk_addr);
++  }
++
+   oop* sg_addr = ik->adr_signers();
+   if (PSScavenge::should_scavenge(sg_addr)) {
+     pm->claim_or_forward_breadth(sg_addr);
+@@ -316,6 +327,11 @@
+   oop* pd_addr = ik->adr_protection_domain();
+   if (PSScavenge::should_scavenge(pd_addr)) {
+     pm->claim_or_forward_depth(pd_addr);
++  }
++
++  oop* hk_addr = ik->adr_host_klass();
++  if (PSScavenge::should_scavenge(hk_addr)) {
++    pm->claim_or_forward_depth(hk_addr);
+   }
+ 
+   oop* sg_addr = ik->adr_signers();
+@@ -421,6 +437,7 @@
+     ik->set_constants(NULL);
+     ik->set_class_loader(NULL);
+     ik->set_protection_domain(NULL);
++    ik->set_host_klass(NULL);
+     ik->set_signers(NULL);
+     ik->set_source_file_name(NULL);
+     ik->set_source_debug_extension(NULL);
+@@ -526,6 +543,7 @@
+   st->print(" - constants:         "); ik->constants()->print_value_on(st);         st->cr();
+   st->print(" - class loader:      "); ik->class_loader()->print_value_on(st);      st->cr();
+   st->print(" - protection domain: "); ik->protection_domain()->print_value_on(st); st->cr();
++  st->print(" - host class: ");        ik->host_klass()->print_value_on(st);        st->cr();
+   st->print(" - signers:           "); ik->signers()->print_value_on(st);           st->cr();
+   if (ik->source_file_name() != NULL) {
+     st->print(" - source file:       ");
+@@ -626,7 +644,7 @@
+     ik->_verify_count = Universe::verify_count();
+ #endif
+     // Verify that klass is present in SystemDictionary
+-    if (ik->is_loaded()) {
++    if (ik->is_loaded() && !ik->is_anonymous()) {
+       symbolHandle h_name (thread, ik->name());
+       Handle h_loader (thread, ik->class_loader());
+       Handle h_obj(thread, obj);
+@@ -764,6 +782,9 @@
+     if (ik->protection_domain() != NULL) {
+       guarantee(ik->protection_domain()->is_oop(),  "should be oop");
+     }
++    if (ik->host_klass() != NULL) {
++      guarantee(ik->host_klass()->is_oop(),  "should be oop");
++    }
+     if (ik->signers() != NULL) {
+       guarantee(ik->signers()->is_objArray(),       "should be obj array");
+     }
+diff --git a/src/share/vm/oops/klass.cpp b/src/share/vm/oops/klass.cpp
+--- a/src/share/vm/oops/klass.cpp
++++ b/src/share/vm/oops/klass.cpp
+@@ -478,6 +478,24 @@
+ 
+ 
+ const char* Klass::external_name() const {
++  if (oop_is_instance()) {
++    instanceKlass* ik = (instanceKlass*) this;
++    if (ik->is_anonymous()) {
++      assert(AnonymousClasses, "");
++      intptr_t hash = ik->java_mirror()->identity_hash();
++      char     hash_buf[40];
++      sprintf(hash_buf, "/" UINTX_FORMAT, (uintx)hash);
++      size_t   hash_len = strlen(hash_buf);
++
++      size_t result_len = name()->utf8_length();
++      char*  result     = NEW_RESOURCE_ARRAY(char, result_len + hash_len + 1);
++      name()->as_klass_external_name(result, (int) result_len + 1);
++      assert(strlen(result) == result_len, "");
++      strcpy(result + result_len, hash_buf);
++      assert(strlen(result) == result_len + hash_len, "");
++      return result;
++    }
++  }
+   return name()->as_klass_external_name();
+ }
+ 
+diff --git a/src/share/vm/prims/jvm.cpp b/src/share/vm/prims/jvm.cpp
+--- a/src/share/vm/prims/jvm.cpp
++++ b/src/share/vm/prims/jvm.cpp
+@@ -744,6 +744,7 @@
+ 
+ // common code for JVM_DefineClass() and JVM_DefineClassWithSource()
+ static jclass jvm_define_class_common(JNIEnv *env, const char *name, jobject loader, const jbyte *buf, jsize len, jobject pd, const char *source, TRAPS) {
++  if (source == NULL)  source = "__JVM_DefineClass__";
+ 
+   // Since exceptions can be thrown, class initialization can take place
+   // if name is NULL no check for class name in .class stream has to be made.
+@@ -782,7 +783,7 @@
+ JVM_ENTRY(jclass, JVM_DefineClass(JNIEnv *env, const char *name, jobject loader, const jbyte *buf, jsize len, jobject pd))
+   JVMWrapper2("JVM_DefineClass %s", name);
+ 
+-  return jvm_define_class_common(env, name, loader, buf, len, pd, "__JVM_DefineClass__", THREAD);
++  return jvm_define_class_common(env, name, loader, buf, len, pd, NULL, THREAD);
+ JVM_END
+ 
+ 
+diff --git a/src/share/vm/prims/jvm.h b/src/share/vm/prims/jvm.h
+--- a/src/share/vm/prims/jvm.h
++++ b/src/share/vm/prims/jvm.h
+@@ -421,6 +421,14 @@
+ JVM_DefineClassWithSource(JNIEnv *env, const char *name, jobject loader,
+                           const jbyte *buf, jsize len, jobject pd,
+                           const char *source);
++
++/* Define a class with a source (MLVM) */
++JNIEXPORT jclass JNICALL
++JVM_DefineClassWithCP(JNIEnv *env, const char *name, jobject loader,
++                      const jbyte *buf, jsize len, jobject pd,
++                      const char *source,
++                      // same args as JVM_DefineClassWithSource to this point
++                      jobjectArray constants);
+ 
+ /*
+  * Reflection support functions
+diff --git a/src/share/vm/prims/unsafe.cpp b/src/share/vm/prims/unsafe.cpp
+--- a/src/share/vm/prims/unsafe.cpp
++++ b/src/share/vm/prims/unsafe.cpp
+@@ -837,6 +837,163 @@
+   }
+ UNSAFE_END
+ 
++#define DAC_Args CLS"[B["OBJ
++// define a class but do not make it known to the class loader or system dictionary
++// - host_class:  supplies context for linkage, access control, protection domain, and class loader
++// - data:  bytes of a class file, a raw memory address (length gives the number of bytes)
++// - cp_patches:  where non-null entries exist, they replace corresponding CP entries in data
++
++// When you load an anonymous class U, it works as if you changed its name just before loading,
++// to a name that you will never use again.  Since the name is lost, no other class can directly
++// link to any member of U.  Just after U is loaded, the only way to use it is reflectively,
++// through java.lang.Class methods like Class.newInstance.
++
++// Access checks for linkage sites within U continue to follow the same rules as for named classes.
++// The package of an anonymous class is given by the package qualifier on the name under which it was loaded.
++// An anonymous class also has special privileges to access any member of its host class.
++// This is the main reason why this loading operation is unsafe.  The purpose of this is to
++// allow language implementations to simulate "open classes"; a host class in effect gets
++// new code when an anonymous class is loaded alongside it.  A less convenient but more
++// standard way to do this is with reflection, which can also be set to ignore access
++// restrictions.
++
++// Access into an anonymous class is possible only through reflection.  Therefore, there
++// are no special access rules for calling into an anonymous class.  The relaxed access
++// rule for the host class is applied in the opposite direction:  A host class reflectively
++// access one of its anonymous classes.
++
++// If you load the same bytecodes twice, you get two different classes.  You can reload
++// the same bytecodes with or without varying CP patches.
++
++// By using the CP patching array, you can have a new anonymous class U2 refer to an older one U1.
++// The bytecodes for U2 should refer to U1 by a symbolic name (doesn't matter what the name is).
++// The CONSTANT_Class entry for that name can be patched to refer directly to U1.
++
++// This allows, for example, U2 to use U1 as a superclass or super-interface, or as
++// an outer class (so that U2 is an anonymous inner class of anonymous U1).
++// It is not possible for a named class, or an older anonymous class, to refer by
++// name (via its CP) to a newer anonymous class.
++
++// CP patching may also be used to modify (i.e., hack) the names of methods, classes,
++// or type descriptors used in the loaded anonymous class.
++
++// Finally, CP patching may be used to introduce "live" objects into the constant pool,
++// instead of "dead" strings.  A compiled statement like println((Object)"hello") can
++// be changed to println(greeting), where greeting is an arbitrary object created before
++// the anonymous class is loaded.  This is useful in dynamic languages, in which
++// various kinds of metaobjects must be introduced as constants into bytecode.
++// Note the cast (Object), which tells the verifier to expect an arbitrary object,
++// not just a literal string.  For such ldc instructions, the verifier uses the
++// type Object instead of String, if the loaded constant is not in fact a String.
++
++static oop
++Unsafe_DefineAnonymousClass_impl(JNIEnv *env,
++                                 jclass host_class, jbyteArray data, jobjectArray cp_patches_jh,
++                                 HeapWord* *temp_alloc,
++                                 TRAPS) {
++
++  if (UsePerfData) {
++    ClassLoader::unsafe_defineClassCallCounter()->inc();
++  }
++
++  if (data == NULL) {
++    THROW_0(vmSymbols::java_lang_NullPointerException());
++  }
++
++  jint length = typeArrayOop(JNIHandles::resolve_non_null(data))->length();
++  jint word_length = (length + sizeof(HeapWord)-1) / sizeof(HeapWord);
++  HeapWord* body = NEW_C_HEAP_ARRAY(HeapWord, word_length);
++  if (body == NULL) {
++    THROW_0(vmSymbols::java_lang_OutOfMemoryError());
++  }
++
++  // caller responsible to free it:
++  (*temp_alloc) = body;
++
++  {
++    jbyte* array_base = typeArrayOop(JNIHandles::resolve_non_null(data))->byte_at_addr(0);
++    Copy::conjoint_words((HeapWord*) array_base, body, word_length);
++  }
++
++  u1* class_bytes = (u1*) body;
++  int class_bytes_length = (int) length;
++  if (class_bytes_length < 0)  class_bytes_length = 0;
++  if (class_bytes == NULL
++      || host_class == NULL
++      || length != class_bytes_length)
++    THROW_0(vmSymbols::java_lang_IllegalArgumentException());
++
++  objArrayHandle cp_patches_h;
++  if (cp_patches_jh != NULL) {
++    oop p = JNIHandles::resolve_non_null(cp_patches_jh);
++    if (!p->is_objArray())
++      THROW_0(vmSymbols::java_lang_IllegalArgumentException());
++    cp_patches_h = objArrayHandle(THREAD, (objArrayOop)p);
++  }
++
++  KlassHandle host_klass(THREAD, java_lang_Class::as_klassOop(JNIHandles::resolve_non_null(host_class)));
++  const char* host_source = host_klass->external_name();
++  Handle      host_loader(THREAD, host_klass->class_loader());
++  Handle      host_domain(THREAD, host_klass->protection_domain());
++
++  GrowableArray<Handle>* cp_patches = NULL;
++  if (cp_patches_h.not_null()) {
++    int alen = cp_patches_h->length();
++    for (int i = alen-1; i >= 0; i--) {
++      oop p = cp_patches_h->obj_at(i);
++      if (p != NULL) {
++        Handle patch(THREAD, p);
++        if (cp_patches == NULL)
++          cp_patches = new GrowableArray<Handle>(i+1, i+1, Handle());
++        cp_patches->at_put(i, patch);
++      }
++    }
++  }
++
++  ClassFileStream st(class_bytes, class_bytes_length, (char*) host_source);
++
++  instanceKlassHandle anon_klass;
++  {
++    symbolHandle no_class_name;
++    klassOop anonk = SystemDictionary::parse_stream(no_class_name,
++                                                    host_loader, host_domain,
++                                                    &st, host_klass, cp_patches,
++                                                    CHECK_NULL);
++    if (anonk == NULL)  return NULL;
++    anon_klass = instanceKlassHandle(THREAD, anonk);
++  }
++
++  // let caller initialize it as needed...
++
++  return anon_klass->java_mirror();
++}
++
++UNSAFE_ENTRY(jclass, Unsafe_DefineAnonymousClass(JNIEnv *env, jobject unsafe, jclass host_class, jbyteArray data, jobjectArray cp_patches_jh))
++{
++  UnsafeWrapper("Unsafe_DefineAnonymousClass");
++  ResourceMark rm(THREAD);
++
++  HeapWord* temp_alloc = NULL;
++
++  jobject res_jh = NULL;
++
++  { oop res_oop = Unsafe_DefineAnonymousClass_impl(env,
++                                                   host_class, data, cp_patches_jh,
++                                                   &temp_alloc, THREAD);
++    if (res_oop != NULL)
++      res_jh = JNIHandles::make_local(env, res_oop);
++  }
++
++  // try/finally clause:
++  if (temp_alloc != NULL) {
++    FREE_C_HEAP_ARRAY(HeapWord, temp_alloc);
++  }
++
++  return (jclass) res_jh;
++}
++UNSAFE_END
++
++
+ 
+ UNSAFE_ENTRY(void, Unsafe_MonitorEnter(JNIEnv *env, jobject unsafe, jobject jobj))
+   UnsafeWrapper("Unsafe_MonitorEnter");
+@@ -1292,6 +1449,9 @@
+     {CC"copyMemory",         CC"("ADR ADR"J)V",          FN_PTR(Unsafe_CopyMemory)}
+ };
+ 
++JNINativeMethod anonk_methods[] = {
++    {CC"defineAnonymousClass", CC"("DAC_Args")"CLS,      FN_PTR(Unsafe_DefineAnonymousClass)},
++};
+ 
+ #undef CC
+ #undef FN_PTR
+@@ -1354,6 +1514,15 @@
+         }
+       }
+     }
++    if (AnonymousClasses) {
++      env->RegisterNatives(unsafecls, anonk_methods, sizeof(anonk_methods)/sizeof(JNINativeMethod));
++      if (env->ExceptionOccurred()) {
++        if (PrintMiscellaneous && (Verbose || WizardMode)) {
++          tty->print_cr("Warning:  SDK 1.7 Unsafe.defineClass (anonymous version) not found.");
++        }
++        env->ExceptionClear();
++      }
++    }
+     int status = env->RegisterNatives(unsafecls, methods, sizeof(methods)/sizeof(JNINativeMethod));
+     if (env->ExceptionOccurred()) {
+       if (PrintMiscellaneous && (Verbose || WizardMode)) {
+diff --git a/src/share/vm/runtime/globals.hpp b/src/share/vm/runtime/globals.hpp
+--- a/src/share/vm/runtime/globals.hpp
++++ b/src/share/vm/runtime/globals.hpp
+@@ -3230,6 +3230,9 @@
+           "Skip assert() and verify() which page-in unwanted shared "       \
+           "objects. ")                                                      \
+                                                                             \
++  product(bool, AnonymousClasses, false,                                    \
++          "support sun.misc.Unsafe.defineAnonymousClass")                   \
++                                                                            \
+   product(bool, TaggedStackInterpreter, false,                              \
+           "Insert tags in interpreter execution stack for oopmap generaion")\
+                                                                             \
+diff --git a/src/share/vm/runtime/reflection.cpp b/src/share/vm/runtime/reflection.cpp
+--- a/src/share/vm/runtime/reflection.cpp
++++ b/src/share/vm/runtime/reflection.cpp
+@@ -456,10 +456,32 @@
+   return can_relax_access_check_for(current_class, new_class, classloader_only);
+ }
+ 
++static bool under_host_klass(instanceKlass* ik, klassOop host_klass) {
++  DEBUG_ONLY(int inf_loop_check = 1000 * 1000 * 1000);
++  for (;;) {
++    klassOop hc = (klassOop) ik->host_klass();
++    if (hc == NULL)        return false;
++    if (hc == host_klass)  return true;
++    ik = instanceKlass::cast(hc);
++
++    // There's no way to make a host class loop short of patching memory.
++    // Therefore there cannot be a loop here unles there's another bug.
++    // Still, let's check for it.
++    assert(--inf_loop_check > 0, "no host_klass loop");
++  }
++}
++
+ bool Reflection::can_relax_access_check_for(
+     klassOop accessor, klassOop accessee, bool classloader_only) {
+   instanceKlass* accessor_ik = instanceKlass::cast(accessor);
+   instanceKlass* accessee_ik  = instanceKlass::cast(accessee);
++
++  // If either is on the other's host_klass chain, access is OK,
++  // because one is inside the other.
++  if (under_host_klass(accessor_ik, accessee) ||
++      under_host_klass(accessee_ik, accessor))
++    return true;
++
+   if (RelaxAccessControlCheck ||
+       (accessor_ik->major_version() < JAVA_1_5_VERSION &&
+        accessee_ik->major_version() < JAVA_1_5_VERSION)) {
+diff --git a/src/share/vm/utilities/constantTag.hpp b/src/share/vm/utilities/constantTag.hpp
+--- a/src/share/vm/utilities/constantTag.hpp
++++ b/src/share/vm/utilities/constantTag.hpp
+@@ -71,6 +71,7 @@
+   bool is_string_index() const      { return _tag == JVM_CONSTANT_StringIndex; }
+ 
+   bool is_klass_reference() const   { return is_klass_index() || is_unresolved_klass(); }
++  bool is_klass_or_reference() const{ return is_klass() || is_klass_reference(); }
+   bool is_field_or_method() const   { return is_field() || is_method() || is_interface_method(); }
+   bool is_symbol() const            { return is_utf8(); }
+ 

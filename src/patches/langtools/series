@@ -1,0 +1,20 @@
+# base = cfc480e5499d in http://hg.openjdk.java.net/bsd-port/bsd-port/langtools [2011-01-22]
+
+compile-error-tweak.patch       #+compile-error-tweak
+netbeans-project.patch          #+netbeans-project
+dump-stack-on-error.patch       #+dump-stack-on-error
+
+# pushed to jdk7/tl; will be deleted when they get to bsd-port:
+indy-notrans-7028405.patch      #-/meth #+cfc480e5499d
+
+# non-pushed files are under review or development, or merely experimental:
+meth.patch                      #-/meth #+cfc480e5499d
+indy-bsm-6964498.patch          #-/meth #+cfc480e5499d #-/experimental #-testable
+indy-args-6984311.patch         #-/indy #+cfc480e5499d #-/experimental #-testable
+meth-ldc-6939203.patch          #-/meth #+cfc480e5499d #-/experimental #-testable
+meth-ver-6949040.patch          #-/meth #+cfc480e5499d #-testable
+meth-anno.patch                 #-/meth #+cfc480e5499d #-/experimental #-testable
+
+# Keep these separate, for debugging and review:
+dyncast.patch   #+dyncast       #-/dyncast
+tailc.patch     #+tailc         #-/tailc

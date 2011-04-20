@@ -1,0 +1,115 @@
+diff --git a/src/share/classes/com/sun/java/util/jar/pack/Code.java b/src/share/classes/com/sun/java/util/jar/pack/Code.java
+--- a/src/share/classes/com/sun/java/util/jar/pack/Code.java
++++ b/src/share/classes/com/sun/java/util/jar/pack/Code.java
+@@ -237,6 +237,14 @@
+         int fillp = 0;
+         for (Instruction i = instructionAt(0); i != null; i = i.next()) {
+             map[fillp++] = i.getPC();
++            if (i.getBC() == _invokedynamic) {
++                // This guy gets coded as three escape segments, since
++                // the unpacker cannot be expected to know about 2009
++                // changes to the bytecode format.
++                // See writeByteCodes.writeByteCodes for the encoding.
++                map[fillp++] = i.getPC() + 1;  // the escref for the cp index
++                map[fillp++] = i.getPC() + 3;  // a 2-byte escbyte sequence
++            }
+         }
+         // Make it byte[], short[], or int[] according to the max BCI.
+         insnMap = allocateInstructionMap(map, fillp);
+diff --git a/src/share/classes/com/sun/java/util/jar/pack/Constants.java b/src/share/classes/com/sun/java/util/jar/pack/Constants.java
+--- a/src/share/classes/com/sun/java/util/jar/pack/Constants.java
++++ b/src/share/classes/com/sun/java/util/jar/pack/Constants.java
+@@ -350,7 +350,7 @@
+         _invokespecial        = 183, // 0xb7
+         _invokestatic         = 184, // 0xb8
+         _invokeinterface      = 185, // 0xb9
+-        _xxxunusedxxx         = 186, // 0xba
++        _invokedynamic        = 186, // 0xba
+         _new                  = 187, // 0xbb
+         _newarray             = 188, // 0xbc
+         _anewarray            = 189, // 0xbd
+diff --git a/src/share/classes/com/sun/java/util/jar/pack/Instruction.java b/src/share/classes/com/sun/java/util/jar/pack/Instruction.java
+--- a/src/share/classes/com/sun/java/util/jar/pack/Instruction.java
++++ b/src/share/classes/com/sun/java/util/jar/pack/Instruction.java
+@@ -484,7 +484,7 @@
+         def("bkf", _getstatic, _putfield);              // pack kf (base=Field)
+         def("bkm", _invokevirtual, _invokestatic);      // pack kn (base=Method)
+         def("bkixx", _invokeinterface);         // pack ki (base=IMethod), omit xx
+-        def("", _xxxunusedxxx);
++        def("bknxx", _invokedynamic);
+         def("bkc", _new);                               // pack kc
+         def("bx", _newarray);
+         def("bkc", _anewarray);                 // pack kc
+@@ -499,7 +499,6 @@
+             //System.out.println(i+": l="+BC_LENGTH[0][i]+" i="+BC_INDEX[0][i]);
+             //assert(BC_LENGTH[0][i] != -1);
+             if (BC_LENGTH[0][i] == -1) {
+-                assert(i == _xxxunusedxxx);
+                 continue;  // unknown opcode
+             }
+ 
+@@ -527,7 +526,7 @@
+   "if_icmpne if_icmplt if_icmpge if_icmpgt if_icmple if_acmpeq if_acmpne "+
+   "goto jsr ret tableswitch lookupswitch ireturn lreturn freturn dreturn "+
+   "areturn return getstatic putstatic getfield putfield invokevirtual "+
+-  "invokespecial invokestatic invokeinterface xxxunusedxxx new newarray "+
++  "invokespecial invokestatic invokeinterface invokedynamic new newarray "+
+   "anewarray arraylength athrow checkcast instanceof monitorenter "+
+   "monitorexit wide multianewarray ifnull ifnonnull goto_w jsr_w ";
+         for (int bc = 0; names.length() > 0; bc++) {
+@@ -606,6 +605,7 @@
+                     case 'f': tag = CONSTANT_Fieldref; break;
+                     case 'm': tag = CONSTANT_Methodref; break;
+                     case 'i': tag = CONSTANT_InterfaceMethodref; break;
++                    case 'n': tag = CONSTANT_NameandType; break;
+                 }
+                 assert(tag != CONSTANT_None);
+             } else if (index > 0 && length == 2) {
+diff --git a/src/share/classes/com/sun/java/util/jar/pack/PackageWriter.java b/src/share/classes/com/sun/java/util/jar/pack/PackageWriter.java
+--- a/src/share/classes/com/sun/java/util/jar/pack/PackageWriter.java
++++ b/src/share/classes/com/sun/java/util/jar/pack/PackageWriter.java
+@@ -1330,9 +1330,7 @@
+             // %%% Add a stress mode which issues _ref/_byte_escape.
+             if (verbose > 3)  Utils.log.fine(i.toString());
+ 
+-            if (i.isNonstandard()
+-                && (!p200.getBoolean(Utils.COM_PREFIX+"invokedynamic")
+-                    || i.getBC() != _xxxunusedxxx)) {
++            if (i.isNonstandard()) {
+                 // Crash and burn with a complaint if there are funny
+                 // bytecodes in this class file.
+                 String complaint = code.getMethod()
+@@ -1433,19 +1431,29 @@
+             }
+ 
+             switch (bc) {
+-            case _xxxunusedxxx:  // %%% pretend this is invokedynamic
++            case _invokedynamic:
+                 {
+-                    i.setNonstandardLength(3);
+-                    int refx = i.getShortAt(1);
+-                    Entry ref = (refx == 0)? null: curCPMap[refx];
++                    // The following code has to be kept consistent
++                    // with Code.getInsnMap.  To the unpacker,
++                    // the escape sequences look like three
++                    // instructions.
++                    assert(i.getLength() == 5);
+                     // transmit the opcode, carefully:
+                     bc_codes.putByte(_byte_escape);
+                     bc_escsize.putInt(1);     // one byte of opcode
+                     bc_escbyte.putByte(bc);   // the opcode
+                     // transmit the CP reference, carefully:
++                    Entry ref = i.getCPRef(curCPMap);
+                     bc_codes.putByte(_ref_escape);
+                     bc_escrefsize.putInt(2);  // two bytes of ref
+                     bc_escref.putRef(ref);    // the ref
++                    // transmit the padding bytes:
++                    assert(i.getConstant() == i.getShortAt(3));
++                    bc_codes.putByte(_byte_escape);
++                    bc_escsize.putInt(2);
++                    bc_escbyte.putByte(i.getByteAt(3));
++                    bc_escbyte.putByte(i.getByteAt(4));
++                    // total: 10 tokens in 4 bands; should compress well
+                     continue;
+                 }
+             }

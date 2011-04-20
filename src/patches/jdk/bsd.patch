@@ -1,0 +1,12 @@
+diff --git a/make/common/Defs-bsd.gmk b/make/common/Defs-bsd.gmk
+--- a/make/common/Defs-bsd.gmk
++++ b/make/common/Defs-bsd.gmk
+@@ -297,7 +297,7 @@
+ # the library itself should not.
+ #
+ VM_NAME         = server
+-JVMLIB          = -Xlinker -rpath -Xlinker $(LIBDIR)/$(LIBARCH)/$(VM_NAME) -L$(LIBDIR)/$(LIBARCH)/$(VM_NAME) -ljvm
++JVMLIB          = -L$(LIBDIR)/$(LIBARCH)/$(VM_NAME) -ljvm
+ JAVALIB         = -ljava $(JVMLIB)
+ 
+ #

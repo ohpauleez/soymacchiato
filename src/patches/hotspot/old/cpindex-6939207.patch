@@ -1,0 +1,3313 @@
+6939207: refactor constant pool index processing
+Summary: Factored cleanup of instruction decode which prepares for enhanced ldc semantics.
+Reviewed-by: twisti
+
+Factor instruction field accesses into the wrapper class 'Bytecode'.
+In the debug build, check all operand sizes and byte orders.
+Rigorously check byte order against opcode when loading operands from bytecode streams.
+Make it clear and rigorously checkable which operands are CP cache indexes.
+Distinguish "raw" instruction parsing (for verifier & rewriter) from regular parsing.
+----
+Rename references to "big indexes", "giant indexes", "short" and "long" fields, etc.,
+  to use byte counts (get_index_u2, get_constant_u1, etc.).
+Perform all operand byte swapping at the point where instruction fields are decoded.
+Remove the byte swapping hack from constantPoolOop, but perform extra checking in debug mode.
+Performance note:  Nearly all operand format checks are performed in debug mode only.
+----
+Minor related cleanups to bytecode instruction streams:
+ - Regularize and simplify treatment of wide prefixes.
+ - Delete unused methods and classes from Bytecode and bytecode streams.
+----
+In the template interpreter, give "byte_no" values symbolic names "f1_byte" and "f2_byte".
+Make the new code "f1_oop" stand for a CP cache entry for which a non-NULL oop denotes linkage.
+(This is currently only for an invokedynamic CallSite but will extend to ldc of MH constants.)
+
+diff --git a/src/cpu/sparc/vm/interp_masm_sparc.cpp b/src/cpu/sparc/vm/interp_masm_sparc.cpp
+--- a/src/cpu/sparc/vm/interp_masm_sparc.cpp
++++ b/src/cpu/sparc/vm/interp_masm_sparc.cpp
+@@ -815,25 +815,30 @@
+ 
+ 
+ void InterpreterMacroAssembler::get_index_at_bcp(Register Rtmp, Register Rdst,
+-                                                 int bcp_offset, bool giant_index) {
++                                                 int bcp_offset, size_t index_size) {
+   assert(bcp_offset > 0, "bcp is still pointing to start of bytecode");
+-  if (!giant_index) {
++  if (index_size == sizeof(u2)) {
+     get_2_byte_integer_at_bcp(bcp_offset, Rtmp, Rdst, Unsigned);
+-  } else {
++  } else if (index_size == sizeof(u4)) {
+     assert(EnableInvokeDynamic, "giant index used only for EnableInvokeDynamic");
+     get_4_byte_integer_at_bcp(bcp_offset, Rtmp, Rdst);
+     assert(constantPoolCacheOopDesc::decode_secondary_index(~123) == 123, "else change next line");
+     xor3(Rdst, -1, Rdst);  // convert to plain index
++  } else if (index_size == sizeof(u1)) {
++    assert(EnableMethodHandles, "tiny index used only for EnableMethodHandles");
++    ldub(Lbcp, bcp_offset, Rdst);
++  } else {
++    ShouldNotReachHere();
+   }
+ }
+ 
+ 
+ void InterpreterMacroAssembler::get_cache_and_index_at_bcp(Register cache, Register tmp,
+-                                                           int bcp_offset, bool giant_index) {
++                                                           int bcp_offset, size_t index_size) {
+   assert(bcp_offset > 0, "bcp is still pointing to start of bytecode");
+   assert_different_registers(cache, tmp);
+   assert_not_delayed();
+-  get_index_at_bcp(cache, tmp, bcp_offset, giant_index);
++  get_index_at_bcp(cache, tmp, bcp_offset, index_size);
+   // convert from field index to ConstantPoolCacheEntry index and from
+   // word index to byte offset
+   sll(tmp, exact_log2(in_words(ConstantPoolCacheEntry::size()) * BytesPerWord), tmp);
+@@ -842,12 +847,15 @@
+ 
+ 
+ void InterpreterMacroAssembler::get_cache_entry_pointer_at_bcp(Register cache, Register tmp,
+-                                                               int bcp_offset, bool giant_index) {
++                                                               int bcp_offset, size_t index_size) {
+   assert(bcp_offset > 0, "bcp is still pointing to start of bytecode");
+   assert_different_registers(cache, tmp);
+   assert_not_delayed();
+-  assert(!giant_index,"NYI");
+-  get_2_byte_integer_at_bcp(bcp_offset, cache, tmp, Unsigned);
++  if (index_size == sizeof(u2)) {
++    get_2_byte_integer_at_bcp(bcp_offset, cache, tmp, Unsigned);
++  } else {
++    ShouldNotReachHere();  // other sizes not supported here
++  }
+               // convert from field index to ConstantPoolCacheEntry index
+               // and from word index to byte offset
+   sll(tmp, exact_log2(in_words(ConstantPoolCacheEntry::size()) * BytesPerWord), tmp);
+diff --git a/src/cpu/sparc/vm/interp_masm_sparc.hpp b/src/cpu/sparc/vm/interp_masm_sparc.hpp
+--- a/src/cpu/sparc/vm/interp_masm_sparc.hpp
++++ b/src/cpu/sparc/vm/interp_masm_sparc.hpp
+@@ -191,9 +191,9 @@
+                                   Register   Rdst,
+                                   setCCOrNot should_set_CC = dont_set_CC );
+ 
+-  void get_cache_and_index_at_bcp(Register cache, Register tmp, int bcp_offset, bool giant_index = false);
+-  void get_cache_entry_pointer_at_bcp(Register cache, Register tmp, int bcp_offset, bool giant_index = false);
+-  void get_index_at_bcp(Register Rtmp, Register Rdst, int bcp_offset, bool giant_index = false);
++  void get_cache_and_index_at_bcp(Register cache, Register tmp, int bcp_offset, size_t index_size = sizeof(u2));
++  void get_cache_entry_pointer_at_bcp(Register cache, Register tmp, int bcp_offset, size_t index_size = sizeof(u2));
++  void get_index_at_bcp(Register Rtmp, Register Rdst, int bcp_offset, size_t index_size = sizeof(u2));
+ 
+ 
+   // common code
+diff --git a/src/cpu/sparc/vm/templateInterpreter_sparc.cpp b/src/cpu/sparc/vm/templateInterpreter_sparc.cpp
+--- a/src/cpu/sparc/vm/templateInterpreter_sparc.cpp
++++ b/src/cpu/sparc/vm/templateInterpreter_sparc.cpp
+@@ -204,7 +204,7 @@
+   // out of the main line of code...
+   if (EnableInvokeDynamic) {
+     __ bind(L_giant_index);
+-    __ get_cache_and_index_at_bcp(cache, G1_scratch, 1, true);
++    __ get_cache_and_index_at_bcp(cache, G1_scratch, 1, sizeof(u4));
+     __ ba(false, L_got_cache);
+     __ delayed()->nop();
+   }
+diff --git a/src/cpu/sparc/vm/templateTable_sparc.cpp b/src/cpu/sparc/vm/templateTable_sparc.cpp
+--- a/src/cpu/sparc/vm/templateTable_sparc.cpp
++++ b/src/cpu/sparc/vm/templateTable_sparc.cpp
+@@ -1961,23 +1961,30 @@
+ }
+ 
+ // ----------------------------------------------------------------------------
+-void TemplateTable::resolve_cache_and_index(int byte_no, Register Rcache, Register index) {
+-  assert(byte_no == 1 || byte_no == 2, "byte_no out of range");
+-  bool is_invokedynamic = (bytecode() == Bytecodes::_invokedynamic);
+-
++void TemplateTable::resolve_cache_and_index(int byte_no,
++                                            Register result,
++                                            Register Rcache,
++                                            Register index,
++                                            size_t index_size) {
+   // Depends on cpCacheOop layout!
+-  const int shift_count = (1 + byte_no)*BitsPerByte;
+   Label resolved;
+ 
+-  __ get_cache_and_index_at_bcp(Rcache, index, 1, is_invokedynamic);
+-  if (is_invokedynamic) {
+-    // We are resolved if the f1 field contains a non-null CallSite object.
++  __ get_cache_and_index_at_bcp(Rcache, index, 1, index_size);
++  if (byte_no == f1_oop) {
++    // We are resolved if the f1 field contains a non-null object (CallSite, etc.)
++    // This kind of CP cache entry does not need to match the flags byte, because
++    // there is a 1-1 relation between bytecode type and CP entry type.
++    assert_different_registers(result, Rcache);
+     __ ld_ptr(Rcache, constantPoolCacheOopDesc::base_offset() +
+-              ConstantPoolCacheEntry::f1_offset(), Lbyte_code);
+-    __ tst(Lbyte_code);
++              ConstantPoolCacheEntry::f1_offset(), result);
++    __ tst(result);
+     __ br(Assembler::notEqual, false, Assembler::pt, resolved);
+     __ delayed()->set((int)bytecode(), O1);
+   } else {
++    assert(byte_no == f1_byte || byte_no == f2_byte, "byte_no out of range");
++    assert(result == noreg, "");  //else change code for setting result
++    const int shift_count = (1 + byte_no)*BitsPerByte;
++
+     __ ld_ptr(Rcache, constantPoolCacheOopDesc::base_offset() +
+               ConstantPoolCacheEntry::indices_offset(), Lbyte_code);
+ 
+@@ -2004,7 +2011,10 @@
+   // first time invocation - must resolve first
+   __ call_VM(noreg, entry, O1);
+   // Update registers with resolved info
+-  __ get_cache_and_index_at_bcp(Rcache, index, 1, is_invokedynamic);
++  __ get_cache_and_index_at_bcp(Rcache, index, 1, index_size);
++  if (result != noreg)
++    __ ld_ptr(Rcache, constantPoolCacheOopDesc::base_offset() +
++              ConstantPoolCacheEntry::f1_offset(), result);
+   __ bind(resolved);
+ }
+ 
+@@ -2013,7 +2023,8 @@
+                                                Register Ritable_index,
+                                                Register Rflags,
+                                                bool is_invokevirtual,
+-                                               bool is_invokevfinal) {
++                                               bool is_invokevfinal,
++                                               bool is_invokedynamic) {
+   // Uses both G3_scratch and G4_scratch
+   Register Rcache = G3_scratch;
+   Register Rscratch = G4_scratch;
+@@ -2037,11 +2048,15 @@
+ 
+   if (is_invokevfinal) {
+     __ get_cache_and_index_at_bcp(Rcache, Rscratch, 1);
++    __ ld_ptr(Rcache, method_offset, Rmethod);
++  } else if (byte_no == f1_oop) {
++    // Resolved f1_oop goes directly into 'method' register.
++    resolve_cache_and_index(byte_no, Rmethod, Rcache, Rscratch, sizeof(u4));
+   } else {
+-    resolve_cache_and_index(byte_no, Rcache, Rscratch);
++    resolve_cache_and_index(byte_no, noreg, Rcache, Rscratch, sizeof(u2));
++    __ ld_ptr(Rcache, method_offset, Rmethod);
+   }
+ 
+-  __ ld_ptr(Rcache, method_offset, Rmethod);
+   if (Ritable_index != noreg) {
+     __ ld_ptr(Rcache, index_offset, Ritable_index);
+   }
+@@ -2122,7 +2137,7 @@
+   Register Rflags = G1_scratch;
+   ByteSize cp_base_offset = constantPoolCacheOopDesc::base_offset();
+ 
+-  resolve_cache_and_index(byte_no, Rcache, index);
++  resolve_cache_and_index(byte_no, noreg, Rcache, index, sizeof(u2));
+   jvmti_post_field_access(Rcache, index, is_static, false);
+   load_field_cp_cache_entry(Rclass, Rcache, index, Roffset, Rflags, is_static);
+ 
+@@ -2487,7 +2502,7 @@
+   Register Rflags = G1_scratch;
+   ByteSize cp_base_offset = constantPoolCacheOopDesc::base_offset();
+ 
+-  resolve_cache_and_index(byte_no, Rcache, index);
++  resolve_cache_and_index(byte_no, noreg, Rcache, index, sizeof(u2));
+   jvmti_post_field_mod(Rcache, index, is_static);
+   load_field_cp_cache_entry(Rclass, Rcache, index, Roffset, Rflags, is_static);
+ 
+@@ -2828,6 +2843,7 @@
+ 
+ void TemplateTable::invokevirtual(int byte_no) {
+   transition(vtos, vtos);
++  assert(byte_no == f2_byte, "use this argument");
+ 
+   Register Rscratch = G3_scratch;
+   Register Rtemp = G4_scratch;
+@@ -2835,7 +2851,7 @@
+   Register Rrecv = G5_method;
+   Label notFinal;
+ 
+-  load_invoke_cp_cache_entry(byte_no, G5_method, noreg, Rret, true);
++  load_invoke_cp_cache_entry(byte_no, G5_method, noreg, Rret, true, false, false);
+   __ mov(SP, O5_savedSP); // record SP that we wanted the callee to restore
+ 
+   // Check for vfinal
+@@ -2876,9 +2892,10 @@
+ 
+ void TemplateTable::fast_invokevfinal(int byte_no) {
+   transition(vtos, vtos);
++  assert(byte_no == f2_byte, "use this argument");
+ 
+   load_invoke_cp_cache_entry(byte_no, G5_method, noreg, Lscratch, true,
+-                             /*is_invokevfinal*/true);
++                             /*is_invokevfinal*/true, false);
+   __ mov(SP, O5_savedSP); // record SP that we wanted the callee to restore
+   invokevfinal_helper(G3_scratch, Lscratch);
+ }
+@@ -2913,12 +2930,13 @@
+ 
+ void TemplateTable::invokespecial(int byte_no) {
+   transition(vtos, vtos);
++  assert(byte_no == f1_byte, "use this argument");
+ 
+   Register Rscratch = G3_scratch;
+   Register Rtemp = G4_scratch;
+   Register Rret = Lscratch;
+ 
+-  load_invoke_cp_cache_entry(byte_no, G5_method, noreg, Rret, false);
++  load_invoke_cp_cache_entry(byte_no, G5_method, noreg, Rret, /*virtual*/ false, false, false);
+   __ mov(SP, O5_savedSP); // record SP that we wanted the callee to restore
+ 
+   __ verify_oop(G5_method);
+@@ -2946,12 +2964,13 @@
+ 
+ void TemplateTable::invokestatic(int byte_no) {
+   transition(vtos, vtos);
++  assert(byte_no == f1_byte, "use this argument");
+ 
+   Register Rscratch = G3_scratch;
+   Register Rtemp = G4_scratch;
+   Register Rret = Lscratch;
+ 
+-  load_invoke_cp_cache_entry(byte_no, G5_method, noreg, Rret, false);
++  load_invoke_cp_cache_entry(byte_no, G5_method, noreg, Rret, /*virtual*/ false, false, false);
+   __ mov(SP, O5_savedSP); // record SP that we wanted the callee to restore
+ 
+   __ verify_oop(G5_method);
+@@ -3004,6 +3023,7 @@
+ 
+ void TemplateTable::invokeinterface(int byte_no) {
+   transition(vtos, vtos);
++  assert(byte_no == f1_byte, "use this argument");
+ 
+   Register Rscratch = G4_scratch;
+   Register Rret = G3_scratch;
+@@ -3013,7 +3033,7 @@
+   Register Rflags = O1;
+   assert_different_registers(Rscratch, G5_method);
+ 
+-  load_invoke_cp_cache_entry(byte_no, Rinterface, Rindex, Rflags, false);
++  load_invoke_cp_cache_entry(byte_no, Rinterface, Rindex, Rflags, /*virtual*/ false, false, false);
+   __ mov(SP, O5_savedSP); // record SP that we wanted the callee to restore
+ 
+   // get receiver
+@@ -3130,6 +3150,7 @@
+ 
+ void TemplateTable::invokedynamic(int byte_no) {
+   transition(vtos, vtos);
++  assert(byte_no == f1_oop, "use this argument");
+ 
+   if (!EnableInvokeDynamic) {
+     // We should not encounter this bytecode if !EnableInvokeDynamic.
+@@ -3144,17 +3165,18 @@
+ 
+   // G5: CallSite object (f1)
+   // XX: unused (f2)
+-  // G3: receiver address
+   // XX: flags (unused)
+ 
+-  Register Rscratch = G3_scratch;
+-  Register Rtemp = G1_scratch;  // XXX can I use G1 here?  At least it's used in invokeinterface...
+-  Register Rret = Lscratch;
++  Register G5_callsite = G5_method;
++  Register Rscratch    = G3_scratch;
++  Register Rtemp       = G1_scratch;
++  Register Rret        = Lscratch;
+ 
+-  load_invoke_cp_cache_entry(byte_no, G5_method, noreg, Rret, false);
++  load_invoke_cp_cache_entry(byte_no, G5_callsite, noreg, Rret,
++                             /*virtual*/ false, /*vfinal*/ false, /*indy*/ true);
+   __ mov(SP, O5_savedSP);  // record SP that we wanted the callee to restore
+ 
+-  __ verify_oop(G5_method);
++  __ verify_oop(G5_callsite);
+ 
+   // profile this call
+   __ profile_call(O4);
+@@ -3168,7 +3190,7 @@
+   __ sll(Rret, LogBytesPerWord, Rret);
+   __ ld_ptr(Rtemp, Rret, Rret);  // get return address
+ 
+-  __ ld_ptr(G5_method, __ delayed_value(java_dyn_CallSite::target_offset_in_bytes, Rscratch), G3_method_handle);
++  __ ld_ptr(G5_callsite, __ delayed_value(java_dyn_CallSite::target_offset_in_bytes, Rscratch), G3_method_handle);
+   __ null_check(G3_method_handle);
+ 
+   // Adjust Rret first so Llast_SP can be same as Rret
+diff --git a/src/cpu/x86/vm/interp_masm_x86_32.cpp b/src/cpu/x86/vm/interp_masm_x86_32.cpp
+--- a/src/cpu/x86/vm/interp_masm_x86_32.cpp
++++ b/src/cpu/x86/vm/interp_masm_x86_32.cpp
+@@ -189,11 +189,11 @@
+ }
+ 
+ 
+-void InterpreterMacroAssembler::get_cache_index_at_bcp(Register reg, int bcp_offset, bool giant_index) {
++void InterpreterMacroAssembler::get_cache_index_at_bcp(Register reg, int bcp_offset, size_t index_size) {
+   assert(bcp_offset > 0, "bcp is still pointing to start of bytecode");
+-  if (!giant_index) {
++  if (index_size == sizeof(u2)) {
+     load_unsigned_short(reg, Address(rsi, bcp_offset));
+-  } else {
++  } else if (index_size == sizeof(u4)) {
+     assert(EnableInvokeDynamic, "giant index used only for EnableInvokeDynamic");
+     movl(reg, Address(rsi, bcp_offset));
+     // Check if the secondary index definition is still ~x, otherwise
+@@ -201,14 +201,19 @@
+     // plain index.
+     assert(constantPoolCacheOopDesc::decode_secondary_index(~123) == 123, "else change next line");
+     notl(reg);  // convert to plain index
++  } else if (index_size == sizeof(u1)) {
++    assert(EnableMethodHandles, "tiny index used only for EnableMethodHandles");
++    load_unsigned_byte(reg, Address(rsi, bcp_offset));
++  } else {
++    ShouldNotReachHere();
+   }
+ }
+ 
+ 
+ void InterpreterMacroAssembler::get_cache_and_index_at_bcp(Register cache, Register index,
+-                                                           int bcp_offset, bool giant_index) {
++                                                           int bcp_offset, size_t index_size) {
+   assert(cache != index, "must use different registers");
+-  get_cache_index_at_bcp(index, bcp_offset, giant_index);
++  get_cache_index_at_bcp(index, bcp_offset, index_size);
+   movptr(cache, Address(rbp, frame::interpreter_frame_cache_offset * wordSize));
+   assert(sizeof(ConstantPoolCacheEntry) == 4*wordSize, "adjust code below");
+   shlptr(index, 2); // convert from field index to ConstantPoolCacheEntry index
+@@ -216,9 +221,9 @@
+ 
+ 
+ void InterpreterMacroAssembler::get_cache_entry_pointer_at_bcp(Register cache, Register tmp,
+-                                                               int bcp_offset, bool giant_index) {
++                                                               int bcp_offset, size_t index_size) {
+   assert(cache != tmp, "must use different register");
+-  get_cache_index_at_bcp(tmp, bcp_offset, giant_index);
++  get_cache_index_at_bcp(tmp, bcp_offset, index_size);
+   assert(sizeof(ConstantPoolCacheEntry) == 4*wordSize, "adjust code below");
+                                // convert from field index to ConstantPoolCacheEntry index
+                                // and from word offset to byte offset
+diff --git a/src/cpu/x86/vm/interp_masm_x86_32.hpp b/src/cpu/x86/vm/interp_masm_x86_32.hpp
+--- a/src/cpu/x86/vm/interp_masm_x86_32.hpp
++++ b/src/cpu/x86/vm/interp_masm_x86_32.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -76,9 +76,9 @@
+   void get_cpool_and_tags(Register cpool, Register tags)   { get_constant_pool(cpool); movptr(tags, Address(cpool, constantPoolOopDesc::tags_offset_in_bytes()));
+   }
+   void get_unsigned_2_byte_index_at_bcp(Register reg, int bcp_offset);
+-  void get_cache_and_index_at_bcp(Register cache, Register index, int bcp_offset, bool giant_index = false);
+-  void get_cache_entry_pointer_at_bcp(Register cache, Register tmp, int bcp_offset, bool giant_index = false);
+-  void get_cache_index_at_bcp(Register index, int bcp_offset, bool giant_index = false);
++  void get_cache_and_index_at_bcp(Register cache, Register index, int bcp_offset, size_t index_size = sizeof(u2));
++  void get_cache_entry_pointer_at_bcp(Register cache, Register tmp, int bcp_offset, size_t index_size = sizeof(u2));
++  void get_cache_index_at_bcp(Register index, int bcp_offset, size_t index_size = sizeof(u2));
+ 
+   // Expression stack
+   void f2ieee();                                           // truncate ftos to 32bits
+diff --git a/src/cpu/x86/vm/interp_masm_x86_64.cpp b/src/cpu/x86/vm/interp_masm_x86_64.cpp
+--- a/src/cpu/x86/vm/interp_masm_x86_64.cpp
++++ b/src/cpu/x86/vm/interp_masm_x86_64.cpp
+@@ -187,11 +187,11 @@
+ 
+ void InterpreterMacroAssembler::get_cache_index_at_bcp(Register index,
+                                                        int bcp_offset,
+-                                                       bool giant_index) {
++                                                       size_t index_size) {
+   assert(bcp_offset > 0, "bcp is still pointing to start of bytecode");
+-  if (!giant_index) {
++  if (index_size == sizeof(u2)) {
+     load_unsigned_short(index, Address(r13, bcp_offset));
+-  } else {
++  } else if (index_size == sizeof(u4)) {
+     assert(EnableInvokeDynamic, "giant index used only for EnableInvokeDynamic");
+     movl(index, Address(r13, bcp_offset));
+     // Check if the secondary index definition is still ~x, otherwise
+@@ -199,6 +199,11 @@
+     // plain index.
+     assert(constantPoolCacheOopDesc::decode_secondary_index(~123) == 123, "else change next line");
+     notl(index);  // convert to plain index
++  } else if (index_size == sizeof(u1)) {
++    assert(EnableMethodHandles, "tiny index used only for EnableMethodHandles");
++    load_unsigned_byte(index, Address(r13, bcp_offset));
++  } else {
++    ShouldNotReachHere();
+   }
+ }
+ 
+@@ -206,9 +211,9 @@
+ void InterpreterMacroAssembler::get_cache_and_index_at_bcp(Register cache,
+                                                            Register index,
+                                                            int bcp_offset,
+-                                                           bool giant_index) {
++                                                           size_t index_size) {
+   assert(cache != index, "must use different registers");
+-  get_cache_index_at_bcp(index, bcp_offset, giant_index);
++  get_cache_index_at_bcp(index, bcp_offset, index_size);
+   movptr(cache, Address(rbp, frame::interpreter_frame_cache_offset * wordSize));
+   assert(sizeof(ConstantPoolCacheEntry) == 4 * wordSize, "adjust code below");
+   // convert from field index to ConstantPoolCacheEntry index
+@@ -219,9 +224,9 @@
+ void InterpreterMacroAssembler::get_cache_entry_pointer_at_bcp(Register cache,
+                                                                Register tmp,
+                                                                int bcp_offset,
+-                                                               bool giant_index) {
++                                                               size_t index_size) {
+   assert(cache != tmp, "must use different register");
+-  get_cache_index_at_bcp(tmp, bcp_offset, giant_index);
++  get_cache_index_at_bcp(tmp, bcp_offset, index_size);
+   assert(sizeof(ConstantPoolCacheEntry) == 4 * wordSize, "adjust code below");
+   // convert from field index to ConstantPoolCacheEntry index
+   // and from word offset to byte offset
+diff --git a/src/cpu/x86/vm/interp_masm_x86_64.hpp b/src/cpu/x86/vm/interp_masm_x86_64.hpp
+--- a/src/cpu/x86/vm/interp_masm_x86_64.hpp
++++ b/src/cpu/x86/vm/interp_masm_x86_64.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2003-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 2003-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -95,10 +95,10 @@
+ 
+   void get_unsigned_2_byte_index_at_bcp(Register reg, int bcp_offset);
+   void get_cache_and_index_at_bcp(Register cache, Register index,
+-                                  int bcp_offset, bool giant_index = false);
++                                  int bcp_offset, size_t index_size = sizeof(u2));
+   void get_cache_entry_pointer_at_bcp(Register cache, Register tmp,
+-                                      int bcp_offset, bool giant_index = false);
+-  void get_cache_index_at_bcp(Register index, int bcp_offset, bool giant_index = false);
++                                      int bcp_offset, size_t index_size = sizeof(u2));
++  void get_cache_index_at_bcp(Register index, int bcp_offset, size_t index_size = sizeof(u2));
+ 
+ 
+   void pop_ptr(Register r = rax);
+diff --git a/src/cpu/x86/vm/templateInterpreter_x86_32.cpp b/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
+--- a/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
++++ b/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
+@@ -214,7 +214,7 @@
+     __ cmpb(Address(rsi, 0), Bytecodes::_invokedynamic);
+     __ jcc(Assembler::equal, L_giant_index);
+   }
+-  __ get_cache_and_index_at_bcp(rbx, rcx, 1, false);
++  __ get_cache_and_index_at_bcp(rbx, rcx, 1, sizeof(u2));
+   __ bind(L_got_cache);
+   __ movl(rbx, Address(rbx, rcx,
+                     Address::times_ptr, constantPoolCacheOopDesc::base_offset() +
+@@ -226,7 +226,7 @@
+   // out of the main line of code...
+   if (EnableInvokeDynamic) {
+     __ bind(L_giant_index);
+-    __ get_cache_and_index_at_bcp(rbx, rcx, 1, true);
++    __ get_cache_and_index_at_bcp(rbx, rcx, 1, sizeof(u4));
+     __ jmp(L_got_cache);
+   }
+ 
+diff --git a/src/cpu/x86/vm/templateInterpreter_x86_64.cpp b/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
+--- a/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
++++ b/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
+@@ -192,7 +192,7 @@
+     __ cmpb(Address(r13, 0), Bytecodes::_invokedynamic);
+     __ jcc(Assembler::equal, L_giant_index);
+   }
+-  __ get_cache_and_index_at_bcp(rbx, rcx, 1, false);
++  __ get_cache_and_index_at_bcp(rbx, rcx, 1, sizeof(u2));
+   __ bind(L_got_cache);
+   __ movl(rbx, Address(rbx, rcx,
+                        Address::times_ptr,
+@@ -206,7 +206,7 @@
+   // out of the main line of code...
+   if (EnableInvokeDynamic) {
+     __ bind(L_giant_index);
+-    __ get_cache_and_index_at_bcp(rbx, rcx, 1, true);
++    __ get_cache_and_index_at_bcp(rbx, rcx, 1, sizeof(u4));
+     __ jmp(L_got_cache);
+   }
+ 
+diff --git a/src/cpu/x86/vm/templateTable_x86_32.cpp b/src/cpu/x86/vm/templateTable_x86_32.cpp
+--- a/src/cpu/x86/vm/templateTable_x86_32.cpp
++++ b/src/cpu/x86/vm/templateTable_x86_32.cpp
+@@ -2103,22 +2103,29 @@
+   __ membar(order_constraint);
+ }
+ 
+-void TemplateTable::resolve_cache_and_index(int byte_no, Register Rcache, Register index) {
+-  assert(byte_no == 1 || byte_no == 2, "byte_no out of range");
+-  bool is_invokedynamic = (bytecode() == Bytecodes::_invokedynamic);
+-
++void TemplateTable::resolve_cache_and_index(int byte_no,
++                                            Register result,
++                                            Register Rcache,
++                                            Register index,
++                                            size_t index_size) {
+   Register temp = rbx;
+ 
+-  assert_different_registers(Rcache, index, temp);
++  assert_different_registers(result, Rcache, index, temp);
+ 
+-  const int shift_count = (1 + byte_no)*BitsPerByte;
+   Label resolved;
+-  __ get_cache_and_index_at_bcp(Rcache, index, 1, is_invokedynamic);
+-  if (is_invokedynamic) {
+-    // we are resolved if the f1 field contains a non-null CallSite object
+-    __ cmpptr(Address(Rcache, index, Address::times_ptr, constantPoolCacheOopDesc::base_offset() + ConstantPoolCacheEntry::f1_offset()), (int32_t) NULL_WORD);
++  __ get_cache_and_index_at_bcp(Rcache, index, 1, index_size);
++  if (byte_no == f1_oop) {
++    // We are resolved if the f1 field contains a non-null object (CallSite, etc.)
++    // This kind of CP cache entry does not need to match the flags byte, because
++    // there is a 1-1 relation between bytecode type and CP entry type.
++    assert(result != noreg, ""); //else do cmpptr(Address(...), (int32_t) NULL_WORD)
++    __ movptr(result, Address(Rcache, index, Address::times_ptr, constantPoolCacheOopDesc::base_offset() + ConstantPoolCacheEntry::f1_offset()));
++    __ testptr(result, result);
+     __ jcc(Assembler::notEqual, resolved);
+   } else {
++    assert(byte_no == f1_byte || byte_no == f2_byte, "byte_no out of range");
++    assert(result == noreg, "");  //else change code for setting result
++    const int shift_count = (1 + byte_no)*BitsPerByte;
+     __ movl(temp, Address(Rcache, index, Address::times_4, constantPoolCacheOopDesc::base_offset() + ConstantPoolCacheEntry::indices_offset()));
+     __ shrl(temp, shift_count);
+     // have we resolved this bytecode?
+@@ -2144,7 +2151,9 @@
+   __ movl(temp, (int)bytecode());
+   __ call_VM(noreg, entry, temp);
+   // Update registers with resolved info
+-  __ get_cache_and_index_at_bcp(Rcache, index, 1, is_invokedynamic);
++  __ get_cache_and_index_at_bcp(Rcache, index, 1, index_size);
++  if (result != noreg)
++    __ movptr(result, Address(Rcache, index, Address::times_ptr, constantPoolCacheOopDesc::base_offset() + ConstantPoolCacheEntry::f1_offset()));
+   __ bind(resolved);
+ }
+ 
+@@ -2178,7 +2187,8 @@
+                                                Register itable_index,
+                                                Register flags,
+                                                bool is_invokevirtual,
+-                                               bool is_invokevfinal /*unused*/) {
++                                               bool is_invokevfinal /*unused*/,
++                                               bool is_invokedynamic) {
+   // setup registers
+   const Register cache = rcx;
+   const Register index = rdx;
+@@ -2200,13 +2210,18 @@
+   const int index_offset = in_bytes(constantPoolCacheOopDesc::base_offset() +
+                                     ConstantPoolCacheEntry::f2_offset());
+ 
+-  resolve_cache_and_index(byte_no, cache, index);
+-
+-  __ movptr(method, Address(cache, index, Address::times_ptr, method_offset));
++  if (byte_no == f1_oop) {
++    // Resolved f1_oop goes directly into 'method' register.
++    assert(is_invokedynamic, "");
++    resolve_cache_and_index(byte_no, method, cache, index, sizeof(u4));
++  } else {
++    resolve_cache_and_index(byte_no, noreg, cache, index, sizeof(u2));
++    __ movptr(method, Address(cache, index, Address::times_ptr, method_offset));
++  }
+   if (itable_index != noreg) {
+     __ movptr(itable_index, Address(cache, index, Address::times_ptr, index_offset));
+   }
+-  __ movl(flags , Address(cache, index, Address::times_ptr, flags_offset ));
++  __ movl(flags, Address(cache, index, Address::times_ptr, flags_offset));
+ }
+ 
+ 
+@@ -2260,7 +2275,7 @@
+   const Register off   = rbx;
+   const Register flags = rax;
+ 
+-  resolve_cache_and_index(byte_no, cache, index);
++  resolve_cache_and_index(byte_no, noreg, cache, index, sizeof(u2));
+   jvmti_post_field_access(cache, index, is_static, false);
+   load_field_cp_cache_entry(obj, cache, index, off, flags, is_static);
+ 
+@@ -2469,7 +2484,7 @@
+   const Register off   = rbx;
+   const Register flags = rax;
+ 
+-  resolve_cache_and_index(byte_no, cache, index);
++  resolve_cache_and_index(byte_no, noreg, cache, index, sizeof(u2));
+   jvmti_post_field_mod(cache, index, is_static);
+   load_field_cp_cache_entry(obj, cache, index, off, flags, is_static);
+ 
+@@ -2907,10 +2922,11 @@
+   // save 'interpreter return address'
+   __ save_bcp();
+ 
+-  load_invoke_cp_cache_entry(byte_no, method, index, flags, is_invokevirtual);
++  load_invoke_cp_cache_entry(byte_no, method, index, flags, is_invokevirtual, false, is_invokedynamic);
+ 
+   // load receiver if needed (note: no return address pushed yet)
+   if (load_receiver) {
++    assert(!is_invokedynamic, "");
+     __ movl(recv, flags);
+     __ andl(recv, 0xFF);
+     // recv count is 0 based?
+@@ -3002,6 +3018,7 @@
+ 
+ void TemplateTable::invokevirtual(int byte_no) {
+   transition(vtos, vtos);
++  assert(byte_no == f2_byte, "use this argument");
+   prepare_invoke(rbx, noreg, byte_no);
+ 
+   // rbx,: index
+@@ -3014,6 +3031,7 @@
+ 
+ void TemplateTable::invokespecial(int byte_no) {
+   transition(vtos, vtos);
++  assert(byte_no == f1_byte, "use this argument");
+   prepare_invoke(rbx, noreg, byte_no);
+   // do the call
+   __ verify_oop(rbx);
+@@ -3024,6 +3042,7 @@
+ 
+ void TemplateTable::invokestatic(int byte_no) {
+   transition(vtos, vtos);
++  assert(byte_no == f1_byte, "use this argument");
+   prepare_invoke(rbx, noreg, byte_no);
+   // do the call
+   __ verify_oop(rbx);
+@@ -3034,12 +3053,14 @@
+ 
+ void TemplateTable::fast_invokevfinal(int byte_no) {
+   transition(vtos, vtos);
++  assert(byte_no == f2_byte, "use this argument");
+   __ stop("fast_invokevfinal not used on x86");
+ }
+ 
+ 
+ void TemplateTable::invokeinterface(int byte_no) {
+   transition(vtos, vtos);
++  assert(byte_no == f1_byte, "use this argument");
+   prepare_invoke(rax, rbx, byte_no);
+ 
+   // rax,: Interface
+@@ -3128,11 +3149,11 @@
+     return;
+   }
+ 
++  assert(byte_no == f1_oop, "use this argument");
+   prepare_invoke(rax, rbx, byte_no);
+ 
+   // rax: CallSite object (f1)
+   // rbx: unused (f2)
+-  // rcx: receiver address
+   // rdx: flags (unused)
+ 
+   if (ProfileInterpreter) {
+diff --git a/src/cpu/x86/vm/templateTable_x86_64.cpp b/src/cpu/x86/vm/templateTable_x86_64.cpp
+--- a/src/cpu/x86/vm/templateTable_x86_64.cpp
++++ b/src/cpu/x86/vm/templateTable_x86_64.cpp
+@@ -2051,21 +2051,28 @@
+   }
+ }
+ 
+-void TemplateTable::resolve_cache_and_index(int byte_no, Register Rcache, Register index) {
+-  assert(byte_no == 1 || byte_no == 2, "byte_no out of range");
+-  bool is_invokedynamic = (bytecode() == Bytecodes::_invokedynamic);
++void TemplateTable::resolve_cache_and_index(int byte_no,
++                                            Register result,
++                                            Register Rcache,
++                                            Register index,
++                                            size_t index_size) {
++  const Register temp = rbx;
++  assert_different_registers(result, Rcache, index, temp);
+ 
+-  const Register temp = rbx;
+-  assert_different_registers(Rcache, index, temp);
+-
+-  const int shift_count = (1 + byte_no) * BitsPerByte;
+   Label resolved;
+-  __ get_cache_and_index_at_bcp(Rcache, index, 1, is_invokedynamic);
+-  if (is_invokedynamic) {
+-    // we are resolved if the f1 field contains a non-null CallSite object
+-    __ cmpptr(Address(Rcache, index, Address::times_ptr, constantPoolCacheOopDesc::base_offset() + ConstantPoolCacheEntry::f1_offset()), (int32_t) NULL_WORD);
++  __ get_cache_and_index_at_bcp(Rcache, index, 1, index_size);
++  if (byte_no == f1_oop) {
++    // We are resolved if the f1 field contains a non-null object (CallSite, etc.)
++    // This kind of CP cache entry does not need to match the flags byte, because
++    // there is a 1-1 relation between bytecode type and CP entry type.
++    assert(result != noreg, ""); //else do cmpptr(Address(...), (int32_t) NULL_WORD)
++    __ movptr(result, Address(Rcache, index, Address::times_ptr, constantPoolCacheOopDesc::base_offset() + ConstantPoolCacheEntry::f1_offset()));
++    __ testptr(result, result);
+     __ jcc(Assembler::notEqual, resolved);
+   } else {
++    assert(byte_no == f1_byte || byte_no == f2_byte, "byte_no out of range");
++    assert(result == noreg, "");  //else change code for setting result
++    const int shift_count = (1 + byte_no) * BitsPerByte;
+     __ movl(temp, Address(Rcache, index, Address::times_ptr, constantPoolCacheOopDesc::base_offset() + ConstantPoolCacheEntry::indices_offset()));
+     __ shrl(temp, shift_count);
+     // have we resolved this bytecode?
+@@ -2100,7 +2107,9 @@
+   __ call_VM(noreg, entry, temp);
+ 
+   // Update registers with resolved info
+-  __ get_cache_and_index_at_bcp(Rcache, index, 1, is_invokedynamic);
++  __ get_cache_and_index_at_bcp(Rcache, index, 1, index_size);
++  if (result != noreg)
++    __ movptr(result, Address(Rcache, index, Address::times_ptr, constantPoolCacheOopDesc::base_offset() + ConstantPoolCacheEntry::f1_offset()));
+   __ bind(resolved);
+ }
+ 
+@@ -2136,7 +2145,8 @@
+                                                Register itable_index,
+                                                Register flags,
+                                                bool is_invokevirtual,
+-                                               bool is_invokevfinal /*unused*/) {
++                                               bool is_invokevfinal, /*unused*/
++                                               bool is_invokedynamic) {
+   // setup registers
+   const Register cache = rcx;
+   const Register index = rdx;
+@@ -2156,15 +2166,18 @@
+   const int index_offset = in_bytes(constantPoolCacheOopDesc::base_offset() +
+                                     ConstantPoolCacheEntry::f2_offset());
+ 
+-  resolve_cache_and_index(byte_no, cache, index);
+-
+-  assert(wordSize == 8, "adjust code below");
+-  __ movptr(method, Address(cache, index, Address::times_8, method_offset));
++  if (byte_no == f1_oop) {
++    // Resolved f1_oop goes directly into 'method' register.
++    assert(is_invokedynamic, "");
++    resolve_cache_and_index(byte_no, method, cache, index, sizeof(u4));
++  } else {
++    resolve_cache_and_index(byte_no, noreg, cache, index, sizeof(u2));
++    __ movptr(method, Address(cache, index, Address::times_ptr, method_offset));
++  }
+   if (itable_index != noreg) {
+-    __ movptr(itable_index,
+-            Address(cache, index, Address::times_8, index_offset));
++    __ movptr(itable_index, Address(cache, index, Address::times_ptr, index_offset));
+   }
+-  __ movl(flags , Address(cache, index, Address::times_8, flags_offset));
++  __ movl(flags, Address(cache, index, Address::times_ptr, flags_offset));
+ }
+ 
+ 
+@@ -2223,7 +2236,7 @@
+   const Register flags = rax;
+   const Register bc = c_rarg3; // uses same reg as obj, so don't mix them
+ 
+-  resolve_cache_and_index(byte_no, cache, index);
++  resolve_cache_and_index(byte_no, noreg, cache, index, sizeof(u2));
+   jvmti_post_field_access(cache, index, is_static, false);
+   load_field_cp_cache_entry(obj, cache, index, off, flags, is_static);
+ 
+@@ -2426,7 +2439,7 @@
+   const Register flags = rax;
+   const Register bc    = c_rarg3;
+ 
+-  resolve_cache_and_index(byte_no, cache, index);
++  resolve_cache_and_index(byte_no, noreg, cache, index, sizeof(u2));
+   jvmti_post_field_mod(cache, index, is_static);
+   load_field_cp_cache_entry(obj, cache, index, off, flags, is_static);
+ 
+@@ -2852,10 +2865,11 @@
+   // save 'interpreter return address'
+   __ save_bcp();
+ 
+-  load_invoke_cp_cache_entry(byte_no, method, index, flags, is_invokevirtual);
++  load_invoke_cp_cache_entry(byte_no, method, index, flags, is_invokevirtual, false, is_invokedynamic);
+ 
+   // load receiver if needed (note: no return address pushed yet)
+   if (load_receiver) {
++    assert(!is_invokedynamic, "");
+     __ movl(recv, flags);
+     __ andl(recv, 0xFF);
+     if (TaggedStackInterpreter) __ shll(recv, 1);  // index*2
+@@ -2952,6 +2966,7 @@
+ 
+ void TemplateTable::invokevirtual(int byte_no) {
+   transition(vtos, vtos);
++  assert(byte_no == f2_byte, "use this argument");
+   prepare_invoke(rbx, noreg, byte_no);
+ 
+   // rbx: index
+@@ -2964,6 +2979,7 @@
+ 
+ void TemplateTable::invokespecial(int byte_no) {
+   transition(vtos, vtos);
++  assert(byte_no == f1_byte, "use this argument");
+   prepare_invoke(rbx, noreg, byte_no);
+   // do the call
+   __ verify_oop(rbx);
+@@ -2974,6 +2990,7 @@
+ 
+ void TemplateTable::invokestatic(int byte_no) {
+   transition(vtos, vtos);
++  assert(byte_no == f1_byte, "use this argument");
+   prepare_invoke(rbx, noreg, byte_no);
+   // do the call
+   __ verify_oop(rbx);
+@@ -2983,11 +3000,13 @@
+ 
+ void TemplateTable::fast_invokevfinal(int byte_no) {
+   transition(vtos, vtos);
++  assert(byte_no == f2_byte, "use this argument");
+   __ stop("fast_invokevfinal not used on amd64");
+ }
+ 
+ void TemplateTable::invokeinterface(int byte_no) {
+   transition(vtos, vtos);
++  assert(byte_no == f1_byte, "use this argument");
+   prepare_invoke(rax, rbx, byte_no);
+ 
+   // rax: Interface
+@@ -3065,6 +3084,7 @@
+ 
+ void TemplateTable::invokedynamic(int byte_no) {
+   transition(vtos, vtos);
++  assert(byte_no == f1_oop, "use this argument");
+ 
+   if (!EnableInvokeDynamic) {
+     // We should not encounter this bytecode if !EnableInvokeDynamic.
+@@ -3077,6 +3097,7 @@
+     return;
+   }
+ 
++  assert(byte_no == f1_oop, "use this argument");
+   prepare_invoke(rax, rbx, byte_no);
+ 
+   // rax: CallSite object (f1)
+diff --git a/src/share/vm/c1/c1_GraphBuilder.cpp b/src/share/vm/c1/c1_GraphBuilder.cpp
+--- a/src/share/vm/c1/c1_GraphBuilder.cpp
++++ b/src/share/vm/c1/c1_GraphBuilder.cpp
+@@ -2438,13 +2438,13 @@
+       case Bytecodes::_invokestatic   : // fall through
+       case Bytecodes::_invokedynamic  : // fall through
+       case Bytecodes::_invokeinterface: invoke(code); break;
+-      case Bytecodes::_new            : new_instance(s.get_index_big()); break;
++      case Bytecodes::_new            : new_instance(s.get_index_u2()); break;
+       case Bytecodes::_newarray       : new_type_array(); break;
+       case Bytecodes::_anewarray      : new_object_array(); break;
+       case Bytecodes::_arraylength    : ipush(append(new ArrayLength(apop(), lock_stack()))); break;
+       case Bytecodes::_athrow         : throw_op(s.cur_bci()); break;
+-      case Bytecodes::_checkcast      : check_cast(s.get_index_big()); break;
+-      case Bytecodes::_instanceof     : instance_of(s.get_index_big()); break;
++      case Bytecodes::_checkcast      : check_cast(s.get_index_u2()); break;
++      case Bytecodes::_instanceof     : instance_of(s.get_index_u2()); break;
+       // Note: we do not have special handling for the monitorenter bytecode if DeoptC1 && DeoptOnAsyncException
+       case Bytecodes::_monitorenter   : monitorenter(apop(), s.cur_bci()); break;
+       case Bytecodes::_monitorexit    : monitorexit (apop(), s.cur_bci()); break;
+diff --git a/src/share/vm/ci/ciStreams.cpp b/src/share/vm/ci/ciStreams.cpp
+--- a/src/share/vm/ci/ciStreams.cpp
++++ b/src/share/vm/ci/ciStreams.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -81,27 +81,21 @@
+ // providing accessors for constant pool items.
+ 
+ // ------------------------------------------------------------------
+-// ciBytecodeStream::wide
+-//
+-// Special handling for the wide bytcode
+-Bytecodes::Code ciBytecodeStream::wide()
+-{
+-  // Get following bytecode; do not return wide
+-  Bytecodes::Code bc = (Bytecodes::Code)_pc[1];
+-  _pc += 2;                     // Skip both bytecodes
+-  _pc += 2;                     // Skip index always
+-  if( bc == Bytecodes::_iinc )
+-    _pc += 2;                   // Skip optional constant
+-  _was_wide = _pc;              // Flag last wide bytecode found
+-  return bc;
+-}
+-
+-// ------------------------------------------------------------------
+-// ciBytecodeStream::table
++// ciBytecodeStream::next_wide_or_table
+ //
+ // Special handling for switch ops
+-Bytecodes::Code ciBytecodeStream::table( Bytecodes::Code bc ) {
+-  switch( bc ) {                // Check for special bytecode handling
++Bytecodes::Code ciBytecodeStream::next_wide_or_table(Bytecodes::Code bc) {
++  switch (bc) {                // Check for special bytecode handling
++  case Bytecodes::_wide:
++    // Special handling for the wide bytcode
++    // Get following bytecode; do not return wide
++    assert(Bytecodes::Code(_pc[0]) == Bytecodes::_wide, "");
++    bc = Bytecodes::java_code(_raw_bc = (Bytecodes::Code)_pc[1]);
++    assert(Bytecodes::wide_length_for(bc) > 2, "must make progress");
++    _pc += Bytecodes::wide_length_for(bc);
++    _was_wide = _pc;              // Flag last wide bytecode found
++    assert(is_wide(), "accessor works right");
++    break;
+ 
+   case Bytecodes::_lookupswitch:
+     _pc++;                      // Skip wide bytecode
+@@ -164,7 +158,7 @@
+ int ciBytecodeStream::get_klass_index() const {
+   switch(cur_bc()) {
+   case Bytecodes::_ldc:
+-    return get_index();
++    return get_index_u1();
+   case Bytecodes::_ldc_w:
+   case Bytecodes::_ldc2_w:
+   case Bytecodes::_checkcast:
+@@ -173,7 +167,7 @@
+   case Bytecodes::_multianewarray:
+   case Bytecodes::_new:
+   case Bytecodes::_newarray:
+-    return get_index_big();
++    return get_index_u2();
+   default:
+     ShouldNotReachHere();
+     return 0;
+@@ -199,10 +193,10 @@
+ int ciBytecodeStream::get_constant_index() const {
+   switch(cur_bc()) {
+   case Bytecodes::_ldc:
+-    return get_index();
++    return get_index_u1();
+   case Bytecodes::_ldc_w:
+   case Bytecodes::_ldc2_w:
+-    return get_index_big();
++    return get_index_u2();
+   default:
+     ShouldNotReachHere();
+     return 0;
+@@ -239,7 +233,7 @@
+          cur_bc() == Bytecodes::_putfield ||
+          cur_bc() == Bytecodes::_getstatic ||
+          cur_bc() == Bytecodes::_putstatic, "wrong bc");
+-  return get_index_big();
++  return get_index_u2_cpcache();
+ }
+ 
+ 
+@@ -319,7 +313,9 @@
+     ShouldNotReachHere();
+   }
+ #endif
+-  return get_index_int();
++  if (has_index_u4())
++    return get_index_u4();  // invokedynamic
++  return get_index_u2_cpcache();
+ }
+ 
+ // ------------------------------------------------------------------
+diff --git a/src/share/vm/ci/ciStreams.hpp b/src/share/vm/ci/ciStreams.hpp
+--- a/src/share/vm/ci/ciStreams.hpp
++++ b/src/share/vm/ci/ciStreams.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -31,15 +31,19 @@
+ // their original form during iteration.
+ class ciBytecodeStream : StackObj {
+ private:
+- // Handling for the weird bytecodes
+-  Bytecodes::Code wide();       // Handle wide bytecode
+-  Bytecodes::Code table(Bytecodes::Code); // Handle complicated inline table
++  // Handling for the weird bytecodes
++  Bytecodes::Code next_wide_or_table(Bytecodes::Code); // Handle _wide & complicated inline table
+ 
+   static Bytecodes::Code check_java(Bytecodes::Code c) {
+     assert(Bytecodes::is_java_code(c), "should not return _fast bytecodes");
+     return c;
+   }
+ 
++  static Bytecodes::Code check_defined(Bytecodes::Code c) {
++    assert(Bytecodes::is_defined(c), "");
++    return c;
++  }
++
+   ciMethod* _method;           // the method
+   ciInstanceKlass* _holder;
+   address _bc_start;            // Start of current bytecode for table
+@@ -50,11 +54,21 @@
+   address _end;                    // Past end of bytecodes
+   address _pc;                     // Current PC
+   Bytecodes::Code _bc;             // Current bytecode
++  Bytecodes::Code _raw_bc;         // Current bytecode, raw form
+ 
+   void reset( address base, unsigned int size ) {
+     _bc_start =_was_wide = 0;
+     _start = _pc = base; _end = base + size; }
+ 
++  void assert_wide(bool require_wide) const {
++    if (require_wide)
++         { assert(is_wide(),  "must be a wide instruction"); }
++    else { assert(!is_wide(), "must not be a wide instruction"); }
++  }
++
++  Bytecode* bytecode() const { return Bytecode_at(_bc_start); }
++  Bytecode* next_bytecode() const { return Bytecode_at(_pc); }
++
+ public:
+   // End-Of-Bytecodes
+   static Bytecodes::Code EOBC() {
+@@ -92,11 +106,12 @@
+   }
+ 
+   address cur_bcp() const       { return _bc_start; }  // Returns bcp to current instruction
+-  int next_bci() const          { return _pc -_start; }
++  int next_bci() const          { return _pc - _start; }
+   int cur_bci() const           { return _bc_start - _start; }
+   int instruction_size() const  { return _pc - _bc_start; }
+ 
+   Bytecodes::Code cur_bc() const{ return check_java(_bc); }
++  Bytecodes::Code cur_bc_raw() const { return check_defined(_raw_bc); }
+   Bytecodes::Code next_bc()     { return Bytecodes::java_code((Bytecodes::Code)* _pc); }
+ 
+   // Return current ByteCode and increment PC to next bytecode, skipping all
+@@ -109,85 +124,76 @@
+ 
+     // Fetch Java bytecode
+     // All rewritten bytecodes maintain the size of original bytecode.
+-    _bc = Bytecodes::java_code((Bytecodes::Code)*_pc);
++    _bc = Bytecodes::java_code(_raw_bc = (Bytecodes::Code)*_pc);
+     int csize = Bytecodes::length_for(_bc); // Expected size
+-
+-    if( _bc == Bytecodes::_wide ) {
+-      _bc=wide();                           // Handle wide bytecode
+-    } else if( csize == 0 ) {
+-      _bc=table(_bc);                       // Handle inline tables
+-    } else {
+-      _pc += csize;                         // Bump PC past bytecode
++    _pc += csize;                           // Bump PC past bytecode
++    if (csize == 0) {
++      _bc = next_wide_or_table(_bc);
+     }
+     return check_java(_bc);
+   }
+ 
+   bool is_wide() const { return ( _pc == _was_wide ); }
+ 
++  // Does this instruction contain an index which refes into the CP cache?
++  bool uses_cp_cache() const { return Bytecodes::uses_cp_cache(cur_bc_raw()); }
++
++  int get_index_u1() const {
++    return bytecode()->get_index_u1(cur_bc_raw());
++  }
++
+   // Get a byte index following this bytecode.
+   // If prefixed with a wide bytecode, get a wide index.
+   int get_index() const {
+-    assert_index_size(is_wide() ? 2 : 1);
+     return (_pc == _was_wide)   // was widened?
+-      ? Bytes::get_Java_u2(_bc_start+2) // yes, return wide index
+-      : _bc_start[1];           // no, return narrow index
++      ? get_index_u2(true)      // yes, return wide index
++      : get_index_u1();         // no, return narrow index
+   }
+ 
+-  // Get 2-byte index (getfield/putstatic/etc)
+-  int get_index_big() const {
+-    assert_index_size(2);
+-    return Bytes::get_Java_u2(_bc_start+1);
++  // Get 2-byte index (byte swapping depending on which bytecode)
++  int get_index_u2(bool is_wide = false) const {
++    return bytecode()->get_index_u2(cur_bc_raw(), is_wide);
+   }
+ 
+-  // Get 2-byte index (or 4-byte, for invokedynamic)
+-  int get_index_int() const {
+-    return has_giant_index() ? get_index_giant() : get_index_big();
++  // Get 2-byte index in native byte order.  (Rewriter::rewrite makes these.)
++  int get_index_u2_cpcache() const {
++    return bytecode()->get_index_u2_cpcache(cur_bc_raw());
+   }
+ 
+   // Get 4-byte index, for invokedynamic.
+-  int get_index_giant() const {
+-    assert_index_size(4);
+-    return Bytes::get_native_u4(_bc_start+1);
++  int get_index_u4() const {
++    return bytecode()->get_index_u4(cur_bc_raw());
+   }
+ 
+-  bool has_giant_index() const { return (cur_bc() == Bytecodes::_invokedynamic); }
++  bool has_index_u4() const {
++    return bytecode()->has_index_u4(cur_bc_raw());
++  }
+ 
+   // Get dimensions byte (multinewarray)
+   int get_dimensions() const { return *(unsigned char*)(_pc-1); }
+ 
+   // Sign-extended index byte/short, no widening
+-  int get_byte() const { return (int8_t)(_pc[-1]); }
+-  int get_short() const { return (int16_t)Bytes::get_Java_u2(_pc-2); }
+-  int get_long() const  { return (int32_t)Bytes::get_Java_u4(_pc-4); }
++  int get_constant_u1()                     const { return bytecode()->get_constant_u1(instruction_size()-1, cur_bc_raw()); }
++  int get_constant_u2(bool is_wide = false) const { return bytecode()->get_constant_u2(instruction_size()-2, cur_bc_raw(), is_wide); }
+ 
+   // Get a byte signed constant for "iinc".  Invalid for other bytecodes.
+   // If prefixed with a wide bytecode, get a wide constant
+-  int get_iinc_con() const {return (_pc==_was_wide) ? get_short() :get_byte();}
++  int get_iinc_con() const {return (_pc==_was_wide) ? (jshort) get_constant_u2(true) : (jbyte) get_constant_u1();}
+ 
+   // 2-byte branch offset from current pc
+-  int get_dest( ) const {
+-    assert( Bytecodes::length_at(_bc_start) == sizeof(jshort)+1,  "get_dest called with bad bytecode" );
+-    return _bc_start-_start + (short)Bytes::get_Java_u2(_pc-2);
++  int get_dest() const {
++    return cur_bci() + bytecode()->get_offset_s2(cur_bc_raw());
+   }
+ 
+   // 2-byte branch offset from next pc
+-  int next_get_dest( ) const {
+-    address next_bc_start = _pc;
+-    assert( _pc < _end, "" );
+-    Bytecodes::Code next_bc = (Bytecodes::Code)*_pc;
+-    assert( next_bc != Bytecodes::_wide, "");
+-    int next_csize = Bytecodes::length_for(next_bc);
+-    assert( next_csize != 0, "" );
+-    assert( next_bc <= Bytecodes::_jsr_w, "");
+-    address next_pc = _pc + next_csize;
+-    assert( Bytecodes::length_at(next_bc_start) == sizeof(jshort)+1,  "next_get_dest called with bad bytecode" );
+-    return next_bc_start-_start + (short)Bytes::get_Java_u2(next_pc-2);
++  int next_get_dest() const {
++    assert(_pc < _end, "");
++    return next_bci() + next_bytecode()->get_offset_s2(Bytecodes::_ifeq);
+   }
+ 
+   // 4-byte branch offset from current pc
+-  int get_far_dest( ) const {
+-    assert( Bytecodes::length_at(_bc_start) == sizeof(jint)+1, "dest4 called with bad bytecode" );
+-    return _bc_start-_start + (int)Bytes::get_Java_u4(_pc-4);
++  int get_far_dest() const {
++    return cur_bci() + bytecode()->get_offset_s4(cur_bc_raw());
+   }
+ 
+   // For a lookup or switch table, return target destination
+@@ -234,22 +240,6 @@
+ 
+   ciCPCache*  get_cpcache();
+   ciCallSite* get_call_site();
+-
+- private:
+-  void assert_index_size(int required_size) const {
+-#ifdef ASSERT
+-    int isize = instruction_size() - (is_wide() ? 1 : 0) - 1;
+-    if (isize == 2 &&  cur_bc() == Bytecodes::_iinc)
+-      isize = 1;
+-    else if (isize <= 2)
+-      ;                         // no change
+-    else if (has_giant_index())
+-      isize = 4;
+-    else
+-      isize = 2;
+-    assert(isize = required_size, "wrong index size");
+-#endif
+-  }
+ };
+ 
+ 
+diff --git a/src/share/vm/ci/ciTypeFlow.cpp b/src/share/vm/ci/ciTypeFlow.cpp
+--- a/src/share/vm/ci/ciTypeFlow.cpp
++++ b/src/share/vm/ci/ciTypeFlow.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2000-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 2000-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -2132,6 +2132,7 @@
+   if (!Bytecodes::can_trap(str.cur_bc()))  return false;
+ 
+   switch (str.cur_bc()) {
++    // %%% FIXME: ldc of Class can generate an exception
+     case Bytecodes::_ldc:
+     case Bytecodes::_ldc_w:
+     case Bytecodes::_ldc2_w:
+diff --git a/src/share/vm/classfile/verifier.cpp b/src/share/vm/classfile/verifier.cpp
+--- a/src/share/vm/classfile/verifier.cpp
++++ b/src/share/vm/classfile/verifier.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1998-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1998-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -410,13 +410,13 @@
+           no_control_flow = false; break;
+         case Bytecodes::_ldc :
+           verify_ldc(
+-            opcode, bcs.get_index(), &current_frame,
++            opcode, bcs.get_index_u1(), &current_frame,
+             cp, bci, CHECK_VERIFY(this));
+           no_control_flow = false; break;
+         case Bytecodes::_ldc_w :
+         case Bytecodes::_ldc2_w :
+           verify_ldc(
+-            opcode, bcs.get_index_big(), &current_frame,
++            opcode, bcs.get_index_u2(), &current_frame,
+             cp, bci, CHECK_VERIFY(this));
+           no_control_flow = false; break;
+         case Bytecodes::_iload :
+@@ -1182,7 +1182,7 @@
+           no_control_flow = false; break;
+         case Bytecodes::_new :
+         {
+-          index = bcs.get_index_big();
++          index = bcs.get_index_u2();
+           verify_cp_class_type(index, cp, CHECK_VERIFY(this));
+           VerificationType new_class_type =
+             cp_index_to_type(index, cp, CHECK_VERIFY(this));
+@@ -1202,7 +1202,7 @@
+           no_control_flow = false; break;
+         case Bytecodes::_anewarray :
+           verify_anewarray(
+-            bcs.get_index_big(), cp, &current_frame, CHECK_VERIFY(this));
++            bcs.get_index_u2(), cp, &current_frame, CHECK_VERIFY(this));
+           no_control_flow = false; break;
+         case Bytecodes::_arraylength :
+           type = current_frame.pop_stack(
+@@ -1215,7 +1215,7 @@
+           no_control_flow = false; break;
+         case Bytecodes::_checkcast :
+         {
+-          index = bcs.get_index_big();
++          index = bcs.get_index_u2();
+           verify_cp_class_type(index, cp, CHECK_VERIFY(this));
+           current_frame.pop_stack(
+             VerificationType::reference_check(), CHECK_VERIFY(this));
+@@ -1225,7 +1225,7 @@
+           no_control_flow = false; break;
+         }
+         case Bytecodes::_instanceof : {
+-          index = bcs.get_index_big();
++          index = bcs.get_index_u2();
+           verify_cp_class_type(index, cp, CHECK_VERIFY(this));
+           current_frame.pop_stack(
+             VerificationType::reference_check(), CHECK_VERIFY(this));
+@@ -1240,7 +1240,7 @@
+           no_control_flow = false; break;
+         case Bytecodes::_multianewarray :
+         {
+-          index = bcs.get_index_big();
++          index = bcs.get_index_u2();
+           u2 dim = *(bcs.bcp()+3);
+           verify_cp_class_type(index, cp, CHECK_VERIFY(this));
+           VerificationType new_array_type =
+@@ -1299,7 +1299,7 @@
+   while (!bcs.is_last_bytecode()) {
+     if (bcs.raw_next() != Bytecodes::_illegal) {
+       int bci = bcs.bci();
+-      if (bcs.code() == Bytecodes::_new) {
++      if (bcs.raw_code() == Bytecodes::_new) {
+         code_data[bci] = NEW_OFFSET;
+       } else {
+         code_data[bci] = BYTECODE_OFFSET;
+@@ -1654,7 +1654,7 @@
+   int keys, delta;
+   current_frame->pop_stack(
+     VerificationType::integer_type(), CHECK_VERIFY(this));
+-  if (bcs->code() == Bytecodes::_tableswitch) {
++  if (bcs->raw_code() == Bytecodes::_tableswitch) {
+     jint low = (jint)Bytes::get_Java_u4(aligned_bcp + jintSize);
+     jint high = (jint)Bytes::get_Java_u4(aligned_bcp + 2*jintSize);
+     if (low > high) {
+@@ -1710,7 +1710,7 @@
+                                               StackMapFrame* current_frame,
+                                               constantPoolHandle cp,
+                                               TRAPS) {
+-  u2 index = bcs->get_index_big();
++  u2 index = bcs->get_index_u2();
+   verify_cp_type(index, cp, 1 << JVM_CONSTANT_Fieldref, CHECK_VERIFY(this));
+ 
+   // Get field name and signature
+@@ -1750,7 +1750,7 @@
+     &sig_stream, field_type, CHECK_VERIFY(this));
+   u2 bci = bcs->bci();
+   bool is_assignable;
+-  switch (bcs->code()) {
++  switch (bcs->raw_code()) {
+     case Bytecodes::_getstatic: {
+       for (int i = 0; i < n; i++) {
+         current_frame->push_stack(field_type[i], CHECK_VERIFY(this));
+@@ -1870,7 +1870,7 @@
+         ref_class_type.name(), CHECK_VERIFY(this));
+       methodOop m = instanceKlass::cast(ref_klass)->uncached_lookup_method(
+         vmSymbols::object_initializer_name(),
+-        cp->signature_ref_at(bcs->get_index_big()));
++        cp->signature_ref_at(bcs->get_index_u2()));
+       instanceKlassHandle mh(THREAD, m->method_holder());
+       if (m->is_protected() && !mh->is_same_class_package(_klass())) {
+         bool assignable = current_type().is_assignable_from(
+@@ -1893,8 +1893,8 @@
+     bool *this_uninit, VerificationType return_type,
+     constantPoolHandle cp, TRAPS) {
+   // Make sure the constant pool item is the right type
+-  u2 index = bcs->get_index_big();
+-  Bytecodes::Code opcode = bcs->code();
++  u2 index = bcs->get_index_u2();
++  Bytecodes::Code opcode = bcs->raw_code();
+   unsigned int types = (opcode == Bytecodes::_invokeinterface
+                                 ? 1 << JVM_CONSTANT_InterfaceMethodref
+                       : opcode == Bytecodes::_invokedynamic
+diff --git a/src/share/vm/includeDB_core b/src/share/vm/includeDB_core
+--- a/src/share/vm/includeDB_core
++++ b/src/share/vm/includeDB_core
+@@ -827,6 +827,7 @@
+ ciStreams.cpp                           ciStreams.hpp
+ ciStreams.cpp                           ciUtilities.hpp
+ 
++ciStreams.hpp                           bytecode.hpp
+ ciStreams.hpp                           ciClassList.hpp
+ ciStreams.hpp                           ciExceptionHandler.hpp
+ ciStreams.hpp                           ciInstanceKlass.hpp
+diff --git a/src/share/vm/interpreter/bytecode.cpp b/src/share/vm/interpreter/bytecode.cpp
+--- a/src/share/vm/interpreter/bytecode.cpp
++++ b/src/share/vm/interpreter/bytecode.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -26,19 +26,12 @@
+ #include "incls/_bytecode.cpp.incl"
+ 
+ // Implementation of Bytecode
+-// Should eventually get rid of these functions and use ThisRelativeObj methods instead
+ 
+-void Bytecode::set_code(Bytecodes::Code code) {
+-  Bytecodes::check(code);
+-  *addr_at(0) = u_char(code);
+-}
+-
+-
+-bool Bytecode::check_must_rewrite() const {
+-  assert(Bytecodes::can_rewrite(code()), "post-check only");
++bool Bytecode::check_must_rewrite(Bytecodes::Code code) const {
++  assert(Bytecodes::can_rewrite(code), "post-check only");
+ 
+   // Some codes are conditionally rewriting.  Look closely at them.
+-  switch (code()) {
++  switch (code) {
+   case Bytecodes::_aload_0:
+     // Even if RewriteFrequentPairs is turned on,
+     // the _aload_0 code might delay its rewrite until
+@@ -58,14 +51,85 @@
+ }
+ 
+ 
++#ifdef ASSERT
++
++void Bytecode::assert_same_format_as(Bytecodes::Code testbc, bool is_wide) const {
++  Bytecodes::Code thisbc = Bytecodes::cast(byte_at(0));
++  if (thisbc == Bytecodes::_breakpoint)  return;  // let the assertion fail silently
++  if (is_wide) {
++    assert(thisbc == Bytecodes::_wide, "expected a wide instruction");
++    thisbc = Bytecodes::cast(byte_at(1));
++    if (thisbc == Bytecodes::_breakpoint)  return;
++  }
++  int thisflags = Bytecodes::flags(testbc, is_wide) & Bytecodes::_all_fmt_bits;
++  int testflags = Bytecodes::flags(thisbc, is_wide) & Bytecodes::_all_fmt_bits;
++  if (thisflags != testflags)
++    tty->print_cr("assert_same_format_as(%d) failed on bc=%d%s; %d != %d",
++                  (int)testbc, (int)thisbc, (is_wide?"/wide":""), testflags, thisflags);
++  assert(thisflags == testflags, "expected format");
++}
++
++void Bytecode::assert_index_size(int size, Bytecodes::Code bc, bool is_wide) {
++  int have_fmt = (Bytecodes::flags(bc, is_wide)
++                  & (Bytecodes::_fmt_has_u2 | Bytecodes::_fmt_has_u4 |
++                     Bytecodes::_fmt_not_simple |
++                     // Not an offset field:
++                     Bytecodes::_fmt_has_o));
++  int need_fmt = -1;
++  switch (size) {
++  case 1: need_fmt = 0;                      break;
++  case 2: need_fmt = Bytecodes::_fmt_has_u2; break;
++  case 4: need_fmt = Bytecodes::_fmt_has_u4; break;
++  }
++  if (is_wide)  need_fmt |= Bytecodes::_fmt_not_simple;
++  if (have_fmt != need_fmt) {
++    tty->print_cr("assert_index_size %d: bc=%d%s %d != %d", size, bc, (is_wide?"/wide":""), have_fmt, need_fmt);
++    assert(have_fmt == need_fmt, "assert_index_size");
++  }
++}
++
++void Bytecode::assert_offset_size(int size, Bytecodes::Code bc, bool is_wide) {
++  int have_fmt = Bytecodes::flags(bc, is_wide) & Bytecodes::_all_fmt_bits;
++  int need_fmt = -1;
++  switch (size) {
++  case 2: need_fmt = Bytecodes::_fmt_bo2; break;
++  case 4: need_fmt = Bytecodes::_fmt_bo4; break;
++  }
++  if (is_wide)  need_fmt |= Bytecodes::_fmt_not_simple;
++  if (have_fmt != need_fmt) {
++    tty->print_cr("assert_offset_size %d: bc=%d%s %d != %d", size, bc, (is_wide?"/wide":""), have_fmt, need_fmt);
++    assert(have_fmt == need_fmt, "assert_offset_size");
++  }
++}
++
++void Bytecode::assert_constant_size(int size, int where, Bytecodes::Code bc, bool is_wide) {
++  int have_fmt = Bytecodes::flags(bc, is_wide) & (Bytecodes::_all_fmt_bits
++                                                  // Ignore any 'i' field (for iinc):
++                                                  & ~Bytecodes::_fmt_has_i);
++  int need_fmt = -1;
++  switch (size) {
++  case 1: need_fmt = Bytecodes::_fmt_bc;                          break;
++  case 2: need_fmt = Bytecodes::_fmt_bc | Bytecodes::_fmt_has_u2; break;
++  }
++  if (is_wide)  need_fmt |= Bytecodes::_fmt_not_simple;
++  int length = is_wide ? Bytecodes::wide_length_for(bc) : Bytecodes::length_for(bc);
++  if (have_fmt != need_fmt || where + size != length) {
++    tty->print_cr("assert_constant_size %d @%d: bc=%d%s %d != %d", size, where, bc, (is_wide?"/wide":""), have_fmt, need_fmt);
++  }
++  assert(have_fmt == need_fmt, "assert_constant_size");
++  assert(where + size == length, "assert_constant_size oob");
++}
++
++void Bytecode::assert_native_index(Bytecodes::Code bc, bool is_wide) {
++  assert((Bytecodes::flags(bc, is_wide) & Bytecodes::_fmt_has_nbo) != 0, "native index");
++}
++
++#endif //ASSERT
+ 
+ // Implementation of Bytecode_tableupswitch
+ 
+ int Bytecode_tableswitch::dest_offset_at(int i) const {
+-  address x = aligned_addr_at(1);
+-  int x2 = aligned_offset(1 + (3 + i)*jintSize);
+-  int val = java_signed_word_at(x2);
+-  return java_signed_word_at(aligned_offset(1 + (3 + i)*jintSize));
++  return get_Java_u4_at(aligned_offset(1 + (3 + i)*jintSize));
+ }
+ 
+ 
+@@ -74,6 +138,7 @@
+ void Bytecode_invoke::verify() const {
+   Bytecodes::Code bc = adjusted_invoke_code();
+   assert(is_valid(), "check invoke");
++  assert(method()->constants()->cache() != NULL, "do not call this from verifier or rewriter");
+ }
+ 
+ 
+@@ -116,27 +181,12 @@
+ int Bytecode_invoke::index() const {
+   // Note:  Rewriter::rewrite changes the Java_u2 of an invokedynamic to a native_u4,
+   // at the same time it allocates per-call-site CP cache entries.
+-  if (has_giant_index())
+-    return Bytes::get_native_u4(bcp() + 1);
++  Bytecodes::Code stdc = Bytecodes::java_code(code());
++  Bytecode* invoke = Bytecode_at(bcp());
++  if (invoke->has_index_u4(stdc))
++    return invoke->get_index_u4(stdc);
+   else
+-    return Bytes::get_Java_u2(bcp() + 1);
+-}
+-
+-
+-// Implementation of Bytecode_static
+-
+-void Bytecode_static::verify() const {
+-  assert(Bytecodes::java_code(code()) == Bytecodes::_putstatic
+-      || Bytecodes::java_code(code()) == Bytecodes::_getstatic, "check static");
+-}
+-
+-
+-BasicType Bytecode_static::result_type(methodOop method) const {
+-  int index = java_hwrd_at(1);
+-  constantPoolOop constants = method->constants();
+-  symbolOop field_type = constants->signature_ref_at(index);
+-  BasicType basic_type = FieldType::basic_type(field_type);
+-  return basic_type;
++    return invoke->get_index_u2_cpcache(stdc);
+ }
+ 
+ 
+@@ -156,7 +206,8 @@
+ 
+ 
+ int Bytecode_field::index() const {
+-  return java_hwrd_at(1);
++  Bytecode* invoke = Bytecode_at(bcp());
++  return invoke->get_index_u2_cpcache(Bytecodes::_getfield);
+ }
+ 
+ 
+@@ -164,7 +215,7 @@
+ 
+ int Bytecode_loadconstant::index() const {
+   Bytecodes::Code stdc = Bytecodes::java_code(code());
+-  return stdc == Bytecodes::_ldc ? java_byte_at(1) : java_hwrd_at(1);
++  return stdc == Bytecodes::_ldc ? get_index_u1(stdc) : get_index_u2(stdc);
+ }
+ 
+ //------------------------------------------------------------------------------
+diff --git a/src/share/vm/interpreter/bytecode.hpp b/src/share/vm/interpreter/bytecode.hpp
+--- a/src/share/vm/interpreter/bytecode.hpp
++++ b/src/share/vm/interpreter/bytecode.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -26,92 +26,100 @@
+ // relative to an objects 'this' pointer.
+ 
+ class ThisRelativeObj VALUE_OBJ_CLASS_SPEC {
+- private:
+-  int     sign_extend        (int x, int size)   const     { const int s = (BytesPerInt - size)*BitsPerByte; return (x << s) >> s; }
+-
+  public:
+   // Address computation
+   address addr_at            (int offset)        const     { return (address)this + offset; }
++  int     byte_at            (int offset)        const     { return *(addr_at(offset)); }
+   address aligned_addr_at    (int offset)        const     { return (address)round_to((intptr_t)addr_at(offset), jintSize); }
+   int     aligned_offset     (int offset)        const     { return aligned_addr_at(offset) - addr_at(0); }
+ 
+-  // Java unsigned accessors (using Java spec byte ordering)
+-  int     java_byte_at       (int offset)        const     { return *(jubyte*)addr_at(offset); }
+-  int     java_hwrd_at       (int offset)        const     { return java_byte_at(offset) << (1 * BitsPerByte) | java_byte_at(offset + 1); }
+-  int     java_word_at       (int offset)        const     { return java_hwrd_at(offset) << (2 * BitsPerByte) | java_hwrd_at(offset + 2); }
+-
+-  // Java signed accessors (using Java spec byte ordering)
+-  int     java_signed_byte_at(int offset)        const     { return sign_extend(java_byte_at(offset), 1); }
+-  int     java_signed_hwrd_at(int offset)        const     { return sign_extend(java_hwrd_at(offset), 2); }
+-  int     java_signed_word_at(int offset)        const     { return             java_word_at(offset)    ; }
+-
+-  // Fast accessors (using the machine's natural byte ordering)
+-  int     fast_byte_at       (int offset)        const     { return *(jubyte *)addr_at(offset); }
+-  int     fast_hwrd_at       (int offset)        const     { return *(jushort*)addr_at(offset); }
+-  int     fast_word_at       (int offset)        const     { return *(juint  *)addr_at(offset); }
+-
+-  // Fast signed accessors (using the machine's natural byte ordering)
+-  int     fast_signed_byte_at(int offset)        const     { return *(jbyte *)addr_at(offset); }
+-  int     fast_signed_hwrd_at(int offset)        const     { return *(jshort*)addr_at(offset); }
+-  int     fast_signed_word_at(int offset)        const     { return *(jint  *)addr_at(offset); }
+-
+-  // Fast manipulators (using the machine's natural byte ordering)
+-  void    set_fast_byte_at   (int offset, int x) const     { *(jbyte *)addr_at(offset) = (jbyte )x; }
+-  void    set_fast_hwrd_at   (int offset, int x) const     { *(jshort*)addr_at(offset) = (jshort)x; }
+-  void    set_fast_word_at   (int offset, int x) const     { *(jint  *)addr_at(offset) = (jint  )x; }
++  // Word access:
++  int     get_Java_u2_at     (int offset)        const     { return Bytes::get_Java_u2(addr_at(offset)); }
++  int     get_Java_u4_at     (int offset)        const     { return Bytes::get_Java_u4(addr_at(offset)); }
++  int     get_native_u2_at   (int offset)        const     { return Bytes::get_native_u2(addr_at(offset)); }
++  int     get_native_u4_at   (int offset)        const     { return Bytes::get_native_u4(addr_at(offset)); }
+ };
+ 
+ 
+ // The base class for different kinds of bytecode abstractions.
+ // Provides the primitive operations to manipulate code relative
+ // to an objects 'this' pointer.
++// FIXME: Make this a ResourceObj, include the enclosing methodOop, and cache the opcode.
+ 
+ class Bytecode: public ThisRelativeObj {
+  protected:
+   u_char byte_at(int offset) const               { return *addr_at(offset); }
+-  bool check_must_rewrite() const;
++  bool check_must_rewrite(Bytecodes::Code bc) const;
+ 
+  public:
+   // Attributes
+   address bcp() const                            { return addr_at(0); }
+-  address next_bcp() const                       { return addr_at(0) + Bytecodes::length_at(bcp()); }
+   int instruction_size() const                   { return Bytecodes::length_at(bcp()); }
+ 
++  // Warning: Use code() with caution on live bytecode streams.  4926272
+   Bytecodes::Code code() const                   { return Bytecodes::code_at(addr_at(0)); }
+   Bytecodes::Code java_code() const              { return Bytecodes::java_code(code()); }
+-  bool must_rewrite() const                      { return Bytecodes::can_rewrite(code()) && check_must_rewrite(); }
+-  bool is_active_breakpoint() const              { return Bytecodes::is_active_breakpoint_at(bcp()); }
+-
+-  int     one_byte_index() const                 { assert_index_size(1); return byte_at(1); }
+-  int     two_byte_index() const                 { assert_index_size(2); return (byte_at(1) << 8) + byte_at(2); }
+-
+-  int     offset() const                         { return (two_byte_index() << 16) >> 16; }
+-  address destination() const                    { return bcp() + offset(); }
+-
+-  // Attribute modification
+-  void    set_code(Bytecodes::Code code);
++  bool must_rewrite(Bytecodes::Code code) const  { return Bytecodes::can_rewrite(code) && check_must_rewrite(code); }
+ 
+   // Creation
+   inline friend Bytecode* Bytecode_at(address bcp);
+ 
+- private:
+-  void assert_index_size(int required_size) const {
+-#ifdef ASSERT
+-    int isize = instruction_size() - 1;
+-    if (isize == 2 && code() == Bytecodes::_iinc)
+-      isize = 1;
+-    else if (isize <= 2)
+-      ;                         // no change
+-    else if (code() == Bytecodes::_invokedynamic)
+-      isize = 4;
+-    else
+-      isize = 2;
+-    assert(isize = required_size, "wrong index size");
+-#endif
++  // Static functions for parsing bytecodes in place.
++  int get_index_u1(Bytecodes::Code bc) const {
++    assert_same_format_as(bc); assert_index_size(1, bc);
++    return *(jubyte*)addr_at(1);
++  }
++  int get_index_u2(Bytecodes::Code bc, bool is_wide = false) const {
++    assert_same_format_as(bc, is_wide); assert_index_size(2, bc, is_wide);
++    address p = addr_at(is_wide ? 2 : 1);
++    if (can_use_native_byte_order(bc, is_wide))
++          return Bytes::get_native_u2(p);
++    else  return Bytes::get_Java_u2(p);
++  }
++  int get_index_u2_cpcache(Bytecodes::Code bc) const {
++    assert_same_format_as(bc); assert_index_size(2, bc); assert_native_index(bc);
++    return Bytes::get_native_u2(addr_at(1)) DEBUG_ONLY(+ constantPoolOopDesc::CPCACHE_INDEX_TAG);
++  }
++  int get_index_u4(Bytecodes::Code bc) const {
++    assert_same_format_as(bc); assert_index_size(4, bc);
++    assert(can_use_native_byte_order(bc), "");
++    return Bytes::get_native_u4(addr_at(1));
++  }
++  bool has_index_u4(Bytecodes::Code bc) const {
++    return bc == Bytecodes::_invokedynamic;
++  }
++
++  int get_offset_s2(Bytecodes::Code bc) const {
++    assert_same_format_as(bc); assert_offset_size(2, bc);
++    return (jshort) Bytes::get_Java_u2(addr_at(1));
++  }
++  int get_offset_s4(Bytecodes::Code bc) const {
++    assert_same_format_as(bc); assert_offset_size(4, bc);
++    return (jint) Bytes::get_Java_u4(addr_at(1));
++  }
++
++  int get_constant_u1(int offset, Bytecodes::Code bc) const {
++    assert_same_format_as(bc); assert_constant_size(1, offset, bc);
++    return *(jbyte*)addr_at(offset);
++  }
++  int get_constant_u2(int offset, Bytecodes::Code bc, bool is_wide = false) const {
++    assert_same_format_as(bc, is_wide); assert_constant_size(2, offset, bc, is_wide);
++    return (jshort) Bytes::get_Java_u2(addr_at(offset));
++  }
++
++  // These are used locally and also from bytecode streams.
++  void assert_same_format_as(Bytecodes::Code testbc, bool is_wide = false) const NOT_DEBUG_RETURN;
++  static void assert_index_size(int required_size, Bytecodes::Code bc, bool is_wide = false) NOT_DEBUG_RETURN;
++  static void assert_offset_size(int required_size, Bytecodes::Code bc, bool is_wide = false) NOT_DEBUG_RETURN;
++  static void assert_constant_size(int required_size, int where, Bytecodes::Code bc, bool is_wide = false) NOT_DEBUG_RETURN;
++  static void assert_native_index(Bytecodes::Code bc, bool is_wide = false) NOT_DEBUG_RETURN;
++  static bool can_use_native_byte_order(Bytecodes::Code bc, bool is_wide = false) {
++    return (!Bytes::is_Java_byte_ordering_different() || Bytecodes::native_byte_order(bc /*, is_wide*/));
+   }
+ };
+ 
+ inline Bytecode* Bytecode_at(address bcp) {
++  // Warning: Use with caution on live bytecode streams.  4926272
+   return (Bytecode*)bcp;
+ }
+ 
+@@ -124,8 +132,8 @@
+   int  _offset;
+ 
+  public:
+-  int  match() const                             { return java_signed_word_at(0 * jintSize); }
+-  int  offset() const                            { return java_signed_word_at(1 * jintSize); }
++  int  match() const                             { return get_Java_u4_at(0 * jintSize); }
++  int  offset() const                            { return get_Java_u4_at(1 * jintSize); }
+ };
+ 
+ 
+@@ -134,8 +142,8 @@
+   void verify() const PRODUCT_RETURN;
+ 
+   // Attributes
+-  int  default_offset() const                    { return java_signed_word_at(aligned_offset(1 + 0*jintSize)); }
+-  int  number_of_pairs() const                   { return java_signed_word_at(aligned_offset(1 + 1*jintSize)); }
++  int  default_offset() const                    { return get_Java_u4_at(aligned_offset(1 + 0*jintSize)); }
++  int  number_of_pairs() const                   { return get_Java_u4_at(aligned_offset(1 + 1*jintSize)); }
+   LookupswitchPair* pair_at(int i) const         { assert(0 <= i && i < number_of_pairs(), "pair index out of bounds");
+                                                    return (LookupswitchPair*)aligned_addr_at(1 + (1 + i)*2*jintSize); }
+   // Creation
+@@ -154,9 +162,9 @@
+   void verify() const PRODUCT_RETURN;
+ 
+   // Attributes
+-  int  default_offset() const                    { return java_signed_word_at(aligned_offset(1 + 0*jintSize)); }
+-  int  low_key() const                           { return java_signed_word_at(aligned_offset(1 + 1*jintSize)); }
+-  int  high_key() const                          { return java_signed_word_at(aligned_offset(1 + 2*jintSize)); }
++  int  default_offset() const                    { return get_Java_u4_at(aligned_offset(1 + 0*jintSize)); }
++  int  low_key() const                           { return get_Java_u4_at(aligned_offset(1 + 1*jintSize)); }
++  int  high_key() const                          { return get_Java_u4_at(aligned_offset(1 + 2*jintSize)); }
+   int  dest_offset_at(int i) const;
+   int  length()                                  { return high_key()-low_key()+1; }
+ 
+@@ -206,7 +214,6 @@
+   bool is_invokedynamic() const                  { return adjusted_invoke_code() == Bytecodes::_invokedynamic; }
+ 
+   bool has_receiver() const                      { return !is_invokestatic() && !is_invokedynamic(); }
+-  bool has_giant_index() const                   { return is_invokedynamic(); }
+ 
+   bool is_valid() const                          { return is_invokeinterface() ||
+                                                           is_invokevirtual()   ||
+@@ -252,26 +259,6 @@
+ }
+ 
+ 
+-// Abstraction for {get,put}static
+-
+-class Bytecode_static: public Bytecode {
+- public:
+-  void verify() const;
+-
+-  // Returns the result type of the send by inspecting the field ref
+-  BasicType result_type(methodOop method) const;
+-
+-  // Creation
+-  inline friend Bytecode_static* Bytecode_static_at(const methodOop method, address bcp);
+-};
+-
+-inline Bytecode_static* Bytecode_static_at(const methodOop method, address bcp) {
+-  Bytecode_static* b = (Bytecode_static*)bcp;
+-  debug_only(b->verify());
+-  return b;
+-}
+-
+-
+ // Abstraction for checkcast
+ 
+ class Bytecode_checkcast: public Bytecode {
+@@ -279,7 +266,7 @@
+   void verify() const { assert(Bytecodes::java_code(code()) == Bytecodes::_checkcast, "check checkcast"); }
+ 
+   // Returns index
+-  long index() const   { return java_hwrd_at(1); };
++  long index() const   { return get_index_u2(Bytecodes::_checkcast); };
+ 
+   // Creation
+   inline friend Bytecode_checkcast* Bytecode_checkcast_at(address bcp);
+@@ -299,7 +286,7 @@
+   void verify() const { assert(code() == Bytecodes::_instanceof, "check instanceof"); }
+ 
+   // Returns index
+-  long index() const   { return java_hwrd_at(1); };
++  long index() const   { return get_index_u2(Bytecodes::_instanceof); };
+ 
+   // Creation
+   inline friend Bytecode_instanceof* Bytecode_instanceof_at(address bcp);
+@@ -317,7 +304,7 @@
+   void verify() const { assert(java_code() == Bytecodes::_new, "check new"); }
+ 
+   // Returns index
+-  long index() const   { return java_hwrd_at(1); };
++  long index() const   { return get_index_u2(Bytecodes::_new); };
+ 
+   // Creation
+   inline friend Bytecode_new* Bytecode_new_at(address bcp);
+@@ -335,7 +322,7 @@
+   void verify() const { assert(java_code() == Bytecodes::_multianewarray, "check new"); }
+ 
+   // Returns index
+-  long index() const   { return java_hwrd_at(1); };
++  long index() const   { return get_index_u2(Bytecodes::_multianewarray); };
+ 
+   // Creation
+   inline friend Bytecode_multianewarray* Bytecode_multianewarray_at(address bcp);
+@@ -353,7 +340,7 @@
+   void verify() const { assert(java_code() == Bytecodes::_anewarray, "check anewarray"); }
+ 
+   // Returns index
+-  long index() const   { return java_hwrd_at(1); };
++  long index() const   { return get_index_u2(Bytecodes::_anewarray); };
+ 
+   // Creation
+   inline friend Bytecode_anewarray* Bytecode_anewarray_at(address bcp);
+diff --git a/src/share/vm/interpreter/bytecodeStream.cpp b/src/share/vm/interpreter/bytecodeStream.cpp
+--- a/src/share/vm/interpreter/bytecodeStream.cpp
++++ b/src/share/vm/interpreter/bytecodeStream.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -48,6 +48,25 @@
+       }
+     }
+   }
+-  _code = code;
++  _raw_code = code;
+   return code;
+ }
++
++#ifdef ASSERT
++void BaseBytecodeStream::assert_raw_index_size(int size) const {
++  if (raw_code() == Bytecodes::_invokedynamic && is_raw()) {
++    // in raw mode, pretend indy is "bJJ__"
++    assert(size == 2, "raw invokedynamic instruction has 2-byte index only");
++  } else {
++    bytecode()->assert_index_size(size, raw_code(), is_wide());
++  }
++}
++
++void BaseBytecodeStream::assert_raw_stream(bool want_raw) const {
++  if (want_raw) {
++    assert( is_raw(), "this function only works on raw streams");
++  } else {
++    assert(!is_raw(), "this function only works on non-raw streams");
++  }
++}
++#endif //ASSERT
+diff --git a/src/share/vm/interpreter/bytecodeStream.hpp b/src/share/vm/interpreter/bytecodeStream.hpp
+--- a/src/share/vm/interpreter/bytecodeStream.hpp
++++ b/src/share/vm/interpreter/bytecodeStream.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -32,13 +32,13 @@
+ // while ((c = s.next()) >= 0) {
+ //   ...
+ // }
+-//
++
+ // A RawBytecodeStream is a simple version of BytecodeStream.
+ // It is used ONLY when we know the bytecodes haven't been rewritten
+-// yet, such as in the rewriter or the verifier. Currently only the
+-// verifier uses this class.
++// yet, such as in the rewriter or the verifier.
+ 
+-class RawBytecodeStream: StackObj {
++// Here is the common base class for both RawBytecodeStream and BytecodeStream:
++class BaseBytecodeStream: StackObj {
+  protected:
+   // stream buffer
+   methodHandle    _method;                       // read from method directly
+@@ -49,15 +49,17 @@
+   int             _end_bci;                      // bci after the current iteration interval
+ 
+   // last bytecode read
+-  Bytecodes::Code _code;
++  Bytecodes::Code _raw_code;
+   bool            _is_wide;
++  bool            _is_raw;                       // false in 'cooked' BytecodeStream
++
++  // Construction
++  BaseBytecodeStream(methodHandle method) : _method(method) {
++    set_interval(0, _method->code_size());
++    _is_raw = false;
++  }
+ 
+  public:
+-  // Construction
+-  RawBytecodeStream(methodHandle method) : _method(method) {
+-    set_interval(0, _method->code_size());
+-  }
+-
+   // Iteration control
+   void set_interval(int beg_bci, int end_bci) {
+     // iterate over the interval [beg_bci, end_bci)
+@@ -72,6 +74,46 @@
+     set_interval(beg_bci, _method->code_size());
+   }
+ 
++  bool is_raw() const { return _is_raw; }
++
++  // Stream attributes
++  methodHandle    method() const                 { return _method; }
++
++  int             bci() const                    { return _bci; }
++  int             next_bci() const               { return _next_bci; }
++  int             end_bci() const                { return _end_bci; }
++
++  Bytecodes::Code raw_code() const               { return _raw_code; }
++  bool            is_wide() const                { return _is_wide; }
++  int             instruction_size() const       { return (_next_bci - _bci); }
++  bool            is_last_bytecode() const       { return _next_bci >= _end_bci; }
++
++  address         bcp() const                    { return method()->code_base() + _bci; }
++  Bytecode*       bytecode() const               { return Bytecode_at(bcp()); }
++
++  // State changes
++  void            set_next_bci(int bci)          { assert(0 <= bci && bci <= method()->code_size(), "illegal bci"); _next_bci = bci; }
++
++  // Bytecode-specific attributes
++  int             dest() const                   { return bci() + bytecode()->get_offset_s2(raw_code()); }
++  int             dest_w() const                 { return bci() + bytecode()->get_offset_s4(raw_code()); }
++
++  // One-byte indices.
++  int             get_index_u1() const           { assert_raw_index_size(1); return *(jubyte*)(bcp()+1); }
++
++ protected:
++  void assert_raw_index_size(int size) const NOT_DEBUG_RETURN;
++  void assert_raw_stream(bool want_raw) const NOT_DEBUG_RETURN;
++};
++
++class RawBytecodeStream: public BaseBytecodeStream {
++ public:
++  // Construction
++  RawBytecodeStream(methodHandle method) : BaseBytecodeStream(method) {
++    _is_raw = true;
++  }
++
++ public:
+   // Iteration
+   // Use raw_next() rather than next() for faster method reference
+   Bytecodes::Code raw_next() {
+@@ -80,7 +122,7 @@
+     _bci = _next_bci;
+     assert(!is_last_bytecode(), "caller should check is_last_bytecode()");
+ 
+-    address bcp = RawBytecodeStream::bcp();
++    address bcp = this->bcp();
+     code        = Bytecodes::code_or_bp_at(bcp);
+ 
+     // set next bytecode position
+@@ -90,84 +132,49 @@
+              && code != Bytecodes::_lookupswitch, "can't be special bytecode");
+       _is_wide = false;
+       _next_bci += l;
+-      _code = code;
++      _raw_code = code;
+       return code;
+-    } else if (code == Bytecodes::_wide && _bci + 1 >= _end_bci) {
+-      return Bytecodes::_illegal;
+     } else {
+       return raw_next_special(code);
+     }
+   }
+   Bytecodes::Code raw_next_special(Bytecodes::Code code);
+ 
+-  // Stream attributes
+-  methodHandle    method() const                 { return _method; }
+-
+-  int             bci() const                    { return _bci; }
+-  int             next_bci() const               { return _next_bci; }
+-  int             end_bci() const                { return _end_bci; }
+-
+-  Bytecodes::Code code() const                   { return _code; }
+-  bool            is_wide() const                { return _is_wide; }
+-  int             instruction_size() const       { return (_next_bci - _bci); }
+-  bool            is_last_bytecode() const       { return _next_bci >= _end_bci; }
+-
+-  address         bcp() const                    { return method()->code_base() + _bci; }
+-  address         next_bcp()                     { return method()->code_base() + _next_bci; }
+-
+-  // State changes
+-  void            set_next_bci(int bci)          { assert(0 <= bci && bci <= method()->code_size(), "illegal bci"); _next_bci = bci; }
+-
+-  // Bytecode-specific attributes
+-  int             dest() const                   { return bci() + (short)Bytes::get_Java_u2(bcp() + 1); }
+-  int             dest_w() const                 { return bci() + (int  )Bytes::get_Java_u4(bcp() + 1); }
+-
+-  // Unsigned indices, widening
+-  int             get_index() const              { assert_index_size(is_wide() ? 2 : 1);
+-                                                   return (is_wide()) ? Bytes::get_Java_u2(bcp() + 2) : bcp()[1]; }
+-  int             get_index_big() const          { assert_index_size(2);
+-                                                   return (int)Bytes::get_Java_u2(bcp() + 1);  }
+-  int             get_index_int() const          { return has_giant_index() ? get_index_giant() : get_index_big(); }
+-  int             get_index_giant() const        { assert_index_size(4); return Bytes::get_native_u4(bcp() + 1); }
+-  int             has_giant_index() const        { return (code() == Bytecodes::_invokedynamic); }
++  // Unsigned indices, widening, with no swapping of bytes
++  int             get_index() const          { return (is_wide()) ? get_index_u2_raw(bcp() + 2) : get_index_u1(); }
++  // Get an unsigned 2-byte index, with no swapping of bytes.
++  int             get_index_u2() const       { assert(!is_wide(), ""); return get_index_u2_raw(bcp() + 1);  }
+ 
+  private:
+-  void assert_index_size(int required_size) const {
+-#ifdef ASSERT
+-    int isize = instruction_size() - (int)_is_wide - 1;
+-    if (isize == 2 && code() == Bytecodes::_iinc)
+-      isize = 1;
+-    else if (isize <= 2)
+-      ;                         // no change
+-    else if (has_giant_index())
+-      isize = 4;
+-    else
+-      isize = 2;
+-    assert(isize = required_size, "wrong index size");
+-#endif
++  int get_index_u2_raw(address p) const {
++    assert_raw_index_size(2); assert_raw_stream(true);
++    return Bytes::get_Java_u2(p);
+   }
+ };
+ 
+ // In BytecodeStream, non-java bytecodes will be translated into the
+ // corresponding java bytecodes.
+ 
+-class BytecodeStream: public RawBytecodeStream {
++class BytecodeStream: public BaseBytecodeStream {
++  Bytecodes::Code _code;
++
+  public:
+   // Construction
+-  BytecodeStream(methodHandle method) : RawBytecodeStream(method) { }
++  BytecodeStream(methodHandle method) : BaseBytecodeStream(method) { }
+ 
+   // Iteration
+   Bytecodes::Code next() {
+-    Bytecodes::Code code;
++    Bytecodes::Code raw_code, code;
+     // set reading position
+     _bci = _next_bci;
+     if (is_last_bytecode()) {
+       // indicate end of bytecode stream
+-      code = Bytecodes::_illegal;
++      raw_code = code = Bytecodes::_illegal;
+     } else {
+       // get bytecode
+-      address bcp = BytecodeStream::bcp();
+-      code        = Bytecodes::java_code_at(bcp);
++      address bcp = this->bcp();
++      raw_code = Bytecodes::code_at(bcp);
++      code = Bytecodes::java_code(raw_code);
+       // set next bytecode position
+       //
+       // note that we cannot advance before having the
+@@ -181,14 +188,29 @@
+       _is_wide      = false;
+       // check for special (uncommon) cases
+       if (code == Bytecodes::_wide) {
+-        code = (Bytecodes::Code)bcp[1];
++        raw_code = (Bytecodes::Code)bcp[1];
++        code = raw_code;  // wide BCs are always Java-normal
+         _is_wide = true;
+       }
+       assert(Bytecodes::is_java_code(code), "sanity check");
+     }
++    _raw_code = raw_code;
+     _code = code;
+     return _code;
+   }
+ 
+   bool            is_active_breakpoint() const   { return Bytecodes::is_active_breakpoint_at(bcp()); }
++  Bytecodes::Code code() const                   { return _code; }
++
++  // Unsigned indices, widening
++  int             get_index() const              { return is_wide() ? bytecode()->get_index_u2(raw_code(), true) : get_index_u1(); }
++  // Get an unsigned 2-byte index, swapping the bytes if necessary.
++  int             get_index_u2() const           { assert_raw_stream(false);
++                                                   return bytecode()->get_index_u2(raw_code(), false); }
++  // Get an unsigned 2-byte index in native order.
++  int             get_index_u2_cpcache() const   { assert_raw_stream(false);
++                                                   return bytecode()->get_index_u2_cpcache(raw_code()); }
++  int             get_index_u4() const           { assert_raw_stream(false);
++                                                   return bytecode()->get_index_u4(raw_code()); }
++  int             has_index_u4() const           { return bytecode()->get_index_u4(raw_code()); }
+ };
+diff --git a/src/share/vm/interpreter/bytecodeTracer.cpp b/src/share/vm/interpreter/bytecodeTracer.cpp
+--- a/src/share/vm/interpreter/bytecodeTracer.cpp
++++ b/src/share/vm/interpreter/bytecodeTracer.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -39,6 +39,7 @@
+   // (Also, ensure that occasional false positives are benign.)
+   methodOop _current_method;
+   bool      _is_wide;
++  Bytecodes::Code _code;
+   address   _next_pc;                // current decoding position
+ 
+   void      align()                  { _next_pc = (address)round_to((intptr_t)_next_pc, sizeof(jint)); }
+@@ -46,23 +47,26 @@
+   short     get_short()              { short i=Bytes::get_Java_u2(_next_pc); _next_pc+=2; return i; }
+   int       get_int()                { int i=Bytes::get_Java_u4(_next_pc); _next_pc+=4; return i; }
+ 
+-  int       get_index()              { return *(address)_next_pc++; }
+-  int       get_big_index()          { int i=Bytes::get_Java_u2(_next_pc); _next_pc+=2; return i; }
+-  int       get_giant_index()        { int i=Bytes::get_native_u4(_next_pc); _next_pc+=4; return i; }
+-  int       get_index_special()      { return (is_wide()) ? get_big_index() : get_index(); }
++  int       get_index_u1()           { return *(address)_next_pc++; }
++  int       get_index_u2()           { int i=Bytes::get_Java_u2(_next_pc); _next_pc+=2; return i; }
++  int       get_index_u2_cpcache()   { int i=Bytes::get_native_u2(_next_pc); _next_pc+=2; return i + constantPoolOopDesc::CPCACHE_INDEX_TAG; }
++  int       get_index_u4()           { int i=Bytes::get_native_u4(_next_pc); _next_pc+=4; return i; }
++  int       get_index_special()      { return (is_wide()) ? get_index_u2() : get_index_u1(); }
+   methodOop method()                 { return _current_method; }
+   bool      is_wide()                { return _is_wide; }
++  Bytecodes::Code raw_code()         { return Bytecodes::Code(_code); }
+ 
+ 
+-  bool      check_index(int i, bool in_cp_cache, int& cp_index, outputStream* st = tty);
++  bool      check_index(int i, int& cp_index, outputStream* st = tty);
+   void      print_constant(int i, outputStream* st = tty);
+   void      print_field_or_method(int i, outputStream* st = tty);
+-  void      print_attributes(Bytecodes::Code code, int bci, outputStream* st = tty);
++  void      print_attributes(int bci, outputStream* st = tty);
+   void      bytecode_epilog(int bci, outputStream* st = tty);
+ 
+  public:
+   BytecodePrinter() {
+     _is_wide = false;
++    _code = Bytecodes::_illegal;
+   }
+ 
+   // This method is called while executing the raw bytecodes, so none of
+@@ -89,7 +93,8 @@
+     } else {
+       code = Bytecodes::code_at(bcp);
+     }
+-    int bci = bcp - method->code_base();
++    _code = code;
++     int bci = bcp - method->code_base();
+     st->print("[%ld] ", (long) Thread::current()->osthread()->thread_id());
+     if (Verbose) {
+       st->print("%8d  %4d  " INTPTR_FORMAT " " INTPTR_FORMAT " %s",
+@@ -99,10 +104,11 @@
+            BytecodeCounter::counter_value(), bci, Bytecodes::name(code));
+     }
+     _next_pc = is_wide() ? bcp+2 : bcp+1;
+-    print_attributes(code, bci);
++    print_attributes(bci);
+     // Set is_wide for the next one, since the caller of this doesn't skip
+     // the next bytecode.
+     _is_wide = (code == Bytecodes::_wide);
++    _code = Bytecodes::_illegal;
+   }
+ 
+   // Used for methodOop::print_codes().  The input bcp comes from
+@@ -116,6 +122,7 @@
+     if (is_wide()) {
+       code = Bytecodes::code_at(bcp+1);
+     }
++    _code = code;
+     int bci = bcp - method->code_base();
+     // Print bytecode index and name
+     if (is_wide()) {
+@@ -124,7 +131,7 @@
+       st->print("%d %s", bci, Bytecodes::name(code));
+     }
+     _next_pc = is_wide() ? bcp+2 : bcp+1;
+-    print_attributes(code, bci, st);
++    print_attributes(bci, st);
+     bytecode_epilog(bci, st);
+   }
+ };
+@@ -185,12 +192,13 @@
+   }
+ }
+ 
+-bool BytecodePrinter::check_index(int i, bool in_cp_cache, int& cp_index, outputStream* st) {
++bool BytecodePrinter::check_index(int i, int& cp_index, outputStream* st) {
+   constantPoolOop constants = method()->constants();
+   int ilimit = constants->length(), climit = 0;
++  Bytecodes::Code code = raw_code();
+ 
+   constantPoolCacheOop cache = NULL;
+-  if (in_cp_cache) {
++  if (Bytecodes::uses_cp_cache(code)) {
+     cache = constants->cache();
+     if (cache != NULL) {
+       //climit = cache->length();  // %%% private!
+@@ -201,7 +209,7 @@
+     }
+   }
+ 
+-  if (in_cp_cache && constantPoolCacheOopDesc::is_secondary_index(i)) {
++  if (cache != NULL && constantPoolCacheOopDesc::is_secondary_index(i)) {
+     i = constantPoolCacheOopDesc::decode_secondary_index(i);
+     st->print(" secondary cache[%d] of", i);
+     if (i >= 0 && i < climit) {
+@@ -218,8 +226,6 @@
+   }
+ 
+   if (cache != NULL) {
+-    i = Bytes::swap_u2(i);
+-    if (WizardMode)  st->print(" (swap=%d)", i);
+     goto check_cache_index;
+   }
+ 
+@@ -234,6 +240,17 @@
+   return false;
+ 
+  check_cache_index:
++#ifdef ASSERT
++  {
++    const int CPCACHE_INDEX_TAG = constantPoolOopDesc::CPCACHE_INDEX_TAG;
++    if (i >= CPCACHE_INDEX_TAG && i < climit + CPCACHE_INDEX_TAG) {
++      i -= CPCACHE_INDEX_TAG;
++    } else {
++      st->print_cr(" CP[%d] missing bias?", i);
++      return false;
++    }
++  }
++#endif //ASSERT
+   if (i >= 0 && i < climit) {
+     if (cache->entry_at(i)->is_secondary_entry()) {
+       st->print_cr(" secondary entry?");
+@@ -248,7 +265,7 @@
+ 
+ void BytecodePrinter::print_constant(int i, outputStream* st) {
+   int orig_i = i;
+-  if (!check_index(orig_i, false, i, st))  return;
++  if (!check_index(orig_i, i, st))  return;
+ 
+   constantPoolOop constants = method()->constants();
+   constantTag tag = constants->tag_at(i);
+@@ -279,7 +296,7 @@
+ 
+ void BytecodePrinter::print_field_or_method(int i, outputStream* st) {
+   int orig_i = i;
+-  if (!check_index(orig_i, true, i, st))  return;
++  if (!check_index(orig_i, i, st))  return;
+ 
+   constantPoolOop constants = method()->constants();
+   constantTag tag = constants->tag_at(i);
+@@ -303,9 +320,9 @@
+ }
+ 
+ 
+-void BytecodePrinter::print_attributes(Bytecodes::Code code, int bci, outputStream* st) {
++void BytecodePrinter::print_attributes(int bci, outputStream* st) {
+   // Show attributes of pre-rewritten codes
+-  code = Bytecodes::java_code(code);
++  Bytecodes::Code code = Bytecodes::java_code(raw_code());
+   // If the code doesn't have any fields there's nothing to print.
+   // note this is ==1 because the tableswitch and lookupswitch are
+   // zero size (for some reason) and we want to print stuff out for them.
+@@ -323,12 +340,12 @@
+       st->print_cr(" " INT32_FORMAT, get_short());
+       break;
+     case Bytecodes::_ldc:
+-      print_constant(get_index(), st);
++      print_constant(get_index_u1(), st);
+       break;
+ 
+     case Bytecodes::_ldc_w:
+     case Bytecodes::_ldc2_w:
+-      print_constant(get_big_index(), st);
++      print_constant(get_index_u2(), st);
+       break;
+ 
+     case Bytecodes::_iload:
+@@ -352,7 +369,7 @@
+       break;
+ 
+     case Bytecodes::_newarray: {
+-        BasicType atype = (BasicType)get_index();
++        BasicType atype = (BasicType)get_index_u1();
+         const char* str = type2name(atype);
+         if (str == NULL || atype == T_OBJECT || atype == T_ARRAY) {
+           assert(false, "Unidentified basic type");
+@@ -361,15 +378,15 @@
+       }
+       break;
+     case Bytecodes::_anewarray: {
+-        int klass_index = get_big_index();
++        int klass_index = get_index_u2();
+         constantPoolOop constants = method()->constants();
+         symbolOop name = constants->klass_name_at(klass_index);
+         st->print_cr(" %s ", name->as_C_string());
+       }
+       break;
+     case Bytecodes::_multianewarray: {
+-        int klass_index = get_big_index();
+-        int nof_dims = get_index();
++        int klass_index = get_index_u2();
++        int nof_dims = get_index_u1();
+         constantPoolOop constants = method()->constants();
+         symbolOop name = constants->klass_name_at(klass_index);
+         st->print_cr(" %s %d", name->as_C_string(), nof_dims);
+@@ -451,31 +468,31 @@
+     case Bytecodes::_getstatic:
+     case Bytecodes::_putfield:
+     case Bytecodes::_getfield:
+-      print_field_or_method(get_big_index(), st);
++      print_field_or_method(get_index_u2_cpcache(), st);
+       break;
+ 
+     case Bytecodes::_invokevirtual:
+     case Bytecodes::_invokespecial:
+     case Bytecodes::_invokestatic:
+-      print_field_or_method(get_big_index(), st);
++      print_field_or_method(get_index_u2_cpcache(), st);
+       break;
+ 
+     case Bytecodes::_invokeinterface:
+-      { int i = get_big_index();
+-        int n = get_index();
+-        get_index();            // ignore zero byte
++      { int i = get_index_u2_cpcache();
++        int n = get_index_u1();
++        get_byte();            // ignore zero byte
+         print_field_or_method(i, st);
+       }
+       break;
+ 
+     case Bytecodes::_invokedynamic:
+-      print_field_or_method(get_giant_index(), st);
++      print_field_or_method(get_index_u4(), st);
+       break;
+ 
+     case Bytecodes::_new:
+     case Bytecodes::_checkcast:
+     case Bytecodes::_instanceof:
+-      { int i = get_big_index();
++      { int i = get_index_u2();
+         constantPoolOop constants = method()->constants();
+         symbolOop name = constants->klass_name_at(i);
+         st->print_cr(" %d <%s>", i, name->as_C_string());
+diff --git a/src/share/vm/interpreter/bytecodes.cpp b/src/share/vm/interpreter/bytecodes.cpp
+--- a/src/share/vm/interpreter/bytecodes.cpp
++++ b/src/share/vm/interpreter/bytecodes.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -35,14 +35,11 @@
+ 
+ bool            Bytecodes::_is_initialized = false;
+ const char*     Bytecodes::_name          [Bytecodes::number_of_codes];
+-const char*     Bytecodes::_format        [Bytecodes::number_of_codes];
+-const char*     Bytecodes::_wide_format   [Bytecodes::number_of_codes];
+ BasicType       Bytecodes::_result_type   [Bytecodes::number_of_codes];
+ s_char          Bytecodes::_depth         [Bytecodes::number_of_codes];
+-u_char          Bytecodes::_length        [Bytecodes::number_of_codes];
+-bool            Bytecodes::_can_trap      [Bytecodes::number_of_codes];
++u_char          Bytecodes::_lengths       [Bytecodes::number_of_codes];
+ Bytecodes::Code Bytecodes::_java_code     [Bytecodes::number_of_codes];
+-bool            Bytecodes::_can_rewrite   [Bytecodes::number_of_codes];
++u_short         Bytecodes::_flags         [(1<<BitsPerByte)*2];
+ 
+ 
+ Bytecodes::Code Bytecodes::code_at(methodOop method, int bci) {
+@@ -122,15 +119,22 @@
+ 
+ void Bytecodes::def(Code code, const char* name, const char* format, const char* wide_format, BasicType result_type, int depth, bool can_trap, Code java_code) {
+   assert(wide_format == NULL || format != NULL, "short form must exist if there's a wide form");
++  int len  = (format      != NULL ? (int) strlen(format)      : 0);
++  int wlen = (wide_format != NULL ? (int) strlen(wide_format) : 0);
+   _name          [code] = name;
+-  _format        [code] = format;
+-  _wide_format   [code] = wide_format;
+   _result_type   [code] = result_type;
+   _depth         [code] = depth;
+-  _can_trap      [code] = can_trap;
+-  _length        [code] = format != NULL ? (u_char)strlen(format) : 0;
++  _lengths       [code] = (wlen << 4) | (len & 0xF);
+   _java_code     [code] = java_code;
+-  if (java_code != code)  _can_rewrite[java_code] = true;
++  int bc_flags = 0;
++  if (can_trap)           bc_flags |= _bc_can_trap;
++  if (java_code != code)  bc_flags |= _bc_can_rewrite;
++  _flags[(u1)code+0*(1<<BitsPerByte)] = compute_flags(format,      bc_flags);
++  _flags[(u1)code+1*(1<<BitsPerByte)] = compute_flags(wide_format, bc_flags);
++  assert(is_defined(code)      == (format != NULL),      "");
++  assert(wide_is_defined(code) == (wide_format != NULL), "");
++  assert(length_for(code)      == len, "");
++  assert(wide_length_for(code) == wlen, "");
+ }
+ 
+ 
+@@ -138,23 +142,92 @@
+ //
+ // b: bytecode
+ // c: signed constant, Java byte-ordering
+-// i: unsigned index , Java byte-ordering
+-// j: unsigned index , native byte-ordering
+-// o: branch offset  , Java byte-ordering
++// i: unsigned local index, Java byte-ordering (I = native byte ordering)
++// j: unsigned CP cache index, Java byte-ordering (J = native byte ordering)
++// k: unsigned CP index, Java byte-ordering
++// o: branch offset, Java byte-ordering
+ // _: unused/ignored
+ // w: wide bytecode
+ //
+-// Note: Right now the format strings are used for 2 purposes:
++// Note: The format strings are used for 2 purposes:
+ //       1. to specify the length of the bytecode
+ //          (= number of characters in format string)
+-//       2. to specify the bytecode attributes
+-//
+-//       The bytecode attributes are currently used only for bytecode tracing
+-//       (see BytecodeTracer); thus if more specific format information is
+-//       used, one would also have to adjust the bytecode tracer.
++//       2. to derive bytecode format flags (_fmt_has_k, etc.)
+ //
+ // Note: For bytecodes with variable length, the format string is the empty string.
+ 
++int Bytecodes::compute_flags(const char* format, int more_flags) {
++  if (format == NULL)  return 0;  // not even more_flags
++  int flags = more_flags;
++  const char* fp = format;
++  switch (*fp) {
++  case '\0':
++    flags |= _fmt_not_simple; // but variable
++    break;
++  case 'b':
++    flags |= _fmt_not_variable;  // but simple
++    ++fp;  // skip 'b'
++    break;
++  case 'w':
++    flags |= _fmt_not_variable | _fmt_not_simple;
++    ++fp;  // skip 'w'
++    guarantee(*fp == 'b', "wide format must start with 'wb'");
++    ++fp;  // skip 'b'
++    break;
++  }
++
++  int has_nbo = 0, has_jbo = 0, has_size = 0;
++  for (;;) {
++    int this_flag = 0;
++    char fc = *fp++;
++    switch (fc) {
++    case '\0':  // end of string
++      assert(flags == (jchar)flags, "change _format_flags");
++      return flags;
++
++    case '_': continue;         // ignore these
++
++    case 'j': this_flag = _fmt_has_j; has_jbo = 1; break;
++    case 'k': this_flag = _fmt_has_k; has_jbo = 1; break;
++    case 'i': this_flag = _fmt_has_i; has_jbo = 1; break;
++    case 'c': this_flag = _fmt_has_c; has_jbo = 1; break;
++    case 'o': this_flag = _fmt_has_o; has_jbo = 1; break;
++
++    // uppercase versions mark native byte order (from Rewriter)
++    // actually, only the 'J' case happens currently
++    case 'J': this_flag = _fmt_has_j; has_nbo = 1; break;
++    case 'K': this_flag = _fmt_has_k; has_nbo = 1; break;
++    case 'I': this_flag = _fmt_has_i; has_nbo = 1; break;
++    case 'C': this_flag = _fmt_has_c; has_nbo = 1; break;
++    case 'O': this_flag = _fmt_has_o; has_nbo = 1; break;
++    default:  guarantee(false, "bad char in format");
++    }
++
++    flags |= this_flag;
++
++    guarantee(!(has_jbo && has_nbo), "mixed byte orders in format");
++    if (has_nbo)
++      flags |= _fmt_has_nbo;
++
++    int this_size = 1;
++    if (*fp == fc) {
++      // advance beyond run of the same characters
++      this_size = 2;
++      while (*++fp == fc)  this_size++;
++      switch (this_size) {
++      case 2: flags |= _fmt_has_u2; break;
++      case 4: flags |= _fmt_has_u4; break;
++      default: guarantee(false, "bad rep count in format");
++      }
++    }
++    guarantee(has_size == 0 ||                     // no field yet
++              this_size == has_size ||             // same size
++              this_size < has_size && *fp == '\0', // last field can be short
++              "mixed field sizes in format");
++    has_size = this_size;
++  }
++}
++
+ void Bytecodes::initialize() {
+   if (_is_initialized) return;
+   assert(number_of_codes <= 256, "too many bytecodes");
+@@ -189,9 +262,9 @@
+   def(_dconst_1            , "dconst_1"            , "b"    , NULL    , T_DOUBLE ,  2, false);
+   def(_bipush              , "bipush"              , "bc"   , NULL    , T_INT    ,  1, false);
+   def(_sipush              , "sipush"              , "bcc"  , NULL    , T_INT    ,  1, false);
+-  def(_ldc                 , "ldc"                 , "bi"   , NULL    , T_ILLEGAL,  1, true );
+-  def(_ldc_w               , "ldc_w"               , "bii"  , NULL    , T_ILLEGAL,  1, true );
+-  def(_ldc2_w              , "ldc2_w"              , "bii"  , NULL    , T_ILLEGAL,  2, true );
++  def(_ldc                 , "ldc"                 , "bk"   , NULL    , T_ILLEGAL,  1, true );
++  def(_ldc_w               , "ldc_w"               , "bkk"  , NULL    , T_ILLEGAL,  1, true );
++  def(_ldc2_w              , "ldc2_w"              , "bkk"  , NULL    , T_ILLEGAL,  2, true );
+   def(_iload               , "iload"               , "bi"   , "wbii"  , T_INT    ,  1, false);
+   def(_lload               , "lload"               , "bi"   , "wbii"  , T_LONG   ,  2, false);
+   def(_fload               , "fload"               , "bi"   , "wbii"  , T_FLOAT  ,  1, false);
+@@ -349,26 +422,26 @@
+   def(_dreturn             , "dreturn"             , "b"    , NULL    , T_DOUBLE , -2, true);
+   def(_areturn             , "areturn"             , "b"    , NULL    , T_OBJECT , -1, true);
+   def(_return              , "return"              , "b"    , NULL    , T_VOID   ,  0, true);
+-  def(_getstatic           , "getstatic"           , "bjj"  , NULL    , T_ILLEGAL,  1, true );
+-  def(_putstatic           , "putstatic"           , "bjj"  , NULL    , T_ILLEGAL, -1, true );
+-  def(_getfield            , "getfield"            , "bjj"  , NULL    , T_ILLEGAL,  0, true );
+-  def(_putfield            , "putfield"            , "bjj"  , NULL    , T_ILLEGAL, -2, true );
+-  def(_invokevirtual       , "invokevirtual"       , "bjj"  , NULL    , T_ILLEGAL, -1, true);
+-  def(_invokespecial       , "invokespecial"       , "bjj"  , NULL    , T_ILLEGAL, -1, true);
+-  def(_invokestatic        , "invokestatic"        , "bjj"  , NULL    , T_ILLEGAL,  0, true);
+-  def(_invokeinterface     , "invokeinterface"     , "bjj__", NULL    , T_ILLEGAL, -1, true);
+-  def(_invokedynamic       , "invokedynamic"       , "bjjjj", NULL    , T_ILLEGAL,  0, true );
+-  def(_new                 , "new"                 , "bii"  , NULL    , T_OBJECT ,  1, true );
++  def(_getstatic           , "getstatic"           , "bJJ"  , NULL    , T_ILLEGAL,  1, true );
++  def(_putstatic           , "putstatic"           , "bJJ"  , NULL    , T_ILLEGAL, -1, true );
++  def(_getfield            , "getfield"            , "bJJ"  , NULL    , T_ILLEGAL,  0, true );
++  def(_putfield            , "putfield"            , "bJJ"  , NULL    , T_ILLEGAL, -2, true );
++  def(_invokevirtual       , "invokevirtual"       , "bJJ"  , NULL    , T_ILLEGAL, -1, true);
++  def(_invokespecial       , "invokespecial"       , "bJJ"  , NULL    , T_ILLEGAL, -1, true);
++  def(_invokestatic        , "invokestatic"        , "bJJ"  , NULL    , T_ILLEGAL,  0, true);
++  def(_invokeinterface     , "invokeinterface"     , "bJJ__", NULL    , T_ILLEGAL, -1, true);
++  def(_invokedynamic       , "invokedynamic"       , "bJJJJ", NULL    , T_ILLEGAL,  0, true );
++  def(_new                 , "new"                 , "bkk"  , NULL    , T_OBJECT ,  1, true );
+   def(_newarray            , "newarray"            , "bc"   , NULL    , T_OBJECT ,  0, true );
+-  def(_anewarray           , "anewarray"           , "bii"  , NULL    , T_OBJECT ,  0, true );
++  def(_anewarray           , "anewarray"           , "bkk"  , NULL    , T_OBJECT ,  0, true );
+   def(_arraylength         , "arraylength"         , "b"    , NULL    , T_VOID   ,  0, true );
+   def(_athrow              , "athrow"              , "b"    , NULL    , T_VOID   , -1, true );
+-  def(_checkcast           , "checkcast"           , "bii"  , NULL    , T_OBJECT ,  0, true );
+-  def(_instanceof          , "instanceof"          , "bii"  , NULL    , T_INT    ,  0, true );
++  def(_checkcast           , "checkcast"           , "bkk"  , NULL    , T_OBJECT ,  0, true );
++  def(_instanceof          , "instanceof"          , "bkk"  , NULL    , T_INT    ,  0, true );
+   def(_monitorenter        , "monitorenter"        , "b"    , NULL    , T_VOID   , -1, true );
+   def(_monitorexit         , "monitorexit"         , "b"    , NULL    , T_VOID   , -1, true );
+   def(_wide                , "wide"                , ""     , NULL    , T_VOID   ,  0, false);
+-  def(_multianewarray      , "multianewarray"      , "biic" , NULL    , T_OBJECT ,  1, true );
++  def(_multianewarray      , "multianewarray"      , "bkkc" , NULL    , T_OBJECT ,  1, true );
+   def(_ifnull              , "ifnull"              , "boo"  , NULL    , T_VOID   , -1, false);
+   def(_ifnonnull           , "ifnonnull"           , "boo"  , NULL    , T_VOID   , -1, false);
+   def(_goto_w              , "goto_w"              , "boooo", NULL    , T_VOID   ,  0, false);
+@@ -378,35 +451,35 @@
+   //  JVM bytecodes
+   //  bytecode               bytecode name           format   wide f.   result tp  stk traps  std code
+ 
+-  def(_fast_agetfield      , "fast_agetfield"      , "bjj"  , NULL    , T_OBJECT ,  0, true , _getfield       );
+-  def(_fast_bgetfield      , "fast_bgetfield"      , "bjj"  , NULL    , T_INT    ,  0, true , _getfield       );
+-  def(_fast_cgetfield      , "fast_cgetfield"      , "bjj"  , NULL    , T_CHAR   ,  0, true , _getfield       );
+-  def(_fast_dgetfield      , "fast_dgetfield"      , "bjj"  , NULL    , T_DOUBLE ,  0, true , _getfield       );
+-  def(_fast_fgetfield      , "fast_fgetfield"      , "bjj"  , NULL    , T_FLOAT  ,  0, true , _getfield       );
+-  def(_fast_igetfield      , "fast_igetfield"      , "bjj"  , NULL    , T_INT    ,  0, true , _getfield       );
+-  def(_fast_lgetfield      , "fast_lgetfield"      , "bjj"  , NULL    , T_LONG   ,  0, true , _getfield       );
+-  def(_fast_sgetfield      , "fast_sgetfield"      , "bjj"  , NULL    , T_SHORT  ,  0, true , _getfield       );
++  def(_fast_agetfield      , "fast_agetfield"      , "bJJ"  , NULL    , T_OBJECT ,  0, true , _getfield       );
++  def(_fast_bgetfield      , "fast_bgetfield"      , "bJJ"  , NULL    , T_INT    ,  0, true , _getfield       );
++  def(_fast_cgetfield      , "fast_cgetfield"      , "bJJ"  , NULL    , T_CHAR   ,  0, true , _getfield       );
++  def(_fast_dgetfield      , "fast_dgetfield"      , "bJJ"  , NULL    , T_DOUBLE ,  0, true , _getfield       );
++  def(_fast_fgetfield      , "fast_fgetfield"      , "bJJ"  , NULL    , T_FLOAT  ,  0, true , _getfield       );
++  def(_fast_igetfield      , "fast_igetfield"      , "bJJ"  , NULL    , T_INT    ,  0, true , _getfield       );
++  def(_fast_lgetfield      , "fast_lgetfield"      , "bJJ"  , NULL    , T_LONG   ,  0, true , _getfield       );
++  def(_fast_sgetfield      , "fast_sgetfield"      , "bJJ"  , NULL    , T_SHORT  ,  0, true , _getfield       );
+ 
+-  def(_fast_aputfield      , "fast_aputfield"      , "bjj"  , NULL    , T_OBJECT ,  0, true , _putfield       );
+-  def(_fast_bputfield      , "fast_bputfield"      , "bjj"  , NULL    , T_INT    ,  0, true , _putfield       );
+-  def(_fast_cputfield      , "fast_cputfield"      , "bjj"  , NULL    , T_CHAR   ,  0, true , _putfield       );
+-  def(_fast_dputfield      , "fast_dputfield"      , "bjj"  , NULL    , T_DOUBLE ,  0, true , _putfield       );
+-  def(_fast_fputfield      , "fast_fputfield"      , "bjj"  , NULL    , T_FLOAT  ,  0, true , _putfield       );
+-  def(_fast_iputfield      , "fast_iputfield"      , "bjj"  , NULL    , T_INT    ,  0, true , _putfield       );
+-  def(_fast_lputfield      , "fast_lputfield"      , "bjj"  , NULL    , T_LONG   ,  0, true , _putfield       );
+-  def(_fast_sputfield      , "fast_sputfield"      , "bjj"  , NULL    , T_SHORT  ,  0, true , _putfield       );
++  def(_fast_aputfield      , "fast_aputfield"      , "bJJ"  , NULL    , T_OBJECT ,  0, true , _putfield       );
++  def(_fast_bputfield      , "fast_bputfield"      , "bJJ"  , NULL    , T_INT    ,  0, true , _putfield       );
++  def(_fast_cputfield      , "fast_cputfield"      , "bJJ"  , NULL    , T_CHAR   ,  0, true , _putfield       );
++  def(_fast_dputfield      , "fast_dputfield"      , "bJJ"  , NULL    , T_DOUBLE ,  0, true , _putfield       );
++  def(_fast_fputfield      , "fast_fputfield"      , "bJJ"  , NULL    , T_FLOAT  ,  0, true , _putfield       );
++  def(_fast_iputfield      , "fast_iputfield"      , "bJJ"  , NULL    , T_INT    ,  0, true , _putfield       );
++  def(_fast_lputfield      , "fast_lputfield"      , "bJJ"  , NULL    , T_LONG   ,  0, true , _putfield       );
++  def(_fast_sputfield      , "fast_sputfield"      , "bJJ"  , NULL    , T_SHORT  ,  0, true , _putfield       );
+ 
+   def(_fast_aload_0        , "fast_aload_0"        , "b"    , NULL    , T_OBJECT ,  1, true , _aload_0        );
+-  def(_fast_iaccess_0      , "fast_iaccess_0"      , "b_jj" , NULL    , T_INT    ,  1, true , _aload_0        );
+-  def(_fast_aaccess_0      , "fast_aaccess_0"      , "b_jj" , NULL    , T_OBJECT ,  1, true , _aload_0        );
+-  def(_fast_faccess_0      , "fast_faccess_0"      , "b_jj" , NULL    , T_OBJECT ,  1, true , _aload_0        );
++  def(_fast_iaccess_0      , "fast_iaccess_0"      , "b_JJ" , NULL    , T_INT    ,  1, true , _aload_0        );
++  def(_fast_aaccess_0      , "fast_aaccess_0"      , "b_JJ" , NULL    , T_OBJECT ,  1, true , _aload_0        );
++  def(_fast_faccess_0      , "fast_faccess_0"      , "b_JJ" , NULL    , T_OBJECT ,  1, true , _aload_0        );
+ 
+   def(_fast_iload          , "fast_iload"          , "bi"   , NULL    , T_INT    ,  1, false, _iload);
+   def(_fast_iload2         , "fast_iload2"         , "bi_i" , NULL    , T_INT    ,  2, false, _iload);
+   def(_fast_icaload        , "fast_icaload"        , "bi_"  , NULL    , T_INT    ,  0, false, _iload);
+ 
+   // Faster method invocation.
+-  def(_fast_invokevfinal   , "fast_invokevfinal"   , "bjj"  , NULL    , T_ILLEGAL, -1, true, _invokevirtual   );
++  def(_fast_invokevfinal   , "fast_invokevfinal"   , "bJJ"  , NULL    , T_ILLEGAL, -1, true, _invokevirtual   );
+ 
+   def(_fast_linearswitch   , "fast_linearswitch"   , ""     , NULL    , T_VOID   , -1, false, _lookupswitch   );
+   def(_fast_binaryswitch   , "fast_binaryswitch"   , ""     , NULL    , T_VOID   , -1, false, _lookupswitch   );
+diff --git a/src/share/vm/interpreter/bytecodes.hpp b/src/share/vm/interpreter/bytecodes.hpp
+--- a/src/share/vm/interpreter/bytecodes.hpp
++++ b/src/share/vm/interpreter/bytecodes.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -280,17 +280,43 @@
+     number_of_codes
+   };
+ 
++  // Flag bits derived from format strings, can_trap, can_rewrite, etc.:
++  enum Flags {
++    // semantic flags:
++    _bc_can_trap      = 1<<0,     // bytecode execution can trap or block
++    _bc_can_rewrite   = 1<<1,     // bytecode execution has an alternate form
++
++    // format bits (determined only by the format string):
++    _fmt_has_c        = 1<<2,     // constant, such as sipush "bcc"
++    _fmt_has_j        = 1<<3,     // constant pool cache index, such as getfield "bjj"
++    _fmt_has_k        = 1<<4,     // constant pool index, such as ldc "bk"
++    _fmt_has_i        = 1<<5,     // local index, such as iload
++    _fmt_has_o        = 1<<6,     // offset, such as ifeq
++    _fmt_has_nbo      = 1<<7,     // contains native-order field(s)
++    _fmt_has_u2       = 1<<8,     // contains double-byte field(s)
++    _fmt_has_u4       = 1<<9,     // contains quad-byte field
++    _fmt_not_variable = 1<<10,    // not of variable length (simple or wide)
++    _fmt_not_simple   = 1<<11,    // either wide or variable length
++    _all_fmt_bits     = (_fmt_not_simple*2 - _fmt_has_c),
++
++    // Example derived format syndromes:
++    _fmt_b      = _fmt_not_variable,
++    _fmt_bc     = _fmt_b | _fmt_has_c,
++    _fmt_bi     = _fmt_b | _fmt_has_i,
++    _fmt_bkk    = _fmt_b | _fmt_has_k | _fmt_has_u2,
++    _fmt_bJJ    = _fmt_b | _fmt_has_j | _fmt_has_u2 | _fmt_has_nbo,
++    _fmt_bo2    = _fmt_b | _fmt_has_o | _fmt_has_u2,
++    _fmt_bo4    = _fmt_b | _fmt_has_o | _fmt_has_u4
++  };
++
+  private:
+   static bool        _is_initialized;
+   static const char* _name          [number_of_codes];
+-  static const char* _format        [number_of_codes];
+-  static const char* _wide_format   [number_of_codes];
+   static BasicType   _result_type   [number_of_codes];
+   static s_char      _depth         [number_of_codes];
+-  static u_char      _length        [number_of_codes];
+-  static bool        _can_trap      [number_of_codes];
++  static u_char      _lengths       [number_of_codes];
+   static Code        _java_code     [number_of_codes];
+-  static bool        _can_rewrite   [number_of_codes];
++  static jchar       _flags         [(1<<BitsPerByte)*2]; // all second page for wide formats
+ 
+   static void        def(Code code, const char* name, const char* format, const char* wide_format, BasicType result_type, int depth, bool can_trap);
+   static void        def(Code code, const char* name, const char* format, const char* wide_format, BasicType result_type, int depth, bool can_trap, Code java_code);
+@@ -322,24 +348,18 @@
+    static Code       non_breakpoint_code_at(address bcp, methodOop method = NULL);
+ 
+   // Bytecode attributes
+-  static bool        is_defined     (int  code)    { return 0 <= code && code < number_of_codes && _format[code] != NULL; }
+-  static bool        wide_is_defined(int  code)    { return is_defined(code) && _wide_format[code] != NULL; }
++  static bool        is_defined     (int  code)    { return 0 <= code && code < number_of_codes && flags(code, false) != 0; }
++  static bool        wide_is_defined(int  code)    { return is_defined(code) && flags(code, true) != 0; }
+   static const char* name           (Code code)    { check(code);      return _name          [code]; }
+-  static const char* format         (Code code)    { check(code);      return _format        [code]; }
+-  static const char* wide_format    (Code code)    { return _wide_format[code]; }
+   static BasicType   result_type    (Code code)    { check(code);      return _result_type   [code]; }
+   static int         depth          (Code code)    { check(code);      return _depth         [code]; }
+-  static int         length_for     (Code code)    { return _length[code]; }
+-  static bool        can_trap       (Code code)    { check(code);      return _can_trap      [code]; }
++  static int         length_for     (Code code)    { check(code);      return _lengths       [code] & 0xF; }
++  static int         wide_length_for(Code code)    { check(code);      return _lengths       [code] >> 4; }
++  static bool        can_trap       (Code code)    { check(code);      return has_all_flags(code, _bc_can_trap, false); }
+   static Code        java_code      (Code code)    { check(code);      return _java_code     [code]; }
+-  static bool        can_rewrite    (Code code)    { check(code);      return _can_rewrite   [code]; }
+-  static int         wide_length_for(Code code)    {
+-    if (!is_defined(code)) {
+-      return 0;
+-    }
+-    const char* wf = wide_format(code);
+-    return (wf == NULL) ? 0 : (int)strlen(wf);
+-  }
++  static bool        can_rewrite    (Code code)    { check(code);      return has_all_flags(code, _bc_can_rewrite, false); }
++  static bool        native_byte_order(Code code)  { check(code);      return has_all_flags(code, _fmt_has_nbo, false); }
++  static bool        uses_cp_cache  (Code code)    { check(code);      return has_all_flags(code, _fmt_has_j, false); }
+   // if 'end' is provided, it indicates the end of the code buffer which
+   // should not be read past when parsing.
+   static int         special_length_at(address bcp, address end = NULL);
+@@ -355,6 +375,16 @@
+ 
+   static bool        is_zero_const  (Code code)    { return (code == _aconst_null || code == _iconst_0
+                                                            || code == _fconst_0 || code == _dconst_0); }
++  static int         compute_flags  (const char* format, int more_flags = 0);  // compute the flags
++  static int         flags          (int code, bool is_wide) {
++    assert(code == (u_char)code, "must be a byte");
++    return _flags[code + (is_wide ? (1<<BitsPerByte) : 0)];
++  }
++  static int         format_bits    (Code code, bool is_wide) { return flags(code, is_wide) & _all_fmt_bits; }
++  static bool        has_all_flags  (Code code, int test_flags, bool is_wide) {
++    return (flags(code, is_wide) & test_flags) == test_flags;
++  }
++
+   // Initialization
+   static void        initialize     ();
+ };
+diff --git a/src/share/vm/interpreter/interpreter.cpp b/src/share/vm/interpreter/interpreter.cpp
+--- a/src/share/vm/interpreter/interpreter.cpp
++++ b/src/share/vm/interpreter/interpreter.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -226,8 +226,9 @@
+ // not yet been executed (in Java semantics, not in actual operation).
+ bool AbstractInterpreter::is_not_reached(methodHandle method, int bci) {
+   address bcp = method->bcp_from(bci);
++  Bytecodes::Code code = Bytecodes::code_at(bcp, method());
+ 
+-  if (!Bytecode_at(bcp)->must_rewrite()) {
++  if (!Bytecode_at(bcp)->must_rewrite(code)) {
+     // might have been reached
+     return false;
+   }
+diff --git a/src/share/vm/interpreter/interpreterRuntime.cpp b/src/share/vm/interpreter/interpreterRuntime.cpp
+--- a/src/share/vm/interpreter/interpreterRuntime.cpp
++++ b/src/share/vm/interpreter/interpreterRuntime.cpp
+@@ -63,7 +63,7 @@
+ IRT_ENTRY(void, InterpreterRuntime::ldc(JavaThread* thread, bool wide))
+   // access constant pool
+   constantPoolOop pool = method(thread)->constants();
+-  int index = wide ? two_byte_index(thread) : one_byte_index(thread);
++  int index = wide ? get_index_u2(thread, Bytecodes::_ldc_w) : get_index_u1(thread, Bytecodes::_ldc);
+   constantTag tag = pool->tag_at(index);
+ 
+   if (tag.is_unresolved_klass() || tag.is_klass()) {
+@@ -135,7 +135,7 @@
+ IRT_ENTRY(void, InterpreterRuntime::multianewarray(JavaThread* thread, jint* first_size_address))
+   // We may want to pass in more arguments - could make this slightly faster
+   constantPoolOop constants = method(thread)->constants();
+-  int          i = two_byte_index(thread);
++  int          i = get_index_u2(thread, Bytecodes::_multianewarray);
+   klassOop klass = constants->klass_at(i, CHECK);
+   int   nof_dims = number_of_dimensions(thread);
+   assert(oop(klass)->is_klass(), "not a class");
+@@ -169,7 +169,7 @@
+ // Quicken instance-of and check-cast bytecodes
+ IRT_ENTRY(void, InterpreterRuntime::quicken_io_cc(JavaThread* thread))
+   // Force resolving; quicken the bytecode
+-  int which = two_byte_index(thread);
++  int which = get_index_u2(thread, Bytecodes::_checkcast);
+   constantPoolOop cpool = method(thread)->constants();
+   // We'd expect to assert that we're only here to quicken bytecodes, but in a multithreaded
+   // program we might have seen an unquick'd bytecode in the interpreter but have another
+@@ -463,7 +463,7 @@
+ 
+   {
+     JvmtiHideSingleStepping jhss(thread);
+-    LinkResolver::resolve_field(info, pool, two_byte_index(thread),
++    LinkResolver::resolve_field(info, pool, get_index_u2_cpcache(thread, bytecode),
+                                 bytecode, false, CHECK);
+   } // end JvmtiHideSingleStepping
+ 
+@@ -634,7 +634,7 @@
+   {
+     JvmtiHideSingleStepping jhss(thread);
+     LinkResolver::resolve_invoke(info, receiver, pool,
+-                                 two_byte_index(thread), bytecode, CHECK);
++                                 get_index_u2_cpcache(thread, bytecode), bytecode, CHECK);
+     if (JvmtiExport::can_hotswap_or_post_breakpoint()) {
+       int retry_count = 0;
+       while (info.resolved_method()->is_old()) {
+@@ -645,7 +645,7 @@
+                   "Could not resolve to latest version of redefined method");
+         // method is redefined in the middle of resolve so re-try.
+         LinkResolver::resolve_invoke(info, receiver, pool,
+-                                     two_byte_index(thread), bytecode, CHECK);
++                                     get_index_u2_cpcache(thread, bytecode), bytecode, CHECK);
+       }
+     }
+   } // end JvmtiHideSingleStepping
+@@ -704,7 +704,7 @@
+     caller_bci = caller_method->bci_from(caller_bcp);
+     site_index = Bytes::get_native_u4(caller_bcp+1);
+   }
+-  assert(site_index == four_byte_index(thread), "");
++  assert(site_index == InterpreterRuntime::bytecode(thread)->get_index_u4(bytecode), "");
+   assert(constantPoolCacheOopDesc::is_secondary_index(site_index), "proper format");
+   // there is a second CPC entries that is of interest; it caches signature info:
+   int main_index = pool->cache()->secondary_entry_at(site_index)->main_entry_index();
+diff --git a/src/share/vm/interpreter/interpreterRuntime.hpp b/src/share/vm/interpreter/interpreterRuntime.hpp
+--- a/src/share/vm/interpreter/interpreterRuntime.hpp
++++ b/src/share/vm/interpreter/interpreterRuntime.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -40,9 +40,13 @@
+     return Bytecodes::code_at(bcp(thread), method(thread));
+   }
+   static bool      already_resolved(JavaThread *thread) { return cache_entry(thread)->is_resolved(code(thread)); }
+-  static int       one_byte_index(JavaThread *thread)   { return bcp(thread)[1]; }
+-  static int       two_byte_index(JavaThread *thread)   { return Bytes::get_Java_u2(bcp(thread) + 1); }
+-  static int       four_byte_index(JavaThread *thread)  { return Bytes::get_native_u4(bcp(thread) + 1); }
++  static Bytecode* bytecode(JavaThread *thread)      { return Bytecode_at(bcp(thread)); }
++  static int       get_index_u1(JavaThread *thread, Bytecodes::Code bc)
++                                                        { return bytecode(thread)->get_index_u1(bc); }
++  static int       get_index_u2(JavaThread *thread, Bytecodes::Code bc)
++                                                        { return bytecode(thread)->get_index_u2(bc); }
++  static int       get_index_u2_cpcache(JavaThread *thread, Bytecodes::Code bc)
++                                                        { return bytecode(thread)->get_index_u2_cpcache(bc); }
+   static int       number_of_dimensions(JavaThread *thread)  { return bcp(thread)[3]; }
+ 
+   static ConstantPoolCacheEntry* cache_entry_at(JavaThread *thread, int i)  { return method(thread)->constants()->cache()->entry_at(i); }
+diff --git a/src/share/vm/interpreter/rewriter.cpp b/src/share/vm/interpreter/rewriter.cpp
+--- a/src/share/vm/interpreter/rewriter.cpp
++++ b/src/share/vm/interpreter/rewriter.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1998-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1998-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -103,16 +103,15 @@
+ 
+ 
+ // Rewrite a classfile-order CP index into a native-order CPC index.
+-int Rewriter::rewrite_member_reference(address bcp, int offset) {
++void Rewriter::rewrite_member_reference(address bcp, int offset) {
+   address p = bcp + offset;
+   int  cp_index    = Bytes::get_Java_u2(p);
+   int  cache_index = cp_entry_to_cp_cache(cp_index);
+   Bytes::put_native_u2(p, cache_index);
+-  return cp_index;
+ }
+ 
+ 
+-void Rewriter::rewrite_invokedynamic(address bcp, int offset, int delete_me) {
++void Rewriter::rewrite_invokedynamic(address bcp, int offset) {
+   address p = bcp + offset;
+   assert(p[-1] == Bytecodes::_invokedynamic, "");
+   int cp_index = Bytes::get_Java_u2(p);
+@@ -178,7 +177,7 @@
+         case Bytecodes::_lookupswitch   : {
+ #ifndef CC_INTERP
+           Bytecode_lookupswitch* bc = Bytecode_lookupswitch_at(bcp);
+-          bc->set_code(
++          (*bcp) = (
+             bc->number_of_pairs() < BinarySwitchThreshold
+             ? Bytecodes::_fast_linearswitch
+             : Bytecodes::_fast_binaryswitch
+@@ -197,7 +196,7 @@
+           rewrite_member_reference(bcp, prefix_length+1);
+           break;
+         case Bytecodes::_invokedynamic:
+-          rewrite_invokedynamic(bcp, prefix_length+1, int(sizeof"@@@@DELETE ME"));
++          rewrite_invokedynamic(bcp, prefix_length+1);
+           break;
+         case Bytecodes::_jsr            : // fall through
+         case Bytecodes::_jsr_w          : nof_jsrs++;                   break;
+diff --git a/src/share/vm/interpreter/rewriter.hpp b/src/share/vm/interpreter/rewriter.hpp
+--- a/src/share/vm/interpreter/rewriter.hpp
++++ b/src/share/vm/interpreter/rewriter.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1998-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1998-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -64,8 +64,8 @@
+   void scan_method(methodOop m);
+   methodHandle rewrite_jsrs(methodHandle m, TRAPS);
+   void rewrite_Object_init(methodHandle m, TRAPS);
+-  int  rewrite_member_reference(address bcp, int offset);
+-  void rewrite_invokedynamic(address bcp, int offset, int cp_index);
++  void rewrite_member_reference(address bcp, int offset);
++  void rewrite_invokedynamic(address bcp, int offset);
+ 
+  public:
+   // Driver routine:
+diff --git a/src/share/vm/interpreter/templateTable.cpp b/src/share/vm/interpreter/templateTable.cpp
+--- a/src/share/vm/interpreter/templateTable.cpp
++++ b/src/share/vm/interpreter/templateTable.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -434,15 +434,15 @@
+   def(Bytecodes::_dreturn             , ____|disp|clvm|____, dtos, dtos, _return             , dtos         );
+   def(Bytecodes::_areturn             , ____|disp|clvm|____, atos, atos, _return             , atos         );
+   def(Bytecodes::_return              , ____|disp|clvm|____, vtos, vtos, _return             , vtos         );
+-  def(Bytecodes::_getstatic           , ubcp|____|clvm|____, vtos, vtos, getstatic           ,  1           );
+-  def(Bytecodes::_putstatic           , ubcp|____|clvm|____, vtos, vtos, putstatic           ,  2           );
+-  def(Bytecodes::_getfield            , ubcp|____|clvm|____, vtos, vtos, getfield            ,  1           );
+-  def(Bytecodes::_putfield            , ubcp|____|clvm|____, vtos, vtos, putfield            ,  2           );
+-  def(Bytecodes::_invokevirtual       , ubcp|disp|clvm|____, vtos, vtos, invokevirtual       ,  2           );
+-  def(Bytecodes::_invokespecial       , ubcp|disp|clvm|____, vtos, vtos, invokespecial       ,  1           );
+-  def(Bytecodes::_invokestatic        , ubcp|disp|clvm|____, vtos, vtos, invokestatic        ,  1           );
+-  def(Bytecodes::_invokeinterface     , ubcp|disp|clvm|____, vtos, vtos, invokeinterface     ,  1           );
+-  def(Bytecodes::_invokedynamic       , ubcp|disp|clvm|____, vtos, vtos, invokedynamic       ,  1           );
++  def(Bytecodes::_getstatic           , ubcp|____|clvm|____, vtos, vtos, getstatic           , f1_byte      );
++  def(Bytecodes::_putstatic           , ubcp|____|clvm|____, vtos, vtos, putstatic           , f2_byte      );
++  def(Bytecodes::_getfield            , ubcp|____|clvm|____, vtos, vtos, getfield            , f1_byte      );
++  def(Bytecodes::_putfield            , ubcp|____|clvm|____, vtos, vtos, putfield            , f2_byte      );
++  def(Bytecodes::_invokevirtual       , ubcp|disp|clvm|____, vtos, vtos, invokevirtual       , f2_byte      );
++  def(Bytecodes::_invokespecial       , ubcp|disp|clvm|____, vtos, vtos, invokespecial       , f1_byte      );
++  def(Bytecodes::_invokestatic        , ubcp|disp|clvm|____, vtos, vtos, invokestatic        , f1_byte      );
++  def(Bytecodes::_invokeinterface     , ubcp|disp|clvm|____, vtos, vtos, invokeinterface     , f1_byte      );
++  def(Bytecodes::_invokedynamic       , ubcp|disp|clvm|____, vtos, vtos, invokedynamic       , f1_oop       );
+   def(Bytecodes::_new                 , ubcp|____|clvm|____, vtos, atos, _new                ,  _           );
+   def(Bytecodes::_newarray            , ubcp|____|clvm|____, itos, atos, newarray            ,  _           );
+   def(Bytecodes::_anewarray           , ubcp|____|clvm|____, itos, atos, anewarray           ,  _           );
+@@ -502,7 +502,7 @@
+   def(Bytecodes::_fast_iload2         , ubcp|____|____|____, vtos, itos, fast_iload2         ,  _       );
+   def(Bytecodes::_fast_icaload        , ubcp|____|____|____, vtos, itos, fast_icaload        ,  _       );
+ 
+-  def(Bytecodes::_fast_invokevfinal   , ubcp|disp|clvm|____, vtos, vtos, fast_invokevfinal   ,  2           );
++  def(Bytecodes::_fast_invokevfinal   , ubcp|disp|clvm|____, vtos, vtos, fast_invokevfinal   , f2_byte      );
+ 
+   def(Bytecodes::_fast_linearswitch   , ubcp|disp|____|____, itos, vtos, fast_linearswitch   ,  _           );
+   def(Bytecodes::_fast_binaryswitch   , ubcp|disp|____|____, itos, vtos, fast_binaryswitch   ,  _           );
+diff --git a/src/share/vm/interpreter/templateTable.hpp b/src/share/vm/interpreter/templateTable.hpp
+--- a/src/share/vm/interpreter/templateTable.hpp
++++ b/src/share/vm/interpreter/templateTable.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -73,6 +73,7 @@
+  public:
+   enum Operation { add, sub, mul, div, rem, _and, _or, _xor, shl, shr, ushr };
+   enum Condition { equal, not_equal, less, less_equal, greater, greater_equal };
++  enum CacheByte { f1_byte = 1, f2_byte = 2, f1_oop = 0x11 };  // byte_no codes
+ 
+  private:
+   static bool            _is_initialized;        // true if TemplateTable has been initialized
+@@ -244,13 +245,18 @@
+ 
+   static void _return(TosState state);
+ 
+-  static void resolve_cache_and_index(int byte_no, Register cache, Register index);
++  static void resolve_cache_and_index(int byte_no,       // one of 1,2,11
++                                      Register result ,  // either noreg or output for f1/f2
++                                      Register cache,    // output for CP cache
++                                      Register index,    // output for CP index
++                                      size_t index_size); // one of 1,2,4
+   static void load_invoke_cp_cache_entry(int byte_no,
+                                          Register method,
+                                          Register itable_index,
+                                          Register flags,
+-                                         bool is_invokevirtual = false,
+-                                         bool is_virtual_final = false);
++                                         bool is_invokevirtual,
++                                         bool is_virtual_final,
++                                         bool is_invokedynamic);
+   static void load_field_cp_cache_entry(Register obj,
+                                         Register cache,
+                                         Register index,
+diff --git a/src/share/vm/oops/constantPoolOop.cpp b/src/share/vm/oops/constantPoolOop.cpp
+--- a/src/share/vm/oops/constantPoolOop.cpp
++++ b/src/share/vm/oops/constantPoolOop.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -297,11 +297,9 @@
+ 
+ 
+ int constantPoolOopDesc::remap_instruction_operand_from_cache(int operand) {
+-  // Operand was fetched by a stream using get_Java_u2, yet was stored
+-  // by Rewriter::rewrite_member_reference in native order.
+-  // So now we have to fix the damage by swapping back to native order.
+-  assert((int)(u2)operand == operand, "clean u2");
+-  int cpc_index = Bytes::swap_u2(operand);
++  int cpc_index = operand;
++  DEBUG_ONLY(cpc_index -= CPCACHE_INDEX_TAG);
++  assert((int)(u2)cpc_index == cpc_index, "clean u2");
+   int member_index = cache()->entry_at(cpc_index)->constant_pool_index();
+   return member_index;
+ }
+diff --git a/src/share/vm/oops/constantPoolOop.hpp b/src/share/vm/oops/constantPoolOop.hpp
+--- a/src/share/vm/oops/constantPoolOop.hpp
++++ b/src/share/vm/oops/constantPoolOop.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -434,6 +434,10 @@
+   // Debugging
+   const char* printable_name_at(int which) PRODUCT_RETURN0;
+ 
++#ifdef ASSERT
++  enum { CPCACHE_INDEX_TAG = 0x10000 };  // helps keep CP cache indices distinct from CP indices
++#endif //ASSERT
++
+  private:
+ 
+   symbolOop impl_name_ref_at(int which, bool uncached);
+@@ -441,7 +445,7 @@
+   int       impl_klass_ref_index_at(int which, bool uncached);
+   int       impl_name_and_type_ref_index_at(int which, bool uncached);
+ 
+-  int remap_instruction_operand_from_cache(int operand);
++  int remap_instruction_operand_from_cache(int operand);  // operand must be biased by CPCACHE_INDEX_TAG
+ 
+   // Used while constructing constant pool (only by ClassFileParser)
+   jint klass_index_at(int which) {
+diff --git a/src/share/vm/oops/generateOopMap.cpp b/src/share/vm/oops/generateOopMap.cpp
+--- a/src/share/vm/oops/generateOopMap.cpp
++++ b/src/share/vm/oops/generateOopMap.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -1254,7 +1254,7 @@
+       case Bytecodes::_invokestatic:
+       case Bytecodes::_invokedynamic:
+       case Bytecodes::_invokeinterface:
+-        int idx = currentBC->get_index_int();
++        int idx = currentBC->has_index_u4() ? currentBC->get_index_u4() : currentBC->get_index_u2();
+         constantPoolOop cp    = method()->constants();
+         int nameAndTypeIdx    = cp->name_and_type_ref_index_at(idx);
+         int signatureIdx      = cp->signature_ref_index_at(nameAndTypeIdx);
+@@ -1286,7 +1286,7 @@
+       case Bytecodes::_invokestatic:
+       case Bytecodes::_invokedynamic:
+       case Bytecodes::_invokeinterface:
+-        int idx = currentBC->get_index_int();
++        int idx = currentBC->has_index_u4() ? currentBC->get_index_u4() : currentBC->get_index_u2();
+         constantPoolOop cp    = method()->constants();
+         int nameAndTypeIdx    = cp->name_and_type_ref_index_at(idx);
+         int signatureIdx      = cp->signature_ref_index_at(nameAndTypeIdx);
+@@ -1356,8 +1356,8 @@
+ 
+     case Bytecodes::_ldc2_w:            ppush(vvCTS);               break;
+ 
+-    case Bytecodes::_ldc:               do_ldc(itr->get_index(), itr->bci());    break;
+-    case Bytecodes::_ldc_w:             do_ldc(itr->get_index_big(), itr->bci());break;
++    case Bytecodes::_ldc:               do_ldc(itr->get_index(),    itr->bci()); break;
++    case Bytecodes::_ldc_w:             do_ldc(itr->get_index_u2(), itr->bci()); break;
+ 
+     case Bytecodes::_iload:
+     case Bytecodes::_fload:             ppload(vCTS, itr->get_index()); break;
+@@ -1550,17 +1550,17 @@
+     case Bytecodes::_jsr_w:             do_jsr(itr->dest_w());       break;
+ 
+     case Bytecodes::_getstatic:         do_field(true,  true,
+-                                                 itr->get_index_big(),
++                                                 itr->get_index_u2_cpcache(),
+                                                  itr->bci()); break;
+-    case Bytecodes::_putstatic:         do_field(false, true,  itr->get_index_big(), itr->bci()); break;
+-    case Bytecodes::_getfield:          do_field(true,  false, itr->get_index_big(), itr->bci()); break;
+-    case Bytecodes::_putfield:          do_field(false, false, itr->get_index_big(), itr->bci()); break;
++    case Bytecodes::_putstatic:         do_field(false, true,  itr->get_index_u2_cpcache(), itr->bci()); break;
++    case Bytecodes::_getfield:          do_field(true,  false, itr->get_index_u2_cpcache(), itr->bci()); break;
++    case Bytecodes::_putfield:          do_field(false, false, itr->get_index_u2_cpcache(), itr->bci()); break;
+ 
+     case Bytecodes::_invokevirtual:
+-    case Bytecodes::_invokespecial:     do_method(false, false, itr->get_index_big(), itr->bci()); break;
+-    case Bytecodes::_invokestatic:      do_method(true,  false, itr->get_index_big(), itr->bci()); break;
+-    case Bytecodes::_invokedynamic:     do_method(true,  false, itr->get_index_int(), itr->bci()); break;
+-    case Bytecodes::_invokeinterface:   do_method(false, true,  itr->get_index_big(), itr->bci()); break;
++    case Bytecodes::_invokespecial:     do_method(false, false, itr->get_index_u2_cpcache(), itr->bci()); break;
++    case Bytecodes::_invokestatic:      do_method(true,  false, itr->get_index_u2_cpcache(), itr->bci()); break;
++    case Bytecodes::_invokedynamic:     do_method(true,  false, itr->get_index_u4(),         itr->bci()); break;
++    case Bytecodes::_invokeinterface:   do_method(false, true,  itr->get_index_u2_cpcache(), itr->bci()); break;
+     case Bytecodes::_newarray:
+     case Bytecodes::_anewarray:         pp_new_ref(vCTS, itr->bci()); break;
+     case Bytecodes::_checkcast:         do_checkcast(); break;
+diff --git a/src/share/vm/opto/bytecodeInfo.cpp b/src/share/vm/opto/bytecodeInfo.cpp
+--- a/src/share/vm/opto/bytecodeInfo.cpp
++++ b/src/share/vm/opto/bytecodeInfo.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1998-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1998-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -340,7 +340,7 @@
+     Bytecodes::Code call_bc = iter.cur_bc();
+     // An invokedynamic instruction does not have a klass.
+     if (call_bc != Bytecodes::_invokedynamic) {
+-      int index = iter.get_index_int();
++      int index = iter.get_index_u2_cpcache();
+       if (!caller_method->is_klass_loaded(index, true)) {
+         return false;
+       }
+diff --git a/src/share/vm/opto/parse2.cpp b/src/share/vm/opto/parse2.cpp
+--- a/src/share/vm/opto/parse2.cpp
++++ b/src/share/vm/opto/parse2.cpp
+@@ -1317,8 +1317,8 @@
+   case Bytecodes::_iconst_3: push(intcon( 3)); break;
+   case Bytecodes::_iconst_4: push(intcon( 4)); break;
+   case Bytecodes::_iconst_5: push(intcon( 5)); break;
+-  case Bytecodes::_bipush:   push(intcon( iter().get_byte())); break;
+-  case Bytecodes::_sipush:   push(intcon( iter().get_short())); break;
++  case Bytecodes::_bipush:   push(intcon(iter().get_constant_u1())); break;
++  case Bytecodes::_sipush:   push(intcon(iter().get_constant_u2())); break;
+   case Bytecodes::_aconst_null: push(null());  break;
+   case Bytecodes::_ldc:
+   case Bytecodes::_ldc_w:
+diff --git a/src/share/vm/prims/jvmtiClassFileReconstituter.cpp b/src/share/vm/prims/jvmtiClassFileReconstituter.cpp
+--- a/src/share/vm/prims/jvmtiClassFileReconstituter.cpp
++++ b/src/share/vm/prims/jvmtiClassFileReconstituter.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2005-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 2005-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -638,7 +638,7 @@
+ 
+     // length of bytecode (mnemonic + operands)
+     address bcp = bs.bcp();
+-    int len = bs.next_bcp() - bcp;
++    int     len = bs.instruction_size();
+     assert(len > 0, "length must be > 0");
+ 
+     // copy the bytecodes
+diff --git a/src/share/vm/prims/methodComparator.cpp b/src/share/vm/prims/methodComparator.cpp
+--- a/src/share/vm/prims/methodComparator.cpp
++++ b/src/share/vm/prims/methodComparator.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2000-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 2000-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -130,8 +130,8 @@
+   case Bytecodes::_multianewarray : // fall through
+   case Bytecodes::_checkcast      : // fall through
+   case Bytecodes::_instanceof     : {
+-    u2 cpi_old = _s_old->get_index_big();
+-    u2 cpi_new = _s_new->get_index_big();
++    u2 cpi_old = _s_old->get_index_u2();
++    u2 cpi_new = _s_new->get_index_u2();
+     if ((_old_cp->klass_at_noresolve(cpi_old) != _new_cp->klass_at_noresolve(cpi_new)))
+         return false;
+     if (c_old == Bytecodes::_multianewarray &&
+@@ -147,9 +147,10 @@
+   case Bytecodes::_invokevirtual   : // fall through
+   case Bytecodes::_invokespecial   : // fall through
+   case Bytecodes::_invokestatic    : // fall through
++  case Bytecodes::_invokedynamic   : // fall through
+   case Bytecodes::_invokeinterface : {
+-    u2 cpci_old = _s_old->get_index_int();
+-    u2 cpci_new = _s_new->get_index_int();
++    u2 cpci_old = _s_old->has_index_u4() ? _s_old->get_index_u4() : _s_old->get_index_u2();
++    u2 cpci_new = _s_new->has_index_u4() ? _s_new->get_index_u4() : _s_new->get_index_u2();
+     // Check if the names of classes, field/method names and signatures at these indexes
+     // are the same. Indices which are really into constantpool cache (rather than constant
+     // pool itself) are accepted by the constantpool query routines below.
+@@ -167,8 +168,8 @@
+       cpi_old = _s_old->bcp()[1];
+       cpi_new = _s_new->bcp()[1];
+     } else {
+-      cpi_old = _s_old->get_index_big();
+-      cpi_new = _s_new->get_index_big();
++      cpi_old = _s_old->get_index_u2();
++      cpi_new = _s_new->get_index_u2();
+     }
+     constantTag tag_old = _old_cp->tag_at(cpi_old);
+     constantTag tag_new = _new_cp->tag_at(cpi_new);
+@@ -199,8 +200,8 @@
+   }
+ 
+   case Bytecodes::_ldc2_w : {
+-    u2 cpi_old = _s_old->get_index_big();
+-    u2 cpi_new = _s_new->get_index_big();
++    u2 cpi_old = _s_old->get_index_u2();
++    u2 cpi_new = _s_new->get_index_u2();
+     constantTag tag_old = _old_cp->tag_at(cpi_old);
+     constantTag tag_new = _new_cp->tag_at(cpi_new);
+     if (tag_old.value() != tag_new.value())
+@@ -221,7 +222,7 @@
+     break;
+ 
+   case Bytecodes::_sipush    :
+-    if (_s_old->get_index_big() != _s_new->get_index_big())
++    if (_s_old->get_index_u2() != _s_new->get_index_u2())
+       return false;
+     break;
+ 
+@@ -260,8 +261,8 @@
+   case Bytecodes::_ifnonnull : // fall through
+   case Bytecodes::_ifnull    : // fall through
+   case Bytecodes::_jsr       : {
+-    short old_ofs = (short) _s_old->get_index_big();
+-    short new_ofs = (short) _s_new->get_index_big();
++    short old_ofs = (short) _s_old->get_index_u2();
++    short new_ofs = (short) _s_new->get_index_u2();
+     if (_switchable_test) {
+       int old_dest = _s_old->bci() + old_ofs;
+       int new_dest = _s_new->bci() + new_ofs;
+@@ -285,9 +286,11 @@
+     if (_s_old->is_wide() != _s_new->is_wide())
+       return false;
+     if (! _s_old->is_wide()) {
+-      if (_s_old->get_index_big() != _s_new->get_index_big())
++      // We could use get_index_u1 and get_constant_u1, but it's simpler to grab both bytes at once:
++      if (Bytes::get_Java_u2(_s_old->bcp() + 1) != Bytes::get_Java_u2(_s_new->bcp() + 1))
+         return false;
+     } else {
++      // We could use get_index_u2 and get_constant_u2, but it's simpler to grab all four bytes at once:
+       if (Bytes::get_Java_u4(_s_old->bcp() + 1) != Bytes::get_Java_u4(_s_new->bcp() + 1))
+         return false;
+     }
+@@ -357,8 +360,8 @@
+         }
+       }
+     } else { // !_switchable_test, can use fast rough compare
+-      int len_old = _s_old->next_bcp() - _s_old->bcp();
+-      int len_new = _s_new->next_bcp() - _s_new->bcp();
++      int len_old = _s_old->instruction_size();
++      int len_new = _s_new->instruction_size();
+       if (len_old != len_new)
+         return false;
+       if (memcmp(_s_old->bcp(), _s_new->bcp(), len_old) != 0)
+diff --git a/src/share/vm/prims/methodHandleWalk.cpp b/src/share/vm/prims/methodHandleWalk.cpp
+--- a/src/share/vm/prims/methodHandleWalk.cpp
++++ b/src/share/vm/prims/methodHandleWalk.cpp
+@@ -732,7 +732,7 @@
+   case Bytecodes::_dreturn:
+   case Bytecodes::_areturn:
+   case Bytecodes::_return:
+-    assert(strcmp(Bytecodes::format(op), "b") == 0, "wrong bytecode format");
++    assert(Bytecodes::format_bits(op, false) == Bytecodes::_fmt_b, "wrong bytecode format");
+     _bytecode.push(op);
+     break;
+ 
+@@ -748,7 +748,7 @@
+   case Bytecodes::_fstore:
+   case Bytecodes::_dstore:
+   case Bytecodes::_astore:
+-    assert(strcmp(Bytecodes::format(op), "bi") == 0, "wrong bytecode format");
++    assert(Bytecodes::format_bits(op, false) == Bytecodes::_fmt_bi, "wrong bytecode format");
+     assert((char) index == index, "index does not fit in 8-bit");
+     _bytecode.push(op);
+     _bytecode.push(index);
+@@ -757,18 +757,18 @@
+   // bii
+   case Bytecodes::_ldc2_w:
+   case Bytecodes::_checkcast:
+-    assert(strcmp(Bytecodes::format(op), "bii") == 0, "wrong bytecode format");
++    assert(Bytecodes::format_bits(op, false) == Bytecodes::_fmt_bkk, "wrong bytecode format");
+     assert((short) index == index, "index does not fit in 16-bit");
+     _bytecode.push(op);
+     _bytecode.push(index >> 8);
+     _bytecode.push(index);
+     break;
+ 
+-  // bjj
++  // bJJ
+   case Bytecodes::_invokestatic:
+   case Bytecodes::_invokespecial:
+   case Bytecodes::_invokevirtual:
+-    assert(strcmp(Bytecodes::format(op), "bjj") == 0, "wrong bytecode format");
++    assert(Bytecodes::format_bits(op, false) == Bytecodes::_fmt_bJJ, "wrong bytecode format");
+     assert((short) index == index, "index does not fit in 16-bit");
+     _bytecode.push(op);
+     _bytecode.push(index >> 8);

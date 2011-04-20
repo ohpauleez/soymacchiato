@@ -1,0 +1,2187 @@
+7001424: implement JSR 292 EG adjustments, November 2010
+Reviewed-by: twisti
+
+diff --git a/src/share/classes/java/dyn/CallSite.java b/src/share/classes/java/dyn/CallSite.java
+--- a/src/share/classes/java/dyn/CallSite.java
++++ b/src/share/classes/java/dyn/CallSite.java
+@@ -35,14 +35,25 @@
+  * which is called its {@code target}.
+  * An {@code invokedynamic} instruction linked to a {@code CallSite} delegates
+  * all calls to the site's current target.
++ * A {@code CallSite} may be associated with several {@code invokedynamic}
++ * instructions, or it may be "free floating", associated with none.
++ * In any case, it may be invoked through an associated method handle
++ * called its {@linkplain #dynamicInvoker dynamic invoker}.
+  * <p>
+- * If a mutable target is not required, the {@code invokedynamic} instruction
+- * should be linked to a {@linkplain ConstantCallSite constant call site}.
+- * If a volatile target is required, because updates to the target must be
+- * reliably witnessed by other threads, the {@code invokedynamic} instruction
+- * should be linked to a {@linkplain VolatileCallSite volatile call site}.
++ * {@code CallSite} is an abstract class which does not allow
++ * direct subclassing by users.  It has three immediate,
++ * concrete subclasses that may be either instantiated or subclassed.
++ * <ul>
++ * <li>If a mutable target is not required, an {@code invokedynamic} instruction
++ * may be permanently bound by means of a {@linkplain ConstantCallSite constant call site}.
++ * <li>If a mutable target is required which has volatile variable semantics,
++ * because updates to the target must be immediately and reliably witnessed by other threads,
++ * a {@linkplain VolatileCallSite volatile call site} may be used.
++ * <li>Otherwise, if a mutable target is required,
++ * a {@linkplain MutableCallSite mutable call site} may be used.
++ * </ul>
+  * <p>
+- * A call site may be <em>relinked</em> by changing its target.
++ * A non-constant call site may be <em>relinked</em> by changing its target.
+  * The new target must have the same {@linkplain MethodHandle#type() type}
+  * as the previous target.
+  * Thus, though a call site can be relinked to a series of
+@@ -72,6 +83,7 @@
+ </pre></blockquote>
+  * @author John Rose, JSR 292 EG
+  */
++abstract
+ public class CallSite {
+     private static final Access IMPL_TOKEN = Access.getToken();
+ 
+@@ -87,7 +99,6 @@
+     private MemberName calleeNameRemoveForPFD;
+ 
+     /**
+-     * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+      * Make a blank call site object with the given method type.
+      * An initial target method is supplied which will throw
+      * an {@link IllegalStateException} if called.
+@@ -95,16 +106,20 @@
+      * Before this {@code CallSite} object is returned from a bootstrap method,
+      * it is usually provided with a more useful target method,
+      * via a call to {@link CallSite#setTarget(MethodHandle) setTarget}.
++     * @throws NullPointerException if the proposed type is null
+      */
+-    public CallSite(MethodType type) {
++    /*package-private*/
++    CallSite(MethodType type) {
+         target = MethodHandles.invokers(type).uninitializedCallSite();
+     }
+ 
+     /**
+      * Make a blank call site object, possibly equipped with an initial target method handle.
+      * @param target the method handle which will be the initial target of the call site
++     * @throws NullPointerException if the proposed target is null
+      */
+-    public CallSite(MethodHandle target) {
++    /*package-private*/
++    CallSite(MethodHandle target) {
+         target.type();  // null check
+         this.target = target;
+     }
+@@ -199,6 +214,8 @@
+      * @throws NullPointerException if the proposed new target is null
+      * @throws WrongMethodTypeException if the proposed new target
+      *         has a method type that differs from the previous target
++     * @throws UnsupportedOperationException if the call site is
++     *         in fact a {@link ConstantCallSite}
+      */
+     public void setTarget(MethodHandle newTarget) {
+         checkTargetChange(this.target, newTarget);
+@@ -216,14 +233,6 @@
+         return new WrongMethodTypeException(String.valueOf(target)+" should be of type "+type);
+     }
+ 
+-    /** Produce a printed representation that displays information about this call site
+-     *  that may be useful to the human reader.
+-     */
+-    @Override
+-    public String toString() {
+-        return super.toString() + type();
+-    }
+-
+     /**
+      * Produce a method handle equivalent to an invokedynamic instruction
+      * which has been linked to this call site.
+@@ -240,7 +249,7 @@
+      */
+     public final MethodHandle dynamicInvoker() {
+         if (this instanceof ConstantCallSite) {
+-            return target;  // will not change dynamically
++            return getTarget0();  // will not change dynamically
+         }
+         MethodHandle getTarget = MethodHandleImpl.bindReceiver(IMPL_TOKEN, GET_TARGET, this);
+         MethodHandle invoker = MethodHandles.exactInvoker(this.type());
+diff --git a/src/share/classes/java/dyn/ClassValue.java b/src/share/classes/java/dyn/ClassValue.java
+--- a/src/share/classes/java/dyn/ClassValue.java
++++ b/src/share/classes/java/dyn/ClassValue.java
+@@ -28,44 +28,78 @@
+ import java.util.WeakHashMap;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicReference;
++import java.lang.reflect.UndeclaredThrowableException;
+ 
+ /**
+  * Lazily associate a computed value with (potentially) every class.
+  * @author John Rose, JSR 292 EG
+  */
+-public abstract class ClassValue<T> {
++public class ClassValue<T> {
+     /**
+      * Compute the given class's derived value for this {@code ClassValue}.
+      * <p>
+      * This method will be invoked within the first thread that accesses
+-     * the value with the {@link #get}.
++     * the value with the {@link #get get} method.
+      * <p>
+      * Normally, this method is invoked at most once per class,
+-     * but it may be invoked again in case of subsequent invocations
+-     * of {@link #remove} followed by {@link #get}.
++     * but it may be invoked again if there has been a call to
++     * {@link #remove remove}.
++     * <p>
++     * If there is no override from a subclass, this method returns
++     * the result of applying the {@code ClassValue}'s {@code computeValue}
++     * method handle, which was supplied at construction time.
+      *
+-     * @return the computed value for this thread-local
++     * @return the newly computed value associated with this {@code ClassValue}, for the given class or interface
++     * @throws UndeclaredThrowableException if the {@code computeValue} method handle invocation throws something other than a {@code RuntimeException} or {@code Error}
++     * @throws UnsupportedOperationException if the {@code computeValue} method handle is null (subclasses must override)
+      */
+-    protected abstract T computeValue(Class<?> type);
++    protected T computeValue(Class<?> type) {
++        if (computeValue == null)
++            return null;
++        try {
++            return (T) (Object) computeValue.invokeGeneric(type);
++        } catch (Throwable ex) {
++            if (ex instanceof Error)             throw (Error) ex;
++            if (ex instanceof RuntimeException)  throw (RuntimeException) ex;
++            throw new UndeclaredThrowableException(ex);
++        }
++    }
++
++    private final MethodHandle computeValue;
+ 
+     /**
+      * Creates a new class value.
++     * Subclasses which use this constructor must override
++     * the {@link #computeValue computeValue} method,
++     * since the default {@code computeValue} method requires a method handle,
++     * which this constructor does not provide.
+      */
+     protected ClassValue() {
++        this.computeValue = null;
++    }
++
++    /**
++     * Creates a new class value, whose {@link #computeValue computeValue} method
++     * will return the result of {@code computeValue.invokeGeneric(type)}.
++     * @throws NullPointerException  if the method handle parameter is null
++     */
++    public ClassValue(MethodHandle computeValue) {
++        computeValue.getClass();  // trigger NPE if null
++        this.computeValue = computeValue;
+     }
+ 
+     /**
+      * Returns the value for the given class.
+      * If no value has yet been computed, it is obtained by
+-     * by an invocation of the {@link #computeValue} method.
++     * an invocation of the {@link #computeValue computeValue} method.
+      * <p>
+      * The actual installation of the value on the class
+-     * is performed while the class's synchronization lock
+-     * is held.  At that point, if racing threads have
++     * is performed atomically.
++     * At that point, if racing threads have
+      * computed values, one is chosen, and returned to
+      * all the racing threads.
+      *
+-     * @return the current thread's value of this thread-local
++     * @return the current value associated with this {@code ClassValue}, for the given class or interface
+      */
+     public T get(Class<?> type) {
+         ClassValueMap map = getMap(type);
+@@ -81,9 +115,16 @@
+     /**
+      * Removes the associated value for the given class.
+      * If this value is subsequently {@linkplain #get read} for the same class,
+-     * its value will be reinitialized by invoking its {@link #computeValue} method.
++     * its value will be reinitialized by invoking its {@link #computeValue computeValue} method.
+      * This may result in an additional invocation of the
+-     * {@code computeValue} method for the given class.
++     * {@code computeValue computeValue} method for the given class.
++     * <p>
++     * If racing threads perform a combination of {@code get} and {@code remove} calls,
++     * the calls are serialized.
++     * A value produced by a call to {@code computeValue} will be discarded, if
++     * the corresponding {@code get} call was followed by a {@code remove} call
++     * before the {@code computeValue} could complete.
++     * In such a case, the {@code get} call will re-invoke {@code computeValue}.
+      */
+     public void remove(Class<?> type) {
+         ClassValueMap map = getMap(type);
+@@ -118,6 +159,7 @@
+             // Warm up the table with a null entry.
+             map.preInitializeEntry(this);
+         }
++        STORE_BARRIER.lazySet(0);
+         // All stores pending from table expansion are completed.
+         synchronized (map) {
+             value = (T) map.initializeEntry(this, value);
+diff --git a/src/share/classes/java/dyn/ConstantCallSite.java b/src/share/classes/java/dyn/ConstantCallSite.java
+--- a/src/share/classes/java/dyn/ConstantCallSite.java
++++ b/src/share/classes/java/dyn/ConstantCallSite.java
+@@ -32,14 +32,16 @@
+  * @author John Rose, JSR 292 EG
+  */
+ public class ConstantCallSite extends CallSite {
+-    /** Create a call site with a permanent target. */
++    /** Create a call site with a permanent target.
++     * @throws NullPointerException if the proposed target is null
++     */
+     public ConstantCallSite(MethodHandle target) {
+         super(target);
+     }
+     /**
+-     * Throw an {@link IllegalArgumentException}, because this kind of call site cannot change its target.
++     * Throw an {@link UnsupportedOperationException}, because this kind of call site cannot change its target.
+      */
+     @Override public final void setTarget(MethodHandle ignore) {
+-        throw new IllegalArgumentException("ConstantCallSite");
++        throw new UnsupportedOperationException("ConstantCallSite");
+     }
+ }
+diff --git a/src/share/classes/java/dyn/InvokeDynamicBootstrapError.java b/src/share/classes/java/dyn/InvokeDynamicBootstrapError.java
+--- a/src/share/classes/java/dyn/InvokeDynamicBootstrapError.java
++++ b/src/share/classes/java/dyn/InvokeDynamicBootstrapError.java
+@@ -67,4 +67,16 @@
+     public InvokeDynamicBootstrapError(String s, Throwable cause) {
+         super(s, cause);
+     }
++
++    /**
++     * Constructs a {@code InvokeDynamicBootstrapError} with the specified
++     * cause.
++     *
++     * @param cause the cause, may be {@code null}.
++     */
++    public InvokeDynamicBootstrapError(Throwable cause) {
++        // cf. Throwable(Throwable cause) constructor.
++        super(cause == null ? null : cause.toString());
++        initCause(cause);
++    }
+ }
+diff --git a/src/share/classes/java/dyn/Linkage.java b/src/share/classes/java/dyn/Linkage.java
+--- a/src/share/classes/java/dyn/Linkage.java
++++ b/src/share/classes/java/dyn/Linkage.java
+@@ -101,8 +101,9 @@
+     /**
+      * <em>METHOD WILL BE REMOVED FOR PFD:</em>
+      * Invalidate all <code>invokedynamic</code> call sites everywhere.
+-     * @deprecated Use {@linkplain CallSite#setTarget call site target setting}
+-     * and {@link VolatileCallSite#invalidateAll call site invalidation} instead.
++     * @deprecated Use {@linkplain MutableCallSite#setTarget call site target setting},
++     * {@link MutableCallSite#sync call site update pushing},
++     * and {@link Switcher#guardWithTest target switching} instead.
+      */
+     public static
+     Object invalidateAll() {
+@@ -113,8 +114,9 @@
+      * <em>METHOD WILL BE REMOVED FOR PFD:</em>
+      * Invalidate all {@code invokedynamic} call sites in the bytecodes
+      * of any methods of the given class.
+-     * @deprecated Use {@linkplain CallSite#setTarget call site target setting}
+-     * and {@link VolatileCallSite#invalidateAll call site invalidation} instead.
++     * @deprecated Use {@linkplain MutableCallSite#setTarget call site target setting},
++     * {@link MutableCallSite#sync call site update pushing},
++     * and {@link Switcher#guardWithTest target switching} instead.
+      */
+     public static
+     Object invalidateCallerClass(Class<?> callerClass) {
+diff --git a/src/share/classes/java/dyn/MethodHandle.java b/src/share/classes/java/dyn/MethodHandle.java
+--- a/src/share/classes/java/dyn/MethodHandle.java
++++ b/src/share/classes/java/dyn/MethodHandle.java
+@@ -128,8 +128,11 @@
+  * <p>
+  * Bytecode in the JVM can directly obtain a method handle
+  * for any accessible method from a {@code ldc} instruction
+- * which refers to a {@code CONSTANT_Methodref} or
+- * {@code CONSTANT_InterfaceMethodref} constant pool entry.
++ * which refers to a {@code CONSTANT_MethodHandle} constant pool entry.
++ * (Each such entry refers directly to a {@code CONSTANT_Methodref},
++ * {@code CONSTANT_InterfaceMethodref}, or {@code CONSTANT_Fieldref}
++ * constant pool entry.
++ * For more details, see the <a href="package-summary.html#mhcon">package summary</a>.)
+  * <p>
+  * Java code can also use a reflective API called
+  * {@link java.dyn.MethodHandles.Lookup MethodHandles.Lookup}
+@@ -160,7 +163,7 @@
+ Object x, y; String s; int i;
+ MethodType mt; MethodHandle mh;
+ MethodHandles.Lookup lookup = MethodHandles.lookup();
+-// mt is {(char,char) =&gt; String}
++// mt is (char,char)String
+ mt = MethodType.methodType(String.class, char.class, char.class);
+ mh = lookup.findVirtual(String.class, "replace", mt);
+ // (Ljava/lang/String;CC)Ljava/lang/String;
+@@ -169,13 +172,13 @@
+ // weakly typed invocation (using MHs.invoke)
+ s = (String) mh.invokeWithArguments("sappy", 'p', 'v');
+ assert(s.equals("savvy"));
+-// mt is {Object[] =&gt; List}
++// mt is (Object[])List
+ mt = MethodType.methodType(java.util.List.class, Object[].class);
+ mh = lookup.findStatic(java.util.Arrays.class, "asList", mt);
+-// mt is {(Object,Object,Object) =&gt; Object}
++// mt is (Object,Object,Object)Object
+ mt = MethodType.genericMethodType(3);
+ mh = MethodHandles.collectArguments(mh, mt);
+-// mt is {(Object,Object,Object) =&gt; Object}
++// mt is (Object,Object,Object)Object
+ // (Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+ x = mh.invokeExact((Object)1, (Object)2, (Object)3);
+ assert(x.equals(java.util.Arrays.asList(1,2,3)));
+@@ -185,12 +188,20 @@
+ // (Ljava/util/List;)I
+ i = (int) mh.invokeExact(java.util.Arrays.asList(1,2,3));
+ assert(i == 3);
++mt = MethodType.methodType(void.class, String.class);
++mh = lookup.findVirtual(java.io.PrintStream.class, "println", mt);
++mh.invokeExact(System.out, "Hello, world.");
++// (Ljava/io/PrintStream;Ljava/lang/String;)V
+  * </pre></blockquote>
+  * Each of the above calls generates a single invokevirtual instruction
+  * with the name {@code invoke} and the type descriptors indicated in the comments.
+  * The argument types are taken directly from the actual arguments,
+- * while the return type is taken from the type parameter.
+- * (This type parameter may be a primitive, and it defaults to {@code Object}.)
++ * while the return type is taken from the cast immediately applied to the call.
++ * This cast may be to a primitive.
++ * If it is missing, the type defaults to {@code Object} if the call
++ * occurs in a context which uses the return value.
++ * If the call occurs as a statement, a cast is impossible,
++ * and there is no return type; the call is {@code void}.
+  * <p>
+  * <em>A note on generic typing:</em>  Method handles do not represent
+  * their function types in terms of Java parameterized (generic) types,
+@@ -216,6 +227,19 @@
+  * fields, methods, and constructors can be represented directly
+  * in a class file's constant pool as constants to be loaded by {@code ldc} bytecodes.
+  * Loading such a constant causes the component classes of its type to be loaded as necessary.
++ * <p>
++ * Method handles cannot be subclassed by the user.
++ * Implementations may (or may not) create internal subclasses of {@code MethodHandle}
++ * which may be visible via the {@code java.lang.Object#getClass Object.getClass}
++ * operation.  The programmer should not draw conclusions about a method handle
++ * from its specific class, as the method handle class hierarchy (if any)
++ * may change from time to time or across implementations from different vendors.
++ * <p>
++ * With respect to the Java Memory Model, any method handle will behave
++ * as if all of its fields are final variables.  This means that any method
++ * handle made visible to the application will always be fully formed.
++ * This is true even if the method handle is published through a shared
++ * variable in a data race.
+  *
+  * @see MethodType
+  * @see MethodHandles
+@@ -282,8 +306,20 @@
+         });
+     }
+ 
+-    /** Produce a printed representation that displays information about this call site
+-     *  that may be useful to the human reader.
++    /**
++     * Returns a string representation of the method handle,
++     * starting with the string {@code "MethodHandle"} and
++     * ending with the string representation of the method handle's type.
++     * In other words, this method returns a string equal to the value of:
++     * <blockquote><pre>
++     * "MethodHandle" + type().toString()
++     * </pre></blockquote>
++     * <p>
++     * Note:  Future releases of this API may add further information
++     * to the string representation.
++     * Therefore, the present syntax should not be parsed by applications.
++     *
++     * @return a string representation of the method handle
+      */
+     @Override
+     public String toString() {
+@@ -512,7 +548,7 @@
+         if (nargs < arrayLength)  throw newIllegalArgumentException("bad spread array length");
+         int keepPosArgs = nargs - arrayLength;
+         MethodType newType = oldType.dropParameterTypes(keepPosArgs, nargs);
+-        newType = newType.insertParameterTypes(keepPosArgs, arrayElement);
++        newType = newType.insertParameterTypes(keepPosArgs, arrayType);
+         return MethodHandles.spreadArguments(this, newType);
+     }
+ 
+@@ -610,6 +646,14 @@
+      * else if the type of the target does not exactly match
+      * the requested type, a {@link WrongMethodTypeException} is thrown.
+      * <p>
++     * A method handle's type handler is not guaranteed to be called every
++     * time its {@code asType} or {@code invokeGeneric} method is called.
++     * If the implementation is able to prove that an equivalent
++     * type handler call has already occurred (on the same two arguments),
++     * it may substitute the result of that previous invocation, without
++     * making a new invocation.  Thus, type handlers should not (in general)
++     * perform significant side effects.
++     * <p>
+      * Therefore, the type handler is invoked as if by this code:
+      * <blockquote><pre>
+      * MethodHandle target = this;      // original method handle
+@@ -637,9 +681,9 @@
+      methodType(MethodHandle.class, MethodHandle.class, MethodType.class));
+ MethodHandle makeAnyList = makeEmptyList.withTypeHandler(collectingTypeHandler);
+ 
+-System.out.println(makeAnyList.invokeGeneric()); // prints []
+-System.out.println(makeAnyList.invokeGeneric(1)); // prints [1]
+-System.out.println(makeAnyList.invokeGeneric("two", "too")); // prints [two, too]
++assertEquals("[]", makeAnyList.invokeGeneric().toString());
++assertEquals("[1]", makeAnyList.invokeGeneric(1).toString());
++assertEquals("[two, too]", makeAnyList.invokeGeneric("two", "too").toString());
+      * <pre><blockquote>
+      */
+     public MethodHandle withTypeHandler(MethodHandle typeHandler) {
+diff --git a/src/share/classes/java/dyn/MethodHandles.java b/src/share/classes/java/dyn/MethodHandles.java
+--- a/src/share/classes/java/dyn/MethodHandles.java
++++ b/src/share/classes/java/dyn/MethodHandles.java
+@@ -155,16 +155,39 @@
+         /** The class on behalf of whom the lookup is being performed. */
+         private final Class<?> lookupClass;
+ 
+-        /** The allowed sorts of members which may be looked up (public, etc.), with STATIC for package. */
++        /** The allowed sorts of members which may be looked up (PUBLIC, etc.). */
+         private final int allowedModes;
+ 
+-        private static final int
+-            PUBLIC    = Modifier.PUBLIC,
+-            PACKAGE   = Modifier.STATIC,
+-            PROTECTED = Modifier.PROTECTED,
+-            PRIVATE   = Modifier.PRIVATE,
+-            ALL_MODES = (PUBLIC | PACKAGE | PROTECTED | PRIVATE),
+-            TRUSTED   = -1;
++        /** A single-bit mask representing {@code public} access,
++         *  which may contribute to the result of {@link #lookupModes lookupModes}.
++         *  The value, {@code 0x01}, happens to be the same as the value of the
++         *  {@code public} {@linkplain java.lang.reflect.Modifier#PUBLIC modifier bit}.
++         */
++        public static final int PUBLIC = Modifier.PUBLIC;
++
++        /** A single-bit mask representing {@code private} access,
++         *  which may contribute to the result of {@link #lookupModes lookupModes}.
++         *  The value, {@code 0x02}, happens to be the same as the value of the
++         *  {@code private} {@linkplain java.lang.reflect.Modifier#PRIVATE modifier bit}.
++         */
++        public static final int PRIVATE = Modifier.PRIVATE;
++
++        /** A single-bit mask representing {@code protected} access,
++         *  which may contribute to the result of {@link #lookupModes lookupModes}.
++         *  The value, {@code 0x04}, happens to be the same as the value of the
++         *  {@code protected} {@linkplain java.lang.reflect.Modifier#PROTECTED modifier bit}.
++         */
++        public static final int PROTECTED = Modifier.PROTECTED;
++
++        /** A single-bit mask representing {@code package} access (default access),
++         *  which may contribute to the result of {@link #lookupModes lookupModes}.
++         *  The value is {@code 0x08}, which does not correspond meaningfully to
++         *  any particular {@linkplain java.lang.reflect.Modifier modifier bit}.
++         */
++        public static final int PACKAGE = Modifier.STATIC;
++
++        private static final int ALL_MODES = (PUBLIC | PRIVATE | PROTECTED | PACKAGE);
++        private static final int TRUSTED   = -1;
+ 
+         private static int fixmods(int mods) {
+             mods &= (ALL_MODES - PACKAGE);
+@@ -189,13 +212,11 @@
+         }
+ 
+         /** Which types of members can this lookup object produce?
+-         *  The result is a bit-mask of the {@link java.lang.reflect.Modifier Modifier} bits
+-         *  {@linkplain java.lang.reflect.Modifier#PUBLIC PUBLIC (0x01)},
+-         *  {@linkplain java.lang.reflect.Modifier#PROTECTED PROTECTED (0x02)},
+-         *  {@linkplain java.lang.reflect.Modifier#PRIVATE PRIVATE (0x04)},
+-         *  and {@linkplain java.lang.reflect.Modifier#STATIC STATIC (0x08)}.
+-         *  The modifier bit {@code STATIC} stands in for the package protection mode,
+-         *  which does not have an explicit modifier bit.
++         *  The result is a bit-mask of the bits
++         *  {@linkplain #PUBLIC PUBLIC (0x01)},
++         *  {@linkplain #PRIVATE PRIVATE (0x02)},
++         *  {@linkplain #PROTECTED PROTECTED (0x04)},
++         *  and {@linkplain #PACKAGE PACKAGE (0x08)}.
+          *  <p>
+          *  A freshly-created lookup object
+          *  on the {@linkplain java.dyn.MethodHandles#lookup() caller's class}
+@@ -238,7 +259,7 @@
+         /**
+          * Create a lookup on the specified new lookup class.
+          * The resulting object will report the specified
+-         * class as its own {@link #lookupClass}.
++         * class as its own {@link #lookupClass lookupClass}.
+          * <p>
+          * However, the resulting {@code Lookup} object is guaranteed
+          * to have no more access capabilities than the original.
+@@ -300,35 +321,55 @@
+                 throw newIllegalArgumentException("illegal lookupClass: "+lookupClass);
+         }
+ 
+-        /** Display the name of the class.
+-         *  If there are restrictions on the access permitted to this lookup,
+-         *  display those also.
++        /**
++         * Display the name of the class from which lookups are to be made.
++         * (The name is the one reported by {@link java.lang.Class#getName() Class.getName}.)
++         * If there are restrictions on the access permitted to this lookup,
++         * this is indicated by adding a suffix to the class name, consisting
++         * of a slash and a keyword.  The keyword represents the strongest
++         * allowed access, and is chosen as follows:
++         * <ul>
++         * <li>If no access is allowed, the suffix is "/noaccess".
++         * <li>If only public access is allowed, the suffix is "/public".
++         * <li>If only public and package access are allowed, the suffix is "/package".
++         * <li>If only public, package, and private access are allowed, the suffix is "/private".
++         * </ul>
++         * If none of the above cases apply, it is the case that full
++         * access (public, package, private, and protected) is allowed.
++         * In this case, no suffix is added.
++         * This is true only of an object obtained originally from
++         * {@link java.dyn.MethodHandles#lookup() MethodHandles.lookup}.
++         * Objects created by {@link java.dyn.MethodHandles.Lookup#in() Lookup#in}
++         * always have restricted access, and will display a suffix.
++         * <p>
++         * (It may seem strange that protected access should be
++         * stronger than private access.  Viewed independently from
++         * package access, protected access is the first to be lost,
++         * because it requires a direct subclass relationship between
++         * caller and callee.)
++         * @see #in
+          */
+         @Override
+         public String toString() {
+-            String modestr;
+             String cname = lookupClass.getName();
+             switch (allowedModes) {
+-            case TRUSTED:
+-                return "/trusted";
++            case 0:  // no privileges
++                return cname + "/noaccess";
+             case PUBLIC:
+-                modestr = "/public";
+-                if (lookupClass == Object.class)
+-                    return modestr;
+-                break;
++                return cname + "/public";
+             case PUBLIC|PACKAGE:
+                 return cname + "/package";
+-            case 0:  // no privileges
+-                return cname + "/noaccess";
++            case ALL_MODES & ~PROTECTED:
++                return cname + "/private";
+             case ALL_MODES:
+                 return cname;
++            case TRUSTED:
++                return "/trusted";  // internal only; not exported
++            default:  // Should not happen, but it's a bitfield...
++                cname = cname + "/" + Integer.toHexString(allowedModes);
++                assert(false) : cname;
++                return cname;
+             }
+-            StringBuilder buf = new StringBuilder(cname);
+-            if ((allowedModes & PUBLIC) != 0)     buf.append("/public");
+-            if ((allowedModes & PACKAGE) != 0)    buf.append("/package");
+-            if ((allowedModes & PROTECTED) != 0)  buf.append("/protected");
+-            if ((allowedModes & PRIVATE) != 0)    buf.append("/private");
+-            return buf.toString();
+         }
+ 
+         // call this from an entry point method in Lookup with extraFrames=0.
+@@ -369,13 +410,6 @@
+          * with the receiver type (usually {@code refc}) prepended.
+          * The method and all its argument types must be accessible to the lookup class.
+          * <p>
+-         * (<em>BUG NOTE:</em> The type {@code Object} may be prepended instead
+-         * of the receiver type, if the receiver type is not on the boot class path.
+-         * This is due to a temporary JVM limitation, in which MethodHandle
+-         * claims to be unable to access such classes.  To work around this
+-         * bug, use {@code convertArguments} to normalize the type of the leading
+-         * argument to a type on the boot class path, such as {@code Object}.)
+-         * <p>
+          * When called, the handle will treat the first argument as a receiver
+          * and dispatch on the receiver's type to determine which method
+          * implementation to enter.
+@@ -923,18 +957,6 @@
+         return invokers(type).exactInvoker();
+     }
+ 
+-    /**
+-     * <em>METHOD WILL BE REMOVED FOR PFD:</em>
+-     * Produce a method handle equivalent to an invokedynamic instruction
+-     * which has been linked to the given call site.
+-     * @return a method handle which always invokes the call site's target
+-     * @deprecated Use {@link CallSite#dynamicInvoker} instead.
+-     */
+-    public static
+-    MethodHandle dynamicInvoker(CallSite site) throws NoAccessException {
+-        return site.dynamicInvoker();
+-    }
+-
+     static Invokers invokers(MethodType type) {
+         return MethodTypeImpl.invokers(IMPL_TOKEN, type);
+     }
+@@ -1071,7 +1093,6 @@
+     }
+ 
+     /**
+-     * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+      * Produce a method handle which adapts the type of the
+      * given method handle to a new type by pairwise argument conversion.
+      * The original type and new type must have the same number of arguments.
+@@ -1292,7 +1313,6 @@
+     }
+ 
+     /**
+-     * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+      * Produce a method handle of the requested return type which returns the given
+      * constant value every time it is invoked.
+      * <p>
+@@ -1318,7 +1338,6 @@
+     }
+ 
+     /**
+-     * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+      * Produce a method handle of the requested type which returns the given
+      * constant value every time it is invoked.
+      * <p>
+@@ -1343,7 +1362,6 @@
+     }
+ 
+      /**
+-      * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+       * Produce a method handle which returns its sole argument when invoked.
+       * <p>The identity function for {@code void} takes no arguments and returns no values.
+       * @param type the type of the sole parameter and return value of the desired method handle
+@@ -1355,13 +1373,11 @@
+     }
+ 
+      /**
+-      * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+       * Produce a method handle of the requested type which returns its argument when invoked.
+       * If the return type differs from the first argument type, the argument will be
+       * converted as if by {@link #explicitCastArguments explicitCastArguments}.
+-      * All other arguments are discarded.
++      * If there are additional arguments beyond the first, they are discarded.
+       * <p>The identity function for {@code void} discards all its arguments.
+-      * <p>
+       * @param type the type of the desired method handle
+       * @return a method handle of the given type, which always returns its first argument
+       * @throws WrongMethodTypeException if the first argument cannot be converted to the required return type
+@@ -1446,20 +1462,20 @@
+      * <p>
+      * <b>Example:</b>
+      * <p><blockquote><pre>
+-     *   import static java.dyn.MethodHandles.*;
+-     *   import static java.dyn.MethodType.*;
+-     *   ...
+-     *   MethodHandle cat = lookup().findVirtual(String.class,
+-     *     "concat", methodType(String.class, String.class));
+-     *   System.out.println((String) cat.invokeExact("x", "y")); // xy
+-     *   MethodHandle d0 = dropArguments(cat, 0, String.class);
+-     *   System.out.println((String) d0.invokeExact("x", "y", "z")); // yz
+-     *   MethodHandle d1 = dropArguments(cat, 1, String.class);
+-     *   System.out.println((String) d1.invokeExact("x", "y", "z")); // xz
+-     *   MethodHandle d2 = dropArguments(cat, 2, String.class);
+-     *   System.out.println((String) d2.invokeExact("x", "y", "z")); // xy
+-     *   MethodHandle d12 = dropArguments(cat, 1, int.class, boolean.class);
+-     *   System.out.println((String) d12.invokeExact("x", 12, true, "z")); // xz
++import static java.dyn.MethodHandles.*;
++import static java.dyn.MethodType.*;
++...
++MethodHandle cat = lookup().findVirtual(String.class,
++  "concat", methodType(String.class, String.class));
++assertEquals("xy", (String) cat.invokeExact("x", "y"));
++MethodHandle d0 = dropArguments(cat, 0, String.class);
++assertEquals("yz", (String) d0.invokeExact("x", "y", "z"));
++MethodHandle d1 = dropArguments(cat, 1, String.class);
++assertEquals("xz", (String) d1.invokeExact("x", "y", "z"));
++MethodHandle d2 = dropArguments(cat, 2, String.class);
++assertEquals("xy", (String) d2.invokeExact("x", "y", "z"));
++MethodHandle d12 = dropArguments(cat, 1, int.class, boolean.class);
++assertEquals("xz", (String) d12.invokeExact("x", 12, true, "z"));
+      * </pre></blockquote>
+      * @param target the method handle to invoke after the arguments are dropped
+      * @param valueTypes the type(s) of the argument(s) to drop
+@@ -1532,13 +1548,13 @@
+   "concat", methodType(String.class, String.class));
+ MethodHandle upcase = lookup().findVirtual(String.class,
+   "toUpperCase", methodType(String.class));
+-System.out.println((String) cat.invokeExact("x", "y")); // xy
++assertEquals("xy", (String) cat.invokeExact("x", "y"));
+ MethodHandle f0 = filterArguments(cat, 0, upcase);
+-System.out.println((String) f0.invokeExact("x", "y")); // Xy
++assertEquals("Xy", (String) f0.invokeExact("x", "y")); // Xy
+ MethodHandle f1 = filterArguments(cat, 1, upcase);
+-System.out.println((String) f1.invokeExact("x", "y")); // xY
++assertEquals("xY", (String) f1.invokeExact("x", "y")); // xY
+ MethodHandle f2 = filterArguments(cat, 0, upcase, upcase);
+-System.out.println((String) f2.invokeExact("x", "y")); // XY
++assertEquals("XY", (String) f2.invokeExact("x", "y")); // XY
+      * </pre></blockquote>
+      * @param target the method handle to invoke after arguments are filtered
+      * @param pos the position of the first argument to filter
+@@ -1571,7 +1587,7 @@
+         return adapter;
+     }
+ 
+-    /** <em>PROVISIONAL API, WORK IN PROGRESS:</em>
++    /**
+      * Adapt a target method handle {@code target} by post-processing
+      * its return value with a unary filter function.
+      * <p>
+@@ -1693,6 +1709,9 @@
+      *     return fallback(a..., b...);
+      * }
+      * </pre></blockquote>
++     * Note that the test arguments ({@code a...} in the pseudocode) cannot
++     * be modified by execution of the test, and so are passed unchanged
++     * from the caller to the target or fallback as appropriate.
+      * @param test method handle used for test, must return boolean
+      * @param target method handle to call if test passes
+      * @param fallback method handle to call if test fails
+@@ -1708,40 +1727,19 @@
+         MethodType gtype = test.type();
+         MethodType ttype = target.type();
+         MethodType ftype = fallback.type();
+-        if (ttype != ftype)
++        if (!ttype.equals(ftype))
+             throw misMatchedTypes("target and fallback types", ttype, ftype);
+-        MethodType gtype2 = ttype.changeReturnType(boolean.class);
+-        if (gtype2 != gtype) {
+-            if (gtype.returnType() != boolean.class)
+-                throw newIllegalArgumentException("guard type is not a predicate "+gtype);
+-            int gpc = gtype.parameterCount(), tpc = ttype.parameterCount();
+-            if (gpc < tpc) {
+-                test = dropArguments(test, gpc, ttype.parameterList().subList(gpc, tpc));
+-                gtype = test.type();
+-            }
+-            if (gtype2 != gtype)
++        if (gtype.returnType() != boolean.class)
++            throw newIllegalArgumentException("guard type is not a predicate "+gtype);
++        List<Class<?>> targs = ttype.parameterList();
++        List<Class<?>> gargs = gtype.parameterList();
++        if (!targs.equals(gargs)) {
++            int gpc = gargs.size(), tpc = targs.size();
++            if (gpc >= tpc || !targs.subList(0, gpc).equals(gargs))
+                 throw misMatchedTypes("target and test types", ttype, gtype);
++            test = dropArguments(test, gpc, targs.subList(gpc, tpc));
++            gtype = test.type();
+         }
+-        /* {
+-            MethodHandle invoke = findVirtual(MethodHandle.class, "invoke", target.type());
+-            static MethodHandle choose(boolean z, MethodHandle t, MethodHandle f) {
+-                return z ? t : f;
+-            }
+-            static MethodHandle compose(MethodHandle f, MethodHandle g) {
+-                Class<?> initargs = g.type().parameterArray();
+-                f = dropArguments(f, 1, initargs);  // ignore 2nd copy of args
+-                return combineArguments(f, g);
+-            }
+-            // choose = \z.(z ? target : fallback)
+-            MethodHandle choose = findVirtual(MethodHandles.class, "choose",
+-                    MethodType.methodType(boolean.class, MethodHandle.class, MethodHandle.class));
+-            choose = appendArgument(choose, target);
+-            choose = appendArgument(choose, fallback);
+-            MethodHandle dispatch = compose(choose, test);
+-            // dispatch = \(a...).(test(a...) ? target : fallback)
+-            return combineArguments(invoke, dispatch, 0);
+-            // return \(a...).((test(a...) ? target : fallback).invokeExact(a...))
+-        } */
+         return MethodHandleImpl.makeGuardWithTest(IMPL_TOKEN, test, target, fallback);
+     }
+ 
+@@ -1756,22 +1754,32 @@
+      * If an exception matching the specified type is thrown, the fallback
+      * handle is called instead on the exception, plus the original arguments.
+      * <p>
+-     * The handler must have leading parameter of {@code exType} or a supertype,
+-     * followed by arguments which correspond <em>(how? TBD)</em> to
+-     * all the parameters of the target.
+-     * The target and handler must return the same type.
++     * The target and handler must have the same corresponding
++     * argument and return types, except that handler may omit trailing arguments
++     * (similarly to the predicate in {@link #guardWithTest guardWithTest}).
++     * Also, the handler must have an extra leading parameter of {@code exType} or a supertype.
+      * <p> Here is pseudocode for the resulting adapter:
+      * <blockquote><pre>
+-     * T target(A...);
++     * T target(A..., B...);
+      * T handler(ExType, A...);
+-     * T adapter(A... a) {
++     * T adapter(A... a, B... b) {
+      *   try {
+-     *     return target(a...);
++     *     return target(a..., b...);
+      *   } catch (ExType ex) {
+      *     return handler(ex, a...);
+      *   }
+      * }
+      * </pre></blockquote>
++     * Note that the saved arguments ({@code a...} in the pseudocode) cannot
++     * be modified by execution of the target, and so are passed unchanged
++     * from the caller to the handler, if the handler is invoked.
++     * <p>
++     * The target and handler must return the same type, even if the handler
++     * always throws.  (This might happen, for instance, because the handler
++     * is simulating a {@code finally} clause).
++     * To create such a throwing handler, compose the handler creation logic
++     * with {@link #throwException throwException},
++     * in order to create a method handle of the correct return type.
+      * @param target method handle to call
+      * @param exType the type of exception which the handler will catch
+      * @param handler method handle to call if a matching exception is thrown
+@@ -1785,16 +1793,23 @@
+     MethodHandle catchException(MethodHandle target,
+                                 Class<? extends Throwable> exType,
+                                 MethodHandle handler) {
+-        MethodType targetType = target.type();
+-        MethodType handlerType = handler.type();
+-        boolean ok = (targetType.parameterCount() ==
+-                      handlerType.parameterCount() - 1);
+-//        for (int i = 0; ok && i < numExArgs; i++) {
+-//            if (targetType.parameterType(i) != handlerType.parameterType(1+i))
+-//                ok = false;
+-//        }
+-        if (!ok)
+-            throw newIllegalArgumentException("target and handler types do not match");
++        MethodType ttype = target.type();
++        MethodType htype = handler.type();
++        if (htype.parameterCount() < 1 ||
++            !htype.parameterType(0).isAssignableFrom(exType))
++            throw newIllegalArgumentException("handler does not accept exception type "+exType);
++        if (htype.returnType() != ttype.returnType())
++            throw misMatchedTypes("target and handler return types", ttype, htype);
++        List<Class<?>> targs = ttype.parameterList();
++        List<Class<?>> hargs = htype.parameterList();
++        hargs = hargs.subList(1, hargs.size());  // omit leading parameter from handler
++        if (!targs.equals(hargs)) {
++            int hpc = hargs.size(), tpc = targs.size();
++            if (hpc >= tpc || !targs.subList(0, hpc).equals(hargs))
++                throw misMatchedTypes("target and handler types", ttype, htype);
++            handler = dropArguments(handler, hpc, hargs.subList(hpc, tpc));
++            htype = handler.type();
++        }
+         return MethodHandleImpl.makeGuardWithCatch(IMPL_TOKEN, target, exType, handler);
+     }
+ 
+@@ -1813,10 +1828,10 @@
+ 
+     /**
+      * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+-     * Produce a wrapper instance of the given "SAM" type which redirects its calls to the given method handle.
+-     * A SAM type is a type which declares a single abstract method.
+-     * Additionally, it must have either no constructor (as an interface)
+-     * or have a public or protected constructor of zero arguments (as a class).
++     * Produce a wrapper instance of the given "SAM" interface which redirects
++     * its calls to the given method handle.
++     * A SAM interface is an interface which declares a single abstract method.
++     * The type must be public.  (No additional access checks are performed.)
+      * <p>
+      * The resulting instance of the required SAM type will respond to
+      * invocation of the SAM type's single abstract method by calling
+@@ -1828,9 +1843,9 @@
+      * The method handle may throw an <em>undeclared exception</em>,
+      * which means any checked exception (or other checked throwable)
+      * not declared by the SAM type's single abstract method.
+-     * If this happens, the throwable will be wrapped in an instance
+-     * of {@link UndeclaredThrowableException} and thrown in that
+-     * wrapped form.
++     * If this happens, the throwable will be wrapped in an instance of
++     * {@link java.lang.reflect.UndeclaredThrowableException UndeclaredThrowableException}
++     * and thrown in that wrapped form.
+      * <p>
+      * The wrapper instance is guaranteed to be of a non-public
+      * implementation class C in a package containing no classes
+@@ -1841,18 +1856,36 @@
+      * <li>the SAM type itself and any methods in the SAM type
+      * <li>the supertypes of the SAM type (if any) and their methods
+      * <li>{@link Object} and its methods
++     * <li>{@link java.dyn.AsInstanceObject AsInstanceObject} and its methods</li>
+      * </ul>
+      * <p>
++     * (Note: When determining the unique abstract method of a SAM interface,
++     * the public {@code Object} methods ({@code toString}, {@code equals}, {@code hashCode})
++     * are disregarded.  For example, {@link java.util.Comparator} is a SAM interface,
++     * even though it re-declares the {@code Object.equals} method.)
++     * <p>
+      * No stable mapping is promised between the SAM type and
+      * the implementation class C.  Over time, several implementation
+      * classes might be used for the same SAM type.
+      * <p>
+      * This method is not guaranteed to return a distinct
+-     * wrapper object for each separate call.  If the JVM is able
+-     * to prove that a wrapper has already been created for a given
++     * wrapper object for each separate call.  If the implementation is able
++     * to prove that a wrapper of the required SAM type
++     * has already been created for a given
+      * method handle, or for another method handle with the
+-     * same behavior, the JVM may return that wrapper in place of
++     * same behavior, the implementation may return that wrapper in place of
+      * a new wrapper.
++     * <p>
++     * This method is designed to apply to common use cases
++     * where a single method handle must interoperate with
++     * a type (class or interface) that implements a function-like
++     * API.  Additional variations, such as SAM classes with
++     * private constructors, or interfaces with multiple but related
++     * entry points, must be covered by hand-written or automatically
++     * generated adapter classes.  In those cases, consider implementing
++     * {@link java.dyn.MethodHandles.AsInstanceObject AsInstanceObject}
++     * in the adapters, so that generic code can extract the underlying
++     * method handle without knowing where the SAM adapter came from.
+      * @param target the method handle to invoke from the wrapper
+      * @param samType the desired type of the wrapper, a SAM type
+      * @return a correctly-typed wrapper for the given {@code target}
+@@ -1870,7 +1903,7 @@
+             throw new IllegalArgumentException("not a SAM type: "+samType.getName());
+         MethodType samMT = MethodType.methodType(sam.getReturnType(), sam.getParameterTypes());
+         if (!samMT.equals(target.type()))
+-            throw new IllegalArgumentException("wrong method type");
++            throw new IllegalArgumentException("wrong method type: "+target+" should match "+sam);
+         return samType.cast(Proxy.newProxyInstance(
+                 samType.getClassLoader(),
+                 new Class[]{ samType, AsInstanceObject.class },
+@@ -1883,8 +1916,11 @@
+                     public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+                         if (method.getDeclaringClass() == AsInstanceObject.class)
+                             return getArg(method.getName());
+-                        assert method.equals(sam) : method;
+-                        return target.invokeVarargs(args);
++                        if (method.equals(sam))
++                            return target.invokeVarargs(args);
++                        if (isObjectMethod(method))
++                            return callObjectMethod(this, method, args);
++                        throw new InternalError();
+                     }
+                 }));
+     }
+@@ -1908,12 +1944,43 @@
+     }
+ 
+     private static
++    boolean isObjectMethod(Method m) {
++        switch (m.getName()) {
++        case "toString":
++            return (m.getReturnType() == String.class
++                    && m.getParameterTypes().length == 0);
++        case "hashCode":
++            return (m.getReturnType() == int.class
++                    && m.getParameterTypes().length == 0);
++        case "equals":
++            return (m.getReturnType() == boolean.class
++                    && m.getParameterTypes().length == 1
++                    && m.getParameterTypes()[0] == Object.class);
++        }
++        return false;
++    }
++
++    private static
++    Object callObjectMethod(Object self, Method m, Object[] args) {
++        assert(isObjectMethod(m)) : m;
++        switch (m.getName()) {
++        case "toString":
++            return self.getClass().getName() + "@" + Integer.toHexString(self.hashCode());
++        case "hashCode":
++            return System.identityHashCode(self);
++        case "equals":
++            return (self == args[0]);
++        }
++        return null;
++    }
++
++    private static
+     Method getSamMethod(Class<?> samType) {
+         Method sam = null;
+         for (Method m : samType.getMethods()) {
+             int mod = m.getModifiers();
+             if (Modifier.isAbstract(mod)) {
+-                if (sam != null)
++                if (sam != null && !isObjectMethod(sam))
+                     return null;  // too many abstract methods
+                 sam = m;
+             }
+diff --git a/src/share/classes/java/dyn/MethodType.java b/src/share/classes/java/dyn/MethodType.java
+--- a/src/share/classes/java/dyn/MethodType.java
++++ b/src/share/classes/java/dyn/MethodType.java
+@@ -56,21 +56,34 @@
+  * <p>
+  * This type can be created only by factory methods.
+  * All factory methods may cache values, though caching is not guaranteed.
++ * Some factory methods are static, while others are virtual methods which
++ * modify precursor method types, e.g., by changing a selected parameter.
++ * <p>
++ * Factory methods which operate on groups of parameter types
++ * are systematically presented in two versions, so that both Java arrays and
++ * Java lists can be used to work with groups of parameter types.
++ * The query methods {@code parameterArray} and {@code parameterList}
++ * also provide a choice between arrays and lists.
+  * <p>
+  * {@code MethodType} objects are sometimes derived from bytecode instructions
+  * such as {@code invokedynamic}, specifically from the type descriptor strings associated
+  * with the instructions in a class file's constant pool.
+- * When this occurs, any classes named in the descriptor strings must be loaded.
+- * (But they need not be initialized.)
++ * <p>
++ * Like classes and strings, method types can also be represented directly
++ * in a class file's constant pool as constants.
++ * A method type may be loaded by an {@code ldc} instruction which refers
++ * to a suitable {@code CONSTANT_MethodType} constant pool entry.
++ * The entry refers to a {@code CONSTANT_Utf8} spelling for the descriptor string.
++ * For more details, see the <a href="package-summary.html#mtcon">package summary</a>.
++ * <p>
++ * When the JVM materializes a {@code MethodType} from a descriptor string,
++ * all classes named in the descriptor must be accessible, and will be loaded.
++ * (But the classes need not be initialized, as is the case with a {@code CONSTANT_Class}.)
+  * This loading may occur at any time before the {@code MethodType} object is first derived.
+- * <p>
+- * Like classes and strings, method types can be represented directly
+- * in a class file's constant pool as constants to be loaded by {@code ldc} bytecodes.
+- * Loading such a constant causes its component classes to be loaded as necessary.
+  * @author John Rose, JSR 292 EG
+  */
+ public final
+-class MethodType implements java.lang.reflect.Type {
++class MethodType {
+     private final Class<?>   rtype;
+     private final Class<?>[] ptypes;
+     private MethodTypeForm form; // erased form, plus cached data about primitives
+@@ -142,7 +155,7 @@
+ 
+     /** Convenience method for {@link #methodType(java.lang.Class, java.lang.Class[])}. */
+     public static
+-    MethodType methodType(Class<?> rtype, List<? extends Class<?>> ptypes) {
++    MethodType methodType(Class<?> rtype, List<Class<?>> ptypes) {
+         boolean notrust = false;  // random List impl. could return evil ptypes array
+         return makeImpl(rtype, ptypes.toArray(NO_PTYPES), notrust);
+     }
+@@ -277,7 +290,7 @@
+ 
+     /** Convenience method for {@link #methodType(java.lang.Class, java.lang.Class[])}.
+      * @param num    the position (zero-based) of the inserted parameter type(s)
+-     * @param ptypesToInsert zero or more a new parameter types to insert into the parameter list
++     * @param ptypesToInsert zero or more new parameter types to insert into the parameter list
+      * @return the same type, except with the selected parameter(s) inserted
+      */
+     public MethodType insertParameterTypes(int num, Class<?>... ptypesToInsert) {
+@@ -293,7 +306,7 @@
+     }
+ 
+     /** Convenience method for {@link #methodType(java.lang.Class, java.lang.Class[])}.
+-     * @param ptypesToInsert zero or more a new parameter types to insert after the end of the parameter list
++     * @param ptypesToInsert zero or more new parameter types to insert after the end of the parameter list
+      * @return the same type, except with the selected parameter(s) appended
+      */
+     public MethodType appendParameterTypes(Class<?>... ptypesToInsert) {
+@@ -302,7 +315,7 @@
+ 
+     /** Convenience method for {@link #methodType(java.lang.Class, java.lang.Class[])}.
+      * @param num    the position (zero-based) of the inserted parameter type(s)
+-     * @param ptypesToInsert zero or more a new parameter types to insert into the parameter list
++     * @param ptypesToInsert zero or more new parameter types to insert into the parameter list
+      * @return the same type, except with the selected parameter(s) inserted
+      */
+     public MethodType insertParameterTypes(int num, List<Class<?>> ptypesToInsert) {
+@@ -310,6 +323,14 @@
+     }
+ 
+     /** Convenience method for {@link #methodType(java.lang.Class, java.lang.Class[])}.
++     * @param ptypesToInsert zero or more new parameter types to insert after the end of the parameter list
++     * @return the same type, except with the selected parameter(s) appended
++     */
++    public MethodType appendParameterTypes(List<Class<?>> ptypesToInsert) {
++        return insertParameterTypes(parameterCount(), ptypesToInsert);
++    }
++
++    /** Convenience method for {@link #methodType(java.lang.Class, java.lang.Class[])}.
+      * @param start  the index (zero-based) of the first parameter type to remove
+      * @param end    the index (greater than {@code start}) of the first parameter type after not to remove
+      * @return the same type, except with the selected parameter(s) removed
+@@ -508,8 +529,8 @@
+      * parenthesis enclosed, comma separated list of type names,
+      * followed immediately by the return type.
+      * <p>
+-     * If a type name is array, it the base type followed
+-     * by [], rather than the Class.getName of the array type.
++     * Each type is represented by its
++     * {@link java.lang.Class#getSimpleName simple name}.
+      */
+     @Override
+     public String toString() {
+@@ -517,35 +538,13 @@
+         sb.append("(");
+         for (int i = 0; i < ptypes.length; i++) {
+             if (i > 0)  sb.append(",");
+-            putName(sb, ptypes[i]);
++            sb.append(ptypes[i].getSimpleName());
+         }
+         sb.append(")");
+-        putName(sb, rtype);
++        sb.append(rtype.getSimpleName());
+         return sb.toString();
+     }
+ 
+-    static void putName(StringBuilder sb, Class<?> cls) {
+-        int brackets = 0;
+-        while (cls.isArray()) {
+-            cls = cls.getComponentType();
+-            brackets++;
+-        }
+-        String n = cls.getName();
+-        /*
+-        if (n.startsWith("java.lang.")) {
+-            String nb = n.substring("java.lang.".length());
+-            if (nb.indexOf('.') < 0)  n = nb;
+-        } else if (n.indexOf('.') < 0) {
+-            n = "."+n;          // anonymous package
+-        }
+-        */
+-        sb.append(n);
+-        while (brackets > 0) {
+-            sb.append("[]");
+-            brackets--;
+-        }
+-    }
+-
+     /// Queries which have to do with the bytecode architecture
+ 
+     /** The number of JVM stack slots required to invoke a method
+diff --git a/src/share/classes/java/dyn/CallSite.java b/src/share/classes/java/dyn/MutableCallSite.java
+copy from src/share/classes/java/dyn/CallSite.java
+copy to src/share/classes/java/dyn/MutableCallSite.java
+--- a/src/share/classes/java/dyn/CallSite.java
++++ b/src/share/classes/java/dyn/MutableCallSite.java
+@@ -27,67 +27,61 @@
+ 
+ import sun.dyn.*;
+ import sun.dyn.empty.Empty;
+-import sun.misc.Unsafe;
+-import java.util.Collection;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ /**
+- * A {@code CallSite} is a holder for a variable {@link MethodHandle},
+- * which is called its {@code target}.
+- * An {@code invokedynamic} instruction linked to a {@code CallSite} delegates
++ * A {@code MutableCallSite} is a {@link CallSite} whose target variable
++ * behaves like an ordinary field.
++ * An {@code invokedynamic} instruction linked to a {@code MutableCallSite} delegates
+  * all calls to the site's current target.
++ * The {@linkplain CallSite#dynamicInvoker dynamic invoker} of a mutable call site
++ * also delegates each call to the site's current target.
+  * <p>
+- * If a mutable target is not required, the {@code invokedynamic} instruction
+- * should be linked to a {@linkplain ConstantCallSite constant call site}.
+- * If a volatile target is required, because updates to the target must be
+- * reliably witnessed by other threads, the {@code invokedynamic} instruction
+- * should be linked to a {@linkplain VolatileCallSite volatile call site}.
++ * Here is an example of a mutable call site which introduces a
++ * state variable into a method handle chain.
++ * <blockquote><pre>
++MutableCallSite name = new MutableCallSite(MethodType.methodType(String.class));
++MethodHandle MH_name = name.dynamicInvoker();
++MethodType MT_str2 = MethodType.methodType(String.class, String.class);
++MethodHandle MH_upcase = MethodHandles.lookup()
++    .findVirtual(String.class, "toUpperCase", MT_str2);
++MethodHandle worker1 = MethodHandles.filterReturnValue(MH_name, MH_upcase);
++name.setTarget(MethodHandles.constant(String.class, "Rocky"));
++assertEquals("ROCKY", (String) worker1.invokeExact());
++name.setTarget(MethodHandles.constant(String.class, "Fred"));
++assertEquals("FRED", (String) worker1.invokeExact());
++// (mutation can be continued indefinitely)
++ * </pre></blockquote>
+  * <p>
+- * A call site may be <em>relinked</em> by changing its target.
+- * The new target must have the same {@linkplain MethodHandle#type() type}
+- * as the previous target.
+- * Thus, though a call site can be relinked to a series of
+- * successive targets, it cannot change its type.
++ * The same call site may be used in several places at once.
++ * <blockquote><pre>
++MethodHandle MH_dear = MethodHandles.lookup()
++    .findVirtual(String.class, "concat", MT_str2).bindTo(", dear?");
++MethodHandle worker2 = MethodHandles.filterReturnValue(MH_name, MH_dear);
++assertEquals("Fred, dear?", (String) worker2.invokeExact());
++name.setTarget(MethodHandles.constant(String.class, "Wilma"));
++assertEquals("WILMA", (String) worker1.invokeExact());
++assertEquals("Wilma, dear?", (String) worker2.invokeExact());
++ * </pre></blockquote>
+  * <p>
+- * Here is a sample use of call sites and bootstrap methods which links every
+- * dynamic call site to print its arguments:
+-<blockquote><pre><!-- see indy-demo/src/PrintArgsDemo.java -->
+-static void test() throws Throwable {
+-    // THE FOLLOWING LINE IS PSEUDOCODE FOR A JVM INSTRUCTION
+-    InvokeDynamic[#bootstrapDynamic].baz("baz arg", 2, 3.14);
+-}
+-private static void printArgs(Object... args) {
+-  System.out.println(java.util.Arrays.deepToString(args));
+-}
+-private static final MethodHandle printArgs;
+-static {
+-  MethodHandles.Lookup lookup = MethodHandles.lookup();
+-  Class thisClass = lookup.lookupClass();  // (who am I?)
+-  printArgs = lookup.findStatic(thisClass,
+-      "printArgs", MethodType.methodType(void.class, Object[].class));
+-}
+-private static CallSite bootstrapDynamic(MethodHandles.Lookup caller, String name, MethodType type) {
+-  // ignore caller and name, but match the type:
+-  return new ConstantCallSite(MethodHandles.collectArguments(printArgs, type));
+-}
+-</pre></blockquote>
++ * <em>Non-synchronization of target values:</em>
++ * A write to a mutable call site's target does not force other threads
++ * to become aware of the updated value.  Threads which do not perform
++ * suitable synchronization actions relative to the updated call site
++ * may cache the old target value and delay their use of the new target
++ * value indefinitely.
++ * (This is a normal consequence of the Java Memory Model as applied
++ * to object fields.)
++ * <p>
++ * The {@link #sync sync} operation provides a way to force threads
++ * to accept a new target value, even if there is no other synchronization.
++ * <p>
++ * For target values which will be frequently updated, consider using
++ * a {@linkplain VolatileCallSite volatile call site} instead.
+  * @author John Rose, JSR 292 EG
+  */
+-public class CallSite {
+-    private static final Access IMPL_TOKEN = Access.getToken();
+-
+-    // Fields used only by the JVM.  Do not use or change.
+-    private MemberName vmmethod; // supplied by the JVM (ref. to calling method)
+-    private int        vmindex;  // supplied by the JVM (BCI within calling method)
+-
+-    // The actual payload of this call site:
+-    /*package-private*/
+-    MethodHandle target;
+-
+-    // Remove this field for PFD and delete deprecated methods:
+-    private MemberName calleeNameRemoveForPFD;
+-
++public class MutableCallSite extends CallSite {
+     /**
+-     * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+      * Make a blank call site object with the given method type.
+      * An initial target method is supplied which will throw
+      * an {@link IllegalStateException} if called.
+@@ -95,195 +89,118 @@
+      * Before this {@code CallSite} object is returned from a bootstrap method,
+      * it is usually provided with a more useful target method,
+      * via a call to {@link CallSite#setTarget(MethodHandle) setTarget}.
++     * @throws NullPointerException if the proposed type is null
+      */
+-    public CallSite(MethodType type) {
+-        target = MethodHandles.invokers(type).uninitializedCallSite();
++    public MutableCallSite(MethodType type) {
++        super(type);
+     }
+ 
+     /**
+      * Make a blank call site object, possibly equipped with an initial target method handle.
+      * @param target the method handle which will be the initial target of the call site
++     * @throws NullPointerException if the proposed target is null
+      */
+-    public CallSite(MethodHandle target) {
+-        target.type();  // null check
+-        this.target = target;
++    public MutableCallSite(MethodHandle target) {
++        super(target);
+     }
+ 
+     /**
+-     * Report the type of this call site's target.
+-     * Although targets may change, the call site's type can never change.
+-     * The {@code setTarget} method enforces this invariant by refusing any new target that does
+-     * not have the previous target's type.
+-     * @return the type of the current target, which is also the type of any future target
++     * Perform a synchronization operation on each call site in the given array,
++     * forcing all other threads to throw away any cached values previously
++     * loaded from the target of any of the call sites.
++     * <p>
++     * This operation does not reverse any calls that have already started
++     * on an old target value.
++     * (Java supports {@linkplain java.lang.Object#wait() forward time travel} only.)
++     * <p>
++     * The overall effect is to force all future readers of each call site's target
++     * to accept the most recently stored value.
++     * ("Most recently" is reckoned relative to the {@code sync} itself.)
++     * Conversely, the {@code sync} call may block until all readers have
++     * (somehow) decached all previous versions of each call site's target.
++     * <p>
++     * To avoid race conditions, calls to {@code setTarget} and {@code sync}
++     * should generally be performed under some sort of mutual exclusion.
++     * Note that reader threads may observe an updated target as early
++     * as the {@code setTarget} call that install the value
++     * (and before the {@code sync} that confirms the value).
++     * On the other hand, reader threads may observe previous versions of
++     * the target until the {@code sync} call returns
++     * (and after the {@code setTarget} that attempts to convey the updated version).
++     * <p>
++     * In terms of the Java Memory Model, this operation performs a synchronization
++     * action which is comparable in effect to the writing of a volatile variable
++     * by the current thread, and an eventual volatile read by every other thread
++     * that may access one of the affected call sites.
++     * <p>
++     * The following effects are apparent, for each individual call site {@code S}:
++     * <ul>
++     * <li>A new volatile variable {@code V} is created, and written by the current thread.
++     *     As defined by the JMM, this write is a global synchronization event.
++     * <li>As is normal with thread-local ordering of write events,
++     *     every action already performed by the current thread is
++     *     taken to happen before the volatile write to {@code V}.
++     *     (In some implementations, this means that the current thread
++     *     performs a global release operation.)
++     * <li>Specifically, the write to the current target of {@code S} is
++     *     taken to happen before the volatile write to {@code V}.
++     * <li>The volatile write to {@code V} is placed
++     *     (in an implementation specific manner)
++     *     in the global synchronization order.
++     * <li>Consider an arbitrary thread {@code T} (other than the current thread).
++     *     If {@code T} executes a synchronization action {@code A}
++     *     after the volatile write to {@code V} (in the global synchronization order),
++     *     it is therefore required to see either the current target
++     *     of {@code S}, or a later write to that target,
++     *     if it executes a read on the target of {@code S}.
++     *     (This constraint is called "synchronization-order consistency".)
++     * <li>The JMM specifically allows optimizing compilers to elide
++     *     reads or writes of variables that are known to be useless.
++     *     Such elided reads and writes have no effect on the happens-before
++     *     relation.  Regardless of this fact, the volatile {@code V}
++     *     will not be elided, even though its written value is
++     *     indeterminate and its read value is not used.
++     * </ul>
++     * Because of the last point, the implementation behaves as if a
++     * volatile read of {@code V} were performed by {@code T}
++     * immediately after its action {@code A}.  In the local ordering
++     * of actions in {@code T}, this read happens before any future
++     * read of the target of {@code S}.  It is as if the
++     * implementation arbitrarily picked a read of {@code S}'s target
++     * by {@code T}, and forced a read of {@code V} to precede it,
++     * thereby ensuring communication of the new target value.
++     * <p>
++     * As long as the constraints of the Java Memory Model are obeyed,
++     * implementations may delay the completion of a {@code sync}
++     * operation while other threads ({@code T} above) continue to
++     * use previous values of {@code S}'s target.
++     * However, implementations are (as always) encouraged to avoid
++     * livelock, and to eventually require all threads to take account
++     * of the updated target.
++     * <p>
++     * This operation is likely to be expensive and should be used sparingly.
++     * If possible, it should be buffered for batch processing on sets of call sites.
++     * <p style="font-size:smaller;">
++     * (This is a static method on a set of call sites, not a
++     * virtual method on a single call site, for performance reasons.
++     * Some implementations may incur a large fixed overhead cost
++     * for processing one or more synchronization operations,
++     * but a small incremental cost for each additional call site.
++     * In any case, this operation is likely to be costly, since
++     * other threads may have to be somehow interrupted
++     * in order to make them notice the updated target value.
++     * However, it may be observed that a single call to synchronize
++     * several sites has the same formal effect as many calls,
++     * each on just one of the sites.)
++     * <p>
++     * Simple implementations of {@code MutableCallSite} may use
++     * a volatile variable for the target of a mutable call site.
++     * In such an implementation, the {@code sync} method can be a no-op,
++     * and yet it will conform to the JMM behavior documented above.
+      */
+-    public MethodType type() {
+-        return target.type();
++    public static void sync(MutableCallSite[] sites) {
++        STORE_BARRIER.lazySet(0);
++        // FIXME: NYI
+     }
+-
+-    /** Called from JVM (or low-level Java code) after the BSM returns the newly created CallSite.
+-     *  The parameters are JVM-specific.
+-     */
+-    void initializeFromJVM(String name,
+-                           MethodType type,
+-                           MemberName callerMethod,
+-                           int        callerBCI) {
+-        if (this.vmmethod != null) {
+-            // FIXME
+-            throw new InvokeDynamicBootstrapError("call site has already been linked to an invokedynamic instruction");
+-        }
+-        if (!this.type().equals(type)) {
+-            throw wrongTargetType(target, type);
+-        }
+-        this.vmindex  = callerBCI;
+-        this.vmmethod = callerMethod;
+-    }
+-
+-    /**
+-     * Report the current linkage state of the call site, a value which may change over time.
+-     * <p>
+-     * If a {@code CallSite} object is returned
+-     * from the bootstrap method of the {@code invokedynamic} instruction,
+-     * the {@code CallSite} is permanently bound to that instruction.
+-     * When the {@code invokedynamic} instruction is executed, the target method
+-     * of its associated call site object is invoked directly.
+-     * It is as if the instruction calls {@code getTarget} and then
+-     * calls {@link MethodHandle#invokeExact invokeExact} on the result.
+-     * <p>
+-     * Unless specified differently by a subclass,
+-     * the interactions of {@code getTarget} with memory are the same
+-     * as of a read from an ordinary variable, such as an array element or a
+-     * non-volatile, non-final field.
+-     * <p>
+-     * In particular, the current thread may choose to reuse the result
+-     * of a previous read of the target from memory, and may fail to see
+-     * a recent update to the target by another thread.
+-     * <p>
+-     * In a {@linkplain ConstantCallSite constant call site}, the {@code getTarget} method behaves
+-     * like a read from a {@code final} field of the {@code CallSite}.
+-     * <p>
+-     * In a {@linkplain VolatileCallSite volatile call site}, the {@code getTarget} method behaves
+-     * like a read from a {@code volatile} field of the {@code CallSite}.
+-     * <p>
+-     * This method may not be overridden by application code.
+-     * @return the current linkage state of the call site, its target method handle
+-     * @see ConstantCallSite
+-     * @see VolatileCallSite
+-     * @see #setTarget
+-     */
+-    public final MethodHandle getTarget() {
+-        return getTarget0();
+-    }
+-
+-    /**
+-     * Privileged implementations can override this to force final or volatile semantics on getTarget.
+-     */
+-    /*package-private*/
+-    MethodHandle getTarget0() {
+-        return target;
+-    }
+-
+-    /**
+-     * Set the target method of this call site.
+-     * <p>
+-     * Unless a subclass of CallSite documents otherwise,
+-     * the interactions of {@code setTarget} with memory are the same
+-     * as of a write to an ordinary variable, such as an array element or a
+-     * non-volatile, non-final field.
+-     * <p>
+-     * In particular, unrelated threads may fail to see the updated target
+-     * until they perform a read from memory.
+-     * Stronger guarantees can be created by putting appropriate operations
+-     * into the bootstrap method and/or the target methods used
+-     * at any given call site.
+-     * @param newTarget the new target
+-     * @throws NullPointerException if the proposed new target is null
+-     * @throws WrongMethodTypeException if the proposed new target
+-     *         has a method type that differs from the previous target
+-     */
+-    public void setTarget(MethodHandle newTarget) {
+-        checkTargetChange(this.target, newTarget);
+-        setTargetNormal(newTarget);
+-    }
+-
+-    void checkTargetChange(MethodHandle oldTarget, MethodHandle newTarget) {
+-        MethodType oldType = oldTarget.type();
+-        MethodType newType = newTarget.type();  // null check!
+-        if (!newType.equals(oldType))
+-            throw wrongTargetType(newTarget, oldType);
+-    }
+-
+-    private static WrongMethodTypeException wrongTargetType(MethodHandle target, MethodType type) {
+-        return new WrongMethodTypeException(String.valueOf(target)+" should be of type "+type);
+-    }
+-
+-    /** Produce a printed representation that displays information about this call site
+-     *  that may be useful to the human reader.
+-     */
+-    @Override
+-    public String toString() {
+-        return super.toString() + type();
+-    }
+-
+-    /**
+-     * Produce a method handle equivalent to an invokedynamic instruction
+-     * which has been linked to this call site.
+-     * <p>If this call site is a {@linkplain ConstantCallSite constant call site},
+-     * this method simply returns the call site's target, since that will never change.
+-     * <p>Otherwise, this method is equivalent to the following code:
+-     * <p><blockquote><pre>
+-     * MethodHandle getTarget, invoker, result;
+-     * getTarget = MethodHandles.lookup().bind(this, "getTarget", MethodType.methodType(MethodHandle.class));
+-     * invoker = MethodHandles.exactInvoker(this.type());
+-     * result = MethodHandles.foldArguments(invoker, getTarget)
+-     * </pre></blockquote>
+-     * @return a method handle which always invokes this call site's current target
+-     */
+-    public final MethodHandle dynamicInvoker() {
+-        if (this instanceof ConstantCallSite) {
+-            return target;  // will not change dynamically
+-        }
+-        MethodHandle getTarget = MethodHandleImpl.bindReceiver(IMPL_TOKEN, GET_TARGET, this);
+-        MethodHandle invoker = MethodHandles.exactInvoker(this.type());
+-        return MethodHandles.foldArguments(invoker, getTarget);
+-    }
+-    private static final MethodHandle GET_TARGET;
+-    static {
+-        try {
+-            GET_TARGET = MethodHandles.Lookup.IMPL_LOOKUP.
+-                findVirtual(CallSite.class, "getTarget", MethodType.methodType(MethodHandle.class));
+-        } catch (NoAccessException ignore) {
+-            throw new InternalError();
+-        }
+-    }
+-
+-    /** This guy is rolled into the default target if a MethodType is supplied to the constructor. */
+-    /*package-private*/
+-    static Empty uninitializedCallSite() {
+-        throw new IllegalStateException("uninitialized call site");
+-    }
+-
+-    // unsafe stuff:
+-    private static final Unsafe unsafe = Unsafe.getUnsafe();
+-    private static final long TARGET_OFFSET;
+-
+-    static {
+-        try {
+-            TARGET_OFFSET = unsafe.objectFieldOffset(CallSite.class.getDeclaredField("target"));
+-        } catch (Exception ex) { throw new Error(ex); }
+-    }
+-
+-    /*package-private*/
+-    void setTargetNormal(MethodHandle newTarget) {
+-        target = newTarget;
+-        //CallSiteImpl.setCallSiteTarget(IMPL_TOKEN, this, newTarget);
+-    }
+-    /*package-private*/
+-    MethodHandle getTargetVolatile() {
+-        return (MethodHandle) unsafe.getObjectVolatile(this, TARGET_OFFSET);
+-    }
+-    /*package-private*/
+-    void setTargetVolatile(MethodHandle newTarget) {
+-        unsafe.putObjectVolatile(this, TARGET_OFFSET, newTarget);
+-        //CallSiteImpl.setCallSiteTarget(IMPL_TOKEN, this, newTarget);
+-    }
++    private static final AtomicInteger STORE_BARRIER = new AtomicInteger();
+ }
+diff --git a/src/share/classes/java/dyn/VolatileCallSite.java b/src/share/classes/java/dyn/Switcher.java
+copy from src/share/classes/java/dyn/VolatileCallSite.java
+copy to src/share/classes/java/dyn/Switcher.java
+--- a/src/share/classes/java/dyn/VolatileCallSite.java
++++ b/src/share/classes/java/dyn/Switcher.java
+@@ -25,120 +25,108 @@
+ 
+ package java.dyn;
+ 
+-import java.util.List;
++/**
++ * <p>
++ * A {@code Switcher} is an object which can publish state transitions to other threads.
++ * A switcher is initially in the <em>valid</em> state, but may at any time be
++ * changed to the <em>invalid</em> state.  Invalidation cannot be reversed.
++ * <p>
++ * A single switcher may be used to create any number of guarded method handle pairs.
++ * Each guarded pair is wrapped in a new method handle {@code M},
++ * which is permanently associated with the switcher that created it.
++ * Each pair consists of a target {@code T} and a fallback {@code F}.
++ * While the switcher is valid, invocations to {@code M} are delegated to {@code T}.
++ * After it is invalidated, invocations are delegated to {@code F}.
++ * <p>
++ * Invalidation is global and immediate, as if the switcher contained a
++ * volatile boolean variable consulted on every call to {@code M}.
++ * The invalidation is also permanent, which means the switcher
++ * can change state only once.
++ * The switcher will always delegate to {@code F} after being invalidated.
++ * At that point {@code guardWithTest} may ignore {@code T} and return {@code F}.
++ * <p>
++ * Here is an example of a switcher in action:
++ * <blockquote><pre>
++MethodType MT_str2 = MethodType.methodType(String.class, String.class);
++MethodHandle MH_strcat = MethodHandles.lookup()
++    .findVirtual(String.class, "concat", MT_str2);
++Switcher switcher = new Switcher();
++// the following steps may be repeated to re-use the same switcher:
++MethodHandle worker1 = strcat;
++MethodHandle worker2 = MethodHandles.permuteArguments(strcat, MT_str2, 1, 0);
++MethodHandle worker = switcher.guardWithTest(worker1, worker2);
++assertEquals("method", (String) worker.invokeExact("met", "hod"));
++switcher.invalidate();
++assertEquals("hodmet", (String) worker.invokeExact("met", "hod"));
++ * </pre></blockquote>
++ * <p>
++ * <em>Implementation Note:</em>
++ * A switcher behaves as if implemented on top of {@link MutableCallSite},
++ * approximately as follows:
++ * <blockquote><pre>
++public class Switcher {
++  private static final MethodHandle
++    K_true  = MethodHandles.constant(boolean.class, true),
++    K_false = MethodHandles.constant(boolean.class, false);
++  private final MutableCallSite mcs;
++  private final MethodHandle mcsInvoker;
++  public Switcher() {
++    this.mcs = new MutableCallSite(K_true);
++    this.mcsInvoker = mcs.dynamicInvoker();
++  }
++  public MethodHandle guardWithTest(
++                MethodHandle target, MethodHandle fallback) {
++    // Note:  mcsInvoker is of type ()boolean.
++    // Target and fallback may take any arguments, but must have the same type.
++    return MethodHandles.guardWithTest(this.mcsInvoker, target, fallback);
++  }
++  public static void invalidateAll(Switcher[] switchers) {
++    List<MutableCallSite> mcss = new ArrayList<>();
++    for (Switcher s : switchers)  mcss.add(s.mcs);
++    for (MutableCallSite mcs : mcss)  mcs.setTarget(K_false);
++    MutableCallSite.sync(mcss.toArray(new MutableCallSite[0]));
++  }
++}
++ * </pre></blockquote>
++ * @author Remi Forax, JSR 292 EG
++ */
++public class Switcher {
++    private static final MethodHandle
++        K_true  = MethodHandles.constant(boolean.class, true),
++        K_false = MethodHandles.constant(boolean.class, false);
+ 
+-/**
+- * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+- * A {@code VolatileCallSite} is a {@link CallSite} whose target acts like a volatile variable.
+- * An {@code invokedynamic} instruction linked to a {@code VolatileCallSite} sees updates
+- * to its call site target immediately, even if the update occurs in another thread.
+- * <p>
+- * Also, a volatile call site has the ability to be <em>invalidated</em>,
+- * or reset to a well-defined fallback state.
+- * <p>
+- * A volatile call site can be used as a switch to control the behavior
+- * of another method handle.  For example:
+- * <blockquote><pre>
+-MethodHandle strcat = MethodHandles.lookup()
+-  .findVirtual(String.class, "concat", MethodType.methodType(String.class, String.class));
+-MethodHandle trueCon  = MethodHandles.constant(boolean.class, true);
+-MethodHandle falseCon = MethodHandles.constant(boolean.class, false);
+-VolatileCallSite switcher = new VolatileCallSite(trueCon, falseCon);
+-// following steps may be repeated to re-use the same switcher:
+-MethodHandle worker1 = strcat;
+-MethodHandle worker2 = MethodHandles.permuteArguments(strcat, strcat.type(), 1, 0);
+-MethodHandle worker = MethodHandles.guardWithTest(switcher.dynamicInvoker(), worker1, worker2);
+-System.out.println((String) worker.invokeExact("met", "hod"));  // method
+-switcher.invalidate();
+-System.out.println((String) worker.invokeExact("met", "hod"));  // hodmet
+- * </pre></blockquote>
+- * In this case, the fallback path (worker2) does not cause a state change.
+- * In a real application, the fallback path could cause call sites to relink
+- * themselves in response to a global data structure change.
+- * Thus, volatile call sites can be used to build dependency mechanisms.
+- * @author John Rose, JSR 292 EG
+- */
+-public class VolatileCallSite extends CallSite {
+-    volatile MethodHandle fallback;
++    private final MutableCallSite mcs;
++    private final MethodHandle mcsInvoker;
+ 
+-    /** Create a call site with a volatile target.
+-     *  The initial target and fallback are both set to a method handle
+-     *  of the given type which will throw {@code IllegalStateException}.
+-     */
+-    public VolatileCallSite(MethodType type) {
+-        super(type);
+-        fallback = target;
+-    }
+-
+-    /** Create a call site with a volatile target.
+-     *  The fallback and target are both set to the same initial value.
+-     */
+-    public VolatileCallSite(MethodHandle target) {
+-        super(target);
+-        fallback = target;
+-    }
+-
+-    /** Create a call site with a volatile target.
+-     *  The fallback and target are set to the given initial values.
+-     */
+-    public VolatileCallSite(MethodHandle target, MethodHandle fallback) {
+-        this(target);
+-        checkTargetChange(target, fallback);  // make sure they have the same type
+-        this.fallback = fallback;
+-    }
+-
+-    /** Internal override to nominally final getTarget. */
+-    @Override
+-    MethodHandle getTarget0() {
+-        return getTargetVolatile();
++    /** Create a switcher. */
++    public Switcher() {
++        this.mcs = new MutableCallSite(K_true);
++        this.mcsInvoker = mcs.dynamicInvoker();
+     }
+ 
+     /**
+-     * Set the target method of this call site, as a volatile variable.
+-     * Has the same effect as {@link CallSite#setTarget}, with the additional
+-     * effects associated with volatiles, in the Java Memory Model.
++     * Return a method handle which always delegates either to the target or the fallback.
++     * The method handle will delegate to the target exactly as long as the switcher is valid.
++     * After that, it will permanently delegate to the fallback.
++     * <p>
++     * The target and fallback must be of exactly the same method type,
++     * and the resulting combined method handle will also be of this type.
++     * @see MethodHandles#guardWithTest
+      */
+-    @Override public void setTarget(MethodHandle newTarget) {
+-        checkTargetChange(getTargetVolatile(), newTarget);
+-        setTargetVolatile(newTarget);
++    public MethodHandle guardWithTest(MethodHandle target, MethodHandle fallback) {
++        if (mcs.getTarget() == K_false)
++            return fallback;  // already invalid
++        return MethodHandles.guardWithTest(mcsInvoker, target, fallback);
+     }
+ 
+-    /**
+-     * Return the fallback target for this call site.
+-     * It is initialized to the target the call site had when it was constructed,
+-     * but it may be changed by {@link setFallbackTarget}.
+-     * <p>
+-     * Like the regular target of a volatile call site,
+-     * the fallback target also has the behavior of a volatile variable.
+-     */
+-    public MethodHandle getFallbackTarget() {
+-        return fallback;
++    /** Set all of the given switchers into the invalid state. */
++    public static void invalidateAll(Switcher[] switchers) {
++        MutableCallSite[] sites = new MutableCallSite[switchers.length];
++        for (int i = 0; i < switchers.length; i++) {
++            Switcher switcher = switchers[i];
++            sites[i] = switcher.mcs;
++            switcher.mcs.setTarget(K_false);
++        }
++        MutableCallSite.sync(sites);
+     }
+-
+-    /**
+-     * Update the fallback target for this call site.
+-     * @see #getFallbackTarget
+-     */
+-    public void setFallbackTarget(MethodHandle newFallbackTarget) {
+-        checkTargetChange(fallback, newFallbackTarget);
+-        fallback = newFallbackTarget;
+-    }
+-
+-    /**
+-     * Reset this call site to a known state by changing the target to the fallback target value.
+-     * Equivalent to {@code setTarget(getFallbackTarget())}.
+-     */
+-    public void invalidate() {
+-        setTargetVolatile(getFallbackTarget());
+-    }
+-
+-    /**
+-     * Reset all call sites in a list by changing the target of each to its fallback value.
+-     */
+-    public static void invalidateAll(List<VolatileCallSite> sites) {
+-        for (VolatileCallSite site : sites) {
+-            site.invalidate();
+-        }
+-    }
+-
+ }
+diff --git a/src/share/classes/java/dyn/VolatileCallSite.java b/src/share/classes/java/dyn/VolatileCallSite.java
+--- a/src/share/classes/java/dyn/VolatileCallSite.java
++++ b/src/share/classes/java/dyn/VolatileCallSite.java
+@@ -28,63 +28,37 @@
+ import java.util.List;
+ 
+ /**
+- * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+  * A {@code VolatileCallSite} is a {@link CallSite} whose target acts like a volatile variable.
+  * An {@code invokedynamic} instruction linked to a {@code VolatileCallSite} sees updates
+  * to its call site target immediately, even if the update occurs in another thread.
++ * There may be a performance penalty for such tight coupling between threads.
+  * <p>
+- * Also, a volatile call site has the ability to be <em>invalidated</em>,
+- * or reset to a well-defined fallback state.
++ * Unlike {@code MutableCallSite}, there is no
++ * {@linkplain MutableCallSite#sync sync operation} on volatile
++ * call sites, since every write to a volatile variable is implicitly
++ * synchronized with reader threads.
+  * <p>
+- * A volatile call site can be used as a switch to control the behavior
+- * of another method handle.  For example:
+- * <blockquote><pre>
+-MethodHandle strcat = MethodHandles.lookup()
+-  .findVirtual(String.class, "concat", MethodType.methodType(String.class, String.class));
+-MethodHandle trueCon  = MethodHandles.constant(boolean.class, true);
+-MethodHandle falseCon = MethodHandles.constant(boolean.class, false);
+-VolatileCallSite switcher = new VolatileCallSite(trueCon, falseCon);
+-// following steps may be repeated to re-use the same switcher:
+-MethodHandle worker1 = strcat;
+-MethodHandle worker2 = MethodHandles.permuteArguments(strcat, strcat.type(), 1, 0);
+-MethodHandle worker = MethodHandles.guardWithTest(switcher.dynamicInvoker(), worker1, worker2);
+-System.out.println((String) worker.invokeExact("met", "hod"));  // method
+-switcher.invalidate();
+-System.out.println((String) worker.invokeExact("met", "hod"));  // hodmet
+- * </pre></blockquote>
+- * In this case, the fallback path (worker2) does not cause a state change.
+- * In a real application, the fallback path could cause call sites to relink
+- * themselves in response to a global data structure change.
+- * Thus, volatile call sites can be used to build dependency mechanisms.
++ * In other respects, a {@code VolatileCallSite} is interchangeable
++ * with {@code MutableCallSite}.
++ * @see MutableCallSite
+  * @author John Rose, JSR 292 EG
+  */
+ public class VolatileCallSite extends CallSite {
+-    volatile MethodHandle fallback;
+-
+     /** Create a call site with a volatile target.
+-     *  The initial target and fallback are both set to a method handle
++     *  The initial target is set to a method handle
+      *  of the given type which will throw {@code IllegalStateException}.
++     * @throws NullPointerException if the proposed type is null
+      */
+     public VolatileCallSite(MethodType type) {
+         super(type);
+-        fallback = target;
+     }
+ 
+     /** Create a call site with a volatile target.
+-     *  The fallback and target are both set to the same initial value.
++     *  The target is set to the given value.
++     * @throws NullPointerException if the proposed target is null
+      */
+     public VolatileCallSite(MethodHandle target) {
+         super(target);
+-        fallback = target;
+-    }
+-
+-    /** Create a call site with a volatile target.
+-     *  The fallback and target are set to the given initial values.
+-     */
+-    public VolatileCallSite(MethodHandle target, MethodHandle fallback) {
+-        this(target);
+-        checkTargetChange(target, fallback);  // make sure they have the same type
+-        this.fallback = fallback;
+     }
+ 
+     /** Internal override to nominally final getTarget. */
+@@ -95,50 +69,11 @@
+ 
+     /**
+      * Set the target method of this call site, as a volatile variable.
+-     * Has the same effect as {@link CallSite#setTarget}, with the additional
++     * Has the same effect as {@link CallSite#setTarget CallSite.setTarget}, with the additional
+      * effects associated with volatiles, in the Java Memory Model.
+      */
+     @Override public void setTarget(MethodHandle newTarget) {
+         checkTargetChange(getTargetVolatile(), newTarget);
+         setTargetVolatile(newTarget);
+     }
+-
+-    /**
+-     * Return the fallback target for this call site.
+-     * It is initialized to the target the call site had when it was constructed,
+-     * but it may be changed by {@link setFallbackTarget}.
+-     * <p>
+-     * Like the regular target of a volatile call site,
+-     * the fallback target also has the behavior of a volatile variable.
+-     */
+-    public MethodHandle getFallbackTarget() {
+-        return fallback;
+-    }
+-
+-    /**
+-     * Update the fallback target for this call site.
+-     * @see #getFallbackTarget
+-     */
+-    public void setFallbackTarget(MethodHandle newFallbackTarget) {
+-        checkTargetChange(fallback, newFallbackTarget);
+-        fallback = newFallbackTarget;
+-    }
+-
+-    /**
+-     * Reset this call site to a known state by changing the target to the fallback target value.
+-     * Equivalent to {@code setTarget(getFallbackTarget())}.
+-     */
+-    public void invalidate() {
+-        setTargetVolatile(getFallbackTarget());
+-    }
+-
+-    /**
+-     * Reset all call sites in a list by changing the target of each to its fallback value.
+-     */
+-    public static void invalidateAll(List<VolatileCallSite> sites) {
+-        for (VolatileCallSite site : sites) {
+-            site.invalidate();
+-        }
+-    }
+-
+ }
+diff --git a/src/share/classes/java/dyn/package-info.java b/src/share/classes/java/dyn/package-info.java
+--- a/src/share/classes/java/dyn/package-info.java
++++ b/src/share/classes/java/dyn/package-info.java
+@@ -51,7 +51,7 @@
+  * changes being made to the Java Virtual Machine specification for JSR 292.
+  * This information will be incorporated in a future version of the JVM specification.</em>
+  *
+- * <h3>{@code invokedynamic} instruction format</h3>
++ * <h3><a name="indyinsn"></a>{@code invokedynamic} instruction format</h3>
+  * In bytecode, an {@code invokedynamic} instruction is formatted as five bytes.
+  * The first byte is the opcode 186 (hexadecimal {@code BA}).
+  * The next two bytes are a constant pool index (in the same format as for the other {@code invoke} instructions).
+@@ -82,7 +82,7 @@
+  * instead of a {@code CONSTANT_InvokeDynamic}.  In earlier, obsolete versions of this API, the
+  * bootstrap method was specified dynamically, in a per-class basis, during class initialization.)
+  *
+- * <h3>constant pool entries for {@code invokedynamic} instructions</h3>
++ * <h3><a name="indycon"></a>constant pool entries for {@code invokedynamic} instructions</h3>
+  * If a constant pool entry has the tag {@code CONSTANT_InvokeDynamic} (decimal 18),
+  * it must contain exactly four more bytes after the tag.
+  * These bytes are interpreted as two 16-bit indexes, in the usual {@code u2} format.
+@@ -109,7 +109,7 @@
+  * <em>(Note: The Proposed Final Draft of this specification is likely to support
+  * only the tag 18, not the tag 17.)</em>
+  *
+- * <h3>constant pool entries for {@linkplain java.dyn.MethodType method types}</h3>
++ * <h3><a name="mtcon"></a>constant pool entries for {@linkplain java.dyn.MethodType method types}</h3>
+  * If a constant pool entry has the tag {@code CONSTANT_MethodType} (decimal 16),
+  * it must contain exactly two more bytes, which must be an index to a {@code CONSTANT_Utf8}
+  * entry which represents a method type signature.
+@@ -121,13 +121,8 @@
+  * but not initialized.
+  * Access checking and error reporting is performed exactly as it is for
+  * references by {@code ldc} instructions to {@code CONSTANT_Class} constants.
+- * <p>
+- * Every use of this constant pool entry must lead to the same outcome.
+- * If the resolution of the names in the method type constant causes an exception to occur,
+- * this exception must be recorded by the JVM, and re-thrown on every subsequent attempt
+- * to use this particular constant.
+  *
+- * <h3>constant pool entries for {@linkplain java.dyn.MethodHandle method handles}</h3>
++ * <h3><a name="mhcon"></a>constant pool entries for {@linkplain java.dyn.MethodHandle method handles}</h3>
+  * If a constant pool entry has the tag {@code CONSTANT_MethodHandle} (decimal 15),
+  * it must contain exactly three more bytes.  The first byte after the tag is a subtag
+  * value which must be in the range 1 through 9, and the last two must be an index to a
+@@ -162,7 +157,8 @@
+  * </table>
+  * </code>
+  * <p>
+- * The special names {@code <init>} and {@code <clinit>} are not allowed except for subtag 8 as shown.
++ * The special name {@code <clinit>} is not allowed.
++ * The special name {@code <init>} is not allowed except for subtag 8 as shown.
+  * <p>
+  * The JVM verifier and linker apply the same access checks and restrictions for these references as for the hypothetical
+  * bytecode instructions specified in the last column of the table.  In particular, method handles to
+@@ -183,10 +179,23 @@
+  * Method handle constants for subtags {@code REF_getStatic}, {@code REF_putStatic}, and {@code REF_invokeStatic}
+  * may force class initialization on their first invocation, just like the corresponding bytecodes.
+  * <p>
+- * Every use of this constant pool entry must lead to the same outcome.
+- * If the resolution of the names in the method handle constant causes an exception to occur,
+- * this exception must be recorded by the JVM, and re-thrown on every subsequent attempt
+- * to use this particular constant.
++ * The rules of section 5.4.3 of the
++ * <a href="http://java.sun.com/docs/books/jvms/second_edition/html/ConstantPool.doc.html#73492">JVM Specification</a>
++ * apply to the resolution of {@code CONSTANT_MethodType}, {@code CONSTANT_MethodHandle},
++ * and {@code CONSTANT_InvokeDynamic} constants,
++ * by the execution of {@code invokedynamic} and {@code ldc} instructions.
++ * (Roughly speaking, this means that every use of a constant pool entry
++ * must lead to the same outcome.
++ * If the resolution succeeds, the same object reference is produced
++ * by every subsequent execution of the same instruction.
++ * If the resolution of the constant causes an error to occur,
++ * the same error will be re-thrown on every subsequent attempt
++ * to use this particular constant.)
++ * <p>
++ * Constants created by the resolution of these constant pool types are not necessarily
++ * interned.  Except for {@link CONSTANT_Class} and {@link CONSTANT_String} entries,
++ * two distinct constant pool entries might not resolve to the same reference
++ * even if they contain the same symbolic reference.
+  *
+  * <h2><a name="bsm"></a>Bootstrap Methods</h2>
+  * Before the JVM can execute a dynamic call site (an {@code invokedynamic} instruction),
+@@ -263,7 +272,7 @@
+  *     the expected {@code MethodType} </li>
+  * </ul>
+  *
+- * <h3>timing of linkage</h3>
++ * <h3><a name="linktime"></a>timing of linkage</h3>
+  * A dynamic call site is linked just before its first execution.
+  * The bootstrap method call implementing the linkage occurs within
+  * a thread that is attempting a first execution.
+@@ -398,6 +407,7 @@
+  * Such a practice is likely to produce large class files and constant pools.
+  *
+  * <p style="font-size:smaller;">
++ * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+  * (Usage Note: There is no mechanism for specifying five or more positional arguments to the bootstrap method.
+  * If there are two or more arguments, the Java code of the bootstrap method is required to extract them from
+  * a varargs-style object array.
+@@ -414,7 +424,7 @@
+  * {@link java.dyn.MethodHandle#asSpreader asSpreader}
+  * and {@link java.dyn.MethodHandle#asSpreader asCollector} methods.)
+  *
+- * <h2>Structure Summary</h2>
++ * <h2><a name="structs"></a>Structure Summary</h2>
+  * <blockquote><pre>// summary of constant and attribute structures
+ struct CONSTANT_MethodHandle_info {
+   u1 tag = 15;
+diff --git a/test/java/dyn/ClassValueTest.java b/test/java/dyn/ClassValueTest.java
+--- a/test/java/dyn/ClassValueTest.java
++++ b/test/java/dyn/ClassValueTest.java
+@@ -53,12 +53,13 @@
+         return "CV1:" + type.getName();
+     }
+     static int countForCV1;
+-    static final ClassValue<String> CV1 = new ClassValue<String>() {
++    static final ClassValue<String> CV1 = new CV1();
++    private static class CV1 extends ClassValue<String> {
+         protected String computeValue(Class<?> type) {
+             countForCV1++;
+             return nameForCV1(type);
+         }
+-    };
++    }
+ 
+     static final Class[] CLASSES = {
+         String.class,
+diff --git a/test/java/dyn/InvokeDynamicPrintArgs.java b/test/java/dyn/InvokeDynamicPrintArgs.java
+--- a/test/java/dyn/InvokeDynamicPrintArgs.java
++++ b/test/java/dyn/InvokeDynamicPrintArgs.java
+@@ -99,7 +99,7 @@
+     private static CallSite bsm(Lookup caller, String name, MethodType type) throws ReflectiveOperationException {
+         // ignore caller and name, but match the type:
+         Object bsmInfo = Arrays.asList(caller, name, type);
+-        return new CallSite(MH_printArgs().bindTo(bsmInfo).asCollector(Object[].class, type.parameterCount()).asType(type));
++        return new ConstantCallSite(MH_printArgs().bindTo(bsmInfo).asCollector(Object[].class, type.parameterCount()).asType(type));
+     }
+     private static MethodType MT_bsm() {
+         shouldNotCallThis();
+@@ -117,7 +117,7 @@
+             bsmInfo.addAll(Arrays.asList((Object[])arg));
+         else
+             bsmInfo.add(arg);
+-        return new CallSite(MH_printArgs().bindTo(bsmInfo).asCollector(Object[].class, type.parameterCount()).asType(type));
++        return new ConstantCallSite(MH_printArgs().bindTo(bsmInfo).asCollector(Object[].class, type.parameterCount()).asType(type));
+     }
+     private static MethodType MT_bsm2() {
+         shouldNotCallThis();
+diff --git a/test/java/dyn/JavaDocExamplesTest.java b/test/java/dyn/JavaDocExamplesTest.java
+--- a/test/java/dyn/JavaDocExamplesTest.java
++++ b/test/java/dyn/JavaDocExamplesTest.java
+@@ -107,16 +107,15 @@
+ {} /// JAVADOC
+ MethodHandle cat = lookup().findVirtual(String.class,
+   "concat", methodType(String.class, String.class));
+-cat = cat.asType(methodType(Object.class, String.class, String.class)); /*(String)*/
+-assertEquals("xy", /*(String)*/ cat.invokeExact("x", "y"));
++assertEquals("xy", (String) cat.invokeExact("x", "y"));
+ MethodHandle d0 = dropArguments(cat, 0, String.class);
+-assertEquals("yz", /*(String)*/ d0.invokeExact("x", "y", "z"));
++assertEquals("yz", (String) d0.invokeExact("x", "y", "z"));
+ MethodHandle d1 = dropArguments(cat, 1, String.class);
+-assertEquals("xz", /*(String)*/ d1.invokeExact("x", "y", "z"));
++assertEquals("xz", (String) d1.invokeExact("x", "y", "z"));
+ MethodHandle d2 = dropArguments(cat, 2, String.class);
+-assertEquals("xy", /*(String)*/ d2.invokeExact("x", "y", "z"));
++assertEquals("xy", (String) d2.invokeExact("x", "y", "z"));
+ MethodHandle d12 = dropArguments(cat, 1, int.class, boolean.class);
+-assertEquals("xz", /*(String)*/ d12.invokeExact("x", 12, true, "z"));
++assertEquals("xz", (String) d12.invokeExact("x", 12, true, "z"));
+             }}
+     }
+ 
+@@ -125,16 +124,15 @@
+ {} /// JAVADOC
+ MethodHandle cat = lookup().findVirtual(String.class,
+   "concat", methodType(String.class, String.class));
+-cat = cat.asType(methodType(Object.class, String.class, String.class)); /*(String)*/
+ MethodHandle upcase = lookup().findVirtual(String.class,
+   "toUpperCase", methodType(String.class));
+-assertEquals("xy", /*(String)*/ cat.invokeExact("x", "y")); // xy
++assertEquals("xy", (String) cat.invokeExact("x", "y"));
+ MethodHandle f0 = filterArguments(cat, 0, upcase);
+-assertEquals("Xy", /*(String)*/ f0.invokeExact("x", "y")); // Xy
++assertEquals("Xy", (String) f0.invokeExact("x", "y")); // Xy
+ MethodHandle f1 = filterArguments(cat, 1, upcase);
+-assertEquals("xY", /*(String)*/ f1.invokeExact("x", "y")); // xY
++assertEquals("xY", (String) f1.invokeExact("x", "y")); // xY
+ MethodHandle f2 = filterArguments(cat, 0, upcase, upcase);
+-assertEquals("XY", /*(String)*/ f2.invokeExact("x", "y")); // XY
++assertEquals("XY", (String) f2.invokeExact("x", "y")); // XY
+             }}
+     }
+ 
+@@ -144,24 +142,6 @@
+         Assert.assertEquals(exp, act);
+     }
+ 
+-    @Test public void testVolatileCallSite() throws Throwable {
+-        {{
+-{} /// JAVADOC
+-MethodHandle strcat = MethodHandles.lookup()
+-  .findVirtual(String.class, "concat", MethodType.methodType(String.class, String.class));
+-MethodHandle trueCon  = MethodHandles.constant(boolean.class, true);
+-MethodHandle falseCon = MethodHandles.constant(boolean.class, false);
+-VolatileCallSite switcher = new VolatileCallSite(trueCon, falseCon);
+-// following steps may be repeated to re-use the same switcher:
+-MethodHandle worker1 = strcat;
+-MethodHandle worker2 = MethodHandles.permuteArguments(strcat, strcat.type(), 1, 0);
+-MethodHandle worker = MethodHandles.guardWithTest(switcher.dynamicInvoker(), worker1, worker2);
+-System.out.println((String) worker.invokeExact("met", "hod"));  // method
+-switcher.invalidate();
+-System.out.println((String) worker.invokeExact("met", "hod"));  // hodmet
+-            }}
+-    }
+-
+ static MethodHandle asList;
+     @Test public void testWithTypeHandler() throws Throwable {
+         {{
+@@ -182,9 +162,9 @@
+      methodType(MethodHandle.class, MethodHandle.class, MethodType.class));
+ MethodHandle makeAnyList = makeEmptyList.withTypeHandler(collectingTypeHandler);
+ 
+-System.out.println(makeAnyList.invokeGeneric());
+-System.out.println(makeAnyList.invokeGeneric(1));
+-System.out.println(makeAnyList.invokeGeneric("two", "too"));
++assertEquals("[]", makeAnyList.invokeGeneric().toString());
++assertEquals("[1]", makeAnyList.invokeGeneric(1).toString());
++assertEquals("[two, too]", makeAnyList.invokeGeneric("two", "too").toString());
+             }}
+     }
+ 
+diff --git a/test/java/dyn/MethodHandlesTest.java b/test/java/dyn/MethodHandlesTest.java
+--- a/test/java/dyn/MethodHandlesTest.java
++++ b/test/java/dyn/MethodHandlesTest.java
+@@ -1688,8 +1688,8 @@
+ 
+         // dynamic invoker
+         countTest();
+-        CallSite site = new CallSite(type);
+-        inv = MethodHandles.dynamicInvoker(site);
++        CallSite site = new MutableCallSite(type);
++        inv = site.dynamicInvoker();
+ 
+         // see if we get the result of the original target:
+         try {
+@@ -1820,11 +1820,12 @@
+         MethodHandle throwOrReturn
+                 = PRIVATE.findStatic(MethodHandlesTest.class, "throwOrReturn",
+                     MethodType.methodType(Object.class, Object.class, Throwable.class));
+-        MethodHandle thrower = throwOrReturn;
++        MethodHandle thrower = throwOrReturn.asType(MethodType.genericMethodType(2));
+         while (thrower.type().parameterCount() < nargs)
+             thrower = MethodHandles.dropArguments(thrower, thrower.type().parameterCount(), Object.class);
++        MethodHandle catcher = ValueConversions.varargsList(1+nargs).asType(MethodType.genericMethodType(1+nargs));
+         MethodHandle target = MethodHandles.catchException(thrower,
+-                thrown.getClass(), ValueConversions.varargsList(1+nargs));
++                thrown.getClass(), catcher);
+         assertEquals(thrower.type(), target.type());
+         //System.out.println("catching with "+target+" : "+throwOrReturn);
+         Object[] args = randomArgs(nargs, Object.class);

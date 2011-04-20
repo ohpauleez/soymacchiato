@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project name="indy-demo" default="default" basedir=".">
+    <description>Builds, tests, and runs the project indy-demo.</description>
+
+    <!-- see end of nbproject/project.properties for properties that might need patching here: -->
+    <property name="user.properties.file" value="build.properties"/>
+
+    <import file="nbproject/build-impl.xml"/>
+
+    <property name="excludes" value="JavaDocExamples.java,recipes/*"/>
+
+    <target name="-pre-compile">
+        <echo>Relevant attributes and properties to javac:
+    srcdir:         ${src.dir}
+    destdir:        ${build.classes.dir}
+    compilerarg:    ${javac.compilerargs}
+    compilerarg:    ${endorsed.classpath.cmd.line.arg}
+    classpath:      ${javac.classpath}
+    includes:       ${includes}
+    excludes:       ${excludes}
+    debug=          ${javac.debug}
+    sourcepath:     ${empty.dir}
+    gensrcdir:      ${empty.dir}
+    deprecation=    ${javac.deprecation}
+    encoding=       ${source.encoding}
+    executable=     ${platform.javac}
+    source=         ${javac.source}
+    target=         ${javac.target}
+    tempdir=        ${java.io.tmpdir}
+    other attrs:    fork=yes includeantruntime=false
+    java.home=      ${java.home}
+        </echo>
+    </target>
+
+    <target name="-post-compile" unless="do.not.rewrite.bytecodes">
+        <delete dir="${build.indified-classes.dir}"/>
+        <java classname="indify.Indify" fork="true" failonerror="true" jvm="${platform.java}">
+            <classpath path="${build.classes.dir}"/>
+            <arg line="--quiet"/>
+            <arg line="--dest ${build.indified-classes.dir}"/>
+            <arg value="${build.classes.dir}"/>
+        </java>
+    </target>
+
+    <target name="-post-jar">
+        <delete file="dist/README.TXT"/>
+	<copy file="README.txt" todir="dist"/>
+	<echo>To run this project, you will need the JVM option -XX:+UnlockExperimentalVMOptions -XX:+EnableInvokeDynamic</echo>
+    </target>
+
+    <target depends="init,compile" description="Run the main class under Indify.runApplication." name="run-under-indify"
+            xmlns:j2seproject1="http://www.netbeans.org/ns/j2se-project/1"
+            >
+        <j2seproject1:java classname="indify.Indify">
+            <customize>
+                <arg line="--quiet"/>
+                <arg line="--classpath ${build.classes.dir}"/>
+                <arg line="--java ${main.class} ${application.args}"/>
+            </customize>
+        </j2seproject1:java>
+    </target>
+</project>

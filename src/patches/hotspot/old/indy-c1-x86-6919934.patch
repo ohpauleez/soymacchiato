@@ -1,0 +1,1681 @@
+diff --git a/src/cpu/sparc/vm/c1_CodeStubs_sparc.cpp b/src/cpu/sparc/vm/c1_CodeStubs_sparc.cpp
+--- a/src/cpu/sparc/vm/c1_CodeStubs_sparc.cpp
++++ b/src/cpu/sparc/vm/c1_CodeStubs_sparc.cpp
+@@ -377,6 +377,15 @@
+ 
+ }
+ 
++
++void DeoptimizeStub::emit_code(LIR_Assembler* ce) {
++  __ bind(_entry);
++  __ call(SharedRuntime::deopt_blob()->unpack_with_reexecution());
++  ce->add_call_info_here(_info);
++  debug_only(__ should_not_reach_here());
++}
++
++
+ void ArrayCopyStub::emit_code(LIR_Assembler* ce) {
+   //---------------slow case: call to native-----------------
+   __ bind(_entry);
+diff --git a/src/cpu/sparc/vm/c1_LIRAssembler_sparc.cpp b/src/cpu/sparc/vm/c1_LIRAssembler_sparc.cpp
+--- a/src/cpu/sparc/vm/c1_LIRAssembler_sparc.cpp
++++ b/src/cpu/sparc/vm/c1_LIRAssembler_sparc.cpp
+@@ -378,12 +378,7 @@
+ 
+   int offset = code_offset();
+ 
+-  if (compilation()->has_exception_handlers() || compilation()->env()->jvmti_can_post_on_exceptions()) {
+-    __ call(Runtime1::entry_for(Runtime1::handle_exception_id), relocInfo::runtime_call_type);
+-    __ delayed()->nop();
+-  }
+-
+-  __ call(Runtime1::entry_for(Runtime1::unwind_exception_id), relocInfo::runtime_call_type);
++  __ call(Runtime1::entry_for(Runtime1::handle_exception_id), relocInfo::runtime_call_type);
+   __ delayed()->nop();
+   debug_only(__ stop("should have gone to the caller");)
+   assert(code_offset() - offset <= exception_handler_size, "overflow");
+@@ -685,29 +680,29 @@
+ }
+ 
+ 
+-void LIR_Assembler::call(address entry, relocInfo::relocType rtype, CodeEmitInfo* info) {
+-  __ call(entry, rtype);
++void LIR_Assembler::call(LIR_OpJavaCall* op, relocInfo::relocType rtype) {
++  __ call(op->addr(), rtype);
+   // the peephole pass fills the delay slot
+ }
+ 
+ 
+-void LIR_Assembler::ic_call(address entry, CodeEmitInfo* info) {
++void LIR_Assembler::ic_call(LIR_OpJavaCall* op) {
+   RelocationHolder rspec = virtual_call_Relocation::spec(pc());
+   __ set_oop((jobject)Universe::non_oop_word(), G5_inline_cache_reg);
+   __ relocate(rspec);
+-  __ call(entry, relocInfo::none);
++  __ call(op->addr(), relocInfo::none);
+   // the peephole pass fills the delay slot
+ }
+ 
+ 
+-void LIR_Assembler::vtable_call(int vtable_offset, CodeEmitInfo* info) {
+-  add_debug_info_for_null_check_here(info);
++void LIR_Assembler::vtable_call(LIR_OpJavaCall* op) {
++  add_debug_info_for_null_check_here(op->info());
+   __ ld_ptr(O0, oopDesc::klass_offset_in_bytes(), G3_scratch);
+-  if (__ is_simm13(vtable_offset) ) {
+-    __ ld_ptr(G3_scratch, vtable_offset, G5_method);
++  if (__ is_simm13(op->vtable_offset())) {
++    __ ld_ptr(G3_scratch, op->vtable_offset(), G5_method);
+   } else {
+     // This will generate 2 instructions
+-    __ set(vtable_offset, G5_method);
++    __ set(op->vtable_offset(), G5_method);
+     // ld_ptr, set_hi, set
+     __ ld_ptr(G3_scratch, G5_method, G5_method);
+   }
+@@ -717,6 +712,16 @@
+ }
+ 
+ 
++void LIR_Assembler::preserve_SP() {
++  // XXX I'm not sure yet if these are required on SPARC.
++}
++
++
++void LIR_Assembler::restore_SP() {
++  // XXX I'm not sure yet if these are required on SPARC.
++}
++
++
+ // load with 32-bit displacement
+ int LIR_Assembler::load(Register s, int disp, Register d, BasicType ld_type, CodeEmitInfo *info) {
+   int load_offset = code_offset();
+diff --git a/src/cpu/sparc/vm/c1_MacroAssembler_sparc.cpp b/src/cpu/sparc/vm/c1_MacroAssembler_sparc.cpp
+--- a/src/cpu/sparc/vm/c1_MacroAssembler_sparc.cpp
++++ b/src/cpu/sparc/vm/c1_MacroAssembler_sparc.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -42,17 +42,6 @@
+ }
+ 
+ 
+-void C1_MacroAssembler::method_exit(bool restore_frame) {
+-  // this code must be structured this way so that the return
+-  // instruction can be a safepoint.
+-  if (restore_frame) {
+-    restore();
+-  }
+-  retl();
+-  delayed()->nop();
+-}
+-
+-
+ void C1_MacroAssembler::explicit_null_check(Register base) {
+   Unimplemented();
+ }
+diff --git a/src/cpu/sparc/vm/c1_Runtime1_sparc.cpp b/src/cpu/sparc/vm/c1_Runtime1_sparc.cpp
+--- a/src/cpu/sparc/vm/c1_Runtime1_sparc.cpp
++++ b/src/cpu/sparc/vm/c1_Runtime1_sparc.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -677,7 +677,7 @@
+         __ add(I7, frame::pc_return_offset, Oissuing_pc->after_save());
+ 
+         __ call_VM_leaf(L7_thread_cache, CAST_FROM_FN_PTR(address, SharedRuntime::exception_handler_for_return_address),
+-                        Oissuing_pc->after_save());
++                        G2_thread, Oissuing_pc->after_save());
+         __ verify_not_null_oop(Oexception->after_save());
+         __ jmp(O0, 0);
+         __ delayed()->restore();
+@@ -985,7 +985,6 @@
+ 
+ void Runtime1::generate_handle_exception(StubAssembler* sasm, OopMapSet* oop_maps, OopMap* oop_map, bool) {
+   Label no_deopt;
+-  Label no_handler;
+ 
+   __ verify_not_null_oop(Oexception);
+ 
+@@ -1003,9 +1002,14 @@
+   // whether it had a handler or not we will deoptimize
+   // by entering the deopt blob with a pending exception.
+ 
++#ifdef ASSERT
++  Label done;
+   __ tst(O0);
+-  __ br(Assembler::zero, false, Assembler::pn, no_handler);
++  __ br(Assembler::notZero, false, Assembler::pn, done);
+   __ delayed()->nop();
++  __ stop("should have found address");
++  __ bind(done);
++#endif
+ 
+   // restore the registers that were saved at the beginning and jump to the exception handler.
+   restore_live_registers(sasm);
+@@ -1013,20 +1017,6 @@
+   __ jmp(O0, 0);
+   __ delayed()->restore();
+ 
+-  __ bind(no_handler);
+-  __ mov(L0, I7); // restore return address
+-
+-  // restore exception oop
+-  __ ld_ptr(G2_thread, in_bytes(JavaThread::exception_oop_offset()), Oexception->after_save());
+-  __ st_ptr(G0, G2_thread, in_bytes(JavaThread::exception_oop_offset()));
+-
+-  __ restore();
+-
+-  AddressLiteral exc(Runtime1::entry_for(Runtime1::unwind_exception_id));
+-  __ jump_to(exc, G4);
+-  __ delayed()->nop();
+-
+-
+   oop_maps->add_gc_map(call_offset, oop_map);
+ }
+ 
+diff --git a/src/cpu/sparc/vm/interp_masm_sparc.cpp b/src/cpu/sparc/vm/interp_masm_sparc.cpp
+--- a/src/cpu/sparc/vm/interp_masm_sparc.cpp
++++ b/src/cpu/sparc/vm/interp_masm_sparc.cpp
+@@ -244,9 +244,10 @@
+ }
+ 
+ 
+-void InterpreterMacroAssembler::super_call_VM_leaf(Register thread_cache, address entry_point, Register arg_1) {
++void InterpreterMacroAssembler::super_call_VM_leaf(Register thread_cache, address entry_point, Register arg_1, Register arg_2) {
+   mov(arg_1, O0);
+-  MacroAssembler::call_VM_leaf_base(thread_cache, entry_point, 1);
++  mov(arg_2, O1);
++  MacroAssembler::call_VM_leaf_base(thread_cache, entry_point, 2);
+ }
+ #endif /* CC_INTERP */
+ 
+diff --git a/src/cpu/sparc/vm/interp_masm_sparc.hpp b/src/cpu/sparc/vm/interp_masm_sparc.hpp
+--- a/src/cpu/sparc/vm/interp_masm_sparc.hpp
++++ b/src/cpu/sparc/vm/interp_masm_sparc.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2007 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -121,7 +121,7 @@
+                      bool check_exception = true);
+ 
+ #ifndef CC_INTERP
+-  void super_call_VM_leaf(Register thread_cache, address entry_point, Register arg_1);
++  void super_call_VM_leaf(Register thread_cache, address entry_point, Register arg_1, Register arg_2);
+ 
+   // Generate a subtype check: branch to ok_is_subtype if sub_klass is
+   // a subtype of super_klass.  Blows registers tmp1, tmp2 and tmp3.
+diff --git a/src/cpu/sparc/vm/stubGenerator_sparc.cpp b/src/cpu/sparc/vm/stubGenerator_sparc.cpp
+--- a/src/cpu/sparc/vm/stubGenerator_sparc.cpp
++++ b/src/cpu/sparc/vm/stubGenerator_sparc.cpp
+@@ -379,7 +379,7 @@
+     __ save_frame(0);             // compensates for compiler weakness
+     __ add(O7->after_save(), frame::pc_return_offset, Lscratch); // save the issuing PC
+     BLOCK_COMMENT("call exception_handler_for_return_address");
+-    __ call_VM_leaf(L7_thread_cache, CAST_FROM_FN_PTR(address, SharedRuntime::exception_handler_for_return_address), Lscratch);
++    __ call_VM_leaf(L7_thread_cache, CAST_FROM_FN_PTR(address, SharedRuntime::exception_handler_for_return_address), G2_thread, Lscratch);
+     __ mov(O0, handler_reg);
+     __ restore();                 // compensates for compiler weakness
+ 
+diff --git a/src/cpu/sparc/vm/templateInterpreter_sparc.cpp b/src/cpu/sparc/vm/templateInterpreter_sparc.cpp
+--- a/src/cpu/sparc/vm/templateInterpreter_sparc.cpp
++++ b/src/cpu/sparc/vm/templateInterpreter_sparc.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -1822,7 +1822,7 @@
+   __ add(issuing_pc_addr, Oissuing_pc->after_save());  // likewise set I1 to a value local to the caller
+   __ super_call_VM_leaf(L7_thread_cache,
+                         CAST_FROM_FN_PTR(address, SharedRuntime::exception_handler_for_return_address),
+-                        Oissuing_pc->after_save());
++                        G2_thread, Oissuing_pc->after_save());
+ 
+   // The caller's SP was adjusted upon method entry to accomodate
+   // the callee's non-argument locals. Undo that adjustment.
+diff --git a/src/cpu/x86/vm/c1_CodeStubs_x86.cpp b/src/cpu/x86/vm/c1_CodeStubs_x86.cpp
+--- a/src/cpu/x86/vm/c1_CodeStubs_x86.cpp
++++ b/src/cpu/x86/vm/c1_CodeStubs_x86.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -373,6 +373,14 @@
+ }
+ 
+ 
++void DeoptimizeStub::emit_code(LIR_Assembler* ce) {
++  __ bind(_entry);
++  __ call(RuntimeAddress(SharedRuntime::deopt_blob()->unpack_with_reexecution()));
++  ce->add_call_info_here(_info);
++  debug_only(__ should_not_reach_here());
++}
++
++
+ void ImplicitNullCheckStub::emit_code(LIR_Assembler* ce) {
+   ce->compilation()->implicit_exception_table()->append(_offset, __ offset());
+   __ bind(_entry);
+diff --git a/src/cpu/x86/vm/c1_LIRAssembler_x86.cpp b/src/cpu/x86/vm/c1_LIRAssembler_x86.cpp
+--- a/src/cpu/x86/vm/c1_LIRAssembler_x86.cpp
++++ b/src/cpu/x86/vm/c1_LIRAssembler_x86.cpp
+@@ -436,40 +436,18 @@
+ 
+   int offset = code_offset();
+ 
+-  // if the method does not have an exception handler, then there is
+-  // no reason to search for one
+-  if (compilation()->has_exception_handlers() || compilation()->env()->jvmti_can_post_on_exceptions()) {
+-    // the exception oop and pc are in rax, and rdx
+-    // no other registers need to be preserved, so invalidate them
+-    __ invalidate_registers(false, true, true, false, true, true);
+-
+-    // check that there is really an exception
+-    __ verify_not_null_oop(rax);
+-
+-    // search an exception handler (rax: exception oop, rdx: throwing pc)
+-    __ call(RuntimeAddress(Runtime1::entry_for(Runtime1::handle_exception_nofpu_id)));
+-
+-    // if the call returns here, then the exception handler for particular
+-    // exception doesn't exist -> unwind activation and forward exception to caller
+-  }
+-
+-  // the exception oop is in rax,
++  // the exception oop and pc are in rax, and rdx
+   // no other registers need to be preserved, so invalidate them
+-  __ invalidate_registers(false, true, true, true, true, true);
++  __ invalidate_registers(false, true, true, false, true, true);
+ 
+   // check that there is really an exception
+   __ verify_not_null_oop(rax);
+ 
+-  // unlock the receiver/klass if necessary
+-  // rax,: exception
+-  ciMethod* method = compilation()->method();
+-  if (method->is_synchronized() && GenerateSynchronizationCode) {
+-    monitorexit(FrameMap::rbx_oop_opr, FrameMap::rcx_opr, SYNC_header, 0, rax);
+-  }
++  // search an exception handler (rax: exception oop, rdx: throwing pc)
++  __ call(RuntimeAddress(Runtime1::entry_for(Runtime1::handle_exception_nofpu_id)));
+ 
+-  // unwind activation and forward exception to caller
+-  // rax,: exception
+-  __ jump(RuntimeAddress(Runtime1::entry_for(Runtime1::unwind_exception_id)));
++  __ stop("should not reach here");
++
+   assert(code_offset() - offset <= exception_handler_size, "overflow");
+   __ end_a_stub();
+ 
+@@ -495,8 +473,10 @@
+ 
+   int offset = code_offset();
+   InternalAddress here(__ pc());
++
+   __ pushptr(here.addr());
+   __ jump(RuntimeAddress(SharedRuntime::deopt_blob()->unpack()));
++
+   assert(code_offset() - offset <= deopt_handler_size, "overflow");
+   __ end_a_stub();
+ 
+@@ -593,7 +573,7 @@
+   }
+ 
+   // Pop the stack before the safepoint code
+-  __ leave();
++  __ remove_frame(initial_frame_size_in_bytes());
+ 
+   bool result_is_oop = result->is_valid() ? result->is_oop() : false;
+ 
+@@ -2738,6 +2718,7 @@
+     switch (code) {
+       case lir_static_call:
+       case lir_optvirtual_call:
++      case lir_dynamic_call:
+         offset += NativeCall::displacement_offset;
+         break;
+       case lir_icvirtual_call:
+@@ -2753,30 +2734,41 @@
+ }
+ 
+ 
+-void LIR_Assembler::call(address entry, relocInfo::relocType rtype, CodeEmitInfo* info) {
++void LIR_Assembler::call(LIR_OpJavaCall* op, relocInfo::relocType rtype) {
+   assert(!os::is_MP() || (__ offset() + NativeCall::displacement_offset) % BytesPerWord == 0,
+          "must be aligned");
+-  __ call(AddressLiteral(entry, rtype));
+-  add_call_info(code_offset(), info);
++  __ call(AddressLiteral(op->addr(), rtype));
++  add_call_info(code_offset(), op->info(), op->is_method_handle_invoke());
+ }
+ 
+ 
+-void LIR_Assembler::ic_call(address entry, CodeEmitInfo* info) {
++void LIR_Assembler::ic_call(LIR_OpJavaCall* op) {
+   RelocationHolder rh = virtual_call_Relocation::spec(pc());
+   __ movoop(IC_Klass, (jobject)Universe::non_oop_word());
+   assert(!os::is_MP() ||
+          (__ offset() + NativeCall::displacement_offset) % BytesPerWord == 0,
+          "must be aligned");
+-  __ call(AddressLiteral(entry, rh));
+-  add_call_info(code_offset(), info);
++  __ call(AddressLiteral(op->addr(), rh));
++  add_call_info(code_offset(), op->info(), op->is_method_handle_invoke());
+ }
+ 
+ 
+ /* Currently, vtable-dispatch is only enabled for sparc platforms */
+-void LIR_Assembler::vtable_call(int vtable_offset, CodeEmitInfo* info) {
++void LIR_Assembler::vtable_call(LIR_OpJavaCall* op) {
+   ShouldNotReachHere();
+ }
+ 
++
++void LIR_Assembler::preserve_SP() {
++  __ movptr(rbp, rsp);
++}
++
++
++void LIR_Assembler::restore_SP() {
++  __ movptr(rsp, rbp);
++}
++
++
+ void LIR_Assembler::emit_static_call_stub() {
+   address call_pc = __ pc();
+   address stub = __ start_a_stub(call_stub_size);
+@@ -2829,10 +2821,12 @@
+     } else {
+       unwind_id = Runtime1::handle_exception_nofpu_id;
+     }
++    __ call(RuntimeAddress(Runtime1::entry_for(unwind_id)));
+   } else {
+-    unwind_id = Runtime1::unwind_exception_id;
++    // remove the activation
++    __ remove_frame(initial_frame_size_in_bytes());
++    __ jump(RuntimeAddress(Runtime1::entry_for(Runtime1::unwind_exception_id)));
+   }
+-  __ call(RuntimeAddress(Runtime1::entry_for(unwind_id)));
+ 
+   // enough room for two byte trap
+   __ nop();
+diff --git a/src/cpu/x86/vm/c1_MacroAssembler_x86.cpp b/src/cpu/x86/vm/c1_MacroAssembler_x86.cpp
+--- a/src/cpu/x86/vm/c1_MacroAssembler_x86.cpp
++++ b/src/cpu/x86/vm/c1_MacroAssembler_x86.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -317,14 +317,6 @@
+ }
+ 
+ 
+-void C1_MacroAssembler::method_exit(bool restore_frame) {
+-  if (restore_frame) {
+-    leave();
+-  }
+-  ret(0);
+-}
+-
+-
+ void C1_MacroAssembler::build_frame(int frame_size_in_bytes) {
+   // Make sure there is enough stack space for this method's activation.
+   // Note that we do this before doing an enter(). This matches the
+@@ -333,7 +325,7 @@
+   // between the two compilers.
+   generate_stack_overflow_check(frame_size_in_bytes);
+ 
+-  enter();
++  push(rbp);
+ #ifdef TIERED
+   // c2 leaves fpu stack dirty. Clean it on entry
+   if (UseSSE < 2 ) {
+@@ -344,6 +336,12 @@
+ }
+ 
+ 
++void C1_MacroAssembler::remove_frame(int frame_size_in_bytes) {
++  increment(rsp, frame_size_in_bytes);  // Does not emit code for frame_size == 0
++  pop(rbp);
++}
++
++
+ void C1_MacroAssembler::unverified_entry(Register receiver, Register ic_klass) {
+   if (C1Breakpoint) int3();
+   inline_cache_check(receiver, ic_klass);
+diff --git a/src/cpu/x86/vm/c1_Runtime1_x86.cpp b/src/cpu/x86/vm/c1_Runtime1_x86.cpp
+--- a/src/cpu/x86/vm/c1_Runtime1_x86.cpp
++++ b/src/cpu/x86/vm/c1_Runtime1_x86.cpp
+@@ -688,18 +688,21 @@
+   int call_offset = __ call_RT(noreg, noreg, CAST_FROM_FN_PTR(address, exception_handler_for_pc));
+   oop_maps->add_gc_map(call_offset, oop_map);
+ 
+-  // rax,: handler address or NULL if no handler exists
++  // rax,: handler address
+   //      will be the deopt blob if nmethod was deoptimized while we looked up
+   //      handler regardless of whether handler existed in the nmethod.
+ 
+   // only rax, is valid at this time, all other registers have been destroyed by the runtime call
+   __ invalidate_registers(false, true, true, true, true, true);
+ 
++#ifdef ASSERT
+   // Do we have an exception handler in the nmethod?
+-  Label no_handler;
+   Label done;
+   __ testptr(rax, rax);
+-  __ jcc(Assembler::zero, no_handler);
++  __ jcc(Assembler::notZero, done);
++  __ stop("no handler found");
++  __ bind(done);
++#endif
+ 
+   // exception handler found
+   // patch the return address -> the stub will directly return to the exception handler
+@@ -712,36 +715,14 @@
+   __ leave();
+   __ ret(0);
+ 
+-  __ bind(no_handler);
+-  // no exception handler found in this method, so the exception is
+-  // forwarded to the caller (using the unwind code of the nmethod)
+-  // there is no need to restore the registers
+-
+-  // restore the real return address that was saved before the RT-call
+-  __ movptr(real_return_addr, Address(rsp, temp_1_off * VMRegImpl::stack_slot_size));
+-  __ movptr(Address(rbp, 1*BytesPerWord), real_return_addr);
+-
+-  // load address of JavaThread object for thread-local data
+-  NOT_LP64(__ get_thread(thread);)
+-  // restore exception oop into rax, (convention for unwind code)
+-  __ movptr(exception_oop, Address(thread, JavaThread::exception_oop_offset()));
+-
+-  // clear exception fields in JavaThread because they are no longer needed
+-  // (fields must be cleared because they are processed by GC otherwise)
+-  __ movptr(Address(thread, JavaThread::exception_oop_offset()), NULL_WORD);
+-  __ movptr(Address(thread, JavaThread::exception_pc_offset()), NULL_WORD);
+-
+-  // pop the stub frame off
+-  __ leave();
+-
+-  generate_unwind_exception(sasm);
+-  __ stop("should not reach here");
+ }
+ 
+ 
+ void Runtime1::generate_unwind_exception(StubAssembler *sasm) {
+   // incoming parameters
+   const Register exception_oop = rax;
++  // callee-saved copy of exception_oop during runtime call
++  const Register exception_oop_callee_saved = NOT_LP64(rsi);
+   // other registers used in this stub
+   const Register exception_pc = rdx;
+   const Register handler_addr = rbx;
+@@ -769,38 +750,39 @@
+   // clear the FPU stack in case any FPU results are left behind
+   __ empty_FPU_stack();
+ 
+-  // leave activation of nmethod
+-  __ leave();
+-  // store return address (is on top of stack after leave)
++  // save exception_oop in callee-saved register to preserve it during runtime calls
++  __ verify_not_null_oop(exception_oop);
++  __ movptr(exception_oop_callee_saved, exception_oop);
++
++  NOT_LP64(__ get_thread(thread);)
++  // Get return address (is on top of stack after leave).
+   __ movptr(exception_pc, Address(rsp, 0));
+ 
+-  __ verify_oop(exception_oop);
++  // search the exception handler address of the caller (using the return address)
++  __ call_VM_leaf(CAST_FROM_FN_PTR(address, SharedRuntime::exception_handler_for_return_address), thread, exception_pc);
++  // rax: exception handler address of the caller
+ 
+-  // save exception oop from rax, to stack before call
+-  __ push(exception_oop);
+-
+-  // search the exception handler address of the caller (using the return address)
+-  __ call_VM_leaf(CAST_FROM_FN_PTR(address, SharedRuntime::exception_handler_for_return_address), exception_pc);
+-  // rax,: exception handler address of the caller
+-
+-  // only rax, is valid at this time, all other registers have been destroyed by the call
+-  __ invalidate_registers(false, true, true, true, true, true);
++  // Only RAX and RSI are valid at this time, all other registers have been destroyed by the call.
++  __ invalidate_registers(false, true, true, true, false, true);
+ 
+   // move result of call into correct register
+   __ movptr(handler_addr, rax);
+ 
+-  // restore exception oop in rax, (required convention of exception handler)
+-  __ pop(exception_oop);
++  // Restore exception oop to RAX (required convention of exception handler).
++  __ movptr(exception_oop, exception_oop_callee_saved);
+ 
+-  __ verify_oop(exception_oop);
++  // verify that there is really a valid exception in rax
++  __ verify_not_null_oop(exception_oop);
+ 
+   // get throwing pc (= return address).
+   // rdx has been destroyed by the call, so it must be set again
+   // the pop is also necessary to simulate the effect of a ret(0)
+   __ pop(exception_pc);
+ 
+-  // verify that that there is really a valid exception in rax,
+-  __ verify_not_null_oop(exception_oop);
++  // Restore SP from BP if the exception PC is a MethodHandle call site.
++  NOT_LP64(__ get_thread(thread);)
++  __ cmpl(Address(thread, JavaThread::is_method_handle_exception_offset()), 0);
++  __ cmovptr(Assembler::notEqual, rsp, rbp);
+ 
+   // continue at exception handler (return address removed)
+   // note: do *not* remove arguments when unwinding the
+@@ -808,9 +790,9 @@
+   //       all arguments on the stack when entering the
+   //       runtime to determine the exception handler
+   //       (GC happens at call site with arguments!)
+-  // rax,: exception oop
++  // rax: exception oop
+   // rdx: throwing pc
+-  // rbx,: exception handler
++  // rbx: exception handler
+   __ jmp(handler_addr);
+ }
+ 
+diff --git a/src/cpu/x86/vm/stubGenerator_x86_32.cpp b/src/cpu/x86/vm/stubGenerator_x86_32.cpp
+--- a/src/cpu/x86/vm/stubGenerator_x86_32.cpp
++++ b/src/cpu/x86/vm/stubGenerator_x86_32.cpp
+@@ -369,7 +369,7 @@
+   // The pending exception in Thread is converted into a Java-level exception.
+   //
+   // Contract with Java-level exception handlers:
+-  // rax,: exception
++  // rax: exception
+   // rdx: throwing pc
+   //
+   // NOTE: At entry of this stub, exception-pc must be on stack !!
+@@ -377,6 +377,12 @@
+   address generate_forward_exception() {
+     StubCodeMark mark(this, "StubRoutines", "forward exception");
+     address start = __ pc();
++    const Register thread = rcx;
++
++    // other registers used in this stub
++    const Register exception_oop = rax;
++    const Register handler_addr  = rbx;
++    const Register exception_pc  = rdx;
+ 
+     // Upon entry, the sp points to the return address returning into Java
+     // (interpreted or compiled) code; i.e., the return address becomes the
+@@ -389,8 +395,8 @@
+ #ifdef ASSERT
+     // make sure this code is only executed if there is a pending exception
+     { Label L;
+-      __ get_thread(rcx);
+-      __ cmpptr(Address(rcx, Thread::pending_exception_offset()), (int32_t)NULL_WORD);
++      __ get_thread(thread);
++      __ cmpptr(Address(thread, Thread::pending_exception_offset()), (int32_t)NULL_WORD);
+       __ jcc(Assembler::notEqual, L);
+       __ stop("StubRoutines::forward exception: no pending exception (1)");
+       __ bind(L);
+@@ -398,33 +404,40 @@
+ #endif
+ 
+     // compute exception handler into rbx,
+-    __ movptr(rax, Address(rsp, 0));
++    __ get_thread(thread);
++    __ movptr(exception_pc, Address(rsp, 0));
+     BLOCK_COMMENT("call exception_handler_for_return_address");
+-    __ call_VM_leaf(CAST_FROM_FN_PTR(address, SharedRuntime::exception_handler_for_return_address), rax);
+-    __ mov(rbx, rax);
++    __ call_VM_leaf(CAST_FROM_FN_PTR(address, SharedRuntime::exception_handler_for_return_address), thread, exception_pc);
++    __ mov(handler_addr, rax);
+ 
+-    // setup rax, & rdx, remove return address & clear pending exception
+-    __ get_thread(rcx);
+-    __ pop(rdx);
+-    __ movptr(rax, Address(rcx, Thread::pending_exception_offset()));
+-    __ movptr(Address(rcx, Thread::pending_exception_offset()), NULL_WORD);
++    // setup rax & rdx, remove return address & clear pending exception
++    __ get_thread(thread);
++    __ pop(exception_pc);
++    __ movptr(exception_oop, Address(thread, Thread::pending_exception_offset()));
++    __ movptr(Address(thread, Thread::pending_exception_offset()), NULL_WORD);
+ 
+ #ifdef ASSERT
+     // make sure exception is set
+     { Label L;
+-      __ testptr(rax, rax);
++      __ testptr(exception_oop, exception_oop);
+       __ jcc(Assembler::notEqual, L);
+       __ stop("StubRoutines::forward exception: no pending exception (2)");
+       __ bind(L);
+     }
+ #endif
+ 
++    // Verify that there is really a valid exception in RAX.
++    __ verify_oop(exception_oop);
++
++    // Restore SP from BP if the exception PC is a MethodHandle call site.
++    __ cmpl(Address(thread, JavaThread::is_method_handle_exception_offset()), 0);
++    __ cmovptr(Assembler::notEqual, rsp, rbp);
++
+     // continue at exception handler (return address removed)
+-    // rax,: exception
+-    // rbx,: exception handler
++    // rax: exception
++    // rbx: exception handler
+     // rdx: throwing pc
+-    __ verify_oop(rax);
+-    __ jmp(rbx);
++    __ jmp(handler_addr);
+ 
+     return start;
+   }
+diff --git a/src/cpu/x86/vm/stubGenerator_x86_64.cpp b/src/cpu/x86/vm/stubGenerator_x86_64.cpp
+--- a/src/cpu/x86/vm/stubGenerator_x86_64.cpp
++++ b/src/cpu/x86/vm/stubGenerator_x86_64.cpp
+@@ -466,7 +466,7 @@
+     BLOCK_COMMENT("call exception_handler_for_return_address");
+     __ call_VM_leaf(CAST_FROM_FN_PTR(address,
+                          SharedRuntime::exception_handler_for_return_address),
+-                    c_rarg0);
++                    r15_thread, c_rarg0);
+     __ mov(rbx, rax);
+ 
+     // setup rax & rdx, remove return address & clear pending exception
+diff --git a/src/cpu/x86/vm/templateInterpreter_x86_32.cpp b/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
+--- a/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
++++ b/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
+@@ -1550,6 +1550,7 @@
+ void TemplateInterpreterGenerator::generate_throw_exception() {
+   // Entry point in previous activation (i.e., if the caller was interpreted)
+   Interpreter::_rethrow_exception_entry = __ pc();
++  const Register thread = rcx;
+ 
+   // Restore sp to interpreter_frame_last_sp even though we are going
+   // to empty the expression stack for the exception processing.
+@@ -1598,10 +1599,10 @@
+   // Set the popframe_processing bit in pending_popframe_condition indicating that we are
+   // currently handling popframe, so that call_VMs that may happen later do not trigger new
+   // popframe handling cycles.
+-  __ get_thread(rcx);
+-  __ movl(rdx, Address(rcx, JavaThread::popframe_condition_offset()));
++  __ get_thread(thread);
++  __ movl(rdx, Address(thread, JavaThread::popframe_condition_offset()));
+   __ orl(rdx, JavaThread::popframe_processing_bit);
+-  __ movl(Address(rcx, JavaThread::popframe_condition_offset()), rdx);
++  __ movl(Address(thread, JavaThread::popframe_condition_offset()), rdx);
+ 
+   {
+     // Check to see whether we are returning to a deoptimized frame.
+@@ -1629,8 +1630,8 @@
+     __ subptr(rdi, rax);
+     __ addptr(rdi, wordSize);
+     // Save these arguments
+-    __ get_thread(rcx);
+-    __ super_call_VM_leaf(CAST_FROM_FN_PTR(address, Deoptimization::popframe_preserve_args), rcx, rax, rdi);
++    __ get_thread(thread);
++    __ super_call_VM_leaf(CAST_FROM_FN_PTR(address, Deoptimization::popframe_preserve_args), thread, rax, rdi);
+ 
+     __ remove_activation(vtos, rdx,
+                          /* throw_monitor_exception */ false,
+@@ -1638,8 +1639,8 @@
+                          /* notify_jvmdi */ false);
+ 
+     // Inform deoptimization that it is responsible for restoring these arguments
+-    __ get_thread(rcx);
+-    __ movl(Address(rcx, JavaThread::popframe_condition_offset()), JavaThread::popframe_force_deopt_reexecution_bit);
++    __ get_thread(thread);
++    __ movl(Address(thread, JavaThread::popframe_condition_offset()), JavaThread::popframe_force_deopt_reexecution_bit);
+ 
+     // Continue in deoptimization handler
+     __ jmp(rdx);
+@@ -1665,12 +1666,12 @@
+   // expression stack if necessary.
+   __ mov(rax, rsp);
+   __ movptr(rbx, Address(rbp, frame::interpreter_frame_last_sp_offset * wordSize));
+-  __ get_thread(rcx);
++  __ get_thread(thread);
+   // PC must point into interpreter here
+-  __ set_last_Java_frame(rcx, noreg, rbp, __ pc());
+-  __ super_call_VM_leaf(CAST_FROM_FN_PTR(address, InterpreterRuntime::popframe_move_outgoing_args), rcx, rax, rbx);
+-  __ get_thread(rcx);
+-  __ reset_last_Java_frame(rcx, true, true);
++  __ set_last_Java_frame(thread, noreg, rbp, __ pc());
++  __ super_call_VM_leaf(CAST_FROM_FN_PTR(address, InterpreterRuntime::popframe_move_outgoing_args), thread, rax, rbx);
++  __ get_thread(thread);
++  __ reset_last_Java_frame(thread, true, true);
+   // Restore the last_sp and null it out
+   __ movptr(rsp, Address(rbp, frame::interpreter_frame_last_sp_offset * wordSize));
+   __ movptr(Address(rbp, frame::interpreter_frame_last_sp_offset * wordSize), NULL_WORD);
+@@ -1684,8 +1685,8 @@
+   }
+ 
+   // Clear the popframe condition flag
+-  __ get_thread(rcx);
+-  __ movl(Address(rcx, JavaThread::popframe_condition_offset()), JavaThread::popframe_inactive);
++  __ get_thread(thread);
++  __ movl(Address(thread, JavaThread::popframe_condition_offset()), JavaThread::popframe_inactive);
+ 
+   __ dispatch_next(vtos);
+   // end of PopFrame support
+@@ -1694,27 +1695,27 @@
+ 
+   // preserve exception over this code sequence
+   __ pop_ptr(rax);
+-  __ get_thread(rcx);
+-  __ movptr(Address(rcx, JavaThread::vm_result_offset()), rax);
++  __ get_thread(thread);
++  __ movptr(Address(thread, JavaThread::vm_result_offset()), rax);
+   // remove the activation (without doing throws on illegalMonitorExceptions)
+   __ remove_activation(vtos, rdx, false, true, false);
+   // restore exception
+-  __ get_thread(rcx);
+-  __ movptr(rax, Address(rcx, JavaThread::vm_result_offset()));
+-  __ movptr(Address(rcx, JavaThread::vm_result_offset()), NULL_WORD);
++  __ get_thread(thread);
++  __ movptr(rax, Address(thread, JavaThread::vm_result_offset()));
++  __ movptr(Address(thread, JavaThread::vm_result_offset()), NULL_WORD);
+   __ verify_oop(rax);
+ 
+   // Inbetween activations - previous activation type unknown yet
+   // compute continuation point - the continuation point expects
+   // the following registers set up:
+   //
+-  // rax,: exception
++  // rax: exception
+   // rdx: return address/pc that threw exception
+   // rsp: expression stack of caller
+-  // rbp,: rbp, of caller
++  // rbp: rbp, of caller
+   __ push(rax);                                  // save exception
+   __ push(rdx);                                  // save return address
+-  __ super_call_VM_leaf(CAST_FROM_FN_PTR(address, SharedRuntime::exception_handler_for_return_address), rdx);
++  __ super_call_VM_leaf(CAST_FROM_FN_PTR(address, SharedRuntime::exception_handler_for_return_address), thread, rdx);
+   __ mov(rbx, rax);                              // save exception handler
+   __ pop(rdx);                                   // restore return address
+   __ pop(rax);                                   // restore exception
+@@ -1728,6 +1729,7 @@
+ //
+ address TemplateInterpreterGenerator::generate_earlyret_entry_for(TosState state) {
+   address entry = __ pc();
++  const Register thread = rcx;
+ 
+   __ restore_bcp();
+   __ restore_locals();
+@@ -1735,8 +1737,8 @@
+   __ empty_FPU_stack();
+   __ load_earlyret_value(state);
+ 
+-  __ get_thread(rcx);
+-  __ movptr(rcx, Address(rcx, JavaThread::jvmti_thread_state_offset()));
++  __ get_thread(thread);
++  __ movptr(rcx, Address(thread, JavaThread::jvmti_thread_state_offset()));
+   const Address cond_addr(rcx, JvmtiThreadState::earlyret_state_offset());
+ 
+   // Clear the earlyret state
+diff --git a/src/cpu/x86/vm/templateInterpreter_x86_64.cpp b/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
+--- a/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
++++ b/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
+@@ -1741,7 +1741,7 @@
+   __ push(rdx);                                  // save return address
+   __ super_call_VM_leaf(CAST_FROM_FN_PTR(address,
+                           SharedRuntime::exception_handler_for_return_address),
+-                        rdx);
++                        r15_thread, rdx);
+   __ mov(rbx, rax);                              // save exception handler
+   __ pop(rdx);                                   // restore return address
+   __ pop(rax);                                   // restore exception
+diff --git a/src/share/vm/c1/c1_Canonicalizer.cpp b/src/share/vm/c1/c1_Canonicalizer.cpp
+--- a/src/share/vm/c1/c1_Canonicalizer.cpp
++++ b/src/share/vm/c1/c1_Canonicalizer.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2006 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -222,11 +222,15 @@
+     }
+   } else {
+     LoadField* lf = x->array()->as_LoadField();
+-    if (lf != NULL && lf->field()->is_constant()) {
+-      ciObject* c = lf->field()->constant_value().as_object();
+-      if (c->is_array()) {
+-        ciArray* array = (ciArray*) c;
+-        set_constant(array->length());
++    if (lf != NULL) {
++      ciField* field = lf->field();
++      if (field->is_constant() && field->is_static()) {
++        // final static field
++        ciObject* c = field->constant_value().as_object();
++        if (c->is_array()) {
++          ciArray* array = (ciArray*) c;
++          set_constant(array->length());
++        }
+       }
+     }
+   }
+diff --git a/src/share/vm/c1/c1_CodeStubs.hpp b/src/share/vm/c1/c1_CodeStubs.hpp
+--- a/src/share/vm/c1/c1_CodeStubs.hpp
++++ b/src/share/vm/c1/c1_CodeStubs.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2006 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -415,6 +415,28 @@
+ };
+ 
+ 
++//------------------------------------------------------------------------------
++// DeoptimizeStub
++//
++class DeoptimizeStub : public CodeStub {
++private:
++  CodeEmitInfo* _info;
++
++public:
++  DeoptimizeStub(CodeEmitInfo* info) : _info(new CodeEmitInfo(info)) {}
++
++  virtual void emit_code(LIR_Assembler* e);
++  virtual CodeEmitInfo* info() const           { return _info; }
++  virtual bool is_exception_throw_stub() const { return true; }
++  virtual void visit(LIR_OpVisitState* visitor) {
++    visitor->do_slow_case(_info);
++  }
++#ifndef PRODUCT
++  virtual void print_name(outputStream* out) const { out->print("DeoptimizeStub"); }
++#endif // PRODUCT
++};
++
++
+ class SimpleExceptionStub: public CodeStub {
+  private:
+   LIR_Opr          _obj;
+diff --git a/src/share/vm/c1/c1_GraphBuilder.cpp b/src/share/vm/c1/c1_GraphBuilder.cpp
+--- a/src/share/vm/c1/c1_GraphBuilder.cpp
++++ b/src/share/vm/c1/c1_GraphBuilder.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -1524,18 +1524,14 @@
+     code = Bytecodes::_invokespecial;
+   }
+ 
+-  if (code == Bytecodes::_invokedynamic) {
+-    BAILOUT("invokedynamic NYI"); // FIXME
+-    return;
+-  }
+-
+   // NEEDS_CLEANUP
+   // I've added the target-is_loaded() test below but I don't really understand
+   // how klass->is_loaded() can be true and yet target->is_loaded() is false.
+   // this happened while running the JCK invokevirtual tests under doit.  TKR
+   ciMethod* cha_monomorphic_target = NULL;
+   ciMethod* exact_target = NULL;
+-  if (UseCHA && DeoptC1 && klass->is_loaded() && target->is_loaded()) {
++  if (UseCHA && DeoptC1 && klass->is_loaded() && target->is_loaded() &&
++      !target->is_method_handle_invoke()) {
+     Value receiver = NULL;
+     ciInstanceKlass* receiver_klass = NULL;
+     bool type_is_exact = false;
+@@ -1681,11 +1677,20 @@
+   CHECK_BAILOUT();
+ 
+   // inlining not successful => standard invoke
+-  bool is_static = code == Bytecodes::_invokestatic;
++  bool is_loaded = target->is_loaded();
++  bool has_receiver =
++    code == Bytecodes::_invokespecial   ||
++    code == Bytecodes::_invokevirtual   ||
++    code == Bytecodes::_invokeinterface;
++  bool is_invokedynamic = code == Bytecodes::_invokedynamic;
+   ValueType* result_type = as_ValueType(target->return_type());
++
++  // We require the debug info to be the "state before" because
++  // invokedynamics may deoptimize.
++  ValueStack* state_before = is_invokedynamic ? state()->copy() : NULL;
++
+   Values* args = state()->pop_arguments(target->arg_size_no_receiver());
+-  Value recv = is_static ? NULL : apop();
+-  bool is_loaded = target->is_loaded();
++  Value recv = has_receiver ? apop() : NULL;
+   int vtable_index = methodOopDesc::invalid_vtable_index;
+ 
+ #ifdef SPARC
+@@ -1723,7 +1728,7 @@
+     profile_call(recv, target_klass);
+   }
+ 
+-  Invoke* result = new Invoke(code, result_type, recv, args, vtable_index, target);
++  Invoke* result = new Invoke(code, result_type, recv, args, vtable_index, target, state_before);
+   // push result
+   append_split(result);
+ 
+@@ -2862,20 +2867,18 @@
+   _initial_state = state_at_entry();
+   start_block->merge(_initial_state);
+ 
+-  BlockBegin* sync_handler = NULL;
+-  if (method()->is_synchronized() || _compilation->env()->dtrace_method_probes()) {
+-    // setup an exception handler to do the unlocking and/or notification
+-    sync_handler = new BlockBegin(-1);
+-    sync_handler->set(BlockBegin::exception_entry_flag);
+-    sync_handler->set(BlockBegin::is_on_work_list_flag);
+-    sync_handler->set(BlockBegin::default_exception_handler_flag);
+-
+-    ciExceptionHandler* desc = new ciExceptionHandler(method()->holder(), 0, method()->code_size(), -1, 0);
+-    XHandler* h = new XHandler(desc);
+-    h->set_entry_block(sync_handler);
+-    scope_data()->xhandlers()->append(h);
+-    scope_data()->set_has_handler();
+-  }
++  // setup an exception handler to do the unlocking and/or
++  // notification and unwind the frame.
++  BlockBegin* sync_handler = new BlockBegin(-1);
++  sync_handler->set(BlockBegin::exception_entry_flag);
++  sync_handler->set(BlockBegin::is_on_work_list_flag);
++  sync_handler->set(BlockBegin::default_exception_handler_flag);
++  
++  ciExceptionHandler* desc = new ciExceptionHandler(method()->holder(), 0, method()->code_size(), -1, 0);
++  XHandler* h = new XHandler(desc);
++  h->set_entry_block(sync_handler);
++  scope_data()->xhandlers()->append(h);
++  scope_data()->set_has_handler();
+ 
+   // complete graph
+   _vmap        = new ValueMap();
+diff --git a/src/share/vm/c1/c1_IR.cpp b/src/share/vm/c1/c1_IR.cpp
+--- a/src/share/vm/c1/c1_IR.cpp
++++ b/src/share/vm/c1/c1_IR.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -259,10 +259,10 @@
+ }
+ 
+ 
+-void CodeEmitInfo::record_debug_info(DebugInformationRecorder* recorder, int pc_offset) {
++void CodeEmitInfo::record_debug_info(DebugInformationRecorder* recorder, int pc_offset, bool is_method_handle_invoke) {
+   // record the safepoint before recording the debug info for enclosing scopes
+   recorder->add_safepoint(pc_offset, _oop_map->deep_copy());
+-  _scope_debug_info->record_debug_info(recorder, pc_offset, true/*topmost*/);
++  _scope_debug_info->record_debug_info(recorder, pc_offset, true/*topmost*/, is_method_handle_invoke);
+   recorder->end_safepoint(pc_offset);
+ }
+ 
+diff --git a/src/share/vm/c1/c1_IR.hpp b/src/share/vm/c1/c1_IR.hpp
+--- a/src/share/vm/c1/c1_IR.hpp
++++ b/src/share/vm/c1/c1_IR.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -242,7 +242,7 @@
+   //Whether we should reexecute this bytecode for deopt
+   bool should_reexecute();
+ 
+-  void record_debug_info(DebugInformationRecorder* recorder, int pc_offset, bool topmost) {
++  void record_debug_info(DebugInformationRecorder* recorder, int pc_offset, bool topmost, bool is_method_handle_invoke = false) {
+     if (caller() != NULL) {
+       // Order is significant:  Must record caller first.
+       caller()->record_debug_info(recorder, pc_offset, false/*topmost*/);
+@@ -252,7 +252,6 @@
+     DebugToken* monvals = recorder->create_monitor_values(monitors());
+     // reexecute allowed only for the topmost frame
+     bool reexecute = topmost ? should_reexecute() : false;
+-    bool is_method_handle_invoke = false;
+     bool return_oop = false; // This flag will be ignored since it used only for C2 with escape analysis.
+     recorder->describe_scope(pc_offset, scope()->method(), bci(), reexecute, is_method_handle_invoke, return_oop, locvals, expvals, monvals);
+   }
+@@ -303,7 +302,7 @@
+   int bci() const                                { return _bci; }
+ 
+   void add_register_oop(LIR_Opr opr);
+-  void record_debug_info(DebugInformationRecorder* recorder, int pc_offset);
++  void record_debug_info(DebugInformationRecorder* recorder, int pc_offset, bool is_method_handle_invoke = false);
+ 
+   CodeEmitInfo* next() const        { return _next; }
+   void set_next(CodeEmitInfo* next) { _next = next; }
+diff --git a/src/share/vm/c1/c1_Instruction.cpp b/src/share/vm/c1/c1_Instruction.cpp
+--- a/src/share/vm/c1/c1_Instruction.cpp
++++ b/src/share/vm/c1/c1_Instruction.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2006 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -334,13 +334,14 @@
+ 
+ 
+ Invoke::Invoke(Bytecodes::Code code, ValueType* result_type, Value recv, Values* args,
+-               int vtable_index, ciMethod* target)
++               int vtable_index, ciMethod* target, ValueStack* state_before)
+   : StateSplit(result_type)
+   , _code(code)
+   , _recv(recv)
+   , _args(args)
+   , _vtable_index(vtable_index)
+   , _target(target)
++  , _state_before(state_before)
+ {
+   set_flag(TargetIsLoadedFlag,   target->is_loaded());
+   set_flag(TargetIsFinalFlag,    target_is_loaded() && target->is_final_method());
+@@ -355,6 +356,9 @@
+   _signature = new BasicTypeList(number_of_arguments() + (has_receiver() ? 1 : 0));
+   if (has_receiver()) {
+     _signature->append(as_BasicType(receiver()->type()));
++  } else if (is_invokedynamic()) {
++    // Add the synthetic MethodHandle argument to the signature.
++    _signature->append(T_OBJECT);
+   }
+   for (int i = 0; i < number_of_arguments(); i++) {
+     ValueType* t = argument_at(i)->type();
+@@ -364,6 +368,13 @@
+ }
+ 
+ 
++void Invoke::state_values_do(void f(Value*)) {
++  StateSplit::state_values_do(f);
++  if (state_before() != NULL) state_before()->values_do(f);
++  if (state()        != NULL) state()->values_do(f);
++}
++
++
+ // Implementation of Contant
+ intx Constant::hash() const {
+   if (_state == NULL) {
+diff --git a/src/share/vm/c1/c1_Instruction.hpp b/src/share/vm/c1/c1_Instruction.hpp
+--- a/src/share/vm/c1/c1_Instruction.hpp
++++ b/src/share/vm/c1/c1_Instruction.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1999-2006 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -1134,17 +1134,18 @@
+ 
+ LEAF(Invoke, StateSplit)
+  private:
+-  Bytecodes::Code           _code;
+-  Value                     _recv;
+-  Values*                   _args;
+-  BasicTypeList*            _signature;
+-  int                       _vtable_index;
+-  ciMethod*                 _target;
++  Bytecodes::Code _code;
++  Value           _recv;
++  Values*         _args;
++  BasicTypeList*  _signature;
++  int             _vtable_index;
++  ciMethod*       _target;
++  ValueStack*     _state_before;  // Required for deoptimization.
+ 
+  public:
+   // creation
+   Invoke(Bytecodes::Code code, ValueType* result_type, Value recv, Values* args,
+-         int vtable_index, ciMethod* target);
++         int vtable_index, ciMethod* target, ValueStack* state_before);
+ 
+   // accessors
+   Bytecodes::Code code() const                   { return _code; }
+@@ -1155,6 +1156,7 @@
+   int vtable_index() const                       { return _vtable_index; }
+   BasicTypeList* signature() const               { return _signature; }
+   ciMethod* target() const                       { return _target; }
++  ValueStack* state_before() const               { return _state_before; }
+ 
+   // Returns false if target is not loaded
+   bool target_is_final() const                   { return check_flag(TargetIsFinalFlag); }
+@@ -1162,6 +1164,9 @@
+   // Returns false if target is not loaded
+   bool target_is_strictfp() const                { return check_flag(TargetIsStrictfpFlag); }
+ 
++  // JSR 292 support
++  bool is_invokedynamic() const                  { return code() == Bytecodes::_invokedynamic; }
++
+   // generic
+   virtual bool can_trap() const                  { return true; }
+   virtual void input_values_do(void f(Value*)) {
+@@ -1169,6 +1174,7 @@
+     if (has_receiver()) f(&_recv);
+     for (int i = 0; i < _args->length(); i++) f(_args->adr_at(i));
+   }
++  virtual void state_values_do(void f(Value*));
+ };
+ 
+ 
+diff --git a/src/share/vm/c1/c1_LIR.cpp b/src/share/vm/c1/c1_LIR.cpp
+--- a/src/share/vm/c1/c1_LIR.cpp
++++ b/src/share/vm/c1/c1_LIR.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2000-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 2000-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -689,9 +689,10 @@
+     case lir_static_call:
+     case lir_optvirtual_call:
+     case lir_icvirtual_call:
+-    case lir_virtual_call: {
+-      assert(op->as_OpJavaCall() != NULL, "must be");
+-      LIR_OpJavaCall* opJavaCall = (LIR_OpJavaCall*)op;
++    case lir_virtual_call:
++    case lir_dynamic_call: {
++      LIR_OpJavaCall* opJavaCall = op->as_OpJavaCall();
++      assert(opJavaCall != NULL, "must be");
+ 
+       if (opJavaCall->_receiver->is_valid())     do_input(opJavaCall->_receiver);
+ 
+@@ -1590,6 +1591,7 @@
+      case lir_optvirtual_call:       s = "optvirtual";    break;
+      case lir_icvirtual_call:        s = "icvirtual";     break;
+      case lir_virtual_call:          s = "virtual";       break;
++     case lir_dynamic_call:          s = "dynamic";       break;
+      // LIR_OpArrayCopy
+      case lir_arraycopy:             s = "arraycopy";     break;
+      // LIR_OpLock
+diff --git a/src/share/vm/c1/c1_LIR.hpp b/src/share/vm/c1/c1_LIR.hpp
+--- a/src/share/vm/c1/c1_LIR.hpp
++++ b/src/share/vm/c1/c1_LIR.hpp
+@@ -840,6 +840,7 @@
+       , lir_optvirtual_call
+       , lir_icvirtual_call
+       , lir_virtual_call
++      , lir_dynamic_call
+   , end_opJavaCall
+   , begin_opArrayCopy
+       , lir_arraycopy
+@@ -1052,6 +1053,16 @@
+   LIR_Opr receiver() const                       { return _receiver; }
+   ciMethod* method() const                       { return _method;   }
+ 
++  // JSR 292 support.
++  bool is_invokedynamic() const                  { return code() == lir_dynamic_call; }
++  bool is_method_handle_invoke() const {
++    return
++      is_invokedynamic()  // An invokedynamic is always a MethodHandle call site.
++      ||
++      (method()->holder()->name() == ciSymbol::java_dyn_MethodHandle() &&
++       method()->name()           == ciSymbol::invoke_name());
++  }
++
+   intptr_t vtable_offset() const {
+     assert(_code == lir_virtual_call, "only have vtable for real vcall");
+     return (intptr_t) addr();
+@@ -1766,6 +1777,10 @@
+                     intptr_t vtable_offset, LIR_OprList* arguments, CodeEmitInfo* info) {
+     append(new LIR_OpJavaCall(lir_virtual_call, method, receiver, result, vtable_offset, arguments, info));
+   }
++  void call_dynamic(ciMethod* method, LIR_Opr receiver, LIR_Opr result,
++                    address dest, LIR_OprList* arguments, CodeEmitInfo* info) {
++    append(new LIR_OpJavaCall(lir_dynamic_call, method, receiver, result, dest, arguments, info));
++  }
+ 
+   void get_thread(LIR_Opr result)                { append(new LIR_Op0(lir_get_thread, result)); }
+   void word_align()                              { append(new LIR_Op0(lir_word_align)); }
+diff --git a/src/share/vm/c1/c1_LIRAssembler.cpp b/src/share/vm/c1/c1_LIRAssembler.cpp
+--- a/src/share/vm/c1/c1_LIRAssembler.cpp
++++ b/src/share/vm/c1/c1_LIRAssembler.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2000-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 2000-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -301,9 +301,9 @@
+ }
+ 
+ 
+-void LIR_Assembler::add_call_info(int pc_offset, CodeEmitInfo* cinfo) {
++void LIR_Assembler::add_call_info(int pc_offset, CodeEmitInfo* cinfo, bool is_method_handle_invoke) {
+   flush_debug_info(pc_offset);
+-  cinfo->record_debug_info(compilation()->debug_info_recorder(), pc_offset);
++  cinfo->record_debug_info(compilation()->debug_info_recorder(), pc_offset, is_method_handle_invoke);
+   if (cinfo->exception_handlers() != NULL) {
+     compilation()->add_exception_handlers_for_pco(pc_offset, cinfo->exception_handlers());
+   }
+@@ -413,6 +413,12 @@
+ void LIR_Assembler::emit_call(LIR_OpJavaCall* op) {
+   verify_oop_map(op->info());
+ 
++  // JSR 292
++  // Preserve the SP over MethodHandle call sites.
++  if (op->is_method_handle_invoke()) {
++    preserve_SP();
++  }
++
+   if (os::is_MP()) {
+     // must align calls sites, otherwise they can't be updated atomically on MP hardware
+     align_call(op->code());
+@@ -423,19 +429,25 @@
+ 
+   switch (op->code()) {
+   case lir_static_call:
+-    call(op->addr(), relocInfo::static_call_type, op->info());
++    call(op, relocInfo::static_call_type);
+     break;
+   case lir_optvirtual_call:
+-    call(op->addr(), relocInfo::opt_virtual_call_type, op->info());
++  case lir_dynamic_call:
++    call(op, relocInfo::opt_virtual_call_type);
+     break;
+   case lir_icvirtual_call:
+-    ic_call(op->addr(), op->info());
++    ic_call(op);
+     break;
+   case lir_virtual_call:
+-    vtable_call(op->vtable_offset(), op->info());
++    vtable_call(op);
+     break;
+   default: ShouldNotReachHere();
+   }
++
++  if (op->is_method_handle_invoke()) {
++    restore_SP();
++  }
++
+ #if defined(X86) && defined(TIERED)
+   // C2 leave fpu stack dirty clean it
+   if (UseSSE < 2) {
+diff --git a/src/share/vm/c1/c1_LIRAssembler.hpp b/src/share/vm/c1/c1_LIRAssembler.hpp
+--- a/src/share/vm/c1/c1_LIRAssembler.hpp
++++ b/src/share/vm/c1/c1_LIRAssembler.hpp
+@@ -82,7 +82,7 @@
+   Address as_Address_hi(LIR_Address* addr);
+ 
+   // debug information
+-  void add_call_info(int pc_offset, CodeEmitInfo* cinfo);
++  void add_call_info(int pc_offset, CodeEmitInfo* cinfo, bool is_method_handle_invoke = false);
+   void add_debug_info_for_branch(CodeEmitInfo* info);
+   void add_debug_info_for_div0(int pc_offset, CodeEmitInfo* cinfo);
+   void add_debug_info_for_div0_here(CodeEmitInfo* info);
+@@ -205,9 +205,12 @@
+   void comp_fl2i(LIR_Code code, LIR_Opr left, LIR_Opr right, LIR_Opr result, LIR_Op2* op);
+   void cmove(LIR_Condition code, LIR_Opr left, LIR_Opr right, LIR_Opr result);
+ 
+-  void ic_call(address destination, CodeEmitInfo* info);
+-  void vtable_call(int vtable_offset, CodeEmitInfo* info);
+-  void call(address entry, relocInfo::relocType rtype, CodeEmitInfo* info);
++  void call(        LIR_OpJavaCall* op, relocInfo::relocType rtype);
++  void ic_call(     LIR_OpJavaCall* op);
++  void vtable_call( LIR_OpJavaCall* op);
++
++  void preserve_SP();
++  void restore_SP();
+ 
+   void osr_entry();
+ 
+diff --git a/src/share/vm/c1/c1_LIRGenerator.cpp b/src/share/vm/c1/c1_LIRGenerator.cpp
+--- a/src/share/vm/c1/c1_LIRGenerator.cpp
++++ b/src/share/vm/c1/c1_LIRGenerator.cpp
+@@ -2284,7 +2284,7 @@
+ 
+ 
+ void LIRGenerator::invoke_load_arguments(Invoke* x, LIRItemList* args, const LIR_OprList* arg_list) {
+-  int i = x->has_receiver() ? 1 : 0;
++  int i = (x->has_receiver() || x->is_invokedynamic()) ? 1 : 0;
+   for (; i < args->length(); i++) {
+     LIRItem* param = args->at(i);
+     LIR_Opr loc = arg_list->at(i);
+@@ -2322,6 +2322,10 @@
+     LIRItem* receiver = new LIRItem(x->receiver(), this);
+     argument_items->append(receiver);
+   }
++  if (x->is_invokedynamic()) {
++    // Insert a dummy for the synthetic MethodHandle argument.
++    argument_items->append(NULL);
++  }
+   int idx = x->has_receiver() ? 1 : 0;
+   for (int i = 0; i < x->number_of_arguments(); i++) {
+     LIRItem* param = new LIRItem(x->argument_at(i), this);
+@@ -2371,6 +2375,10 @@
+ 
+   CodeEmitInfo* info = state_for(x, x->state());
+ 
++  // invokedynamics can deoptimize.
++  bool is_invokedynamic = x->code() == Bytecodes::_invokedynamic;
++  CodeEmitInfo* deopt_info = is_invokedynamic ? state_for(x, x->state_before()) : NULL;
++
+   invoke_load_arguments(x, args, arg_list);
+ 
+   if (x->has_receiver()) {
+@@ -2407,6 +2415,47 @@
+         __ call_virtual(x->target(), receiver, result_register, vtable_offset, arg_list, info);
+       }
+       break;
++    case Bytecodes::_invokedynamic: {
++      ciBytecodeStream bcs(x->scope()->method());
++      bcs.force_bci(x->bci());
++      assert(bcs.cur_bc() == Bytecodes::_invokedynamic, "wrong stream");
++      ciCPCache* cpcache = bcs.get_cpcache();
++
++      // Get CallSite offset from constant pool cache pointer.
++      int index = bcs.get_method_index();
++      size_t call_site_offset = cpcache->get_f1_offset(index);
++
++      // If this invokedynamic call site hasn't been executed yet in
++      // the interpreter, the CallSite object in the constant pool
++      // cache is still null and we need to deoptimize.
++      if (cpcache->is_f1_null_at(index)) {
++        // Cannot re-use same xhandlers for multiple CodeEmitInfos, so
++        // clone all handlers.  This is handled transparently in other
++        // places by the CodeEmitInfo cloning logic but is handled
++        // specially here because a stub isn't being used.
++        x->set_exception_handlers(new XHandlers(x->exception_handlers()));
++
++        DeoptimizeStub* deopt_stub = new DeoptimizeStub(deopt_info);
++        __ jump(deopt_stub);
++      }
++
++      // Use the receiver register for the synthetic MethodHandle
++      // argument.
++      receiver = LIR_Assembler::receiverOpr();
++      LIR_Opr tmp = new_register(objectType);
++
++      // Load CallSite object from constant pool cache.
++      __ oop2reg(cpcache->constant_encoding(), tmp);
++      __ load(new LIR_Address(tmp, call_site_offset, T_OBJECT), tmp);
++
++      // Load target MethodHandle from CallSite object.
++      __ load(new LIR_Address(tmp, java_dyn_CallSite::target_offset_in_bytes(), T_OBJECT), receiver);
++
++      __ call_dynamic(x->target(), receiver, result_register,
++                      SharedRuntime::get_resolve_opt_virtual_call_stub(),
++                      arg_list, info);
++      break;
++    }
+     default:
+       ShouldNotReachHere();
+       break;
+diff --git a/src/share/vm/c1/c1_MacroAssembler.hpp b/src/share/vm/c1/c1_MacroAssembler.hpp
+--- a/src/share/vm/c1/c1_MacroAssembler.hpp
++++ b/src/share/vm/c1/c1_MacroAssembler.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2000-2005 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 2000-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -34,7 +34,7 @@
+ 
+   void inline_cache_check(Register receiver, Register iCache);
+   void build_frame(int frame_size_in_bytes);
+-  void method_exit(bool restore_frame);
++  void remove_frame(int frame_size_in_bytes);
+ 
+   void unverified_entry(Register receiver, Register ic_klass);
+   void verified_entry();
+diff --git a/src/share/vm/ci/ciCPCache.cpp b/src/share/vm/ci/ciCPCache.cpp
+--- a/src/share/vm/ci/ciCPCache.cpp
++++ b/src/share/vm/ci/ciCPCache.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 2009-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -41,6 +41,16 @@
+ 
+ 
+ // ------------------------------------------------------------------
++// ciCPCache::is_f1_null_at
++bool ciCPCache::is_f1_null_at(int index) {
++  VM_ENTRY_MARK;
++  constantPoolCacheOop cpcache = (constantPoolCacheOop) get_oop();
++  oop f1 = cpcache->secondary_entry_at(index)->f1();
++  return (f1 == NULL);
++}
++
++
++// ------------------------------------------------------------------
+ // ciCPCache::print
+ //
+ // Print debugging information about the cache.
+diff --git a/src/share/vm/ci/ciCPCache.hpp b/src/share/vm/ci/ciCPCache.hpp
+--- a/src/share/vm/ci/ciCPCache.hpp
++++ b/src/share/vm/ci/ciCPCache.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 2009-2010 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -39,5 +39,7 @@
+   // requested entry.
+   size_t get_f1_offset(int index);
+ 
++  bool is_f1_null_at(int index);
++
+   void print();
+ };
+diff --git a/src/share/vm/includeDB_compiler1 b/src/share/vm/includeDB_compiler1
+--- a/src/share/vm/includeDB_compiler1
++++ b/src/share/vm/includeDB_compiler1
+@@ -1,5 +1,5 @@
+ //
+-// Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
++// Copyright 1999-2010 Sun Microsystems, Inc.  All Rights Reserved.
+ // DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ //
+ // This code is free software; you can redistribute it and/or modify it
+@@ -246,6 +246,7 @@
+ c1_LIRGenerator.cpp                     c1_LIRGenerator.hpp
+ c1_LIRGenerator.cpp                     c1_ValueStack.hpp
+ c1_LIRGenerator.cpp                     ciArrayKlass.hpp
++c1_LIRGenerator.cpp                     ciCPCache.hpp
+ c1_LIRGenerator.cpp                     ciInstance.hpp
+ c1_LIRGenerator.cpp                     heapRegion.hpp
+ c1_LIRGenerator.cpp                     sharedRuntime.hpp
+diff --git a/src/share/vm/includeDB_core b/src/share/vm/includeDB_core
+--- a/src/share/vm/includeDB_core
++++ b/src/share/vm/includeDB_core
+@@ -540,6 +540,7 @@
+ 
+ ciCPCache.cpp                           cpCacheOop.hpp
+ ciCPCache.cpp                           ciCPCache.hpp
++ciCPCache.cpp                           ciUtilities.hpp
+ 
+ ciCPCache.hpp                           ciClassList.hpp
+ ciCPCache.hpp                           ciObject.hpp
+diff --git a/src/share/vm/opto/runtime.cpp b/src/share/vm/opto/runtime.cpp
+--- a/src/share/vm/opto/runtime.cpp
++++ b/src/share/vm/opto/runtime.cpp
+@@ -864,7 +864,7 @@
+     thread->set_exception_handler_pc(handler_address);
+     thread->set_exception_stack_size(0);
+ 
+-    // Check if the exception PC is a MethodHandle call.
++    // Check if the exception PC is a MethodHandle call site.
+     thread->set_is_method_handle_exception(nm->is_method_handle_return(pc));
+   }
+ 
+@@ -952,7 +952,7 @@
+ 
+   thread->set_vm_result(exception);
+   // Frame not compiled (handles deoptimization blob)
+-  return SharedRuntime::raw_exception_handler_for_return_address(ret_pc);
++  return SharedRuntime::raw_exception_handler_for_return_address(thread, ret_pc);
+ }
+ 
+ 
+diff --git a/src/share/vm/runtime/sharedRuntime.cpp b/src/share/vm/runtime/sharedRuntime.cpp
+--- a/src/share/vm/runtime/sharedRuntime.cpp
++++ b/src/share/vm/runtime/sharedRuntime.cpp
+@@ -256,7 +256,7 @@
+ // The continuation address is the entry point of the exception handler of the
+ // previous frame depending on the return address.
+ 
+-address SharedRuntime::raw_exception_handler_for_return_address(address return_address) {
++address SharedRuntime::raw_exception_handler_for_return_address(JavaThread* thread, address return_address) {
+   assert(frame::verify_return_pc(return_address), "must be a return pc");
+ 
+   // the fastest case first
+@@ -264,6 +264,8 @@
+   if (blob != NULL && blob->is_nmethod()) {
+     nmethod* code = (nmethod*)blob;
+     assert(code != NULL, "nmethod must be present");
++    // Check if the return address is a MethodHandle call site.
++    thread->set_is_method_handle_exception(code->is_method_handle_return(return_address));
+     // native nmethods don't have exception handlers
+     assert(!code->is_native_method(), "no exception handler");
+     assert(code->header_begin() != code->exception_begin(), "no exception handler");
+@@ -289,6 +291,8 @@
+     if (blob->is_nmethod()) {
+       nmethod* code = (nmethod*)blob;
+       assert(code != NULL, "nmethod must be present");
++      // Check if the return address is a MethodHandle call site.
++      thread->set_is_method_handle_exception(code->is_method_handle_return(return_address));
+       assert(code->header_begin() != code->exception_begin(), "no exception handler");
+       return code->exception_begin();
+     }
+@@ -309,10 +313,11 @@
+ }
+ 
+ 
+-JRT_LEAF(address, SharedRuntime::exception_handler_for_return_address(address return_address))
+-  return raw_exception_handler_for_return_address(return_address);
++JRT_LEAF(address, SharedRuntime::exception_handler_for_return_address(JavaThread* thread, address return_address))
++  return raw_exception_handler_for_return_address(thread, return_address);
+ JRT_END
+ 
++
+ address SharedRuntime::get_poll_stub(address pc) {
+   address stub;
+   // Look up the code blob
+@@ -465,16 +470,6 @@
+     t = table.entry_for(catch_pco, -1, 0);
+   }
+ 
+-#ifdef COMPILER1
+-  if (nm->is_compiled_by_c1() && t == NULL && handler_bci == -1) {
+-    // Exception is not handled by this frame so unwind.  Note that
+-    // this is not the same as how C2 does this.  C2 emits a table
+-    // entry that dispatches to the unwind code in the nmethod.
+-    return NULL;
+-  }
+-#endif /* COMPILER1 */
+-
+-
+   if (t == NULL) {
+     tty->print_cr("MISSING EXCEPTION HANDLER for pc " INTPTR_FORMAT " and handler bci %d", ret_pc, handler_bci);
+     tty->print_cr("   Exception:");
+@@ -892,12 +887,13 @@
+   RegisterMap cbl_map(thread, false);
+   frame caller_frame = thread->last_frame().sender(&cbl_map);
+ 
+-  CodeBlob* cb = caller_frame.cb();
+-  guarantee(cb != NULL && cb->is_nmethod(), "must be called from nmethod");
++  CodeBlob* caller_cb = caller_frame.cb();
++  guarantee(caller_cb != NULL && caller_cb->is_nmethod(), "must be called from nmethod");
++  nmethod* caller_nm = caller_cb->as_nmethod_or_null();
+   // make sure caller is not getting deoptimized
+   // and removed before we are done with it.
+   // CLEANUP - with lazy deopt shouldn't need this lock
+-  nmethodLocker caller_lock((nmethod*)cb);
++  nmethodLocker caller_lock(caller_nm);
+ 
+ 
+   // determine call info & receiver
+@@ -929,6 +925,13 @@
+   }
+ #endif
+ 
++  // JSR 292
++  // If the resolved method is a MethodHandle invoke target the call
++  // site must be a MethodHandle call site.
++  if (callee_method->is_method_handle_invoke()) {
++    assert(caller_nm->is_method_handle_return(caller_frame.pc()), "must be MH call site");
++  }
++
+   // Compute entry points. This might require generation of C2I converter
+   // frames, so we cannot be holding any locks here. Furthermore, the
+   // computation of the entry points is independent of patching the call.  We
+@@ -940,13 +943,12 @@
+   StaticCallInfo static_call_info;
+   CompiledICInfo virtual_call_info;
+ 
+-
+   // Make sure the callee nmethod does not get deoptimized and removed before
+   // we are done patching the code.
+-  nmethod* nm = callee_method->code();
+-  nmethodLocker nl_callee(nm);
++  nmethod* callee_nm = callee_method->code();
++  nmethodLocker nl_callee(callee_nm);
+ #ifdef ASSERT
+-  address dest_entry_point = nm == NULL ? 0 : nm->entry_point(); // used below
++  address dest_entry_point = callee_nm == NULL ? 0 : callee_nm->entry_point(); // used below
+ #endif
+ 
+   if (is_virtual) {
+diff --git a/src/share/vm/runtime/sharedRuntime.hpp b/src/share/vm/runtime/sharedRuntime.hpp
+--- a/src/share/vm/runtime/sharedRuntime.hpp
++++ b/src/share/vm/runtime/sharedRuntime.hpp
+@@ -96,10 +96,9 @@
+   static jdouble dexp(jdouble x);
+   static jdouble dpow(jdouble x, jdouble y);
+ 
+-
+   // exception handling across interpreter/compiler boundaries
+-  static address raw_exception_handler_for_return_address(address return_address);
+-  static address exception_handler_for_return_address(address return_address);
++  static address raw_exception_handler_for_return_address(JavaThread* thread, address return_address);
++  static address exception_handler_for_return_address(JavaThread* thread, address return_address);
+ 
+ #ifndef SERIALGC
+   // G1 write barriers
+diff --git a/src/share/vm/runtime/vframeArray.cpp b/src/share/vm/runtime/vframeArray.cpp
+--- a/src/share/vm/runtime/vframeArray.cpp
++++ b/src/share/vm/runtime/vframeArray.cpp
+@@ -223,7 +223,7 @@
+         break;
+       case Deoptimization::Unpack_exception:
+         // exception is pending
+-        pc = SharedRuntime::raw_exception_handler_for_return_address(pc);
++        pc = SharedRuntime::raw_exception_handler_for_return_address(thread, pc);
+         // [phh] We're going to end up in some handler or other, so it doesn't
+         // matter what mdp we point to.  See exception_handler_for_exception()
+         // in interpreterRuntime.cpp.

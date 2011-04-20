@@ -1,0 +1,1330 @@
+diff --git a/src/share/classes/javax/stack/CoRunnable.java b/src/share/classes/javax/stack/CoRunnable.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/javax/stack/CoRunnable.java
+@@ -0,0 +1,4 @@
++package javax.stack;
++public interface CoRunnable {
++	public Object run();
++}
+\ No newline at end of file
+diff --git a/src/share/classes/javax/stack/Continuable.java b/src/share/classes/javax/stack/Continuable.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/javax/stack/Continuable.java
+@@ -0,0 +1,32 @@
++/*
++ * Copyright 2007-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++package javax.stack;
++
++import java.lang.annotation.*;
++
++@Documented
++@Retention(RetentionPolicy.RUNTIME)
++@Target(ElementType.METHOD)
++public @interface Continuable {
++	ContinuableAccess value() default ContinuableAccess.HIDDEN;
++}
+diff --git a/src/share/classes/javax/stack/ContinuableAccess.java b/src/share/classes/javax/stack/ContinuableAccess.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/javax/stack/ContinuableAccess.java
+@@ -0,0 +1,27 @@
++/*
++ * Copyright 2007-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++package javax.stack;
++
++public enum ContinuableAccess {
++		HIDDEN, READONLY, READWRITE
++}
+diff --git a/src/share/classes/javax/stack/Continuation.java b/src/share/classes/javax/stack/Continuation.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/javax/stack/Continuation.java
+@@ -0,0 +1,115 @@
++/*
++ * Copyright 2007-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++package javax.stack;
++
++/**
++ * @author lukas.stadler@jku.at
++ */
++@SuppressWarnings("unused")
++public class Continuation {
++	private static class CONTINUATION_CAPTURED {
++	}
++
++	public static final Object CAPTURED = CONTINUATION_CAPTURED.class;
++	private Object data;
++	private Thread thread;
++
++	private static native void registerNatives();
++
++	static {
++		registerNatives();
++	}
++
++	/**
++	 * Saves the current thread state into the continuation object
++	 * @return null if the continuation was saved or the value given to resume if it was resumed
++	 */
++	public final native Object save();
++
++	/**
++	 * Restores the stack to the state that it had when the continuation was saved.
++	 * @param retValue the value that the save method should return
++	 */
++	public final native void resume(Object retValue);
++
++	/**
++	 * Yields to the given target continuation, passing along the current continuation
++	 * @param target the continuation that will be reinstated
++	 */
++	@Continuable
++	public static final void yield(Continuation target) {
++		Continuation c = new Continuation();
++		if (c.save() == null)
++			target.resume(c);
++	}
++
++	/*
++	 * This method will be called by startDelimited
++	 */
++	@Continuable
++	private static final Object startDelimitedInternal(DelimitedRunnable runnable, Object firstValue) {
++		Continuation cont = new Continuation();
++		Object ret = cont.save();
++		if (ret == CAPTURED)
++			runnable.run(cont, firstValue);
++		return ret;
++	}
++
++	public static final native Object startDelimited(DelimitedRunnable runnable, Object firstValue);
++
++	/*
++	 * This method will be called by continueDelimited
++	 */
++	@Continuable
++	private static final Object continueDelimitedInternal(Continuation cont, Object value) {
++		cont.resume(value);
++		return null;
++	}
++
++	public static final native Object continueDelimited(Continuation continuation, Object value);
++
++	public final native Object dump();
++
++	private static final native Object storeFrameObject(Object retValue);
++
++	private static final native void storeFrameVoid();
++
++	private static final native boolean storeFrameBoolean(boolean retValue);
++
++	private static final native byte storeFrameByte(byte retValue);
++
++	private static final native char storeFrameChar(char retValue);
++
++	private static final native short storeFrameShort(short retValue);
++
++	private static final native int storeFrameInt(int retValue);
++
++	private static final native long storeFrameLong(long retValue);
++
++	private static final native float storeFrameFloat(float retValue);
++
++	private static final native double storeFrameDouble(double retValue);
++
++	private static final native Throwable unwind(Throwable e);
++
++}
+diff --git a/src/share/classes/javax/stack/ContinuationPermission.java b/src/share/classes/javax/stack/ContinuationPermission.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/javax/stack/ContinuationPermission.java
+@@ -0,0 +1,34 @@
++/*
++ * Copyright 2007-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++package javax.stack;
++
++import java.security.BasicPermission;
++
++/* name is either "resumeSecure" or "resumeUnsecure" */
++public class ContinuationPermission extends BasicPermission {
++	private static final long serialVersionUID = -3608714945512368738L;
++
++	public ContinuationPermission(String name) {
++		super(name);
++	}
++}
+\ No newline at end of file
+diff --git a/src/share/classes/javax/stack/Coroutine.java b/src/share/classes/javax/stack/Coroutine.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/javax/stack/Coroutine.java
+@@ -0,0 +1,305 @@
++package javax.stack;
++import javax.stack.Continuable;
++import javax.stack.Continuation;
++
++/**
++ * Experimental coroutine implementation using the continuation framework.
++ * 
++ * This class works very much like the {@link Thread} class, it can either be supplied with a {@link CoRunnable} upon creation or
++ * the run method can be overridden.<br/>
++ * All coroutines belonging to a context are kept in a doubly-linked ring data structure. Due to this there is an ordering of
++ * coroutines, and the next and previous coroutines are known.
++ * 
++ * @author lukas.stadler@jku.at
++ */
++public class Coroutine {
++	// exception used to terminate/close coroutines, created only once because exception creation is expensive
++	private static final CoroutineExitException exitException = new CoroutineExitException();
++
++	// contains the actual stack frames, local variables, etc.
++	private Continuation data;
++
++	// the context this coroutine belongs to
++	private CoroutineContext context;
++
++	// the code that will be executed if run isn't overridden
++	private CoRunnable runnable;
++
++	// the pointers for the doubly-linked ring data structure
++	private Coroutine last;
++	private Coroutine next;
++
++	// if this is non-null then an exception will be raised when this coroutine is resumed
++	private RuntimeException exception;
++
++	/**
++	 * Creates a new coroutine that belongs to the currently active {@link CoroutineContext}. This constructor is only useful if
++	 * the run method is overridden. The coroutine will be inserted after the current coroutine of the context, or as the first
++	 * coroutine if it is the first one added to the context.
++	 * @throws IllegalThreadStateException if there is no current context
++	 */
++	public Coroutine() {
++		initialize(CoroutineContext.getCurrent());
++	}
++
++	/**
++	 * Creates a new coroutine that belongs to the currently active {@link CoroutineContext}. The coroutine will execute the given
++	 * CoRunnable (if it is non-null). The coroutine will be inserted after the current coroutine of the context, or as the first
++	 * coroutine if it is the first one added to the context.
++	 * @throws IllegalThreadStateException if there is no current context
++	 */
++	public Coroutine(CoRunnable runnable) {
++		this.runnable = runnable;
++		initialize(CoroutineContext.getCurrent());
++	}
++
++	/**
++	 * Creates a new coroutine that belongs to the given {@link CoroutineContext}. This constructor is only useful if the run
++	 * method is overridden. The coroutine will be inserted after the current coroutine of the context, or as the first coroutine
++	 * if it is the first one added to the context.
++	 * @throws IllegalArgumentException if context is null
++	 */
++	public Coroutine(CoroutineContext context) {
++		if (context == null)
++			throw new IllegalArgumentException("context cannot be null");
++		initialize(context);
++	}
++
++	/**
++	 * Creates a new coroutine that belongs to the given {@link CoroutineContext}. The coroutine will execute the given CoRunnable
++	 * (if it is non-null). The coroutine will be inserted after the current coroutine of the context, or as the first coroutine
++	 * if it is the first one added to the context.
++	 * @throws IllegalArgumentException if context is null
++	 */
++	public Coroutine(CoroutineContext context, CoRunnable runnable) {
++		if (context == null)
++			throw new IllegalArgumentException("context cannot be null");
++		this.runnable = runnable;
++		initialize(context);
++	}
++
++	/*
++	 * Adds this coroutine into the doubly-linked ring of the given context.
++	 */
++	private void initialize(CoroutineContext context) {
++		if (context == null)
++			throw new IllegalThreadStateException("Cannot create Coroutine without CoroutineContext");
++		context.coroutineAdded(this);
++		this.context = context;
++		if (context.getCurrentCoroutine() == null) {
++			last = this;
++			next = this;
++			context.setCurrentCoroutine(this);
++		}
++		else {
++			Coroutine current = context.getCurrentCoroutine();
++			last = current.last;
++			next = current;
++			current.last = this;
++			last.next = this;
++		}
++	}
++
++	/**
++	 * Yields to the target coroutine, without changing the order of the coroutines
++	 * @param target the coroutine that will be current after this call
++	 * @param value the value that is passed to the target coroutine
++	 * @return the value passed to the yield that makes this coroutine active again
++	 */
++	@Continuable
++	private Object yieldToInternal(Coroutine target, Object value) {
++		assert target != null;
++		// System.out.println("yield to " + target + ", value="+value);
++		context.setCurrentCoroutine(target);
++		if (data == null)
++			data = new Continuation();
++		Object ret = data.save();
++		try {
++			// System.out.println("ret="+ret);
++			if (ret == Continuation.CAPTURED) {
++				if (target.data == null)
++					context.startCoroutine.resume(value);
++				else {
++					// System.out.println("target resume");
++					target.data.resume(value);
++				}
++				return null;
++			}
++			else
++				return ret;
++		}
++		finally {
++			if (exception != null) {
++				// System.out.println("throwing exception in coroutine " + this + ": " + exception);
++				throw exception;
++			}
++		}
++	}
++
++	/**
++	 * Closes the coroutine. This will resume the coroutine and throw a {@link CoroutineExitException}. If it propagates down to
++	 * the starting method the coroutine will end. Thus coroutines can veto the close operation if they catch the
++	 * CoroutineExitException.
++	 */
++	@Continuable
++	public final void close() {
++		if (isActive()) {
++			exception = exitException;
++			if (context == CoroutineContext.getCurrent()) {
++				if (this == Coroutine.getCurrent())
++					throw exception;
++				else
++					try {
++						yieldTo(this, null);
++					}
++					catch (CoroutineExitException e) {
++						// ignore
++					}
++			}
++		}
++	}
++
++	/**
++	 * @return the currently active coroutine, or null if there is no current coroutine context
++	 */
++	public static Coroutine getCurrent() {
++		CoroutineContext currentContext = CoroutineContext.getCurrent();
++		return currentContext == null ? null : currentContext.getCurrentCoroutine();
++	}
++
++	/**
++	 * @return true if this coroutine hasn't ended yet
++	 */
++	public final boolean isActive() {
++		assert (next != null) == (last != null);
++		return next != null;
++	}
++
++	/**
++	 * @return the coroutine that is scheduled to be executed after this one
++	 */
++	public final Coroutine getNext() {
++		return next;
++	}
++
++	/**
++	 * @return the coroutine that was executed before this one
++	 */
++	public final Coroutine getLast() {
++		return last;
++	}
++
++	/**
++	 * @return the context this coroutine belongs to
++	 */
++	public final CoroutineContext getContext() {
++		return context;
++	}
++
++	/**
++	 * Yields to the next scheduled coroutine (as determined by the scheduling behavior of the coroutine context)
++	 * @param value the value to be passed to the next coroutine
++	 * @return the value passed to this coroutine when it is resumed
++	 */
++	@Continuable
++	public static Object yield(Object value) {
++		Coroutine current = getCurrent();
++		return yieldTo(current.context.scheduleNext(current), value);
++	}
++
++	/**
++	 * Yields to the last coroutine. This can be used to implement coroutines that generate values for a caller.
++	 * @param value the value to be passed to the next coroutine
++	 * @return the value passed to this coroutine when it is resumed
++	 */
++	@Continuable
++	public static Object yieldReturn(Object value) {
++		Coroutine current = getCurrent();
++		// System.out.println("current=" + current);
++		// System.out.println("last=" + current.last);
++		return current.yieldToInternal(current.last, value);
++	}
++
++	/**
++	 * Yields to the next coroutine (ignoring the scheduling behavior of the coroutine context). This does not change the
++	 * coroutine order.
++	 * @param value the value to be passed to the next coroutine
++	 * @return the value passed to this coroutine when it is resumed
++	 */
++	@Continuable
++	public static Object yieldNext(Object value) {
++		Coroutine current = getCurrent();
++		return current.yieldToInternal(current.next, value);
++	}
++
++	/**
++	 * Yields to the given coroutine (ignoring the scheduling behavior of the coroutine context). The coroutine order will be
++	 * changed so that the given coroutine is the next one.
++	 * @param target the coroutine to be executed next
++	 * @param value the value to be passed to the next coroutine
++	 * @return the value passed to this coroutine when it is resumed
++	 */
++	@Continuable
++	public static Object yieldTo(Coroutine target, Object value) {
++		Coroutine current = getCurrent();
++		if (target != current.next) {
++			// remove target from its current position
++			target.last.next = target.next;
++			target.next.last = target.last;
++			// add target at the current position
++			target.last = current;
++			target.next = current.next;
++			target.last.next = target;
++			target.next.last = target;
++		}
++		return current.yieldToInternal(target, value);
++	}
++
++	/*
++	 * This method starts the coroutine execution. It catches exception and handles a return from the run method.
++	 */
++	@Continuable
++	final void start(Object value) {
++		Object ret = null;
++		RuntimeException e = null;
++		try {
++			ret = run(value);
++		}
++		catch (Throwable t) {
++			if (t != exitException) {
++				t.printStackTrace();
++				e = new RuntimeException("coroutine terminated by exception", t);
++			}
++		}
++		finally {
++			try {
++				context.coroutineRemoved(this);
++			}
++			catch (Throwable t) {
++				t.printStackTrace();
++			}
++			if (last != this) {
++				last.next = next;
++				next.last = last;
++				Coroutine temp = last;
++				last = null;
++				next = null;
++				if (e != null)
++					temp.exception = e;
++				yieldToInternal(temp, ret);
++			}
++		}
++	}
++
++	/**
++	 * This implementation of the run method calls the CoRunnable.run method.
++	 * @param value the value passed via yield
++	 * @return the value that will be passed to the next coroutine
++	 */
++	protected Object run(Object value) {
++		if (runnable != null)
++			return runnable.run();
++		else
++			return null;
++	}
++}
+diff --git a/src/share/classes/javax/stack/CoroutineContext.java b/src/share/classes/javax/stack/CoroutineContext.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/javax/stack/CoroutineContext.java
+@@ -0,0 +1,85 @@
++package javax.stack;
++import javax.stack.Continuable;
++import javax.stack.Continuation;
++
++/**
++ * This class provides a context in which coroutines can be executed. Coroutines are added to a context either explicitly by
++ * passing the context to the coroutine's constructor or implicitly by creating a coroutine while another coroutine of the context
++ * is running.
++ * 
++ * @author lukas.stadler@jku.at
++ */
++public class CoroutineContext {
++	private static ThreadLocal<CoroutineContext> current = new ThreadLocal<CoroutineContext>();
++
++	private CoroutineContext last;
++	private Coroutine currentCoroutine;
++
++	Continuation startCoroutine = new Continuation();
++
++	@Continuable
++	private void runInternal(Object value) {
++		Object ret = startCoroutine.save();
++		if (ret == Continuation.CAPTURED) {
++			// System.out.println("start initial coroutine: " + value);
++			currentCoroutine.start(value);
++		}
++		else {
++			// System.out.println("start subsequent coroutine: " + ret);
++			currentCoroutine.start(ret);
++		}
++	}
++
++	/**
++	 * Starts the coroutine execution. The first coroutine that was created for this context will be the first one to run.
++	 */
++	public void start(Object value) {
++		if (currentCoroutine == null)
++			throw new IllegalStateException("Cannot start a context with no coroutines");
++		last = current.get();
++		current.set(this);
++		runInternal(value);
++		current.set(last);
++		this.last = null;
++	}
++
++	/**
++	 * This method will be called every time a coroutine is added to this context
++	 */
++	void coroutineAdded(Coroutine coroutine) {
++	}
++
++	/**
++	 * This method will be called every time a coroutine ends (and is thus removed)
++	 */
++	void coroutineRemoved(Coroutine coroutine) {
++	}
++
++	/**
++	 * This method can be overridden to change the default scheduling behavior of a coroutine context.
++	 * @param current the coroutine that is currently executed
++	 * @return the coroutine to be executed next
++	 */
++	Coroutine scheduleNext(Coroutine current) {
++		return current.getNext();
++	}
++
++	/**
++	 * @return the current context of the current thread, or null if there is no active context
++	 */
++	public static CoroutineContext getCurrent() {
++		return current.get();
++	}
++
++	/**
++	 * @return the currently executing coroutine of this context (or the coroutine that will be executed first, if the context
++	 *         hasn't started yet)
++	 */
++	public Coroutine getCurrentCoroutine() {
++		return currentCoroutine;
++	}
++
++	void setCurrentCoroutine(Coroutine coroutine) {
++		currentCoroutine = coroutine;
++	}
++}
+diff --git a/src/share/classes/javax/stack/CoroutineExitException.java b/src/share/classes/javax/stack/CoroutineExitException.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/javax/stack/CoroutineExitException.java
+@@ -0,0 +1,5 @@
++package javax.stack;
++public class CoroutineExitException extends RuntimeException {
++	private static final long serialVersionUID = -9155842264591995913L;
++
++}
+diff --git a/src/share/classes/javax/stack/DelimitedRunnable.java b/src/share/classes/javax/stack/DelimitedRunnable.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/javax/stack/DelimitedRunnable.java
+@@ -0,0 +1,27 @@
++/*
++ * Copyright 2007-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++package javax.stack;
++
++public interface DelimitedRunnable {
++	public void run(Continuation start, Object firstValue);
++}
+diff --git a/src/share/classes/javax/stack/Fiber.java b/src/share/classes/javax/stack/Fiber.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/javax/stack/Fiber.java
+@@ -0,0 +1,69 @@
++/*
++ * Copyright 2007-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++package javax.stack;
++
++public abstract class Fiber {
++	private Continuation returnContinuation;
++	private Continuation continuation = new Continuation();
++
++	private class FiberRunnable implements DelimitedRunnable {
++		@Continuable
++		public final void run(Continuation start, Object firstValue) {
++			returnContinuation = start;
++			Object lastRetValue;
++			try {
++				lastRetValue = generate(firstValue);
++			}
++			catch (RuntimeException e) {
++				e.printStackTrace();
++				lastRetValue = null;
++			}
++			returnContinuation = null;
++			start.resume(lastRetValue);
++		}
++	}
++
++	@Continuable
++	protected abstract Object generate(Object firstIn);
++
++	@Continuable
++	protected Object yield(Object returnValue) {
++		Object o = continuation.save();
++		if (o == Continuation.CAPTURED)
++			returnContinuation.resume(returnValue);
++		return o;
++	}
++
++	@Continuable
++	public Object resume(Object value) {
++		if (returnContinuation == null)
++			return Continuation.startDelimited(new FiberRunnable(), value);
++		else
++			return Continuation.continueDelimited(continuation, value);
++	}
++
++	public void dump() {
++		continuation.dump();
++	}
++
++}
+diff --git a/test/javax/stack/ContinuationTest1.java b/test/javax/stack/ContinuationTest1.java
+new file mode 100644
+--- /dev/null
++++ b/test/javax/stack/ContinuationTest1.java
+@@ -0,0 +1,229 @@
++package javax.stack;
++
++import static org.junit.Assert.assertEquals;
++
++import org.junit.Before;
++import org.junit.Test;
++
++public class ContinuationTest1 extends ContinuationTestTools {
++
++	public ContinuationTest1() {
++		interpreted = this;
++		if (compiled == null)
++			compiled = new ContinuationTest1Compiled();
++	}
++
++	@Before
++	public void setUp() throws Exception {
++		clearActions();
++	}
++
++	@Continuable(ContinuableAccess.HIDDEN)
++	public Object subSave(Continuation cont, int a, int b, int c, int d, int e) {
++		int i;
++		cont.save();
++		i = 0;
++		i += a;
++		i += b;
++		i += c;
++		i += d;
++		i += e;
++		assertEquals(15, i);
++		assertEquals(ContinuationTest1.class, this.getClass());
++		assertEquals(Continuation.class, cont.getClass());
++		return 10102;
++	}
++
++	private int cnt = 0;
++
++	@Test
++	@Continuable(ContinuableAccess.HIDDEN)
++	public void testRec() {
++		Integer i = 100000;
++		Continuation cont = new Continuation();
++		assertEquals(10102, compiled.subSave(cont, 1, 2, 3, 4, 5));
++		assertEquals(ContinuationTest1.class, this.getClass());
++		if (cnt++ == 0) {
++			cont.resume(null);
++		}
++		assertEquals(100000, i);
++	}
++
++	@Test
++	@Continuable(ContinuableAccess.HIDDEN)
++	public void testSimple() {
++		Continuation cont = new Continuation();
++		action(1);
++		if (cont.save() == Continuation.CAPTURED) {
++			action(2);
++			cont.resume(null);
++			action(100);
++		}
++		else
++			action(3);
++
++		action(4);
++		assertActions(new int[] { 1, 2, 3, 4 });
++	}
++
++	@Continuable(ContinuableAccess.HIDDEN)
++	int intSub(Continuation c, int code1, Integer code2, int depth) {
++		if (depth == 0) {
++			action(code1);
++			intTemp = code1;
++			objTemp = code2;
++			thisTemp = this;
++			lastSaveReturn = c.save();
++			action(code2);
++			assertEquals(thisTemp, this);
++			assertEquals(intTemp, code1);
++			assertEquals(objTemp, code2);
++		}
++		else {
++			if ((depth & 3) == 0)
++				compiled.intSub(c, code1, code2, depth - 1);
++			else
++				intSub(c, code1, code2, depth - 1);
++		}
++		return 101;
++	}
++
++	@Continuable(ContinuableAccess.HIDDEN)
++	Integer objSub(Continuation c, int code1, Integer code2, int depth) {
++		if (depth == 0) {
++			action(code1);
++			intTemp = code1;
++			objTemp = code2;
++			thisTemp = this;
++			lastSaveReturn = c.save();
++			assertEquals(thisTemp, this);
++			assertEquals(intTemp, code1);
++			assertEquals(objTemp, code2);
++			action(code2);
++		}
++		else {
++			if ((depth & 3) == 0)
++				compiled.objSub(c, code1, code2, depth - 1);
++			else
++				objSub(c, code1, code2, depth - 1);
++		}
++		return 201;
++	}
++
++	@Continuable(ContinuableAccess.HIDDEN)
++	void resumeRec(Continuation c, Object retValue, int depth) {
++		if (depth == 0) {
++			c.resume(null);
++		}
++		else {
++			if ((depth & 3) == 0)
++				compiled.resumeRec(c, retValue, depth - 1);
++			else
++				resumeRec(c, retValue, depth - 1);
++		}
++	}
++
++	@Continuable(ContinuableAccess.HIDDEN)
++	public void testParamsReturnInternal(int resumeDepth, int saveDepth) {
++		Continuation c = new Continuation();
++		action(1);
++		action(intSub(c, 2, 3, saveDepth));
++		if (lastSaveReturn == Continuation.CAPTURED) {
++			action(4);
++			if (resumeDepth == 0)
++				c.resume(null);
++			else
++				resumeRec(c, null, resumeDepth);
++			action(100);
++		}
++		action(5);
++		action(compiled.intSub(c, 6, 7, saveDepth));
++		if (lastSaveReturn == Continuation.CAPTURED) {
++			action(8);
++			if (resumeDepth == 0)
++				c.resume(null);
++			else
++				resumeRec(c, null, resumeDepth);
++			action(100);
++		}
++		action(9);
++		action(objSub(c, 10, 11, saveDepth));
++		if (lastSaveReturn == Continuation.CAPTURED) {
++			action(12);
++			if (resumeDepth == 0)
++				c.resume(null);
++			else
++				resumeRec(c, null, resumeDepth);
++			action(100);
++		}
++		action(13);
++		action(compiled.objSub(c, 14, 15, saveDepth));
++		if (lastSaveReturn == Continuation.CAPTURED) {
++			action(16);
++			if (resumeDepth == 0)
++				c.resume(null);
++			else
++				resumeRec(c, null, resumeDepth);
++			action(100);
++		}
++		action(17);
++		assertActions(new int[] { 1, 2, 3, 101, 4, 3, 101, 5, 6, 7, 102, 8, 7, 102, 9, 10, 11, 201, 12, 11, 201, 13, 14, 15, 202,
++				16, 15, 202, 17 });
++	}
++
++	@Test
++	public void testParamsReturn() {
++		for (int i2 = 1; i2 < 50; i2++) {
++			for (int i = 0; i < 50; i++) {
++//				System.out.println("resume: " + i + ", save: " + i2);
++				pushActions();
++				testParamsReturnInternal(i, i2);
++				popActions();
++			}
++		}
++	}
++
++	@Test
++	@Continuable(ContinuableAccess.HIDDEN)
++	public void testManyParams() {
++		Continuation cont = new Continuation();
++		if (manyParamsSub(cont, 5, true, false, 1, (short) 2, (byte) 3, (char) 4, (long) 5, 6, (short) 7, (byte) 8, (char) 9,
++				(long) 10, (float) 11, (double) 12, (float) 13, (double) 14, 15, 16, 17, 18, 19, 20) == Continuation.CAPTURED)
++			cont.resume(null);
++	}
++
++	@Continuable(ContinuableAccess.HIDDEN)
++	private Object manyParamsSub(Continuation cont, int depth, boolean a, boolean b, int c, short d, byte e, char f,
++			long g, Integer h, Short i, Byte j, Character k, Long l, float m, double n, Float o, Double p, Integer q, int r,
++			int s, int t, int u, int v) {
++		final Object ret;
++		if (depth > 0)
++			ret = manyParamsSub(cont, depth - 1, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v);
++		else
++			ret = cont.save();
++		assertEquals(cont.getClass(), Continuation.class);
++		assertEquals(a, true);
++		assertEquals(b, false);
++		assertEquals(c, 1);
++		assertEquals(d, (short) 2);
++		assertEquals(e, (byte) 3);
++		assertEquals(f, (char) 4);
++		assertEquals(g, (long) 5);
++		assertEquals(h, 6);
++		assertEquals(i, (short) 7);
++		assertEquals(j, (byte) 8);
++		assertEquals(k, (char) 9);
++		assertEquals(l, (long) 10);
++		assertEquals(m, (float) 11);
++		assertEquals(n, (double) 12);
++		assertEquals(o, (float) 13);
++		assertEquals(p, (double) 14);
++		assertEquals(q, 15);
++		assertEquals(r, 16);
++		assertEquals(s, 17);
++		assertEquals(t, 18);
++		assertEquals(u, 19);
++		assertEquals(v, 20);
++		return ret;
++	}
++}
+diff --git a/test/javax/stack/ContinuationTest1Compiled.java b/test/javax/stack/ContinuationTest1Compiled.java
+new file mode 100644
+--- /dev/null
++++ b/test/javax/stack/ContinuationTest1Compiled.java
+@@ -0,0 +1,225 @@
++package javax.stack;
++
++import static org.junit.Assert.assertEquals;
++
++import org.junit.Before;
++import org.junit.Test;
++
++public class ContinuationTest1Compiled extends ContinuationTestTools {
++
++	public ContinuationTest1Compiled() {
++		compiled = this;
++		if (interpreted == null)
++			interpreted = new ContinuationTest1();
++	}
++
++	@Before
++	public void setUp() throws Exception {
++		clearActions();
++	}
++
++	@Continuable(ContinuableAccess.HIDDEN)
++	public Object subSave(Continuation cont, int a, int b, int c, int d, int e) {
++		int i;
++		cont.save();
++		i = 0;
++		i += a;
++		i += b;
++		i += c;
++		i += d;
++		i += e;
++		assertEquals(15, i);
++		assertEquals(ContinuationTest1Compiled.class, this.getClass());
++		assertEquals(Continuation.class, cont.getClass());
++		return 10102;
++	}
++
++	private int cnt = 0;
++
++	@Test
++	@Continuable(ContinuableAccess.HIDDEN)
++	public void testRec() {
++		Integer i = 100000;
++		Continuation cont = new Continuation();
++		assertEquals(10102, interpreted.subSave(cont, 1, 2, 3, 4, 5));
++		assertEquals(ContinuationTest1Compiled.class, this.getClass());
++		if (cnt++ == 0)
++			cont.resume(null);
++		assertEquals(100000, i);
++	}
++
++	@Test
++	@Continuable(ContinuableAccess.HIDDEN)
++	public void testSimple() {
++		Continuation cont = new Continuation();
++		action(1);
++		if (cont.save() == Continuation.CAPTURED) {
++			action(2);
++			cont.resume(null);
++			action(100);
++		}
++		else
++			action(3);
++
++		action(4);
++		assertActions(new int[] { 1, 2, 3, 4 });
++	}
++
++	@Continuable(ContinuableAccess.HIDDEN)
++	int intSub(Continuation c, int code1, Integer code2, int depth) {
++		if (depth == 0) {
++			action(code1);
++			intTemp = code1;
++			objTemp = code2;
++			lastSaveReturn = c.save();
++			assertEquals(intTemp, code1);
++			assertEquals(objTemp, code2);
++			action(code2);
++		}
++		else {
++			if ((depth & 3) == 0)
++				interpreted.intSub(c, code1, code2, depth - 1);
++			else
++				intSub(c, code1, code2, depth - 1);
++		}
++		return 102;
++	}
++
++	@Continuable(ContinuableAccess.HIDDEN)
++	Integer objSub(Continuation c, int code1, Integer code2, int depth) {
++		if (depth == 0) {
++			action(code1);
++			intTemp = code1;
++			objTemp = code2;
++			lastSaveReturn = c.save();
++			assertEquals(intTemp, code1);
++			assertEquals(objTemp, code2);
++			action(code2);
++		}
++		else {
++			if ((depth & 3) == 0)
++				interpreted.objSub(c, code1, code2, depth - 1);
++			else
++				objSub(c, code1, code2, depth - 1);
++		}
++		return 202;
++	}
++
++	@Continuable(ContinuableAccess.HIDDEN)
++	void resumeRec(Continuation c, Object retValue, int depth) {
++		if (depth == 0) {
++			c.resume(null);
++		}
++		else {
++			if ((depth & 3) == 0)
++				interpreted.resumeRec(c, retValue, depth - 1);
++			else
++				resumeRec(c, retValue, depth - 1);
++		}
++	}
++
++	@Continuable(ContinuableAccess.HIDDEN)
++	public void testParamsReturnInternal(int resumeDepth, int saveDepth) {
++		Continuation c = new Continuation();
++		action(1);
++		action(interpreted.intSub(c, 2, 3, saveDepth));
++		if (lastSaveReturn == Continuation.CAPTURED) {
++			action(4);
++			if (resumeDepth == 0)
++				c.resume(null);
++			else
++				resumeRec(c, null, resumeDepth);
++			action(100);
++		}
++		action(5);
++		action(intSub(c, 6, 7, saveDepth));
++		if (lastSaveReturn == Continuation.CAPTURED) {
++			action(8);
++			if (resumeDepth == 0)
++				c.resume(null);
++			else
++				resumeRec(c, null, resumeDepth);
++			action(100);
++		}
++		action(9);
++		action(interpreted.objSub(c, 10, 11, saveDepth));
++		if (lastSaveReturn == Continuation.CAPTURED) {
++			action(12);
++			if (resumeDepth == 0)
++				c.resume(null);
++			else
++				resumeRec(c, null, resumeDepth);
++			action(100);
++		}
++		action(13);
++		action(objSub(c, 14, 15, saveDepth));
++		if (lastSaveReturn == Continuation.CAPTURED) {
++			action(16);
++			if (resumeDepth == 0)
++				c.resume(null);
++			else
++				resumeRec(c, null, resumeDepth);
++			action(100);
++		}
++		action(17);
++		assertActions(new int[] { 1, 2, 3, 101, 4, 3, 101, 5, 6, 7, 102, 8, 7, 102, 9, 10, 11, 201, 12, 11, 201, 13, 14, 15, 202,
++				16, 15, 202, 17 });
++	}
++
++	@Test
++	public void testParamsReturn() {
++		for (int i2 = 0; i2 < 50; i2++) {
++			for (int i = 0; i < 50; i++) {
++				// System.out.println("resume: " + i + ", save: " + i2);
++				pushActions();
++				testParamsReturnInternal(i, i2);
++				popActions();
++			}
++		}
++	}
++
++	@Test
++	@Continuable(ContinuableAccess.HIDDEN)
++	public void testManyParams() {
++		Continuation cont = new Continuation();
++		if (manyParamsSub(cont, 5, true, false, 1, (short) 2, (byte) 3, (char) 4, (long) 5, 6, (short) 7, (byte) 8, (char) 9,
++				(long) 10, (float) 11, (double) 12, (float) 13, (double) 14, 15, 16, 17, 18, 19, 20) == Continuation.CAPTURED)
++			cont.resume(null);
++	}
++
++	@Continuable(ContinuableAccess.HIDDEN)
++	private Object manyParamsSub(Continuation cont, int depth, boolean a, boolean b, int c, short d, byte e, char f, long g,
++			Integer h, Short i, Byte j, Character k, Long l, float m, double n, Float o, Double p, Integer q, int r, int s,
++			int t, int u, int v) {
++		final Object ret;
++		if (depth > 0)
++			ret = manyParamsSub(cont, depth - 1, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v);
++		else
++			ret = cont.save();
++		assertEquals(cont.getClass(), Continuation.class);
++		assertEquals(a, true);
++		assertEquals(b, false);
++		assertEquals(c, 1);
++		assertEquals(d, (short) 2);
++		assertEquals(e, (byte) 3);
++		assertEquals(f, (char) 4);
++		assertEquals(g, (long) 5);
++		assertEquals(h, 6);
++		assertEquals(i, (short) 7);
++		assertEquals(j, (byte) 8);
++		assertEquals(k, (char) 9);
++		assertEquals(l, (long) 10);
++		assertEquals(m, (float) 11);
++		assertEquals(n, (double) 12);
++		assertEquals(o, (float) 13);
++		assertEquals(p, (double) 14);
++		assertEquals(q, 15);
++		assertEquals(r, 16);
++		assertEquals(s, 17);
++		assertEquals(t, 18);
++		assertEquals(u, 19);
++		assertEquals(v, 20);
++		return ret;
++	}
++
++}
+diff --git a/test/javax/stack/ContinuationTestTools.java b/test/javax/stack/ContinuationTestTools.java
+new file mode 100644
+--- /dev/null
++++ b/test/javax/stack/ContinuationTestTools.java
+@@ -0,0 +1,53 @@
++package javax.stack;
++
++import static org.junit.Assert.assertEquals;
++
++import java.util.ArrayList;
++import java.util.Stack;
++
++public class ContinuationTestTools {
++	private static Stack<ArrayList<Integer>> actions = new Stack<ArrayList<Integer>>();
++
++	protected static Object thisTemp;
++	protected static Object objTemp;
++	protected static int intTemp;
++	protected static Object lastSaveReturn = null;
++
++	protected static ContinuationTest1Compiled compiled;
++	protected static ContinuationTest1 interpreted;
++
++	protected static void clearActions() {
++		actions.clear();
++		actions.add(new ArrayList<Integer>());
++	}
++
++	protected static void pushActions() {
++		actions.push(new ArrayList<Integer>());
++	}
++
++	protected static void popActions() {
++		actions.pop();
++	}
++
++	protected static void action(int code) {
++		actions.peek().add(code);
++	}
++
++	protected static void assertActions(int[] expectedActions) {
++		if (expectedActions.length == actions.peek().size()) {
++			for (int i = 0; i < expectedActions.length; i++)
++				assertEquals(expectedActions[i], actions.peek().get(i));
++		}
++		else {
++			System.out.print("expected: ");
++			for (int i = 0; i < expectedActions.length; i++)
++				System.out.print(expectedActions[i] + " ");
++			System.out.print("\nactual: ");
++			for (int i = 0; i < actions.peek().size(); i++)
++				System.out.print(actions.peek().get(i) + " ");
++
++			assertEquals(expectedActions.length, actions.peek().size());
++		}
++	}
++
++}
+diff --git a/test/javax/stack/DelimitedTest.java b/test/javax/stack/DelimitedTest.java
+new file mode 100644
+--- /dev/null
++++ b/test/javax/stack/DelimitedTest.java
+@@ -0,0 +1,47 @@
++package javax.stack;
++
++import java.io.IOException;
++
++import org.junit.Test;
++
++public class DelimitedTest {
++
++	class TestFiber extends Fiber {
++		@Continuable(ContinuableAccess.HIDDEN)
++		protected Object generate(Object value) {
++			int i = (Integer) value;
++			while (true) {
++				i += (Integer) yield(i);
++			}
++		}
++	}
++
++	private static final long COUNT = 5000;
++	private static final long COUNT2 = 100;
++
++	@Test
++	@Continuable(ContinuableAccess.HIDDEN)
++	public void testRec() throws IOException {
++		try {
++			Continuation cont = new Continuation();
++			cont.save();
++			do {
++				long time = System.nanoTime();
++				for (int i2 = 0; i2 < COUNT2; i2++) {
++					TestFiber test = new TestFiber();
++					for (int i = 0; i < COUNT; i++) {
++						Object ret = test.resume(i);
++						int result = (Integer) ret;
++					}
++				}
++				long tps = (long) (COUNT * COUNT2 * 1000000000d / (System.nanoTime() - time));
++				System.out.println(tps);
++			}
++			while (true);
++		}
++		catch (Throwable e) {
++			e.printStackTrace();
++		}
++	}
++
++}
+\ No newline at end of file

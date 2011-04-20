@@ -1,0 +1,4 @@
+# base = 4d206181439a in http://hg.netbeans.org/main/nb-javac [release65_base]
+quid.patch      #-/quid         #+4d206181439a #+release65_base
+meth.patch      #-/meth         #+4d206181439a #+release65_base
+dyncast.patch   #-/dyncast      #+4d206181439a #+release65_base

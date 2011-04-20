@@ -1,0 +1,313 @@
+# HG changeset patch
+# User never
+# Date 1300488762 25200
+# Node ID d673ef06fe968386125bf6fdc1179c2444c1af92
+# Parent  048f98400b8ec5cd7176a112080f7f2a6b8d2240
+7028374: race in fix_oop_relocations for scavengeable nmethods
+Reviewed-by: kvn
+
+diff --git a/src/cpu/sparc/vm/nativeInst_sparc.cpp b/src/cpu/sparc/vm/nativeInst_sparc.cpp
+--- a/src/cpu/sparc/vm/nativeInst_sparc.cpp
++++ b/src/cpu/sparc/vm/nativeInst_sparc.cpp
+@@ -52,6 +52,22 @@
+   ICache::invalidate_range(instaddr, 7 * BytesPerInstWord);
+ }
+ 
++void NativeInstruction::verify_data64_sethi(address instaddr, intptr_t x) {
++  ResourceMark rm;
++  unsigned char buffer[10 * BytesPerInstWord];
++  CodeBuffer buf(buffer, 10 * BytesPerInstWord);
++  MacroAssembler masm(&buf);
++
++  Register destreg = inv_rd(*(unsigned int *)instaddr);
++  // Generate the proper sequence into a temporary buffer and compare
++  // it with the original sequence.
++  masm.patchable_sethi(x, destreg);
++  int len = buffer - masm.pc();
++  for (int i = 0; i < len; i++) {
++    assert(instaddr[i] == buffer[i], "instructions must match");
++  }
++}
++
+ void NativeInstruction::verify() {
+   // make sure code pattern is actually an instruction address
+   address addr = addr_at(0);
+diff --git a/src/cpu/sparc/vm/nativeInst_sparc.hpp b/src/cpu/sparc/vm/nativeInst_sparc.hpp
+--- a/src/cpu/sparc/vm/nativeInst_sparc.hpp
++++ b/src/cpu/sparc/vm/nativeInst_sparc.hpp
+@@ -254,6 +254,7 @@
+   // sethi.  This only does the sethi.  The disp field (bottom 10 bits)
+   // must be handled separately.
+   static void set_data64_sethi(address instaddr, intptr_t x);
++  static void verify_data64_sethi(address instaddr, intptr_t x);
+ 
+   // combine the fields of a sethi/simm13 pair (simm13 = or, add, jmpl, ld/st)
+   static int data32(int sethi_insn, int arith_insn) {
+diff --git a/src/cpu/sparc/vm/relocInfo_sparc.cpp b/src/cpu/sparc/vm/relocInfo_sparc.cpp
+--- a/src/cpu/sparc/vm/relocInfo_sparc.cpp
++++ b/src/cpu/sparc/vm/relocInfo_sparc.cpp
+@@ -30,7 +30,7 @@
+ #include "oops/oop.inline.hpp"
+ #include "runtime/safepoint.hpp"
+ 
+-void Relocation::pd_set_data_value(address x, intptr_t o) {
++void Relocation::pd_set_data_value(address x, intptr_t o, bool verify_only) {
+   NativeInstruction* ip = nativeInstruction_at(addr());
+   jint inst = ip->long_at(0);
+   assert(inst != NativeInstruction::illegal_instruction(), "no breakpoint");
+@@ -83,7 +83,11 @@
+     guarantee(Assembler::is_simm13(simm13), "offset can't overflow simm13");
+     inst &= ~Assembler::simm(    -1, 13);
+     inst |=  Assembler::simm(simm13, 13);
+-    ip->set_long_at(0, inst);
++    if (verify_only) {
++      assert(ip->long_at(0) == inst, "instructions must match");
++    } else {
++      ip->set_long_at(0, inst);
++    }
+     }
+     break;
+ 
+@@ -97,19 +101,36 @@
+       jint np = oopDesc::encode_heap_oop((oop)x);
+       inst &= ~Assembler::hi22(-1);
+       inst |=  Assembler::hi22((intptr_t)np);
+-      ip->set_long_at(0, inst);
++      if (verify_only) {
++        assert(ip->long_at(0) == inst, "instructions must match");
++      } else {
++        ip->set_long_at(0, inst);
++      }
+       inst2 = ip->long_at( NativeInstruction::nop_instruction_size );
+       guarantee(Assembler::inv_op(inst2)==Assembler::arith_op, "arith op");
+-      ip->set_long_at(NativeInstruction::nop_instruction_size, ip->set_data32_simm13( inst2, (intptr_t)np));
++      if (verify_only) {
++        assert(ip->long_at(NativeInstruction::nop_instruction_size) == NativeInstruction::set_data32_simm13( inst2, (intptr_t)np),
++               "instructions must match");
++      } else {
++        ip->set_long_at(NativeInstruction::nop_instruction_size, NativeInstruction::set_data32_simm13( inst2, (intptr_t)np));
++      }
+       break;
+     }
+-    ip->set_data64_sethi( ip->addr_at(0), (intptr_t)x );
++    if (verify_only) {
++      ip->verify_data64_sethi( ip->addr_at(0), (intptr_t)x );
++    } else {
++      ip->set_data64_sethi( ip->addr_at(0), (intptr_t)x );
++    }
+ #else
+     guarantee(Assembler::inv_op2(inst)==Assembler::sethi_op2, "must be sethi");
+     inst &= ~Assembler::hi22(     -1);
+     inst |=  Assembler::hi22((intptr_t)x);
+     // (ignore offset; it doesn't play into the sethi)
+-    ip->set_long_at(0, inst);
++    if (verify_only) {
++      assert(ip->long_at(0) == inst, "instructions must match");
++    } else {
++      ip->set_long_at(0, inst);
++    }
+ #endif
+     }
+     break;
+diff --git a/src/cpu/x86/vm/relocInfo_x86.cpp b/src/cpu/x86/vm/relocInfo_x86.cpp
+--- a/src/cpu/x86/vm/relocInfo_x86.cpp
++++ b/src/cpu/x86/vm/relocInfo_x86.cpp
+@@ -31,7 +31,7 @@
+ #include "runtime/safepoint.hpp"
+ 
+ 
+-void Relocation::pd_set_data_value(address x, intptr_t o) {
++void Relocation::pd_set_data_value(address x, intptr_t o, bool verify_only) {
+ #ifdef AMD64
+   x += o;
+   typedef Assembler::WhichOperand WhichOperand;
+@@ -40,19 +40,35 @@
+          which == Assembler::narrow_oop_operand ||
+          which == Assembler::imm_operand, "format unpacks ok");
+   if (which == Assembler::imm_operand) {
+-    *pd_address_in_code() = x;
++    if (verify_only) {
++      assert(*pd_address_in_code() == x, "instructions must match");
++    } else {
++      *pd_address_in_code() = x;
++    }
+   } else if (which == Assembler::narrow_oop_operand) {
+     address disp = Assembler::locate_operand(addr(), which);
+-    *(int32_t*) disp = oopDesc::encode_heap_oop((oop)x);
++    if (verify_only) {
++      assert(*(uint32_t*) disp == oopDesc::encode_heap_oop((oop)x), "instructions must match");
++    } else {
++      *(int32_t*) disp = oopDesc::encode_heap_oop((oop)x);
++    }
+   } else {
+     // Note:  Use runtime_call_type relocations for call32_operand.
+     address ip = addr();
+     address disp = Assembler::locate_operand(ip, which);
+     address next_ip = Assembler::locate_next_instruction(ip);
+-    *(int32_t*) disp = x - next_ip;
++    if (verify_only) {
++      assert(*(int32_t*) disp == (x - next_ip), "instructions must match");
++    } else {
++      *(int32_t*) disp = x - next_ip;
++    }
+   }
+ #else
+-  *pd_address_in_code() = x + o;
++  if (verify_only) {
++    assert(*pd_address_in_code() == (x + o), "instructions must match");
++  } else {
++    *pd_address_in_code() = x + o;
++  }
+ #endif // AMD64
+ }
+ 
+diff --git a/src/share/vm/code/codeCache.cpp b/src/share/vm/code/codeCache.cpp
+--- a/src/share/vm/code/codeCache.cpp
++++ b/src/share/vm/code/codeCache.cpp
+@@ -337,7 +337,6 @@
+     if (is_live) {
+       // Perform cur->oops_do(f), maybe just once per nmethod.
+       f->do_code_blob(cur);
+-      cur->fix_oop_relocations();
+     }
+   }
+ 
+@@ -552,6 +551,19 @@
+ }
+ 
+ 
++void CodeCache::verify_oops() {
++  MutexLockerEx mu(CodeCache_lock, Mutex::_no_safepoint_check_flag);
++  VerifyOopClosure voc;
++  FOR_ALL_ALIVE_BLOBS(cb) {
++    if (cb->is_nmethod()) {
++      nmethod *nm = (nmethod*)cb;
++      nm->oops_do(&voc);
++      nm->verify_oop_relocations();
++    }
++  }
++}
++
++
+ address CodeCache::first_address() {
+   assert_locked_or_safepoint(CodeCache_lock);
+   return (address)_heap->begin();
+diff --git a/src/share/vm/code/codeCache.hpp b/src/share/vm/code/codeCache.hpp
+--- a/src/share/vm/code/codeCache.hpp
++++ b/src/share/vm/code/codeCache.hpp
+@@ -122,6 +122,7 @@
+   // GC support
+   static void gc_epilogue();
+   static void gc_prologue();
++  static void verify_oops();
+   // If "unloading_occurred" is true, then unloads (i.e., breaks root links
+   // to) any unmarked codeBlobs in the cache.  Sets "marked_for_unloading"
+   // to "true" iff some code got unloaded.
+diff --git a/src/share/vm/code/nmethod.cpp b/src/share/vm/code/nmethod.cpp
+--- a/src/share/vm/code/nmethod.cpp
++++ b/src/share/vm/code/nmethod.cpp
+@@ -1105,6 +1105,20 @@
+ }
+ 
+ 
++void nmethod::verify_oop_relocations() {
++  // Ensure sure that the code matches the current oop values
++  RelocIterator iter(this, NULL, NULL);
++  while (iter.next()) {
++    if (iter.type() == relocInfo::oop_type) {
++      oop_Relocation* reloc = iter.oop_reloc();
++      if (!reloc->oop_is_immediate()) {
++        reloc->verify_oop_relocation();
++      }
++    }
++  }
++}
++
++
+ ScopeDesc* nmethod::scope_desc_at(address pc) {
+   PcDesc* pd = pc_desc_at(pc);
+   guarantee(pd != NULL, "scope must be present");
+@@ -1823,6 +1837,7 @@
+     assert(cur != NULL, "not NULL-terminated");
+     nmethod* next = cur->_oops_do_mark_link;
+     cur->_oops_do_mark_link = NULL;
++    cur->fix_oop_relocations();
+     NOT_PRODUCT(if (TraceScavenge)  cur->print_on(tty, "oops_do, unmark\n"));
+     cur = next;
+   }
+diff --git a/src/share/vm/code/nmethod.hpp b/src/share/vm/code/nmethod.hpp
+--- a/src/share/vm/code/nmethod.hpp
++++ b/src/share/vm/code/nmethod.hpp
+@@ -459,6 +459,7 @@
+ public:
+   void fix_oop_relocations(address begin, address end) { fix_oop_relocations(begin, end, false); }
+   void fix_oop_relocations()                           { fix_oop_relocations(NULL, NULL, false); }
++  void verify_oop_relocations();
+ 
+   bool is_at_poll_return(address pc);
+   bool is_at_poll_or_poll_return(address pc);
+diff --git a/src/share/vm/code/relocInfo.cpp b/src/share/vm/code/relocInfo.cpp
+--- a/src/share/vm/code/relocInfo.cpp
++++ b/src/share/vm/code/relocInfo.cpp
+@@ -798,6 +798,14 @@
+ }
+ 
+ 
++void oop_Relocation::verify_oop_relocation() {
++  if (!oop_is_immediate()) {
++    // get the oop from the pool, and re-insert it into the instruction:
++    verify_value(value());
++  }
++}
++
++
+ RelocIterator virtual_call_Relocation::parse_ic(nmethod* &nm, address &ic_call, address &first_oop,
+                                                 oop* &oop_addr, bool *is_optimized) {
+   assert(ic_call != NULL, "ic_call address must be set");
+diff --git a/src/share/vm/code/relocInfo.hpp b/src/share/vm/code/relocInfo.hpp
+--- a/src/share/vm/code/relocInfo.hpp
++++ b/src/share/vm/code/relocInfo.hpp
+@@ -765,7 +765,8 @@
+ 
+  protected:
+   // platform-dependent utilities for decoding and patching instructions
+-  void       pd_set_data_value       (address x, intptr_t off); // a set or mem-ref
++  void       pd_set_data_value       (address x, intptr_t off, bool verify_only = false); // a set or mem-ref
++  void       pd_verify_data_value    (address x, intptr_t off) { pd_set_data_value(x, off, true); }
+   address    pd_call_destination     (address orig_addr = NULL);
+   void       pd_set_call_destination (address x);
+   void       pd_swap_in_breakpoint   (address x, short* instrs, int instrlen);
+@@ -880,6 +881,12 @@
+     else
+       pd_set_data_value(x, o);
+   }
++  void        verify_value(address x) {
++    if (addr_in_const())
++      assert(*(address*)addr() == x, "must agree");
++    else
++      pd_verify_data_value(x, offset());
++  }
+ 
+   // The "o" (displacement) argument is relevant only to split relocations
+   // on RISC machines.  In some CPUs (SPARC), the set-hi and set-lo ins'ns
+@@ -950,6 +957,8 @@
+ 
+   void fix_oop_relocation();        // reasserts oop value
+ 
++  void verify_oop_relocation();
++
+   address value()  { return (address) *oop_addr(); }
+ 
+   bool oop_is_immediate()  { return oop_index() == 0; }
+diff --git a/src/share/vm/memory/universe.cpp b/src/share/vm/memory/universe.cpp
+--- a/src/share/vm/memory/universe.cpp
++++ b/src/share/vm/memory/universe.cpp
+@@ -1313,6 +1313,8 @@
+   JNIHandles::verify();
+   if (!silent) gclog_or_tty->print("C-heap ");
+   os::check_heap();
++  if (!silent) gclog_or_tty->print("code cache ");
++  CodeCache::verify_oops();
+   if (!silent) gclog_or_tty->print_cr("]");
+ 
+   _verify_in_progress = false;

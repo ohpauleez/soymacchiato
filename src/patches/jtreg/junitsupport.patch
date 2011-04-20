@@ -1,0 +1,1458 @@
+6891715: jtreg should be able to run tests in JUnit format
+Reviewed-by: jjg, mr
+Portions are coded by jjg; these are reviewed by jrose.
+
+diff --git a/make/Defs.gmk b/make/Defs.gmk
+--- a/make/Defs.gmk
++++ b/make/Defs.gmk
+@@ -84,6 +84,13 @@
+ 
+ JAVATEST_JAR = $(JAVATEST_HOME)/lib/javatest.jar
+ 
++#----- JUnit 4.5: see http://www.junit.org/
++# http://sourceforge.net/projects/junit/files/junit/4.5/junit-4.5.jar/download
++
++ifndef JUNIT_JAR
++  JUNIT_JAR = /java/devtools/share/junit/junit-4.5/junit.jar
++endif
++
+ #----- Ant: see http://ant.apache.org/
+ 
+ ifndef ANTHOME
+diff --git a/make/Makefile b/make/Makefile
+--- a/make/Makefile
++++ b/make/Makefile
+@@ -43,6 +43,7 @@
+ include doc.gmk
+ include javatest.gmk
+ include javahelp.gmk
++include junit.gmk
+ 
+ #----------------------------------------------------------------------
+ #
+diff --git a/make/build.properties b/make/build.properties
+--- a/make/build.properties
++++ b/make/build.properties
+@@ -26,19 +26,25 @@
+ # set locations here, or in ${root}/build.properties, or set on the
+ # ant command line
+ 
++jtreg.build.resources = /w/jjg/work/jtreg
++# FIXME
++
+ # JTHarness or JavaTest (should be should be 4.1.3 or better)
+ #javatest.home = /w/jjg/work/os-jtreg/jtharness-4_1_2-MR1-Rel-b07/JTHarness-build/binaries/
+-javatest.home = /w/jjg/work/jtreg/jtharness-4_1_3-MR1-Rel-b08/JTHarness-build/binaries/
++javatest.home = ${jtreg.build.resources}/jtharness-4_1_3-MR1-Rel-b08/JTHarness-build/binaries/
+ javatest.jar = ${javatest.home}/lib/javatest.jar
+ #   the following is only true for older versions of JavaTest.
+ #   can't use <available> to set it automatically for some reason
+ #javatest.includes.javahelp.ok = true
+ 
+ # JavaHelp (should be version 2.0 or better)
+-javahelp.home = /w/jjg/work/jtreg/javahelp/javahelp_nbproject/dist
++javahelp.home = ${jtreg.build.resources}/javahelp/javahelp_nbproject/dist
+ jhall.jar = ${javahelp.home}/lib/jhall.jar
+ jh.jar = ${javahelp.home}/lib/jh.jar
+ 
++# JUnit (should be 4.5 or better)
++junit.jar = ${jtreg.build.resources}/junit-4.5.jar
++
+ # Ant ((should be version 1.6.5 or better)
+ #ant.home = 
+ ant.jar = /usr/share/java/ant.jar
+diff --git a/make/build.xml b/make/build.xml
+--- a/make/build.xml
++++ b/make/build.xml
+@@ -44,6 +44,7 @@
+     <property name="dist.dir" location="dist" />
+     <property name="dist.jtreg.dir" location="${dist.dir}/jtreg" />
+     <property name="dist.jtreg.zip" location="${dist.dir}/jtreg.zip" />
++    <property name="dist.jtreg-no-junit.zip" location="${dist.dir}/jtreg-no-junit.zip" />
+     
+     <patternset id="helpset">
+         <include name="*.hs"/>
+@@ -71,6 +72,7 @@
+         </tstamp>
+         <available property="javatest.ok" file="${javatest.home}/COPYRIGHT-javatest.html"/>
+         <available property="jtharness.ok" file="${javatest.home}/legal/copyright.txt"/>
++        <available property="junit.ok" file="${junit.jar}"/>
+     </target>
+     
+     <!-- ********** jtreg ************************************************** -->
+@@ -91,11 +93,15 @@
+     </patternset>
+     
+     <target name="dist-jtreg" 
+-        depends="import-javatest,import-jtharness,jar-jtreg,-dist-jtreg.bin,-dist-jtreg.doc,-dist-jtreg.legal"
++        depends="import-javatest,import-junit,import-jtharness,jar-jtreg,-dist-jtreg.bin,-dist-jtreg.doc,-dist-jtreg.legal"
+         description="build jtreg for distribution">
+         <zip destfile="${dist.jtreg.zip}" filesOnly="true" basedir="${dist.dir}">
+             <include name="jtreg/"/>
+         </zip>
++        <zip destfile="${dist.jtreg-no-junit.zip}" filesOnly="true" basedir="${dist.dir}">
++            <include name="jtreg/"/>
++            <exclude name="**/*junit*"/>
++        </zip>
+     </target>
+     
+     <target name="-dist-jtreg.bin" depends="jar-jtreg,-dist-jtreg.doc">
+@@ -138,7 +144,7 @@
+             <manifest>
+                 <attribute name="Built-By" value="${user.name}"/>
+                 <attribute name="Main-Class" value="com.sun.javatest.regtest.Main"/>
+-                <attribute name="Class-Path" value="javatest.jar jh.jar"/>
++                <attribute name="Class-Path" value="javatest.jar jh.jar junit.jar"/>
+                 <attribute name="jtreg-Name" value="jtreg"/>
+                 <attribute name="jtreg-Version" value="${build.version}"/>
+                 <attribute name="jtreg-Milestone" value="${build.milestone}"/>
+@@ -170,7 +176,7 @@
+             debug="true" debuglevel="source,lines" 
+             srcdir="${src.classes.dir}" 
+             destdir="${build.classes.dir}"
+-            classpath="${build.classes.dir}:${javatest.jar}">
++            classpath="${build.classes.dir}:${javatest.jar}:${junit.jar}">
+             <patternset refid="jtreg.jdk11.files"/>
+             <compilerarg line="-Xlint:deprecation"/>
+         </javac>
+@@ -178,7 +184,7 @@
+             debug="true" debuglevel="source,lines" 
+             srcdir="${src.classes.dir}" 
+             destdir="${build.classes.dir}"
+-            classpath="${build.classes.dir}:${javatest.jar}">
++            classpath="${build.classes.dir}:${javatest.jar}:${junit.jar}">
+             <compilerarg line="-Xlint:all"/>
+             <patternset refid="jtreg.packages"/>
+         </javac>
+@@ -251,7 +257,7 @@
+         <!-- have to set fork=true because otherwise output redirection gets screwed up -->
+         <mkdir dir="${build.dir}/jtreg"/>
+         <java fork="true" failonerror="true"
+-            classname="com.sun.javatest.regtest.Main" classpath="${build.classes.dir}:${javatest.jar}:${jh.jar}"
++            classname="com.sun.javatest.regtest.Main" classpath="${build.classes.dir}:${javatest.jar}:${junit.jar}:${jh.jar}"
+             output="${build.dir}/jtreg/usage.txt">
+             <jvmarg value="-Dprogram=jtreg"/>
+             <arg value="-help"/>
+@@ -278,6 +284,10 @@
+         <copy file="${javatest.jar}" tofile="${dist.jtreg.dir}/lib/javatest.jar"/>
+     </target>
+ 
++    <target name="import-junit" depends="-init" if="junit.ok">
++        <copy file="${junit.jar}" tofile="${dist.jtreg.dir}/lib/junit.jar"/>
++    </target>
++
+     <target name="import-jtharness" depends="-init,import-javahelp" if="jtharness.ok">
+         <copy todir="${dist.jtreg.dir}/legal/jtharness" file="${javatest.home}/legal/copyright.txt"/>
+         <copy todir="${dist.jtreg.dir}/legal/jtharness" file="${javatest.home}/legal/license.txt"/>
+@@ -333,7 +343,7 @@
+  
+     <target name="-test-jtreg.i18n" depends="compile-jtreg,-ant-jct.utils">
+         <!-- have to set fork=true because otherwise output redirection gets screwed up -->
+-        <java fork="true" classname="com.sun.javatest.regtest.Main" classpath="${build.classes.dir}:${javatest.jar}:${jh.jar}"
++        <java fork="true" classname="com.sun.javatest.regtest.Main" classpath="${build.classes.dir}:${javatest.jar}:${junit.jar}:${jh.jar}"
+             output="${build.dir}/jtreg.i18n" >
+             <sysproperty key="javatest.i18n.log" value="com.sun.javatest.regtest"/>
+             <arg value="-help"/>
+diff --git a/make/classes_com_sun_javatest_regtest.gmk b/make/classes_com_sun_javatest_regtest.gmk
+--- a/make/classes_com_sun_javatest_regtest.gmk
++++ b/make/classes_com_sun_javatest_regtest.gmk
+@@ -42,6 +42,7 @@
+ 	IgnoreAction.java \
+ 	IgnoreKind.java \
+ 	JDK.java \
++	JUnitAction.java \
+ 	Main.java \
+ 	MainAction.java \
+ 	Option.java \
+@@ -71,21 +72,21 @@
+ 		$(JAVAFILES.com.sun.javatest.regtest-jdk11:%=$(JAVADIR)/com/sun/javatest/regtest/%) \
+ 		$(JAVATEST_JAR) \
+ 		$(CLASSDIR)
+-	CLASSPATH=$(JAVADIR):$(CLASSDIR):$(JAVATEST_JAR) \
++	CLASSPATH=$(JAVADIR):$(CLASSDIR):$(JAVATEST_JAR):$(JUNIT_JAR) \
+ 		$(J2SEJAVAC) -source 1.2 -target 1.1 -d $(CLASSDIR) $(JAVAFILES.com.sun.javatest.regtest-jdk11:%=$(JAVADIR)/com/sun/javatest/regtest/%)
+ 	echo "classes built at `date`" > $@
+ 
+ $(BUILDDIR)/classes.com.sun.javatest.regtest.ok: \
+ 		$(JAVAFILES.com.sun.javatest.regtest-j2se:%=$(JAVADIR)/com/sun/javatest/regtest/%) \
+ 		$(BUILDDIR)/classes.com.sun.javatest.regtest-jdk11.ok 
+-	CLASSPATH=$(CLASSDIR):$(ANTHOME)/lib/ant.jar:$(JAVATEST_JAR):$(JAVAHELP_JAR) \
++	CLASSPATH=$(CLASSDIR):$(ANTHOME)/lib/ant.jar:$(JAVATEST_JAR):$(JUNIT_JAR):$(JAVAHELP_JAR) \
+ 		$(J2SEJAVAC) -target $(J2SEJAVAC_TARGET) -encoding ISO8859-1 -d $(CLASSDIR) $(JAVAFILES.com.sun.javatest.regtest-j2se:%=$(JAVADIR)/com/sun/javatest/regtest/%)
+ 	echo "classes built at `date`" > $@
+ 
+ TARGETS.com.sun.javatest.regtest += $(BUILDDIR)/classes.com.sun.javatest.regtest.ok
+ 
+ $(JTREG_IMAGEDIR)/lib/jtreg.jar: JAR_MAINCLASS = com.sun.javatest.regtest.Main
+-$(JTREG_IMAGEDIR)/lib/jtreg.jar: JAR_CLASSPATH = javatest.jar jh.jar
++$(JTREG_IMAGEDIR)/lib/jtreg.jar: JAR_CLASSPATH = javatest.jar jh.jar junit.jar
+ 
+ #----------------------------------------------------------------------
+ #
+@@ -268,6 +269,11 @@
+ 
+ #----------------------------------------------------------------------
+ 
++# on some platforms the launcher inserts extra environment variables:
++T6517916-ENVIRONMENT-NORMALIZATIONS = \
++	-e 's|^JAVA_MAIN_CLASS[_0-9]*=|JAVA_MAIN_CLASS=|' \
++	-e '/^JAVA_MAIN_CLASS=/s|MainWrapper|Main|'
++
+ $(BUILDDIR)/T6517916.ok: \
+ 		$(TESTDIR)/javatest/regtest/6517916/T6517916.java \
+ 		$(JTREG_IMAGEDIR)/lib/javatest.jar \
+@@ -287,11 +293,16 @@
+ 		-svm \
+ 		$(TESTDIR)/javatest/regtest/6517916
+ 	$(SED) -e 's|:[^:]*ovm/classes:|:|' -e 's|:[^:]*/6517916:|:|' \
++		$(T6517916-ENVIRONMENT-NORMALIZATIONS) \
+ 		< $(@:%.ok=%)/work/ovm/scratch/T6517916.out \
+ 		> $(@:%.ok=%)/work/ovm/scratch/T6517916.out2
++	$(SED) \
++		$(T6517916-ENVIRONMENT-NORMALIZATIONS) \
++		< $(@:%.ok=%)/work/svm/scratch/T6517916.out \
++		> $(@:%.ok=%)/work/svm/scratch/T6517916.out2
+ 	$(DIFF) \
+ 		$(@:%.ok=%)/work/ovm/scratch/T6517916.out2 \
+-		$(@:%.ok=%)/work/svm/scratch/T6517916.out 
++		$(@:%.ok=%)/work/svm/scratch/T6517916.out2
+ 	echo "test passed at `date`" > $@
+ 
+ TESTS.com.sun.javatest.regtest += $(BUILDDIR)/T6517916.ok
+diff --git a/make/export.gmk b/make/export.gmk
+--- a/make/export.gmk
++++ b/make/export.gmk
+@@ -29,6 +29,7 @@
+ #
+ 
+ ZIPFILES = $(IMAGES_DIR)/jtreg.zip
++ZIPFILES += $(IMAGES_DIR)/jtreg-no-junit.zip
+ VERBOSEZIPFILES = $(ZIPFILES:%.zip=%-$(VERBOSE_ZIP_SUFFIX).zip)
+ 
+ BUILDFILES += $(ZIPFILES)
+diff --git a/make/jtreg.gmk b/make/jtreg.gmk
+--- a/make/jtreg.gmk
++++ b/make/jtreg.gmk
+@@ -25,6 +25,7 @@
+ 
+ 
+ JTREG_ZIP = $(IMAGES_DIR)/jtreg.zip
++JTREG_NO_JUNIT_ZIP = $(IMAGES_DIR)/jtreg-no-junit.zip
+ 	
+ TARGETS.ZIP.jtreg += $(JTREG_IMAGEJARDIR)/javatest.jar
+ TARGETS.ZIP.jtreg += $(JTREG_IMAGEJARDIR)/jh.jar
+@@ -34,5 +35,12 @@
+ 	$(RM) $@
+ 	dir=`pwd`; cd $(IMAGES_DIR); $(ZIP) -rq $$dir/$@ $(@F:%.zip=%)
+ 
++$(JTREG_NO_JUNIT_ZIP): $(JTREG_ZIP)
++	$(RM) $@ $@-tmp.zip
++	$(CP) $(JTREG_ZIP) $@-tmp.zip
++	$(ZIP) -d $@-tmp.zip `(cd $(IMAGES_DIR); find jtreg -type f | grep -i junit)`
++	$(CP) $@-tmp.zip $@
++	$(RM) $@-tmp.zip
++
+ TESTS += \
+ 	$(TESTS.jtreg) 
+diff --git a/make/javatest.gmk b/make/junit.gmk
+copy from make/javatest.gmk
+copy to make/junit.gmk
+--- a/make/javatest.gmk
++++ b/make/junit.gmk
+@@ -1,5 +1,5 @@
+ #
+-# Copyright 2007 Sun Microsystems, Inc.  All Rights Reserved.
++# Copyright 2009 Sun Microsystems, Inc.  All Rights Reserved.
+ # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ #
+ # This code is free software; you can redistribute it and/or modify it
+@@ -23,34 +23,9 @@
+ # have any questions.
+ #
+ 
+-ifdef JTHARNESS_HOME
+-    TARGETS.ZIP.jtreg += $(JTREG_IMAGEDIR)/legal/jtharness/copyright.txt
+-    TARGETS.ZIP.jtreg += $(JTREG_IMAGEDIR)/legal/jtharness/license.txt
+-else
+-    TARGETS.ZIP.jtreg += $(JTREG_IMAGEDIR)/legal/javatest/copyright.html
+-    TARGETS.ZIP.jtreg += $(JTREG_IMAGEDIR)/doc/javatest/javatestGUI.pdf
+-endif
++TARGETS.ZIP.jtreg += $(JTREG_IMAGEJARDIR)/junit.jar
+ 
+-$(JTREG_IMAGEDIR)/legal/jtharness/copyright.txt \
+-$(JTREG_IMAGEDIR)/legal/jtharness/license.txt: \
+-		$(JTREG_IMAGEDIR)/legal/jtharness/%: $(JTHARNESS_HOME)/legal/%
++$(JTREG_IMAGEDIR)/lib/junit.jar: $(JUNIT_JAR)
+ 	$(RM) -f $@
+ 	$(MKDIR) -p $(@D)
+-	$(CP) $< $@
+-
+-$(JTREG_IMAGEDIR)/legal/javatest/copyright.html: \
+-		$(JAVATEST_HOME)/COPYRIGHT-javatest.html
+-	$(RM) -f $@
+-	$(MKDIR) -p $(@D)
+-	$(CP) $< $@
+-
+-$(JTREG_IMAGEDIR)/doc/javatest/javatestGUI.pdf: \
+-		$(JTREG_IMAGEDIR)/%: $(JAVATEST_HOME)/%
+-	$(RM) -f $@
+-	$(MKDIR) -p $(@D)
+-	$(CP) $< $@
+-
+-$(JTREG_IMAGEDIR)/lib/javatest.jar: $(JAVATEST_JAR)
+-	$(RM) -f $@
+-	$(MKDIR) -p $(@D)
+-	$(CP) $(JAVATEST_JAR) $@
++	$(CP) $(JUNIT_JAR) $@
+diff --git a/make/netbeans/jtreg/nbproject/project.xml b/make/netbeans/jtreg/nbproject/project.xml
+--- a/make/netbeans/jtreg/nbproject/project.xml
++++ b/make/netbeans/jtreg/nbproject/project.xml
+@@ -113,7 +113,7 @@
+         <java-data xmlns="http://www.netbeans.org/ns/freeform-project-java/1">
+             <compilation-unit>
+                 <package-root>${root}/src/share/classes</package-root>
+-                <classpath mode="compile">${javatest.jar}:${jh.jar}:${ant.jar}</classpath>
++                <classpath mode="compile">${javatest.jar}:${jh.jar}:${ant.jar}:${junit.jar}</classpath>
+                 <source-level>1.5</source-level>
+             </compilation-unit>
+         </java-data>
+diff --git a/src/share/classes/com/sun/javatest/regtest/Action.java b/src/share/classes/com/sun/javatest/regtest/Action.java
+--- a/src/share/classes/com/sun/javatest/regtest/Action.java
++++ b/src/share/classes/com/sun/javatest/regtest/Action.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1998-2007 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1998-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -511,6 +511,11 @@
+         IGNORE_TEST_SUPPRESSED   = "@ignore suppressed by command line option",
+         IGNORE_TEST_SUPPRESSED_C = "@ignore suppressed by command line option: ",
+ 
++        // junit
++        JUNIT_NO_DRIVER        = "No JUnit 4 driver (install junit.jar next to jtreg.jar)",
++        JUNIT_NO_CLASSNAME     = "No class provided for `junit'",
++        JUNIT_BAD_MAIN_ARG     = "Bad argument provided for class in `junit'",
++
+         // main
+         MAIN_NO_CLASSNAME     = "No class provided for `main'",
+         MAIN_MANUAL_NO_VAL    = "Arguments to `manual' option not supported: ",
+diff --git a/src/share/classes/com/sun/javatest/regtest/JUnitAction.java b/src/share/classes/com/sun/javatest/regtest/JUnitAction.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/com/sun/javatest/regtest/JUnitAction.java
+@@ -0,0 +1,102 @@
++/*
++ * Copyright 1998-2008 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Sun designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Sun in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++
++package com.sun.javatest.regtest;
++
++import java.io.File;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++
++import com.sun.javatest.Status;
++import com.sun.javatest.TestResult;
++import java.util.Iterator;
++
++/**
++ * This class implements the "junit" action, which is a variation of "main".
++ *
++ * @author John R. Rose
++ * @see MainAction
++ */
++public class JUnitAction extends MainAction
++{
++    /**
++     * This method does initial processing of the options and arguments for the
++     * action.  Processing is determined by the requirements of run().
++     *
++     * Verify arguments are not of length 0 and separate them into the options
++     * to java, the classname, and the parameters to the named class.
++     *
++     * Verify that the options are valid for the "junit" action.
++     *
++     * @param opts The options for the action.
++     * @param args The arguments for the actions.
++     * @param reason Indication of why this action was invoked.
++     * @param script The script.
++     * @exception  ParseException If the options or arguments are not expected
++     *             for the action or are improperly formated.
++     */
++    public void init(String[][] opts, String[] args, String reason,
++                     RegressionScript script)
++        throws ParseException
++    {
++        if (args.length == 0)
++            throw new ParseException(JUNIT_NO_CLASSNAME);
++
++        init(opts, args, reason, script, JUnitRunner.class.getName());
++
++        if (getMainArgs().length() != 0)
++            throw new ParseException(JUNIT_BAD_MAIN_ARG);
++
++    } // init()
++
++    protected String getActionName() {
++        return "junit";
++    }
++
++    public static class JUnitRunner {
++        public static void main(String... args) throws Exception {
++            if (args.length != 1)
++                throw new Error("wrong number of arguments");
++            Class<?> mainClass = Class.forName(args[0]);
++            org.junit.runner.Result result;
++            try {
++                result = org.junit.runner.JUnitCore.runClasses(mainClass);
++            } catch (NoClassDefFoundError ex) {
++                throw new Exception(JUNIT_NO_DRIVER, ex);
++            }
++            if (!result.wasSuccessful()) {
++                List<org.junit.runner.notification.Failure> failures = result.getFailures();
++                for (Iterator<org.junit.runner.notification.Failure>
++                                it = failures.iterator(); it.hasNext(); ) {
++                    org.junit.runner.notification.Failure failure = it.next();
++                    System.err.println("JavaTest Message: JUnit Failure: "+failure);
++                }
++                throw new Exception("JUnit test failure");
++            }
++        }
++    }
++
++}
+diff --git a/src/share/classes/com/sun/javatest/regtest/Main.java b/src/share/classes/com/sun/javatest/regtest/Main.java
+--- a/src/share/classes/com/sun/javatest/regtest/Main.java
++++ b/src/share/classes/com/sun/javatest/regtest/Main.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2007 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -1174,11 +1174,20 @@
+         File jtreg_jar = findJar("jtreg.jar", "lib/jtreg.jar", getClass());
+         if (jtreg_jar == null)
+             throw new Fault(i18n, "main.cantFind.jtreg.jar");
+-
++        
++        File junit_jar = null;
++        try {
++            junit_jar = findJar("junit.jar", "lib/junit.jar", org.junit.runner.JUnitCore.class);
++        } catch (NoClassDefFoundError ex) {
++        }
++        if (junit_jar == null) {
++            // Leave a place-holder for the optional jar.
++            junit_jar = new File(jtreg_jar.getParentFile(), "junit.jar");
++        }
++        
+         File childJDKHome = jdk.getAbsoluteFile();
+         File childJava = new File(new File(childJDKHome, "bin"), "java");
+         File childTools  = new File(new File(childJDKHome, "lib"), "tools.jar");
+-
+         File scratchDir = canon(new File(workDirArg, "scratch"));
+ 
+         List<String> c = new ArrayList<String>();
+@@ -1215,6 +1224,9 @@
+ 
+         c.add("-Djavatest.child=true");
+ 
++        if (junit_jar != null)
++            c.add("-Djunit.jar=" + junit_jar.getPath());
++
+         c.add(Main.class.getName());
+ 
+         for (String o: testVMOpts)
+@@ -1543,6 +1555,10 @@
+             if (ignoreKind != null)
+                 rp.setIgnoreKind(ignoreKind);
+ 
++            String junit_jar = System.getProperty("junit.jar");
++            if (junit_jar != null)
++                rp.setJUnitJar(new File(junit_jar));
++
+             return rp;
+         } catch (TestSuite.Fault f) {
+             f.printStackTrace();
+diff --git a/src/share/classes/com/sun/javatest/regtest/MainAction.java b/src/share/classes/com/sun/javatest/regtest/MainAction.java
+--- a/src/share/classes/com/sun/javatest/regtest/MainAction.java
++++ b/src/share/classes/com/sun/javatest/regtest/MainAction.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1998-2007 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1998-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -75,6 +75,19 @@
+                      RegressionScript script)
+         throws ParseException
+     {
++        init(opts, args, reason, script, null);
++    }
++
++    /**
++     * Local version of public init function.
++     * Supports extra driverClass option, to interpose before main class.
++     * @param driverClass actual class to invoke, with main class as first argument
++     */
++    void init(String[][] opts, String[] args, String reason,
++                     RegressionScript script,
++                     String driverClass)
++        throws ParseException
++    {
+         this.script = script;
+         this.reason = reason;
+ 
+@@ -119,6 +132,10 @@
+             timeout = 0;
+         }
+ 
++        if (driverClass != null) {
++            driverFN = driverClass;
++        }
++
+         // separate the arguments into the options to java, the
+         // classname and the parameters to the named class
+         for (int i = 0; i < args.length; i++) {
+@@ -151,6 +168,16 @@
+         }
+     } // init()
+ 
++    public String getJavaArgs() {
++        return javaArgs;
++    }
++    public String getMainArgs() {
++        return mainArgs;
++    }
++    public String getMainClassName() {
++        return buildFN;
++    }
++    
+     @Override
+     public File[] getSourceFiles() {
+         List<File> l = new ArrayList<File>();
+@@ -202,7 +229,7 @@
+         if (!(status = ba.build(buildOpts, buildArgs, SREASON_ASSUMED_BUILD, script)).isPassed())
+             return status;
+ 
+-        section = startAction("main", javaArgs + buildFN + mainArgs, reason);
++        section = startAction(getActionName(), javaArgs + buildFN + mainArgs, reason);
+ 
+         if (script.isCheck()) {
+             status = Status.passed(CHECK_PASS);
+@@ -219,7 +246,21 @@
+ 
+     //----------internal methods------------------------------------------------
+ 
++    protected String getActionName() {
++        return "main";
++    }
++
+     private Status runOtherJVM() throws TestRunException {
++        // Arguments to wrapper:
++        String mainClass = buildFN;
++        String stringifiedArgs = (mainArgs == null ? "" : mainArgs);
++        if (driverFN != null) {
++            if (stringifiedArgs.equals(""))
++                stringifiedArgs = mainClass;
++            else
++                stringifiedArgs = mainClass + " " + stringifiedArgs;
++            mainClass = driverFN;
++        }
+ 
+         // WRITE ARGUMENT FILE
+         String mainArgFileName = script.absTestClsDir() + FILESEP + buildFN
+@@ -227,8 +268,8 @@
+         FileWriter fw;
+         try {
+             fw = new FileWriter(mainArgFileName);
+-            fw.write(buildFN + "\0");
+-            fw.write((mainArgs == null ? "" : mainArgs) + "\0" );
++            fw.write(mainClass + "\0");
++            fw.write(stringifiedArgs + "\0" );
+             fw.close();
+         } catch (IOException e) {
+             return Status.error(MAIN_CANT_WRITE_ARGS);
+@@ -287,7 +328,7 @@
+         command.add("com.sun.javatest.regtest.MainWrapper");
+         command.add(mainArgFileName);
+ 
+-        String[] mArgs = StringArray.splitWS(mainArgs);
++        String[] mArgs = StringArray.splitWS(stringifiedArgs);
+         for (int i = 0; i < mArgs.length; i++)
+             command.add(mArgs[i]);
+ 
+@@ -305,7 +346,7 @@
+         PrintWriter sysErr = section.createOutput("System.err");
+         try {
+             if (showCmd)
+-                JTCmd("main", cmdArgs, section);
++                JTCmd(getActionName(), cmdArgs, section);
+ //          for (int i = 0; i < cmdArgs.length; i++)
+ //              System.out.print(" " + cmdArgs[i]);
+ //          System.out.println();
+@@ -394,6 +435,16 @@
+                 //return Status.error(MAIN_SECMGR_BAD);
+             }
+         }
++        
++        String mainClass = buildFN;
++        String stringifiedArgs = (mainArgs == null ? "" : mainArgs);
++        if (driverFN != null) {
++            if (stringifiedArgs.equals(""))
++                stringifiedArgs = mainClass;
++            else
++                stringifiedArgs = mainClass + " " + stringifiedArgs;
++            mainClass = driverFN;
++        }
+ 
+         ByteArrayOutputStream newOut = new ByteArrayOutputStream();
+         ByteArrayOutputStream newErr = new ByteArrayOutputStream();
+@@ -417,15 +468,21 @@
+                     }
+                 }
+             }
+-            ClassLoader loader = new URLClassLoader(urls.toArray(new URL[urls.size()]));
+-            Class<?> c = loader.loadClass(buildFN);
++            Class<?> c;
++            if (driverFN == null) {
++                ClassLoader loader = new URLClassLoader(urls.toArray(new URL[urls.size()]));
++                c = loader.loadClass(buildFN);
++            } else {
++                c = Class.forName(driverFN);
++            }
++
+             Class<?>[] argTypes = { String[].class };
+             Method method = c.getMethod("main", argTypes);
+-
++            
+             // XXX 4/1 possible to use splitSeparator instead?
+-            String[] tmpArgs = StringArray.splitWS(mainArgs);
++            String[] tmpArgs = StringArray.splitWS(stringifiedArgs);
+             Object[] runArgs = {tmpArgs};
+-
++            
+             Status stat = redirectOutput(psOut, psErr);
+             if (!stat.isPassed()) {
+                 return stat;
+@@ -489,14 +546,14 @@
+             e.printStackTrace(new PrintWriter(psErr, true));
+             psErr.println();
+             psErr.println("JavaTest Message: main() method must be in a public class named");
+-            psErr.println("JavaTest Message: " + buildFN + " in file " + buildFN + ".java");
++            psErr.println("JavaTest Message: " + mainClass + " in file " + mainClass + ".java");
+             psErr.println();
+             status = Status.error(MAIN_CANT_LOAD_TEST + e);
+         } catch (NoSuchMethodException e) {
+             e.printStackTrace(new PrintWriter(psErr, true));
+             psErr.println();
+             psErr.println("JavaTest Message: main() method must be in a public class named");
+-            psErr.println("JavaTest Message: " + buildFN + " in file " + buildFN + ".java");
++            psErr.println("JavaTest Message: " + mainClass + " in file " + mainClass + ".java");
+             psErr.println();
+             status = Status.error(MAIN_CANT_FIND_MAIN);
+         } finally {
+@@ -697,6 +754,7 @@
+ 
+     private String  javaArgs = "";
+     private String  mainArgs = "";
++    private String  driverFN = null;
+     private String  buildFN  = null;
+     private String  policyFN = null;
+     private String  secureFN = null;
+diff --git a/src/share/classes/com/sun/javatest/regtest/RegressionParameters.java b/src/share/classes/com/sun/javatest/regtest/RegressionParameters.java
+--- a/src/share/classes/com/sun/javatest/regtest/RegressionParameters.java
++++ b/src/share/classes/com/sun/javatest/regtest/RegressionParameters.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2001-2007 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 2001-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -139,6 +139,7 @@
+     private static final String TEST_JAVA_OPTIONS = ".testJavaOpts";
+     private static final String IGNORE = ".ignore";
+     private static final String RETAIN_ARGS = ".retain";
++    private static final String JUNIT = ".junit";
+     
+     @Override
+     public void load(Map data, boolean checkChecksum) throws Interview.Fault {
+@@ -182,6 +183,10 @@
+         v = (String) data.get(prefix + RETAIN_ARGS);
+         if (v != null)
+             setRetainArgs(Arrays.asList(StringArray.splitSeparator("\n", v)));
++
++        v = (String) data.get(prefix + JUNIT);
++        if (v != null)
++            setJUnitJar(new File(v));
+     }
+     
+     @SuppressWarnings("unchecked")
+@@ -214,7 +219,10 @@
+             data.put(prefix + TEST_COMPILER_OPTIONS, StringUtils.join(testCompilerOpts, "\n"));
+         
+         if (testJavaOpts != null) 
+-            data.put(prefix + TEST_JAVA_OPTIONS, StringUtils.join(testJavaOpts, "\n")); 
++            data.put(prefix + TEST_JAVA_OPTIONS, StringUtils.join(testJavaOpts, "\n"));
++
++        if (junitJar != null)
++            data.put(prefix + JUNIT, junitJar.getPath());
+     }
+ 
+     //---------------------------------------------------------------------
+@@ -288,7 +296,23 @@
+         return jdk;
+     }
+ 
+-    JDK jdk; 
++    JDK jdk;
++
++    //---------------------------------------------------------------------
++
++    void setJUnitJar(File junitJar) {
++        junitJar.getClass(); // null check
++        this.junitJar = junitJar;
++    }
++
++    File getJUnitJar() {
++        if (junitJar == null) {
++            File jtClsDir = ProductInfo.getJavaTestClassDir();
++            junitJar = new File(jtClsDir.getParentFile(), "junit.jar");
++        }
++        return junitJar;
++    }
++    private File junitJar;
+ 
+     //---------------------------------------------------------------------
+     
+@@ -438,10 +462,10 @@
+             javaTestClassPath = jtClsDir.getPath();
+             
+             int index = javaTestClassPath.indexOf("javatest.jar");
+-            if (index > 0) {        
++            if (index > 0) {
++                String installDir = javaTestClassPath.substring(0, index);
+                 // append jtreg.jar to the path 
+-                String jtregClassDir = 
+-                    javaTestClassPath.substring(0, index) + "jtreg.jar";
++                String jtregClassDir = installDir + "jtreg.jar";
+                 javaTestClassPath += PATHSEP + jtregClassDir;
+             }
+         }
+diff --git a/src/share/classes/com/sun/javatest/regtest/RegressionScript.java b/src/share/classes/com/sun/javatest/regtest/RegressionScript.java
+--- a/src/share/classes/com/sun/javatest/regtest/RegressionScript.java
++++ b/src/share/classes/com/sun/javatest/regtest/RegressionScript.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 1997-2007 Sun Microsystems, Inc.  All Rights Reserved.
++ * Copyright 1997-2009 Sun Microsystems, Inc.  All Rights Reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -32,9 +32,11 @@
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.LinkedHashSet;
++import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.regex.Pattern;
+ 
+ import com.sun.javatest.Script;
+ import com.sun.javatest.Status;
+@@ -42,9 +44,6 @@
+ import com.sun.javatest.TestEnvironment;
+ import com.sun.javatest.TestResult;
+ 
+-import com.sun.javatest.util.Fifo; 
+-import java.util.regex.Pattern;
+-
+ /**
+   * This class interprets the TestDescription as specified by the JDK tag
+   * specification.
+@@ -82,9 +81,17 @@
+                 
+         try {
+             setLibList(td.getParameter("library"));
+-            
+-            Fifo actionList = parseActions(actions, true);
+-            
++
++            LinkedList<Action> actionList = parseActions(actions, true);
++
++            boolean needJUnit = false;
++            for (Action a: actionList) {
++                if (a instanceof JUnitAction)
++                    needJUnit = true;
++            }
++            if (needJUnit)
++                addClsLib(params.getJUnitJar());
++
+             initScratchDirectory();
+             
+             testResult = getTestResult();
+@@ -97,7 +104,7 @@
+                 status = Status.error(td.getParameter("error"));
+             else {
+                 while (! actionList.isEmpty()) {
+-                    Action action = (Action) actionList.remove();
++                    Action action = actionList.remove();
+                     status = action.run();
+                     if (status.getType() != Status.PASSED)
+                         break;
+@@ -122,10 +129,10 @@
+         try {
+             setLibList(td.getParameter("library"));
+             String actions = td.getParameter("run");
+-            Fifo actionList = parseActions(actions, false);
++            LinkedList<Action> actionList = parseActions(actions, false);
+             Set<File> files = new LinkedHashSet<File>();
+             while (! actionList.isEmpty()) {
+-                Action action = (Action) actionList.remove();
++                Action action = actionList.remove();
+                 File[] a = action.getSourceFiles();
+                 if (a != null)
+                     files.addAll(Arrays.asList(a));
+@@ -157,8 +164,8 @@
+      * is found, a ParseActionsException will be thrown, giving a detail message.
+      * @return a Fifo of Action objects
+      */
+-    Fifo parseActions(String actions, boolean stopOnError) throws ParseActionsException, ParseException {   
+-        Fifo actionList = new Fifo(2);
++    LinkedList<Action> parseActions(String actions, boolean stopOnError) throws ParseActionsException, ParseException {
++        LinkedList<Action> actionList = new LinkedList<Action>();
+         String[] runCmds = StringArray.splitTerminator(LINESEP, actions);
+         populateActionTable();
+         
+@@ -193,7 +200,7 @@
+                 }
+                 Action action = (Action)(c.newInstance());
+                 action.init(opts, args, getReason(tokens), this);
+-                actionList.insert(action);
++                actionList.add(action);
+             } catch (InstantiationException e) {
+                 if (stopOnError)
+                     throw new ParseActionsException(CANT_INSTANTIATE + c + NOT_EXT_ACTION);
+@@ -414,6 +421,7 @@
+         addAction("compile", CompileAction.class);
+         addAction("ignore", IgnoreAction.class);
+         addAction("main", MainAction.class);
++        addAction("junit", JUnitAction.class);
+         addAction("shell", ShellAction.class);
+     } // populateActionTable()
+ 
+@@ -759,7 +767,22 @@
+             System.arraycopy(cacheAbsSrcLibList, 0, cacheJavaSrcPath, 1,
+                              cacheAbsSrcLibList.length);
+         }
+-        return locateFile(fileName, cacheJavaSrcPath);
++        try {
++            return locateFile(fileName, cacheJavaSrcPath);
++        } catch (TestRunException ex) {
++            // Allow the file to define a class in a package,
++            // even though it is directly inside the test dir.
++            int sep = fileName.lastIndexOf(FILESEP);
++            if (sep >= 0) {
++                String baseName = fileName.substring(sep+1);
++                try {
++                    File[] path0 = { absTestSrcDir() };
++                    return locateFile(baseName, path0);
++                } catch (TestRunException ignoreEx) {
++                }
++            }
++            throw ex;
++        }
+     } // locateJavaSrc()
+ 
+     /**
+@@ -799,13 +822,31 @@
+         }
+     } // setLibList()
+ 
++    private void addClsLib(File lib) {
++        assert cacheAbsClsLibListStr == null;
++        File[] newList = new File[cacheAbsClsLibList.length + 1];
++        System.arraycopy(cacheAbsClsLibList, 0, newList, 0, cacheAbsClsLibList.length);
++        newList[newList.length - 1] = lib;
++        cacheAbsClsLibList = newList;
++    } // addClsLib()
++
+     private String cacheAbsClsLibListStr;
+     String absClsLibListStr() throws TestClassException {
+         if (cacheAbsClsLibListStr == null) {
+             cacheAbsClsLibListStr = "";
+             for (int i = 0; i < cacheAbsClsLibList.length; i++) {
++                // It is not clear why the first of the following two statements
++                // was commented out in favor of the second. With the addition
++                // of addClsLib(), above, it is important to use cacheAbsClsLibList
++                // instead of recalculating the entries from  cacheRelSrcLibList.
++                // It is possible the change was made as a defensive measure when
++                // "if (hasEnv()) { ..}" was added to setLibList for the benefit
++                // of the GUI (i.e. getSourceFiles()).  But, absClsLibListStr()
++                // should only be called when hasEnv() is true, implying that
++                // cacheAbsClsLibList is already initialized correctly.
+ //              String curr = cacheAbsClsLibList[i];
+-                File curr = new File(absTestClsDir(), cacheRelSrcLibList[i]);
++//                File curr = new File(absTestClsDir(), cacheRelSrcLibList[i]);
++                File curr = cacheAbsClsLibList[i];
+                 cacheAbsClsLibListStr += curr.getPath() + PATHSEP;
+             }
+         }
+diff --git a/src/share/classes/com/sun/javatest/regtest/RegressionTestFinder.java b/src/share/classes/com/sun/javatest/regtest/RegressionTestFinder.java
+--- a/src/share/classes/com/sun/javatest/regtest/RegressionTestFinder.java
++++ b/src/share/classes/com/sun/javatest/regtest/RegressionTestFinder.java
+@@ -184,6 +184,9 @@
+         if (match(value, SHELL_ACTION))
+             addKeywords += " shell";
+ 
++        if (match(value, JUNIT_ACTION))
++            addKeywords += " junit";
++
+         if (match(value, IGNORE_ACTION))
+             addKeywords += " ignore";
+ 
+@@ -558,6 +561,7 @@
+         OTHERVM_OPTION = Pattern.compile(".*/othervm[/ \t].*",    Pattern.DOTALL),
+         MANUAL_OPTION  = Pattern.compile(".*/manual[/= \t].*",    Pattern.DOTALL),
+         SHELL_ACTION   = Pattern.compile(".*[ \t]shell[/ \t].*",  Pattern.DOTALL),
++        JUNIT_ACTION   = Pattern.compile(".*[ \t]junit[/ \t].*",  Pattern.DOTALL),
+         IGNORE_ACTION  = Pattern.compile(".*[ \t]ignore[/ \t].*", Pattern.DOTALL);
+ 
+     //----------member variables------------------------------------------------
+diff --git a/src/share/doc/javatest/regtest/tag-spec.txt b/src/share/doc/javatest/regtest/tag-spec.txt
+--- a/src/share/doc/javatest/regtest/tag-spec.txt
++++ b/src/share/doc/javatest/regtest/tag-spec.txt
+@@ -1,6 +1,6 @@
+ 	      The JDK Test Framework: Tag Language Specification
+               Comments and questions to: jtreg-comments@sun.com
+-			         1.25 06/10/24
++			         1.26 09/10/10
+ 
+ 
+ This is a specification document, not a tutorial.  For more basic information
+@@ -307,6 +307,36 @@
+ main/othervm actions is also discouraged; the /policy and /secure options
+ should be used instead.
+ 
++    junit[/fail][/manual][/othervm][/policy=<file>][/secure=<class>]
++        [/timeout=<seconds>] <vm-opt>* <class>
++
++Invoke the specified class as a JUnit 4.5 test.  Roughly equivalent to "@run
++main org.junit.runner.JUnitCore <class>".  All initial argument tokens
++beginning with a dash are considered to be VM options; the first argument not
++beginning with a dash is the <class> to be invoked.  No additional arguments
++are allowed.  Passes only if the main method of JUnitCore returns normally and
++does not cause an exception to be thrown, from the main thread or from any
++other thread.  As with a "main" action, a "junit" action is considered to be
++finished when the main method of JUnitCore returns.
++
++The named <class> will be compiled on demand, just as though an "@run build
++<class>" action had been inserted before this action.  If this action requires
++classes other than <class> to be up to date, insert an appropriate build action
++before this action.  If any <vm-opt>s are given then /othervm should be
++specified.
++
++The use of the @library tag, and of the /othervm, /manual, /policy, and /secure
++options, are the same for a "junit" action as for a "main" action; see above.
++
++In order to use a "junit" action, the JUnit 4.5 jar file may need to be placed
++manually alongside the jtreg and javatest jar files in the jtreg installation.
++If junit.jar file is not found, and if no class named org.junit.runner.JUnitCore
++can be found, any "junit" actions will fail, regardless of whether the /fail
++option was selected.
++
++This action executes all the tests in a single JUnit test file.  All the tests
++in that one file will be grouped as a single jtreg test for reporting purposes.
++
+     applet[/fail][/manual[=(yesno|done)]][/othervm][/policy=<file>]
+         [/secure=<class>][/timeout=<sec>] <html-file>
+ 
+diff --git a/src/share/test/javatest/regtest/Basic.java b/src/share/test/javatest/regtest/Basic.java
+--- a/src/share/test/javatest/regtest/Basic.java
++++ b/src/share/test/javatest/regtest/Basic.java
+@@ -143,6 +143,7 @@
+         // action counts
+         int numApplet = 0, numBuild  = 0, numClean  = 0, numCompile = 0,
+             numIgnore = 0, numMain   = 0, numShell  = 0, numMisc    = 0;
++        int numJUnit  = 0;
+ 
+         // applet
+         numPassed += 2; numFailed += 4; numError  += 11;
+@@ -169,6 +170,10 @@
+         numPassed += 0; numFailed += 0; numError  += 2;
+         numIgnore += 2;
+ 
++        // junit
++        numPassed += 6; numFailed += 6; numError  += 8 + 8 /*Pass/Fail, badarg*/;
++        numJUnit  += 28;
++
+         // main
+         numPassed += 12; numFailed += 19; numError  += 12;
+         numMain   += 43;
+@@ -192,6 +197,7 @@
+         actionTable.put("compile", Integer.valueOf(numCompile));
+         actionTable.put("ignore",  Integer.valueOf(numIgnore));
+         actionTable.put("main",    Integer.valueOf(numMain));
++        actionTable.put("junit",   Integer.valueOf(numJUnit));
+         actionTable.put("shell",   Integer.valueOf(numShell));
+         actionTable.put("misc",    Integer.valueOf(numMisc));
+ 
+@@ -407,7 +413,7 @@
+         REP_ACTION           = "action: ";
+ 
+     private static final String[] actionList = {
+-        "applet", "build", "clean", "compile", "ignore", "main", "shell", "misc"
++        "applet", "build", "clean", "compile", "ignore", "junit", "main", "shell", "misc"
+     };
+ 
+     private static final String[] statusList = {
+diff --git a/src/share/test/javatest/regtest/data/basic/junit/BadTag.java b/src/share/test/javatest/regtest/data/basic/junit/BadTag.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/test/javatest/regtest/data/basic/junit/BadTag.java
+@@ -0,0 +1,65 @@
++/*
++ * Copyright 1998-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++
++/* @test
++ * @summary Error: Parse Exception: No class provided for `junit'
++ * @run junit 
++ */
++
++/* @test
++ * @summary Error: Parse Exception: Arguments to `manual' option not supported:  bad_arg
++ * @run junit/manual=bad_arg BadTag
++ */
++
++/* @test
++ * @summary Error: Parse Exception: Bad integer specification: bruno
++ * @run junit/timeout=bruno BadTag
++ */
++
++/* @test
++ * @summary Error: Parse Exception: Bad option for junit: bad_opt
++ * @run junit/bad_opt BadTag
++ */
++
++/* @test
++ * @summary Error: Parse Exception: -vmopt: vm option(s) found, need to specify /othervm
++ * @run junit -vmopt BadTag
++ */
++
++/* @test
++ * @summary Error: Parse Exception: No class provided for `junit'
++ * @run junit/othervm -vmopt
++ */
++
++// NOTE: The following two tests should fail for different reasons when the test
++// version of JDK is changed to JDK1.2.
++
++/* @test
++ * @summary Error: Parse Exception: Option not allowed using provided test JDK: secure
++ * @run junit/secure=secure BadTag
++ */
++
++/* @test
++ * @summary Error: Parse Exception: Option not allowed using provided test JDK: policy
++ * @run junit/policy=strict.policy BadTag
++ */
+diff --git a/src/share/test/javatest/regtest/data/basic/junit/BadTestClass.java b/src/share/test/javatest/regtest/data/basic/junit/BadTestClass.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/test/javatest/regtest/data/basic/junit/BadTestClass.java
+@@ -0,0 +1,36 @@
++/*
++ * Copyright 1998-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++
++/* @test
++ * @summary Failed: `main' threw exception: java.lang.Exception: JUnit test failure
++ * @run junit BadTestClass
++ */
++
++/* @test
++ * @summary Failed: `main' threw exception: java.lang.Exception: JUnit test failure
++ * @run junit/othervm BadTestClass
++ */
++
++class BadTestClass
++{
++}
+diff --git a/src/share/test/javatest/regtest/data/basic/junit/CantFindSrc.java b/src/share/test/javatest/regtest/data/basic/junit/CantFindSrc.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/test/javatest/regtest/data/basic/junit/CantFindSrc.java
+@@ -0,0 +1,27 @@
++/*
++ * Copyright 1999-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++
++/* @test
++ * @summary Error: Can't find source file: CannotFindSrc.java  in directory-list: .../data/basic/junit
++ * @run junit CannotFindSrc
++ */
+diff --git a/src/share/test/javatest/regtest/data/basic/junit/Fail.java b/src/share/test/javatest/regtest/data/basic/junit/Fail.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/test/javatest/regtest/data/basic/junit/Fail.java
+@@ -0,0 +1,81 @@
++/*
++ * Copyright 1998-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++
++/* @test
++ * @summary Failed: `main' threw exception: java.lang.Exception: JUnit test failure
++ * @run junit Fail
++ */
++
++/* @test
++ * @summary Passed: Execution failed as expected
++ * @run junit/fail Fail
++ */
++
++/* @test
++ * @summary Error: Parse Exception: Bad argument provided for class in `junit'
++ * @run junit Fail badarg
++ */
++
++/* @test
++ * @summary Error: Parse Exception: Bad argument provided for class in `junit'
++ * @run junit/fail Fail badarg
++ */
++
++/* @test
++ * @summary Failed: `main' threw exception: java.lang.Exception: JUnit test failure
++ * @run junit/othervm Fail
++ */
++
++/* @test
++ * @summary Passed: Execution failed as expected
++ * @run junit/othervm/fail Fail
++ */
++
++/* @test
++ * @summary Error: Parse Exception: Bad argument provided for class in `junit'
++ * @run junit/othervm Fail badarg
++ */
++
++/* @test
++ * @summary Error: Parse Exception: Bad argument provided for class in `junit'
++ * @run junit/othervm/fail Fail badarg
++ */
++
++import org.junit.*;
++import static org.junit.Assert.*;
++
++public class Fail
++{
++    @Test
++    public void test1() {
++    }
++
++    @Test
++    public void test2() {
++        assertSame(2+2, 5);
++    }
++
++    @Test
++    public void test3() {
++    }
++}
+diff --git a/src/share/test/javatest/regtest/data/basic/junit/InNamedPkg.java b/src/share/test/javatest/regtest/data/basic/junit/InNamedPkg.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/test/javatest/regtest/data/basic/junit/InNamedPkg.java
+@@ -0,0 +1,38 @@
++/*
++ * Copyright 1998-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++
++/* @test
++ * @summary Passed: Execution successful
++ * @run junit org.sun.namedpkg.InNamedPkg
++ */
++package org.sun.namedpkg;
++
++import org.junit.*;
++import static org.junit.Assert.*;
++
++public class InNamedPkg
++{
++    @Test
++    public void test1() {
++    }
++}
+diff --git a/src/share/test/javatest/regtest/data/basic/junit/Pass.java b/src/share/test/javatest/regtest/data/basic/junit/Pass.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/test/javatest/regtest/data/basic/junit/Pass.java
+@@ -0,0 +1,80 @@
++/*
++ * Copyright 1998-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++
++/* @test
++ * @summary Passed: Execution successful
++ * @run junit Pass
++ */
++
++/* @test
++ * @summary Failed: Execution passed unexpectedly
++ * @run junit/fail Pass
++ */
++
++/* @test
++ * @summary Error: Parse Exception: Bad argument provided for class in `junit'
++ * @run junit Pass badarg
++ */
++
++/* @test
++ * @summary Error: Parse Exception: Bad argument provided for class in `junit'
++ * @run junit/fail Pass badarg
++ */
++
++/* @test
++ * @summary Passed: Execution successful
++ * @run junit/othervm Pass
++ */
++
++/* @test
++ * @summary Failed: Execution passed unexpectedly
++ * @run junit/othervm/fail Pass
++ */
++
++/* @test
++ * @summary Error: Parse Exception: Bad argument provided for class in `junit'
++ * @run junit/othervm Pass badarg
++ */
++
++/* @test
++ * @summary Error: Parse Exception: Bad argument provided for class in `junit'
++ * @run junit/othervm/fail Pass badarg
++ */
++
++import org.junit.*;
++import static org.junit.Assert.*;
++
++public class Pass
++{
++    @Test
++    public void test1() {
++    }
++
++    @Test
++    public void test2() {
++    }
++
++    @Test
++    public void test3() {
++    }
++}
+diff --git a/src/share/test/javatest/regtest/data/basic/junit/VMOptsPassed.java b/src/share/test/javatest/regtest/data/basic/junit/VMOptsPassed.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/test/javatest/regtest/data/basic/junit/VMOptsPassed.java
+@@ -0,0 +1,48 @@
++/*
++ * Copyright 1998-2009 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++
++/* @test
++ * @summary Passed: Execution successful
++ * @run junit/othervm -DtestSysProp=testVal VMOptsPassed
++ */
++
++import org.junit.*;
++import static org.junit.Assert.*;
++
++public class VMOptsPassed
++{
++    @Test
++    public void test1() {
++        String sysprop = System.getProperty("testSysProp");
++        if (sysprop == null) {
++            throw new RuntimeException("unable to find passed system property!");
++        } else {
++            if (!sysprop.equals("testVal"))
++                throw new RuntimeException("passed system property incorrectly set " +
++                                           "expected: testVal " +
++                                           "found: " + sysprop);
++            else
++                System.out.println("found passed system property:  testSysProp=" + sysprop);
++        }
++    }
++}
+diff --git a/src/share/test/javatest/regtest/data/basic/main/BadTag.java b/src/share/test/javatest/regtest/data/basic/main/BadTag.java
+--- a/src/share/test/javatest/regtest/data/basic/main/BadTag.java
++++ b/src/share/test/javatest/regtest/data/basic/main/BadTag.java
+@@ -32,7 +32,7 @@
+  */
+ 
+ /* @test
+- * @summary Error: Parse Exception: Bad integer speciication: bruno
++ * @summary Error: Parse Exception: Bad integer specification: bruno
+  * @run main/timeout=bruno BadTag
+  */
+ 

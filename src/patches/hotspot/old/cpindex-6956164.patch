@@ -1,0 +1,135 @@
+6956164: nightly regressions from 6939207
+Summary: Fix errors in 6939207.
+Reviewed-by: kvn
+
+The constant pool index refactoring (6939207) caused three regressions in the nightly tests:
+
+1. The verifier is no longer able to work on methods which have already been verified and rewritten.
+
+Fix:  Add a cut-out to detect this "recursive verification" case.  If after processing a bytecode the verifier notices that it has recursively re-verified the current class, it will stop the first verification.
+
+2. Bytecode instruction length functions need to produce zero or negative results for invalid bytecodes.  This affects the processing of invalid inputs.
+
+Fix:  Remove an assert of bytecode validity on the length functions.
+
+3. Typos in bytecodeStream.hpp.
+
+Fix:  Change an occurrence of get_index_u4 to has_index_u4, and adjust a return type.
+
+diff --git a/src/share/vm/classfile/verifier.cpp b/src/share/vm/classfile/verifier.cpp
+--- a/src/share/vm/classfile/verifier.cpp
++++ b/src/share/vm/classfile/verifier.cpp
+@@ -254,6 +254,9 @@
+   int num_methods = methods->length();
+ 
+   for (int index = 0; index < num_methods; index++) {
++    // Check for recursive re-verification before each method.
++    if (was_recursively_verified())  return;
++
+     methodOop m = (methodOop)methods->obj_at(index);
+     if (m->is_native() || m->is_abstract()) {
+       // If m is native or abstract, skip it.  It is checked in class file
+@@ -262,6 +265,12 @@
+     }
+     verify_method(methodHandle(THREAD, m), CHECK_VERIFY(this));
+   }
++
++  if (_verify_verbose || TraceClassInitialization) {
++    if (was_recursively_verified())
++      tty->print_cr("Recursive verification detected for: %s",
++          _klass->external_name());
++  }
+ }
+ 
+ void ClassVerifier::verify_method(methodHandle m, TRAPS) {
+@@ -326,6 +335,9 @@
+                                 // instruction in sequence
+   Bytecodes::Code opcode;
+   while (!bcs.is_last_bytecode()) {
++    // Check for recursive re-verification before each bytecode.
++    if (was_recursively_verified())  return;
++
+     opcode = bcs.raw_next();
+     u2 bci = bcs.bci();
+ 
+@@ -1470,20 +1482,9 @@
+ 
+   // In some situations, bytecode rewriting may occur while we're verifying.
+   // In this case, a constant pool cache exists and some indices refer to that
+-  // instead.  Get the original index for the tag check
+-  constantPoolCacheOop cache = cp->cache();
+-  if (cache != NULL &&
+-       ((types == (1 <<  JVM_CONSTANT_InterfaceMethodref)) ||
+-        (types == (1 <<  JVM_CONSTANT_Methodref)) ||
+-        (types == (1 <<  JVM_CONSTANT_Fieldref)))) {
+-    int native_index = index;
+-    if (Bytes::is_Java_byte_ordering_different()) {
+-      native_index = Bytes::swap_u2(index);
+-    }
+-    assert((native_index >= 0) && (native_index < cache->length()),
+-      "Must be a legal index into the cp cache");
+-    index = cache->entry_at(native_index)->constant_pool_index();
+-  }
++  // instead.  Be sure we don't pick up such indices by accident.
++  // We must check was_recursively_verified() before we get here.
++  guarantee(cp->cache() == NULL, "not rewritten yet");
+ 
+   verify_cp_index(cp, index, CHECK_VERIFY(this));
+   unsigned int tag = cp->tag_at(index).value();
+diff --git a/src/share/vm/classfile/verifier.hpp b/src/share/vm/classfile/verifier.hpp
+--- a/src/share/vm/classfile/verifier.hpp
++++ b/src/share/vm/classfile/verifier.hpp
+@@ -158,6 +158,16 @@
+   methodHandle        _method; // current method being verified
+   VerificationType    _this_type; // the verification type of the current class
+ 
++  // Some recursive calls from the verifier to the name resolver
++  // can cause the current class to be re-verified and rewritten.
++  // If this happens, the original verification should not continue,
++  // because constant pool indexes will have changed.
++  // The rewriter is preceded by the verifier.  If the verifier throws
++  // an error, rewriting is prevented.  Also, rewriting always precedes
++  // bytecode execution or compilation.  Thus, is_rewritten implies
++  // that a class has been verified and prepared for execution.
++  bool was_recursively_verified() { return _klass->is_rewritten(); }
++
+  public:
+   enum {
+     BYTECODE_OFFSET = 1,
+diff --git a/src/share/vm/interpreter/bytecodeStream.hpp b/src/share/vm/interpreter/bytecodeStream.hpp
+--- a/src/share/vm/interpreter/bytecodeStream.hpp
++++ b/src/share/vm/interpreter/bytecodeStream.hpp
+@@ -212,5 +212,5 @@
+                                                    return bytecode()->get_index_u2_cpcache(raw_code()); }
+   int             get_index_u4() const           { assert_raw_stream(false);
+                                                    return bytecode()->get_index_u4(raw_code()); }
+-  int             has_index_u4() const           { return bytecode()->get_index_u4(raw_code()); }
++  bool            has_index_u4() const           { return bytecode()->has_index_u4(raw_code()); }
+ };
+diff --git a/src/share/vm/interpreter/bytecodes.cpp b/src/share/vm/interpreter/bytecodes.cpp
+--- a/src/share/vm/interpreter/bytecodes.cpp
++++ b/src/share/vm/interpreter/bytecodes.cpp
+@@ -86,6 +86,7 @@
+       return (len > 0 && len == (int)len) ? len : -1;
+     }
+   }
++  // Note: Length functions must return <=0 for invalid bytecodes.
+   return 0;
+ }
+ 
+diff --git a/src/share/vm/interpreter/bytecodes.hpp b/src/share/vm/interpreter/bytecodes.hpp
+--- a/src/share/vm/interpreter/bytecodes.hpp
++++ b/src/share/vm/interpreter/bytecodes.hpp
+@@ -353,8 +353,10 @@
+   static const char* name           (Code code)    { check(code);      return _name          [code]; }
+   static BasicType   result_type    (Code code)    { check(code);      return _result_type   [code]; }
+   static int         depth          (Code code)    { check(code);      return _depth         [code]; }
+-  static int         length_for     (Code code)    { check(code);      return _lengths       [code] & 0xF; }
+-  static int         wide_length_for(Code code)    { check(code);      return _lengths       [code] >> 4; }
++  // Note: Length functions must return <=0 for invalid bytecodes.
++  // Calling check(code) in length functions would throw an unwanted assert.
++  static int         length_for     (Code code)    { /*no check*/      return _lengths       [code] & 0xF; }
++  static int         wide_length_for(Code code)    { /*no check*/      return _lengths       [code] >> 4; }
+   static bool        can_trap       (Code code)    { check(code);      return has_all_flags(code, _bc_can_trap, false); }
+   static Code        java_code      (Code code)    { check(code);      return _java_code     [code]; }
+   static bool        can_rewrite    (Code code)    { check(code);      return has_all_flags(code, _bc_can_rewrite, false); }

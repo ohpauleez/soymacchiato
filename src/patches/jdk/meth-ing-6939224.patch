@@ -1,0 +1,1634 @@
+6939224: MethodHandle.invokeGeneric needs to perform the correct set of conversions
+Summary: JDK changes which run atop the corresponding JVM hook
+Reviewed-by: never, twisti
+
+diff --git a/src/share/classes/java/dyn/MethodHandle.java b/src/share/classes/java/dyn/MethodHandle.java
+--- a/src/share/classes/java/dyn/MethodHandle.java
++++ b/src/share/classes/java/dyn/MethodHandle.java
+@@ -329,6 +329,7 @@
+     public final Object invokeVarargs(Object... arguments) throws Throwable {
+         int argc = arguments == null ? 0 : arguments.length;
+         MethodType type = type();
++        if (type.parameterCount() != argc)  throw badParameterCount(type, argc);
+         if (argc <= 10) {
+             MethodHandle invoker = MethodHandles.invokers(type).genericInvoker();
+             switch (argc) {
+@@ -377,6 +378,10 @@
+         return invokeVarargs(arguments.toArray());
+     }
+ 
++    private static WrongMethodTypeException badParameterCount(MethodType type, int argc) {
++        return new WrongMethodTypeException(type+" does not take "+argc+" parameters");
++    }
++
+     /*  --- this is intentionally NOT a javadoc yet ---
+      * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+      * Produce an adapter method handle which adapts the type of the
+@@ -446,7 +451,7 @@
+      * @throws IllegalArgumentException if the conversion cannot be made
+      * @see MethodHandles#convertArguments
+      */
+-    public final MethodHandle asType(MethodType newType) {
++    public MethodHandle asType(MethodType newType) {
+         return MethodHandles.convertArguments(this, newType);
+     }
+ 
+diff --git a/src/share/classes/java/dyn/MethodHandles.java b/src/share/classes/java/dyn/MethodHandles.java
+--- a/src/share/classes/java/dyn/MethodHandles.java
++++ b/src/share/classes/java/dyn/MethodHandles.java
+@@ -1068,10 +1068,14 @@
+         MethodType oldType = target.type();
+         if (oldType.equals(newType))
+             return target;
+-        MethodHandle res = MethodHandleImpl.convertArguments(IMPL_TOKEN, target,
+-                                                 newType, oldType, null);
++        MethodHandle res = null;
++        try {
++            res = MethodHandleImpl.convertArguments(IMPL_TOKEN, target,
++                                                    newType, oldType, null);
++        } catch (IllegalArgumentException ex) {
++        }
+         if (res == null)
+-            throw newIllegalArgumentException("cannot convert to "+newType+": "+target);
++            throw new WrongMethodTypeException("cannot convert to "+newType+": "+target);
+         return res;
+     }
+ 
+@@ -1392,6 +1396,20 @@
+         return adapter;
+     }
+ 
++    /** Apply the given filter function to the return value of the given target.
++     */
++    /*public*/ static
++    MethodHandle filterReturnValue(MethodHandle target, MethodHandle filter) {
++        MethodType targetType = target.type();
++        MethodType filterType = filter.type();
++        if (filterType.parameterCount() != 1
++            || filterType.parameterType(0) != targetType.returnType())
++            throw newIllegalArgumentException("target and filter types do not match");
++        // FIXME: Too many nodes here.
++        MethodHandle returner = dropArguments(filter, 0, targetType.parameterList());
++        return foldArguments(returner, exactInvoker(target.type()).bindTo(target));
++    }
++
+     /**
+      * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+      * Adapt a target method handle {@code target} by pre-processing
+@@ -1434,7 +1452,7 @@
+      * @return method handle which incorporates the specified argument folding logic
+      * @throws IllegalArgumentException if the first argument type of
+      *          {@code target} is not the same as {@code combiner}'s return type,
+-     *          or if the next {@code foldArgs} argument types of {@code target}
++     *          or if the following argument types of {@code target}
+      *          are not identical with the argument types of {@code combiner}
+      */
+     public static
+@@ -1443,12 +1461,39 @@
+         MethodType combinerType = combiner.type();
+         int foldArgs = combinerType.parameterCount();
+         boolean ok = (targetType.parameterCount() >= 1 + foldArgs);
++        if (ok && !combinerType.parameterList().equals(targetType.parameterList().subList(1, foldArgs+1)))
++            ok = false;
++        if (ok && !combinerType.returnType().equals(targetType.parameterType(0)))
++            ok = false;
+         if (!ok)
+             throw misMatchedTypes("target and combiner types", targetType, combinerType);
+         MethodType newType = targetType.dropParameterTypes(0, 1);
+         return MethodHandleImpl.foldArguments(IMPL_TOKEN, target, newType, combiner);
+     }
+ 
++    // /**
++    //  * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
++    //  * Adapt a target method handle {@code target} by pre-processing
++    //  * some of its arguments to derive a new target method handle.
++    //  * Call the new target on the original arguments.
++    //  * @param combined method handle to call initially on the incoming arguments
++    //  * @return method handle which incorporates the specified dispatching logic
++    //  * @throws IllegalArgumentException if the first argument type of
++    //  *          {@code combiner}'s return type is not {@link MethodHandle},
++    //  *          or if the next argument types of {@code target}
++    //  *          are not identical with the argument types of {@code combiner}
++    //  */
++    // public static
++    // MethodHandle dispatchArguments(MethodType targetType, MethodHandle dispatcher) {
++    //     MethodType dispatcherType = dispatcher.type();
++    //     int foldArgs = dispatcherType.parameterCount();
++    //     boolean ok = (targetType.parameterCount() >= foldArgs);
++    //     if (!ok)
++    //         throw misMatchedTypes("target and dispatcher types", targetType, dispatcherType);
++    //     MethodHandle target = exactInvoker(targetType);
++    //     return MethodHandleImpl.foldArguments(IMPL_TOKEN, target, targetType, dispatcher);
++    // }
++
+     /**
+      * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+      * Make a method handle which adapts a target method handle,
+@@ -1691,4 +1736,9 @@
+         }
+         return null;
+     }
++
++    /*non-public*/
++    static MethodHandle withTypeHandler(MethodHandle target, MethodHandle typeHandler) {
++        return MethodHandleImpl.withTypeHandler(IMPL_TOKEN, target, typeHandler);
++    }
+ }
+diff --git a/src/share/classes/sun/dyn/AdapterMethodHandle.java b/src/share/classes/sun/dyn/AdapterMethodHandle.java
+--- a/src/share/classes/sun/dyn/AdapterMethodHandle.java
++++ b/src/share/classes/sun/dyn/AdapterMethodHandle.java
+@@ -478,6 +478,39 @@
+         return new AdapterMethodHandle(target, newType, makeConv(raw ? OP_RETYPE_RAW : OP_RETYPE_ONLY));
+     }
+ 
++    static MethodHandle makeTypeHandler(Access token,
++                MethodHandle target, MethodHandle typeHandler) {
++        Access.check(token);
++        return new WithTypeHandler(target, typeHandler);
++    }
++
++    static class WithTypeHandler extends AdapterMethodHandle {
++        final MethodHandle target, typeHandler;
++        WithTypeHandler(MethodHandle target, MethodHandle typeHandler) {
++            super(target, target.type(), OP_RETYPE_ONLY);
++            this.target = target;
++            this.typeHandler = typeHandler.asType(TYPE_HANDLER_TYPE);
++        }
++
++        public MethodHandle asType(MethodType newType) {
++            if (this.type() == newType)
++                return this;
++            try {
++                MethodHandle retyped = (MethodHandle) typeHandler.<MethodHandle>invokeExact(target, newType);
++                // Contract:  Must return the desired type, or throw WMT
++                if (retyped.type() != newType)
++                    throw new WrongMethodTypeException(retyped.toString());
++                return retyped;
++            } catch (Throwable ex) {
++                if (ex instanceof Error)  throw (Error)ex;
++                if (ex instanceof RuntimeException)  throw (RuntimeException)ex;
++                throw new RuntimeException(ex);
++            }
++        }
++        private static final MethodType TYPE_HANDLER_TYPE
++            = MethodType.methodType(MethodHandle.class, MethodHandle.class, MethodType.class);
++    }
++
+     /** Can a checkcast adapter validly convert the target to newType?
+      *  The JVM supports all kind of reference casts, even silly ones.
+      */
+diff --git a/src/share/classes/sun/dyn/BoundMethodHandle.java b/src/share/classes/sun/dyn/BoundMethodHandle.java
+--- a/src/share/classes/sun/dyn/BoundMethodHandle.java
++++ b/src/share/classes/sun/dyn/BoundMethodHandle.java
+@@ -103,7 +103,7 @@
+         super(Access.TOKEN, type);
+         this.argument = argument;
+         this.vmargslot = vmargslot;
+-        assert(this.getClass() == AdapterMethodHandle.class);
++        assert(this instanceof AdapterMethodHandle);
+     }
+ 
+     /** Initialize the current object as a Java method handle, binding it
+diff --git a/src/share/classes/sun/dyn/FromGeneric.java b/src/share/classes/sun/dyn/InvokeGeneric.java
+copy from src/share/classes/sun/dyn/FromGeneric.java
+copy to src/share/classes/sun/dyn/InvokeGeneric.java
+--- a/src/share/classes/sun/dyn/FromGeneric.java
++++ b/src/share/classes/sun/dyn/InvokeGeneric.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2009, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -30,597 +30,131 @@
+ import sun.dyn.util.*;
+ 
+ /**
+- * Adapters which mediate between incoming calls which are generic
+- * and outgoing calls which are not.  Any call can be represented generically
+- * boxing up its arguments, and (on return) unboxing the return value.
+- * <p>
+- * A call is "generic" (in MethodHandle terms) if its MethodType features
+- * only Object arguments.  A non-generic call therefore features
+- * primitives and/or reference types other than Object.
+- * An adapter has types for its incoming and outgoing calls.
+- * The incoming call type is simply determined by the adapter's type
+- * (the MethodType it presents to callers).  The outgoing call type
+- * is determined by the adapter's target (a MethodHandle that the adapter
+- * either binds internally or else takes as a leading argument).
+- * (To stretch the term, adapter-like method handles may have multiple
+- * targets or be polymorphic across multiple call types.)
++ * Adapters which manage MethodHanndle.invokeGeneric calls.
++ * The JVM calls one of these when the exact type match fails.
+  * @author jrose
+  */
+-class FromGeneric {
+-    // type for the outgoing call (may have primitives, etc.)
+-    private final MethodType targetType;
+-    // type of the outgoing call internal to the adapter
+-    private final MethodType internalType;
+-    // prototype adapter (clone and customize for each new target!)
+-    private final Adapter adapter;
+-    // entry point for adapter (Adapter mh, a...) => ...
+-    private final MethodHandle entryPoint;
+-    // unboxing invoker of type (MH, Object**N) => raw return value
+-    // it makes up the difference of internalType => targetType
+-    private final MethodHandle unboxingInvoker;
+-    // conversion which boxes a the target's raw return value
+-    private final MethodHandle returnConversion;
++class InvokeGeneric {
++    // erased type for the call, which originates from an invokeGeneric site
++    private final MethodType erasedCallerType;
++    // an invoker of type (MT, MH; A...) -> R
++    private final MethodHandle initialInvoker;
+ 
+-    /** Compute and cache information common to all unboxing adapters
+-     *  that can call out to targets of the erasure-family of the given erased type.
++    /** Compute and cache information for this adapter, so that it can
++     *  call out to targets of the erasure-family of the given erased type.
+      */
+-    private FromGeneric(MethodType targetType) {
+-        this.targetType = targetType;
+-        MethodType internalType0;
+-        // the target invoker will generally need casts on reference arguments
+-        Adapter ad = findAdapter(internalType0 = targetType.erase());
+-        if (ad != null) {
+-            // Immediate hit to exactly the adapter we want,
+-            // with no monkeying around with primitive types.
+-            this.internalType = internalType0;
+-            this.adapter = ad;
+-            this.entryPoint = ad.prototypeEntryPoint();
+-            this.returnConversion = computeReturnConversion(targetType, internalType0);
+-            this.unboxingInvoker = computeUnboxingInvoker(targetType, internalType0);
+-            return;
+-        }
+-
+-        // outgoing primitive arguments will be wrapped; unwrap them
+-        MethodType primsAsObj = MethodTypeImpl.of(targetType).primArgsAsBoxes();
+-        MethodType objArgsRawRet = MethodTypeImpl.of(primsAsObj).primsAsInts();
+-        if (objArgsRawRet != targetType)
+-            ad = findAdapter(internalType0 = objArgsRawRet);
+-        if (ad == null) {
+-            ad = buildAdapterFromBytecodes(internalType0 = targetType);
+-        }
+-        this.internalType = internalType0;
+-        this.adapter = ad;
+-        MethodType tepType = targetType.insertParameterTypes(0, adapter.getClass());
+-        this.entryPoint = ad.prototypeEntryPoint();
+-        this.returnConversion = computeReturnConversion(targetType, internalType0);
+-        this.unboxingInvoker = computeUnboxingInvoker(targetType, internalType0);
++    private InvokeGeneric(MethodType erasedCallerType) throws NoAccessException {
++        this.erasedCallerType = erasedCallerType;
++        this.initialInvoker = makeInitialInvoker();
++        assert initialInvoker.type().equals(erasedCallerType
++                                            .insertParameterTypes(0, MethodType.class, MethodHandle.class))
++            : initialInvoker.type();
+     }
+ 
+-    /**
+-     * The typed target will be called according to targetType.
+-     * The adapter code will in fact see the raw result from internalType,
+-     * and must box it into an object.  Produce a converter for this.
+-     */
+-    private static MethodHandle computeReturnConversion(
+-            MethodType targetType, MethodType internalType) {
+-        Class<?> tret = targetType.returnType();
+-        Class<?> iret = internalType.returnType();
+-        Wrapper wrap = Wrapper.forBasicType(tret);
+-        if (!iret.isPrimitive()) {
+-            assert(iret == Object.class);
+-            return ValueConversions.identity();
+-        } else if (wrap.primitiveType() == iret) {
+-            return ValueConversions.box(wrap, false);
+-        } else {
+-            assert(tret == double.class ? iret == long.class : iret == int.class);
+-            return ValueConversions.boxRaw(wrap, false);
+-        }
+-    }
+-
+-    /**
+-     * The typed target will need an exact invocation point; provide it here.
+-     * The adapter will possibly need to make a slightly different call,
+-     * so adapt the invoker.  This way, the logic for making up the
+-     * difference between what the adapter can call and what the target
+-     * needs can be cached once per type.
+-     */
+-    private static MethodHandle computeUnboxingInvoker(
+-            MethodType targetType, MethodType internalType) {
+-        // All the adapters we have here have reference-untyped internal calls.
+-        assert(internalType == internalType.erase());
+-        MethodHandle invoker = MethodHandles.exactInvoker(targetType);
+-        // cast all narrow reference types, unbox all primitive arguments:
+-        MethodType fixArgsType = internalType.changeReturnType(targetType.returnType());
+-        MethodHandle fixArgs = AdapterMethodHandle.convertArguments(Access.TOKEN,
+-                                 invoker, Invokers.invokerType(fixArgsType),
+-                                 invoker.type(), null);
+-        if (fixArgs == null)
+-            throw new InternalError("bad fixArgs");
+-        // reinterpret the calling sequence as raw:
+-        MethodHandle retyper = AdapterMethodHandle.makeRetypeRaw(Access.TOKEN,
+-                                        Invokers.invokerType(internalType), fixArgs);
+-        if (retyper == null)
+-            throw new InternalError("bad retyper");
+-        return retyper;
+-    }
+-
+-    Adapter makeInstance(MethodHandle typedTarget) {
+-        MethodType type = typedTarget.type();
+-        if (type == targetType) {
+-            return adapter.makeInstance(entryPoint, unboxingInvoker, returnConversion, typedTarget);
+-        }
+-        // my erased-type is not exactly the same as the desired type
+-        assert(type.erase() == targetType);  // else we are busted
+-        MethodHandle invoker = computeUnboxingInvoker(type, internalType);
+-        return adapter.makeInstance(entryPoint, invoker, returnConversion, typedTarget);
+-    }
+-
+-    /** Build an adapter of the given generic type, which invokes typedTarget
+-     *  on the incoming arguments, after unboxing as necessary.
+-     *  The return value is boxed if necessary.
+-     * @param genericType  the required type of the result
+-     * @param typedTarget the target
+-     * @return an adapter method handle
+-     */
+-    public static MethodHandle make(MethodHandle typedTarget) {
+-        MethodType type = typedTarget.type();
+-        if (type == type.generic())  return typedTarget;
+-        return FromGeneric.of(type).makeInstance(typedTarget);
++    private static MethodHandles.Lookup lookup() {
++        return MethodHandleImpl.IMPL_LOOKUP;
+     }
+ 
+     /** Return the adapter information for this type's erasure. */
+-    static FromGeneric of(MethodType type) {
++    static MethodHandle genericInvokerOf(MethodType type) {
+         MethodTypeImpl form = MethodTypeImpl.of(type);
+-        FromGeneric fromGen = form.fromGeneric;
+-        if (fromGen == null)
+-            form.fromGeneric = fromGen = new FromGeneric(form.erasedType());
+-        return fromGen;
++        MethodHandle genericInvoker = form.genericInvoker;
++        if (genericInvoker == null) {
++            try {
++                InvokeGeneric gen = new InvokeGeneric(form.erasedType());
++                form.genericInvoker = genericInvoker = gen.initialInvoker;
++            } catch (NoAccessException ex) {
++                throw new RuntimeException(ex);
++            }
++        }
++        return genericInvoker;
++    }
++
++    private MethodHandle makeInitialInvoker() throws NoAccessException {
++        // postDispatch = #(MH'; MT, MH; A...){MH'(MT, MH; A)}
++        MethodHandle postDispatch = makePostDispatchInvoker();
++        MethodHandle invoker;
++        if (returnConversionPossible()) {
++            invoker = MethodHandles.foldArguments(postDispatch,
++                                                  dispatcher("dispatchWithConversion"));
++        } else {
++            invoker = MethodHandles.foldArguments(postDispatch, dispatcher("dispatch"));
++        }
++        return invoker;
++    }
++
++    private static final Class<?>[] EXTRA_ARGS = { MethodType.class, MethodHandle.class };
++    private MethodHandle makePostDispatchInvoker() {
++        // Take (MH'; MT, MH; A...) and run MH'(MT, MH; A...).
++        MethodType invokerType = erasedCallerType.insertParameterTypes(0, EXTRA_ARGS);
++        return MethodHandles.exactInvoker(invokerType);
++    }
++    private MethodHandle dropDispatchArguments(MethodHandle targetInvoker) {
++        assert(targetInvoker.type().parameterType(0) == MethodHandle.class);
++        return MethodHandles.dropArguments(targetInvoker, 1, EXTRA_ARGS);
++    }
++
++    private MethodHandle dispatcher(String dispatchName) throws NoAccessException {
++        return lookup().bind(this, dispatchName,
++                             MethodType.methodType(MethodHandle.class,
++                                                   MethodType.class, MethodHandle.class));
++    }
++
++    static final boolean USE_AS_TYPE_PATH = true;
++
++    /** Return a method handle to invoke on the callerType, target, and remaining arguments.
++     *  The method handle must finish the call.
++     *  This is the first look at the caller type and target.
++     */
++    private MethodHandle dispatch(MethodType callerType, MethodHandle target) {
++        MethodType targetType = target.type();
++        if (USE_AS_TYPE_PATH || target instanceof AdapterMethodHandle.WithTypeHandler) {
++            MethodHandle newTarget = target.asType(callerType);
++            targetType = callerType;
++            Invokers invokers = MethodTypeImpl.invokers(Access.TOKEN, targetType);
++            MethodHandle invoker = invokers.erasedInvokerWithDrops;
++            if (invoker == null) {
++                invokers.erasedInvokerWithDrops = invoker =
++                    dropDispatchArguments(invokers.erasedInvoker());
++            }
++            return invoker.bindTo(newTarget);
++        }
++        throw new RuntimeException("NYI");
++    }
++
++    private MethodHandle dispatchWithConversion(MethodType callerType, MethodHandle target) {
++        MethodHandle finisher = dispatch(callerType, target);
++        if (returnConversionNeeded(callerType, target))
++            finisher = addReturnConversion(finisher, callerType.returnType());  //FIXME: slow
++        return finisher;
++    }
++
++    private boolean returnConversionPossible() {
++        Class<?> needType = erasedCallerType.returnType();
++        return !needType.isPrimitive();
++    }
++    private boolean returnConversionNeeded(MethodType callerType, MethodHandle target) {
++        Class<?> needType = callerType.returnType();
++        if (needType == erasedCallerType.returnType())
++            return false;  // no conversions possible, since must be primitive or Object
++        Class<?> haveType = target.type().returnType();
++        if (VerifyType.isNullConversion(haveType, needType))
++            return false;
++        return true;
++    }
++    private MethodHandle addReturnConversion(MethodHandle target, Class<?> type) {
++        if (true) throw new RuntimeException("NYI");
++        // FIXME: This is slow because it creates a closure node on every call that requires a return cast.
++        MethodType targetType = target.type();
++        MethodHandle caster = ValueConversions.identity(type);
++        caster = caster.asType(MethodType.methodType(type, targetType.returnType()));
++        // Drop irrelevant arguments, because we only care about the return value:
++        caster = MethodHandles.dropArguments(caster, 1, targetType.parameterList());
++        MethodHandle result = MethodHandles.foldArguments(caster, target);
++        return result.asType(target.type());
+     }
+ 
+     public String toString() {
+-        return "FromGeneric"+targetType;
+-    }
+-
+-    /* Create an adapter that handles spreading calls for the given type. */
+-    static Adapter findAdapter(MethodType internalType) {
+-        MethodType entryType = internalType.generic();
+-        MethodTypeImpl form = MethodTypeImpl.of(internalType);
+-        Class<?> rtype = internalType.returnType();
+-        int argc = form.parameterCount();
+-        int lac = form.longPrimitiveParameterCount();
+-        int iac = form.primitiveParameterCount() - lac;
+-        String intsAndLongs = (iac > 0 ? "I"+iac : "")+(lac > 0 ? "J"+lac : "");
+-        String rawReturn = String.valueOf(Wrapper.forPrimitiveType(rtype).basicTypeChar());
+-        String cname0 = rawReturn + argc;
+-        String cname1 = "A"       + argc;
+-        String[] cnames = { cname0+intsAndLongs, cname0, cname1+intsAndLongs, cname1 };
+-        String iname = "invoke_"+cname0+intsAndLongs;
+-        // e.g., D5I2, D5, L5I2, L5; invoke_D5
+-        for (String cname : cnames) {
+-            Class<? extends Adapter> acls = Adapter.findSubClass(cname);
+-            if (acls == null)  continue;
+-            // see if it has the required invoke method
+-            MethodHandle entryPoint = null;
+-            try {
+-                entryPoint = MethodHandleImpl.IMPL_LOOKUP.findSpecial(acls, iname, entryType, acls);
+-            } catch (NoAccessException ex) {
+-            }
+-            if (entryPoint == null)  continue;
+-            Constructor<? extends Adapter> ctor = null;
+-            try {
+-                ctor = acls.getDeclaredConstructor(MethodHandle.class);
+-            } catch (NoSuchMethodException ex) {
+-            } catch (SecurityException ex) {
+-            }
+-            if (ctor == null)  continue;
+-            try {
+-                // Produce an instance configured as a prototype.
+-                return ctor.newInstance(entryPoint);
+-            } catch (IllegalArgumentException ex) {
+-            } catch (InvocationTargetException wex) {
+-                Throwable ex = wex.getTargetException();
+-                if (ex instanceof Error)  throw (Error)ex;
+-                if (ex instanceof RuntimeException)  throw (RuntimeException)ex;
+-            } catch (InstantiationException ex) {
+-            } catch (IllegalAccessException ex) {
+-            }
+-        }
+-        return null;
+-    }
+-
+-    static Adapter buildAdapterFromBytecodes(MethodType internalType) {
+-        throw new UnsupportedOperationException("NYI");
+-    }
+-
+-    /**
+-     * This adapter takes some untyped arguments, and returns an untyped result.
+-     * Internally, it applies the invoker to the target, which causes the
+-     * objects to be unboxed; the result is a raw type in L/I/J/F/D.
+-     * This result is passed to convert, which is responsible for
+-     * converting the raw result into a boxed object.
+-     * The invoker is kept separate from the target because it can be
+-     * generated once per type erasure family, and reused across adapters.
+-     */
+-    static abstract class Adapter extends JavaMethodHandle {
+-        /*
+-         * class X<<R,int N>> extends Adapter {
+-         *   (MH, Object**N)=>raw(R) invoker;
+-         *   (any**N)=>R target;
+-         *   raw(R)=>Object convert;
+-         *   Object invoke(Object**N a) = convert(invoker(target, a...))
+-         * }
+-         */
+-        protected final MethodHandle invoker;  // (MH, Object**N) => raw(R)
+-        protected final MethodHandle convert;  // raw(R) => Object
+-        protected final MethodHandle target;   // (any**N) => R
+-
+-        @Override
+-        public String toString() {
+-            return target.toString();
+-        }
+-
+-        protected boolean isPrototype() { return target == null; }
+-        protected Adapter(MethodHandle entryPoint) {
+-            this(entryPoint, null, entryPoint, null);
+-            assert(isPrototype());
+-        }
+-        protected MethodHandle prototypeEntryPoint() {
+-            if (!isPrototype())  throw new InternalError();
+-            return convert;
+-        }
+-
+-        protected Adapter(MethodHandle entryPoint,
+-                          MethodHandle invoker, MethodHandle convert, MethodHandle target) {
+-            super(entryPoint);
+-            this.invoker = invoker;
+-            this.convert = convert;
+-            this.target  = target;
+-        }
+-
+-        /** Make a copy of self, with new fields. */
+-        protected abstract Adapter makeInstance(MethodHandle entryPoint,
+-                MethodHandle invoker, MethodHandle convert, MethodHandle target);
+-        // { return new ThisType(entryPoint, convert, target); }
+-
+-        /// Conversions on the value returned from the target.
+-        protected Object convert_L(Object result) throws Throwable { return convert.<Object>invokeExact(result); }
+-        protected Object convert_I(int    result) throws Throwable { return convert.<Object>invokeExact(result); }
+-        protected Object convert_J(long   result) throws Throwable { return convert.<Object>invokeExact(result); }
+-        protected Object convert_F(float  result) throws Throwable { return convert.<Object>invokeExact(result); }
+-        protected Object convert_D(double result) throws Throwable { return convert.<Object>invokeExact(result); }
+-
+-        static private final String CLASS_PREFIX; // "sun.dyn.FromGeneric$"
+-        static {
+-            String aname = Adapter.class.getName();
+-            String sname = Adapter.class.getSimpleName();
+-            if (!aname.endsWith(sname))  throw new InternalError();
+-            CLASS_PREFIX = aname.substring(0, aname.length() - sname.length());
+-        }
+-        /** Find a sibing class of Adapter. */
+-        static Class<? extends Adapter> findSubClass(String name) {
+-            String cname = Adapter.CLASS_PREFIX + name;
+-            try {
+-                return Class.forName(cname).asSubclass(Adapter.class);
+-            } catch (ClassNotFoundException ex) {
+-                return null;
+-            } catch (ClassCastException ex) {
+-                return null;
+-            }
+-        }
+-    }
+-
+-    /* generated classes follow this pattern:
+-    static class xA2 extends Adapter {
+-        protected xA2(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+-        protected xA2(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { super(e, i, c, t); }
+-        protected xA2 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { return new xA2(e, i, c, t); }
+-        protected Object invoke_L2(Object a0, Object a1) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1)); }
+-        protected Object invoke_I2(Object a0, Object a1) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1)); }
+-        protected Object invoke_J2(Object a0, Object a1) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1)); }
+-        protected Object invoke_F2(Object a0, Object a1) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1)); }
+-        protected Object invoke_D2(Object a0, Object a1) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1)); }
+-    }
+-    // */
+-
+-/*
+-: SHELL; n=FromGeneric; cp -p $n.java $n.java-; sed < $n.java- > $n.java+ -e '/{{*{{/,/}}*}}/w /tmp/genclasses.java' -e '/}}*}}/q'; (cd /tmp; javac -d . genclasses.java; java -cp . genclasses) >> $n.java+; echo '}' >> $n.java+; mv $n.java+ $n.java; mv $n.java- $n.java~
+-//{{{
+-import java.util.*;
+-class genclasses {
+-    static String[] TYPES = { "Object", "int   ", "long  ", "float ", "double" };
+-    static String[] TCHARS = { "L",     "I",      "J",      "F",      "D",     "A" };
+-    static String[][] TEMPLATES = { {
+-        "@for@ arity=0..10  rcat<=4 nrefs<=99 nints=0   nlongs=0",
+-        "    //@each-cat@",
+-        "    static class @cat@ extends Adapter {",
+-        "        protected @cat@(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype",
+-        "        protected @cat@(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)",
+-        "                        { super(e, i, c, t); }",
+-        "        protected @cat@ makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)",
+-        "                        { return new @cat@(e, i, c, t); }",
+-        "        //@each-R@",
+-        "        protected Object invoke_@catN@(@Tvav@) throws Throwable { return convert_@Rc@(invoker.<@R@>invokeExact(target@av@)); }",
+-        "        //@end-R@",
+-        "    }",
+-    } };
+-    static final String NEWLINE_INDENT = "\n                ";
+-    enum VAR {
+-        cat, catN, R, Rc, av, Tvav, Ovav;
+-        public final String pattern = "@"+toString().replace('_','.')+"@";
+-        public String binding;
+-        static void makeBindings(boolean topLevel, int rcat, int nrefs, int nints, int nlongs) {
+-            int nargs = nrefs + nints + nlongs;
+-            if (topLevel)
+-                VAR.cat.binding = catstr(ALL_RETURN_TYPES ? TYPES.length : rcat, nrefs, nints, nlongs);
+-            VAR.catN.binding = catstr(rcat, nrefs, nints, nlongs);
+-            VAR.R.binding = TYPES[rcat];
+-            VAR.Rc.binding = TCHARS[rcat];
+-            String[] Tv = new String[nargs];
+-            String[] av = new String[nargs];
+-            String[] Tvav = new String[nargs];
+-            String[] Ovav = new String[nargs];
+-            for (int i = 0; i < nargs; i++) {
+-                int tcat = (i < nrefs) ? 0 : (i < nrefs + nints) ? 1 : 2;
+-                Tv[i] = TYPES[tcat];
+-                av[i] = arg(i);
+-                Tvav[i] = param(Tv[i], av[i]);
+-                Ovav[i] = param("Object", av[i]);
+-            }
+-            VAR.av.binding = comma(", ", av);
+-            VAR.Tvav.binding = comma(Tvav);
+-            VAR.Ovav.binding = comma(Ovav);
+-        }
+-        static String arg(int i) { return "a"+i; }
+-        static String param(String t, String a) { return t+" "+a; }
+-        static String comma(String[] v) { return comma("", v); }
+-        static String comma(String sep, String[] v) {
+-            if (v.length == 0)  return "";
+-            String res = sep+v[0];
+-            for (int i = 1; i < v.length; i++)  res += ", "+v[i];
+-            return res;
+-        }
+-        static String transform(String string) {
+-            for (VAR var : values())
+-                string = string.replaceAll(var.pattern, var.binding);
+-            return string;
+-        }
+-    }
+-    static String[] stringsIn(String[] strings, int beg, int end) {
+-        return Arrays.copyOfRange(strings, beg, Math.min(end, strings.length));
+-    }
+-    static String[] stringsBefore(String[] strings, int pos) {
+-        return stringsIn(strings, 0, pos);
+-    }
+-    static String[] stringsAfter(String[] strings, int pos) {
+-        return stringsIn(strings, pos, strings.length);
+-    }
+-    static int indexAfter(String[] strings, int pos, String tag) {
+-        return Math.min(indexBefore(strings, pos, tag) + 1, strings.length);
+-    }
+-    static int indexBefore(String[] strings, int pos, String tag) {
+-        for (int i = pos, end = strings.length; ; i++) {
+-            if (i == end || strings[i].endsWith(tag))  return i;
+-        }
+-    }
+-    static int MIN_ARITY, MAX_ARITY, MAX_RCAT, MAX_REFS, MAX_INTS, MAX_LONGS;
+-    static boolean ALL_ARG_TYPES, ALL_RETURN_TYPES;
+-    static HashSet<String> done = new HashSet<String>();
+-    public static void main(String... av) {
+-        for (String[] template : TEMPLATES) {
+-            int forLinesLimit = indexBefore(template, 0, "@each-cat@");
+-            String[] forLines = stringsBefore(template, forLinesLimit);
+-            template = stringsAfter(template, forLinesLimit);
+-            for (String forLine : forLines)
+-                expandTemplate(forLine, template);
+-        }
+-    }
+-    static void expandTemplate(String forLine, String[] template) {
+-        String[] params = forLine.split("[^0-9]+");
+-        if (params[0].length() == 0)  params = stringsAfter(params, 1);
+-        System.out.println("//params="+Arrays.asList(params));
+-        int pcur = 0;
+-        MIN_ARITY = Integer.valueOf(params[pcur++]);
+-        MAX_ARITY = Integer.valueOf(params[pcur++]);
+-        MAX_RCAT  = Integer.valueOf(params[pcur++]);
+-        MAX_REFS  = Integer.valueOf(params[pcur++]);
+-        MAX_INTS  = Integer.valueOf(params[pcur++]);
+-        MAX_LONGS = Integer.valueOf(params[pcur++]);
+-        if (pcur != params.length)  throw new RuntimeException("bad extra param: "+forLine);
+-        if (MAX_RCAT >= TYPES.length)  MAX_RCAT = TYPES.length - 1;
+-        ALL_ARG_TYPES = (indexBefore(template, 0, "@each-Tv@") < template.length);
+-        ALL_RETURN_TYPES = (indexBefore(template, 0, "@each-R@") < template.length);
+-        for (int nargs = MIN_ARITY; nargs <= MAX_ARITY; nargs++) {
+-            for (int rcat = 0; rcat <= MAX_RCAT; rcat++) {
+-                expandTemplate(template, true, rcat, nargs, 0, 0);
+-                if (ALL_ARG_TYPES)  break;
+-                expandTemplateForPrims(template, true, rcat, nargs, 1, 1);
+-                if (ALL_RETURN_TYPES)  break;
+-            }
+-        }
+-    }
+-    static String catstr(int rcat, int nrefs, int nints, int nlongs) {
+-        int nargs = nrefs + nints + nlongs;
+-        String cat = TCHARS[rcat] + nargs;
+-        if (!ALL_ARG_TYPES)  cat += (nints==0?"":"I"+nints)+(nlongs==0?"":"J"+nlongs);
+-        return cat;
+-    }
+-    static void expandTemplateForPrims(String[] template, boolean topLevel, int rcat, int nargs, int minints, int minlongs) {
+-        for (int isLong = 0; isLong <= 1; isLong++) {
+-            for (int nprims = 1; nprims <= nargs; nprims++) {
+-                int nrefs = nargs - nprims;
+-                int nints = ((1-isLong) * nprims);
+-                int nlongs = (isLong * nprims);
+-                expandTemplate(template, topLevel, rcat, nrefs, nints, nlongs);
+-            }
+-        }
+-    }
+-    static void expandTemplate(String[] template, boolean topLevel,
+-                               int rcat, int nrefs, int nints, int nlongs) {
+-        int nargs = nrefs + nints + nlongs;
+-        if (nrefs > MAX_REFS || nints > MAX_INTS || nlongs > MAX_LONGS)  return;
+-        VAR.makeBindings(topLevel, rcat, nrefs, nints, nlongs);
+-        if (topLevel && !done.add(VAR.cat.binding)) {
+-            System.out.println("    //repeat "+VAR.cat.binding);
+-            return;
+-        }
+-        for (int i = 0; i < template.length; i++) {
+-            String line = template[i];
+-            if (line.endsWith("@each-cat@")) {
+-                // ignore
+-            } else if (line.endsWith("@each-R@")) {
+-                int blockEnd = indexAfter(template, i, "@end-R@");
+-                String[] block = stringsIn(template, i+1, blockEnd-1);
+-                for (int rcat1 = rcat; rcat1 <= MAX_RCAT; rcat1++)
+-                    expandTemplate(block, false, rcat1, nrefs, nints, nlongs);
+-                VAR.makeBindings(topLevel, rcat, nrefs, nints, nlongs);
+-                i = blockEnd-1; continue;
+-            } else if (line.endsWith("@each-Tv@")) {
+-                int blockEnd = indexAfter(template, i, "@end-Tv@");
+-                String[] block = stringsIn(template, i+1, blockEnd-1);
+-                expandTemplate(block, false, rcat, nrefs, nints, nlongs);
+-                expandTemplateForPrims(block, false, rcat, nargs, nints+1, nlongs+1);
+-                VAR.makeBindings(topLevel, rcat, nrefs, nints, nlongs);
+-                i = blockEnd-1; continue;
+-            } else {
+-                System.out.println(VAR.transform(line));
+-            }
+-        }
++        return "InvokeGeneric"+erasedCallerType;
+     }
+ }
+-//}}} */
+-//params=[0, 10, 4, 99, 0, 0]
+-    static class A0 extends Adapter {
+-        protected A0(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+-        protected A0(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { super(e, i, c, t); }
+-        protected A0 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { return new A0(e, i, c, t); }
+-        protected Object invoke_L0() throws Throwable { return convert_L(invoker.<Object>invokeExact(target)); }
+-        protected Object invoke_I0() throws Throwable { return convert_I(invoker.<int   >invokeExact(target)); }
+-        protected Object invoke_J0() throws Throwable { return convert_J(invoker.<long  >invokeExact(target)); }
+-        protected Object invoke_F0() throws Throwable { return convert_F(invoker.<float >invokeExact(target)); }
+-        protected Object invoke_D0() throws Throwable { return convert_D(invoker.<double>invokeExact(target)); }
+-    }
+-    static class A1 extends Adapter {
+-        protected A1(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+-        protected A1(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { super(e, i, c, t); }
+-        protected A1 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { return new A1(e, i, c, t); }
+-        protected Object invoke_L1(Object a0) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0)); }
+-        protected Object invoke_I1(Object a0) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0)); }
+-        protected Object invoke_J1(Object a0) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0)); }
+-        protected Object invoke_F1(Object a0) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0)); }
+-        protected Object invoke_D1(Object a0) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0)); }
+-    }
+-    static class A2 extends Adapter {
+-        protected A2(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+-        protected A2(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { super(e, i, c, t); }
+-        protected A2 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { return new A2(e, i, c, t); }
+-        protected Object invoke_L2(Object a0, Object a1) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1)); }
+-        protected Object invoke_I2(Object a0, Object a1) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1)); }
+-        protected Object invoke_J2(Object a0, Object a1) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1)); }
+-        protected Object invoke_F2(Object a0, Object a1) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1)); }
+-        protected Object invoke_D2(Object a0, Object a1) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1)); }
+-    }
+-    static class A3 extends Adapter {
+-        protected A3(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+-        protected A3(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { super(e, i, c, t); }
+-        protected A3 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { return new A3(e, i, c, t); }
+-        protected Object invoke_L3(Object a0, Object a1, Object a2) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1, a2)); }
+-        protected Object invoke_I3(Object a0, Object a1, Object a2) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1, a2)); }
+-        protected Object invoke_J3(Object a0, Object a1, Object a2) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1, a2)); }
+-        protected Object invoke_F3(Object a0, Object a1, Object a2) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1, a2)); }
+-        protected Object invoke_D3(Object a0, Object a1, Object a2) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1, a2)); }
+-    }
+-    static class A4 extends Adapter {
+-        protected A4(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+-        protected A4(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { super(e, i, c, t); }
+-        protected A4 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { return new A4(e, i, c, t); }
+-        protected Object invoke_L4(Object a0, Object a1, Object a2, Object a3) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1, a2, a3)); }
+-        protected Object invoke_I4(Object a0, Object a1, Object a2, Object a3) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1, a2, a3)); }
+-        protected Object invoke_J4(Object a0, Object a1, Object a2, Object a3) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1, a2, a3)); }
+-        protected Object invoke_F4(Object a0, Object a1, Object a2, Object a3) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1, a2, a3)); }
+-        protected Object invoke_D4(Object a0, Object a1, Object a2, Object a3) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1, a2, a3)); }
+-    }
+-    static class A5 extends Adapter {
+-        protected A5(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+-        protected A5(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { super(e, i, c, t); }
+-        protected A5 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { return new A5(e, i, c, t); }
+-        protected Object invoke_L5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1, a2, a3, a4)); }
+-        protected Object invoke_I5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1, a2, a3, a4)); }
+-        protected Object invoke_J5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1, a2, a3, a4)); }
+-        protected Object invoke_F5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1, a2, a3, a4)); }
+-        protected Object invoke_D5(Object a0, Object a1, Object a2, Object a3, Object a4) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1, a2, a3, a4)); }
+-    }
+-    static class A6 extends Adapter {
+-        protected A6(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+-        protected A6(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { super(e, i, c, t); }
+-        protected A6 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { return new A6(e, i, c, t); }
+-        protected Object invoke_L6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1, a2, a3, a4, a5)); }
+-        protected Object invoke_I6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1, a2, a3, a4, a5)); }
+-        protected Object invoke_J6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1, a2, a3, a4, a5)); }
+-        protected Object invoke_F6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1, a2, a3, a4, a5)); }
+-        protected Object invoke_D6(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1, a2, a3, a4, a5)); }
+-    }
+-    static class A7 extends Adapter {
+-        protected A7(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+-        protected A7(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { super(e, i, c, t); }
+-        protected A7 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { return new A7(e, i, c, t); }
+-        protected Object invoke_L7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1, a2, a3, a4, a5, a6)); }
+-        protected Object invoke_I7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1, a2, a3, a4, a5, a6)); }
+-        protected Object invoke_J7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1, a2, a3, a4, a5, a6)); }
+-        protected Object invoke_F7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1, a2, a3, a4, a5, a6)); }
+-        protected Object invoke_D7(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1, a2, a3, a4, a5, a6)); }
+-    }
+-    static class A8 extends Adapter {
+-        protected A8(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+-        protected A8(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { super(e, i, c, t); }
+-        protected A8 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { return new A8(e, i, c, t); }
+-        protected Object invoke_L8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7)); }
+-        protected Object invoke_I8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7)); }
+-        protected Object invoke_J8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7)); }
+-        protected Object invoke_F8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7)); }
+-        protected Object invoke_D8(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7)); }
+-    }
+-    static class A9 extends Adapter {
+-        protected A9(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+-        protected A9(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { super(e, i, c, t); }
+-        protected A9 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { return new A9(e, i, c, t); }
+-        protected Object invoke_L9(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8)); }
+-        protected Object invoke_I9(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8)); }
+-        protected Object invoke_J9(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8)); }
+-        protected Object invoke_F9(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8)); }
+-        protected Object invoke_D9(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8)); }
+-    }
+-    static class A10 extends Adapter {
+-        protected A10(MethodHandle entryPoint) { super(entryPoint); }  // to build prototype
+-        protected A10(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { super(e, i, c, t); }
+-        protected A10 makeInstance(MethodHandle e, MethodHandle i, MethodHandle c, MethodHandle t)
+-                        { return new A10(e, i, c, t); }
+-        protected Object invoke_L10(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9) throws Throwable { return convert_L(invoker.<Object>invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)); }
+-        protected Object invoke_I10(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9) throws Throwable { return convert_I(invoker.<int   >invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)); }
+-        protected Object invoke_J10(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9) throws Throwable { return convert_J(invoker.<long  >invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)); }
+-        protected Object invoke_F10(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9) throws Throwable { return convert_F(invoker.<float >invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)); }
+-        protected Object invoke_D10(Object a0, Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9) throws Throwable { return convert_D(invoker.<double>invokeExact(target, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)); }
+-    }
+-}
+diff --git a/src/share/classes/sun/dyn/Invokers.java b/src/share/classes/sun/dyn/Invokers.java
+--- a/src/share/classes/sun/dyn/Invokers.java
++++ b/src/share/classes/sun/dyn/Invokers.java
+@@ -38,6 +38,10 @@
+     // exact invoker for the outgoing call
+     private /*lazy*/ MethodHandle exactInvoker;
+ 
++    // erased (partially untyped but with primitives) invoker for the outgoing call
++    private /*lazy*/ MethodHandle erasedInvoker;
++    /*lazy*/ MethodHandle erasedInvokerWithDrops;  // for InvokeGeneric
++
+     // generic (untyped) invoker for the outgoing call
+     private /*lazy*/ MethodHandle genericInvoker;
+ 
+@@ -80,6 +84,19 @@
+         return invoker;
+     }
+ 
++    public MethodHandle erasedInvoker() {
++        MethodHandle invoker1 = exactInvoker();
++        MethodHandle invoker = erasedInvoker;
++        if (invoker != null)  return invoker;
++        MethodType erasedType = targetType.erase();
++        if (erasedType == targetType.generic())
++            invoker = genericInvoker();
++        else
++            invoker = MethodHandles.convertArguments(invoker1, invokerType(erasedType));
++        erasedInvoker = invoker;
++        return invoker;
++    }
++
+     public MethodHandle varargsInvoker(int objectArgCount) {
+         MethodHandle vaInvoker = varargsInvokers[objectArgCount];
+         if (vaInvoker != null)  return vaInvoker;
+diff --git a/src/share/classes/sun/dyn/MethodHandleImpl.java b/src/share/classes/sun/dyn/MethodHandleImpl.java
+--- a/src/share/classes/sun/dyn/MethodHandleImpl.java
++++ b/src/share/classes/sun/dyn/MethodHandleImpl.java
+@@ -560,7 +560,9 @@
+     MethodHandle bindReceiver(Access token,
+                               MethodHandle target, Object receiver) {
+         Access.check(token);
+-        if (target instanceof AdapterMethodHandle) {
++        if (target instanceof AdapterMethodHandle &&
++            ((AdapterMethodHandle)target).conversionOp() == MethodHandleNatives.Constants.OP_RETYPE_ONLY
++            ) {
+             Object info = MethodHandleNatives.getTargetInfo(target);
+             if (info instanceof DirectMethodHandle) {
+                 DirectMethodHandle dmh = (DirectMethodHandle) info;
+@@ -1257,4 +1259,9 @@
+         Access.check(token);
+         return MethodHandleNatives.getBootstrap(callerClass);
+     }
++
++    public static MethodHandle withTypeHandler(Access token, MethodHandle target, MethodHandle typeHandler) {
++        Access.check(token);
++        return AdapterMethodHandle.makeTypeHandler(token, target, typeHandler);
++    }
+ }
+diff --git a/src/share/classes/sun/dyn/MethodHandleNatives.java b/src/share/classes/sun/dyn/MethodHandleNatives.java
+--- a/src/share/classes/sun/dyn/MethodHandleNatives.java
++++ b/src/share/classes/sun/dyn/MethodHandleNatives.java
+@@ -317,6 +317,20 @@
+     }
+ 
+     /**
++     * The JVM wants to use a MethodType with invokeGeneric.  Give the runtime fair warning.
++     */
++    static void notifyGenericMethodType(MethodType type) {
++        try {
++            // Trigger adapter creation.
++            InvokeGeneric.genericInvokerOf(type);
++        } catch (Exception ex) {
++            Error err = new InternalError("Exception while resolving invokeGeneric");
++            err.initCause(ex);
++            throw err;
++        }
++    }
++
++    /**
+      * The JVM is resolving a CONSTANT_MethodHandle CP entry.  And it wants our help.
+      * It will make an up-call to this method.  (Do not change the name or signature.)
+      */
+diff --git a/src/share/classes/sun/dyn/MethodTypeImpl.java b/src/share/classes/sun/dyn/MethodTypeImpl.java
+--- a/src/share/classes/sun/dyn/MethodTypeImpl.java
++++ b/src/share/classes/sun/dyn/MethodTypeImpl.java
+@@ -48,6 +48,7 @@
+     final long primCounts;              // packed prim & double counts
+     final int vmslots;                  // total number of parameter slots
+     final MethodType erasedType;        // the canonical erasure
++
+     /*lazy*/ MethodType primsAsBoxes;   // replace prims by wrappers
+     /*lazy*/ MethodType primArgsAsBoxes; // wrap args only; make raw return
+     /*lazy*/ MethodType primsAsInts;    // replace prims by int/long
+@@ -59,6 +60,7 @@
+     /*lazy*/ FromGeneric fromGeneric;   // convert cs. w/o prims to with
+     /*lazy*/ SpreadGeneric[] spreadGeneric; // expand one argument to many
+     /*lazy*/ FilterGeneric filterGeneric; // convert argument(s) on the fly
++    /*lazy*/ MethodHandle genericInvoker; // hook for invokeGeneric
+ 
+     public MethodType erasedType() {
+         return erasedType;
+diff --git a/src/share/classes/sun/dyn/util/ValueConversions.java b/src/share/classes/sun/dyn/util/ValueConversions.java
+--- a/src/share/classes/sun/dyn/util/ValueConversions.java
++++ b/src/share/classes/sun/dyn/util/ValueConversions.java
+@@ -377,7 +377,7 @@
+             REBOX_CONVERSIONS = newWrapperCaches(2);
+ 
+     /**
+-     * Becase we normalize primitive types to reduce the number of signatures,
++     * Because we normalize primitive types to reduce the number of signatures,
+      * primitives are sometimes manipulated under an "erased" type,
+      * either int (for types other than long/double) or long (for all types).
+      * When the erased primitive value is then boxed into an Integer or Long,
+@@ -475,10 +475,10 @@
+     }
+ 
+     private static final EnumMap<Wrapper, MethodHandle>[]
+-            ZERO_CONSTANT_FUNCTIONS = newWrapperCaches(1);
++            CONSTANT_FUNCTIONS = newWrapperCaches(2);
+ 
+     public static MethodHandle zeroConstantFunction(Wrapper wrap) {
+-        EnumMap<Wrapper, MethodHandle> cache = ZERO_CONSTANT_FUNCTIONS[0];
++        EnumMap<Wrapper, MethodHandle> cache = CONSTANT_FUNCTIONS[0];
+         MethodHandle mh = cache.get(wrap);
+         if (mh != null) {
+             return mh;
+@@ -544,6 +544,24 @@
+     }
+ 
+     /**
++     * Identity function on ints.
++     * @param x an arbitrary int value
++     * @return the same value x
++     */
++    static int identity(int x) {
++        return x;
++    }
++
++    /**
++     * Identity function on longs.
++     * @param x an arbitrary long value
++     * @return the same value x
++     */
++    static long identity(long x) {
++        return x;
++    }
++
++    /**
+      * Identity function, with reference cast.
+      * @param t an arbitrary reference type
+      * @param x an arbitrary reference value
+@@ -553,7 +571,7 @@
+         return t.cast(x);
+     }
+ 
+-    private static final MethodHandle IDENTITY, CAST_REFERENCE, ALWAYS_NULL, ALWAYS_ZERO, ZERO_OBJECT, IGNORE, EMPTY;
++    private static final MethodHandle IDENTITY, IDENTITY_I, IDENTITY_J, CAST_REFERENCE, ALWAYS_NULL, ALWAYS_ZERO, ZERO_OBJECT, IGNORE, EMPTY;
+     static {
+         try {
+             MethodType idType = MethodType.genericMethodType(1);
+@@ -562,6 +580,8 @@
+             MethodType ignoreType = idType.changeReturnType(void.class);
+             MethodType zeroObjectType = MethodType.genericMethodType(0);
+             IDENTITY = IMPL_LOOKUP.findStatic(ValueConversions.class, "identity", idType);
++            IDENTITY_I = IMPL_LOOKUP.findStatic(ValueConversions.class, "identity", MethodType.methodType(int.class, int.class));
++            IDENTITY_J = IMPL_LOOKUP.findStatic(ValueConversions.class, "identity", MethodType.methodType(long.class, long.class));
+             //CAST_REFERENCE = IMPL_LOOKUP.findVirtual(Class.class, "cast", idType);
+             CAST_REFERENCE = IMPL_LOOKUP.findStatic(ValueConversions.class, "castReference", castType);
+             ALWAYS_NULL = IMPL_LOOKUP.findStatic(ValueConversions.class, "alwaysNull", idType);
+@@ -613,6 +633,49 @@
+         return IDENTITY;
+     }
+ 
++    public static MethodHandle identity(Class<?> type) {
++        if (type == Object.class)
++            return IDENTITY;
++        else if (!type.isPrimitive())
++            return retype(MethodType.methodType(type, type), IDENTITY);
++        else
++            return identity(Wrapper.forPrimitiveType(type));
++    }
++
++    static MethodHandle identity(Wrapper wrap) {
++        EnumMap<Wrapper, MethodHandle> cache = CONSTANT_FUNCTIONS[1];
++        MethodHandle mh = cache.get(wrap);
++        if (mh != null) {
++            return mh;
++        }
++        // slow path
++        MethodType type = MethodType.methodType(wrap.primitiveType(), wrap.primitiveType());
++        try {
++            mh = IMPL_LOOKUP.findStatic(ValueConversions.class, "identity", type);
++        } catch (NoAccessException ex) {
++            mh = null;
++        }
++        if (mh == null && wrap == Wrapper.VOID) {
++            mh = EMPTY;  // #(){} : #()void
++        }
++        if (mh != null) {
++            cache.put(wrap, mh);
++            return mh;
++        }
++
++        // use a raw conversion
++        if (wrap.isSingleWord() && wrap != Wrapper.INT) {
++            mh = retype(type, identity(Wrapper.INT));
++        } else if (wrap.isDoubleWord() && wrap != Wrapper.LONG) {
++            mh = retype(type, identity(Wrapper.LONG));
++        }
++        if (mh != null) {
++            cache.put(wrap, mh);
++            return mh;
++        }
++        throw new IllegalArgumentException("cannot find identity for " + wrap);
++    }
++
+     private static MethodHandle retype(MethodType type, MethodHandle mh) {
+         return AdapterMethodHandle.makeRetypeOnly(IMPL_TOKEN, type, mh);
+     }
+diff --git a/test/java/dyn/InvokeGenericTest.java b/test/java/dyn/InvokeGenericTest.java
+new file mode 100644
+--- /dev/null
++++ b/test/java/dyn/InvokeGenericTest.java
+@@ -0,0 +1,484 @@
++/*
++ * Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Oracle designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Oracle in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++/* @test
++ * @summary unit tests for java.dyn.MethodHandle.invokeGeneric
++ * @compile -target 7 InvokeGenericTest.java
++ * @run junit/othervm -XX:+UnlockExperimentalVMOptions -XX:+EnableMethodHandles test.java.dyn.InvokeGenericTest
++ */
++
++package test.java.dyn;
++
++import java.dyn.*;
++import static java.dyn.MethodHandles.*;
++import static java.dyn.MethodType.*;
++import java.lang.reflect.*;
++import java.util.*;
++import org.junit.*;
++import static org.junit.Assert.*;
++import static org.junit.Assume.*;
++
++
++/**
++ *
++ * @author jrose
++ */
++public class InvokeGenericTest {
++    // How much output?
++    static int verbosity = 0;
++    static {
++        String vstr = System.getProperty("test.java.dyn.InvokeGenericTest.verbosity");
++        if (vstr != null)  verbosity = Integer.parseInt(vstr);
++    }
++
++    @Test
++    public void testFirst() throws Throwable {
++        verbosity += 9; try {
++            // left blank for debugging
++        } finally { printCounts(); verbosity -= 9; }
++    }
++
++    public InvokeGenericTest() {
++    }
++
++    @Before
++    public void checkImplementedPlatform() {
++        boolean platformOK = false;
++        Properties properties = System.getProperties();
++        String vers = properties.getProperty("java.vm.version");
++        String name = properties.getProperty("java.vm.name");
++        String arch = properties.getProperty("os.arch");
++        if ((arch.equals("amd64") || arch.equals("i386") || arch.equals("x86") ||
++             arch.equals("sparc") || arch.equals("sparcv9")) &&
++            (name.contains("Client") || name.contains("Server"))
++            ) {
++            platformOK = true;
++        } else {
++            System.err.println("Skipping tests for unsupported platform: "+Arrays.asList(vers, name, arch));
++        }
++        assumeTrue(platformOK);
++    }
++
++    String testName;
++    static int allPosTests, allNegTests;
++    int posTests, negTests;
++    @After
++    public void printCounts() {
++        if (verbosity >= 2 && (posTests | negTests) != 0) {
++            System.out.println();
++            if (posTests != 0)  System.out.println("=== "+testName+": "+posTests+" positive test cases run");
++            if (negTests != 0)  System.out.println("=== "+testName+": "+negTests+" negative test cases run");
++            allPosTests += posTests;
++            allNegTests += negTests;
++            posTests = negTests = 0;
++        }
++    }
++    void countTest(boolean positive) {
++        if (positive) ++posTests;
++        else          ++negTests;
++    }
++    void countTest() { countTest(true); }
++    void startTest(String name) {
++        if (testName != null)  printCounts();
++        if (verbosity >= 1)
++            System.out.println(name);
++        posTests = negTests = 0;
++        testName = name;
++    }
++
++    @BeforeClass
++    public static void setUpClass() throws Exception {
++        calledLog.clear();
++        calledLog.add(null);
++        nextArgVal = INITIAL_ARG_VAL;
++    }
++
++    @AfterClass
++    public static void tearDownClass() throws Exception {
++        int posTests = allPosTests, negTests = allNegTests;
++        if (verbosity >= 2 && (posTests | negTests) != 0) {
++            System.out.println();
++            if (posTests != 0)  System.out.println("=== "+posTests+" total positive test cases");
++            if (negTests != 0)  System.out.println("=== "+negTests+" total negative test cases");
++        }
++    }
++
++    static List<Object> calledLog = new ArrayList<Object>();
++    static Object logEntry(String name, Object... args) {
++        return Arrays.asList(name, Arrays.asList(args));
++    }
++    static Object called(String name, Object... args) {
++        Object entry = logEntry(name, args);
++        calledLog.add(entry);
++        return entry;
++    }
++    static void assertCalled(String name, Object... args) {
++        Object expected = logEntry(name, args);
++        Object actual   = calledLog.get(calledLog.size() - 1);
++        if (expected.equals(actual) && verbosity < 9)  return;
++        System.out.println("assertCalled "+name+":");
++        System.out.println("expected:   "+expected);
++        System.out.println("actual:     "+actual);
++        System.out.println("ex. types:  "+getClasses(expected));
++        System.out.println("act. types: "+getClasses(actual));
++        assertEquals("previous method call", expected, actual);
++    }
++    static void printCalled(MethodHandle target, String name, Object... args) {
++        if (verbosity >= 3)
++            System.out.println("calling MH="+target+" to "+name+Arrays.toString(args));
++    }
++
++    static Object castToWrapper(Object value, Class<?> dst) {
++        Object wrap = null;
++        if (value instanceof Number)
++            wrap = castToWrapperOrNull(((Number)value).longValue(), dst);
++        if (value instanceof Character)
++            wrap = castToWrapperOrNull((char)(Character)value, dst);
++        if (wrap != null)  return wrap;
++        return dst.cast(value);
++    }
++
++    static Object castToWrapperOrNull(long value, Class<?> dst) {
++        if (dst == int.class || dst == Integer.class)
++            return (int)(value);
++        if (dst == long.class || dst == Long.class)
++            return (long)(value);
++        if (dst == char.class || dst == Character.class)
++            return (char)(value);
++        if (dst == short.class || dst == Short.class)
++            return (short)(value);
++        if (dst == float.class || dst == Float.class)
++            return (float)(value);
++        if (dst == double.class || dst == Double.class)
++            return (double)(value);
++        if (dst == byte.class || dst == Byte.class)
++            return (byte)(value);
++        if (dst == boolean.class || dst == boolean.class)
++            return ((value % 29) & 1) == 0;
++        return null;
++    }
++
++    static final int ONE_MILLION = (1000*1000),  // first int value
++                     TEN_BILLION = (10*1000*1000*1000),  // scale factor to reach upper 32 bits
++                     INITIAL_ARG_VAL = ONE_MILLION << 1;  // <<1 makes space for sign bit;
++    static long nextArgVal;
++    static long nextArg(boolean moreBits) {
++        long val = nextArgVal++;
++        long sign = -(val & 1); // alternate signs
++        val >>= 1;
++        if (moreBits)
++            // Guarantee some bits in the high word.
++            // In any case keep the decimal representation simple-looking,
++            // with lots of zeroes, so as not to make the printed decimal
++            // strings unnecessarily noisy.
++            val += (val % ONE_MILLION) * TEN_BILLION;
++        return val ^ sign;
++    }
++    static int nextArg() {
++        // Produce a 32-bit result something like ONE_MILLION+(smallint).
++        // Example: 1_000_042.
++        return (int) nextArg(false);
++    }
++    static long nextArg(Class<?> kind) {
++        if (kind == long.class   || kind == Long.class ||
++            kind == double.class || kind == Double.class)
++            // produce a 64-bit result something like
++            // ((TEN_BILLION+1) * (ONE_MILLION+(smallint)))
++            // Example: 10_000_420_001_000_042.
++            return nextArg(true);
++        return (long) nextArg();
++    }
++
++    static Object randomArg(Class<?> param) {
++        Object wrap = castToWrapperOrNull(nextArg(param), param);
++        if (wrap != null) {
++            return wrap;
++        }
++//        import sun.dyn.util.Wrapper;
++//        Wrapper wrap = Wrapper.forBasicType(dst);
++//        if (wrap == Wrapper.OBJECT && Wrapper.isWrapperType(dst))
++//            wrap = Wrapper.forWrapperType(dst);
++//        if (wrap != Wrapper.OBJECT)
++//            return wrap.wrap(nextArg++);
++        if (param.isInterface()) {
++            for (Class<?> c : param.getClasses()) {
++                if (param.isAssignableFrom(c) && !c.isInterface())
++                    { param = c; break; }
++            }
++        }
++        if (param.isInterface() || param.isAssignableFrom(String.class))
++            return "#"+nextArg();
++        else
++            try {
++                return param.newInstance();
++            } catch (InstantiationException ex) {
++            } catch (IllegalAccessException ex) {
++            }
++        return null;  // random class not Object, String, Integer, etc.
++    }
++    static Object[] randomArgs(Class<?>... params) {
++        Object[] args = new Object[params.length];
++        for (int i = 0; i < args.length; i++)
++            args[i] = randomArg(params[i]);
++        return args;
++    }
++    static Object[] randomArgs(int nargs, Class<?> param) {
++        Object[] args = new Object[nargs];
++        for (int i = 0; i < args.length; i++)
++            args[i] = randomArg(param);
++        return args;
++    }
++
++    static final Object ANON_OBJ = new Object();
++    static Object zeroArg(Class<?> param) {
++        Object x = castToWrapperOrNull(0L, param);
++        if (x != null)  return x;
++        if (param.isInterface() || param.isAssignableFrom(String.class))  return "\"\"";
++        if (param == Object.class)  return ANON_OBJ;
++        if (param.getComponentType() != null)  return Array.newInstance(param.getComponentType(), 0);
++        return null;
++    }
++    static Object[] zeroArgs(Class<?>... params) {
++        Object[] args = new Object[params.length];
++        for (int i = 0; i < args.length; i++)
++            args[i] = zeroArg(params[i]);
++        return args;
++    }
++    static Object[] zeroArgs(List<Class<?>> params) {
++        return zeroArgs(params.toArray(new Class<?>[0]));
++    }
++
++    static <T, E extends T> T[] array(Class<T[]> atype, E... a) {
++        return Arrays.copyOf(a, a.length, atype);
++    }
++    static <T> T[] cat(T[] a, T... b) {
++        int alen = a.length, blen = b.length;
++        if (blen == 0)  return a;
++        T[] c = Arrays.copyOf(a, alen + blen);
++        System.arraycopy(b, 0, c, alen, blen);
++        return c;
++    }
++    static Integer[] boxAll(int... vx) {
++        Integer[] res = new Integer[vx.length];
++        for (int i = 0; i < res.length; i++) {
++            res[i] = vx[i];
++        }
++        return res;
++    }
++    static Object getClasses(Object x) {
++        if (x == null)  return x;
++        if (x instanceof String)  return x;  // keep the name
++        if (x instanceof List) {
++            // recursively report classes of the list elements
++            Object[] xa = ((List)x).toArray();
++            for (int i = 0; i < xa.length; i++)
++                xa[i] = getClasses(xa[i]);
++            return Arrays.asList(xa);
++        }
++        return x.getClass().getSimpleName();
++    }
++
++    static MethodHandle changeArgTypes(MethodHandle target, Class<?> argType) {
++        return changeArgTypes(target, 0, 999, argType);
++    }
++    static MethodHandle changeArgTypes(MethodHandle target,
++            int beg, int end, Class<?> argType) {
++        MethodType targetType = target.type();
++        end = Math.min(end, targetType.parameterCount());
++        ArrayList<Class<?>> argTypes = new ArrayList<Class<?>>(targetType.parameterList());
++        Collections.fill(argTypes.subList(beg, end), argType);
++        MethodType ttype2 = MethodType.methodType(targetType.returnType(), argTypes);
++        return MethodHandles.convertArguments(target, ttype2);
++    }
++
++    // This lookup is good for all members in and under InvokeGenericTest.
++    static final Lookup LOOKUP = MethodHandles.lookup();
++
++    Map<List<Class<?>>, MethodHandle> CALLABLES = new HashMap<List<Class<?>>, MethodHandle>();
++    MethodHandle callable(List<Class<?>> params) {
++        MethodHandle mh = CALLABLES.get(params);
++        if (mh == null) {
++            mh = collectArguments(collector_MH, methodType(Object.class, params));
++            CALLABLES.put(params, mh);
++        }
++        return mh;
++    }
++    MethodHandle callable(Class<?>... params) {
++        return callable(Arrays.asList(params));
++    }
++    private static Object collector(Object... args) {
++        return Arrays.asList(args);
++    }
++    private static final MethodHandle collector_MH;
++    static {
++        try {
++            collector_MH
++                = LOOKUP.findStatic(LOOKUP.lookupClass(),
++                                    "collector",
++                                    methodType(Object.class, Object[].class));
++        } catch (NoAccessException ex) {
++            throw new RuntimeException(ex);
++        }
++    }
++
++    @Test
++    public void testSimple() throws Throwable {
++        startTest("testSimple");
++        countTest();
++        String[] args = { "one", "two" };
++        MethodHandle mh = callable(Object.class, String.class);
++        Object res; List resl;
++        res = resl = (List) mh.<List>invokeGeneric((String)args[0], (Object)args[1]);
++        //System.out.println(res);
++        assertEquals(Arrays.asList(args), res);
++    }
++
++    @Test
++    public void testWrongArgumentCount() throws Throwable {
++        startTest("testWrongArgumentCount");
++        for (int i = 0; i <= 10; i++) {
++            testWrongArgumentCount(Collections.<Class<?>>nCopies(i, Integer.class));
++            if (i <= 4) {
++                testWrongArgumentCount(Collections.<Class<?>>nCopies(i, int.class));
++                testWrongArgumentCount(Collections.<Class<?>>nCopies(i, long.class));
++            }
++        }
++    }
++    public void testWrongArgumentCount(List<Class<?>> params) throws Throwable {
++        int max = params.size();
++        for (int i = 0; i < max; i++) {
++            List<Class<?>> params2 = params.subList(0, i);
++            for (int k = 0; k <= 2; k++) {
++                if (k == 1)  params  = methodType(Object.class,  params).generic().parameterList();
++                if (k == 2)  params2 = methodType(Object.class, params2).generic().parameterList();
++                testWrongArgumentCount(params, params2);
++                testWrongArgumentCount(params2, params);
++            }
++        }
++    }
++    public void testWrongArgumentCount(List<Class<?>> expect, List<Class<?>> observe) throws Throwable {
++        countTest(false);
++        if (expect.equals(observe))
++            assert(false);
++        MethodHandle target = callable(expect);
++        Object[] args = zeroArgs(observe);
++        Object junk;
++        try {
++            switch (args.length) {
++            case 0:
++                junk = target.invokeGeneric(); break;
++            case 1:
++                junk = target.invokeGeneric(args[0]); break;
++            case 2:
++                junk = target.invokeGeneric(args[0], args[1]); break;
++            case 3:
++                junk = target.invokeGeneric(args[0], args[1], args[2]); break;
++            case 4:
++                junk = target.invokeGeneric(args[0], args[1], args[2], args[3]); break;
++            default:
++                junk = MethodHandles.invokeVarargs(target, args); break;
++            }
++        } catch (WrongMethodTypeException ex) {
++            return;
++        } catch (Exception ex) {
++            throw new RuntimeException("wrong exception calling "+target+target.type()+" on "+Arrays.asList(args)+" : "+ex);
++        }
++        throw new RuntimeException("bad success calling "+target+target.type()+" on "+Arrays.asList(args));
++    }
++
++    /** Make a list of all combinations of the given types, with the given arities.
++     *  A void return type is possible iff the first type is void.class.
++     */
++    static List<MethodType> allMethodTypes(int minargc, int maxargc, Class<?>... types) {
++        ArrayList<MethodType> result = new ArrayList<MethodType>();
++        if (types.length > 0) {
++            ArrayList<MethodType> argcTypes = new ArrayList<MethodType>();
++            // build arity-zero types first
++            for (Class<?> rtype : types) {
++                argcTypes.add(MethodType.methodType(rtype));
++            }
++            if (types[0] == void.class)
++                // void is not an argument type
++                types = Arrays.copyOfRange(types, 1, types.length);
++            for (int argc = 0; argc <= maxargc; argc++) {
++                if (argc >= minargc)
++                    result.addAll(argcTypes);
++                if (argc >= maxargc)
++                    break;
++                ArrayList<MethodType> prevTypes = argcTypes;
++                argcTypes = new ArrayList<MethodType>();
++                for (MethodType prevType : prevTypes) {
++                    for (Class<?> ptype : types) {
++                        argcTypes.add(prevType.insertParameterTypes(argc, ptype));
++                    }
++                }
++            }
++        }
++        return Collections.unmodifiableList(result);
++    }
++    static List<MethodType> allMethodTypes(int argc, Class<?>... types) {
++        return allMethodTypes(argc, argc, types);
++    }
++
++    interface RandomInterface { }
++
++    MethodHandle toString_MH;
++
++    @Test
++    public void testReferenceConversions() throws Throwable {
++        startTest("testReferenceConversions");
++        toString_MH = LOOKUP.
++            findVirtual(Object.class, "toString", MethodType.methodType(String.class));
++        String[] args = { "one", "two" };
++        for (MethodType type : allMethodTypes(2, Object.class, String.class, RandomInterface.class)) {
++            testReferenceConversions(type, args);
++        }
++    }
++    public void testReferenceConversions(MethodType type, Object... args) throws Throwable {
++        countTest();
++        if (verbosity > 3)  System.out.println("target type: "+type);
++        MethodHandle mh = callable(type.parameterList());
++        MethodHandle tsdrop = MethodHandles.dropArguments(toString_MH, 1, type.parameterList());
++        mh = MethodHandles.foldArguments(tsdrop, mh);
++        mh = mh.asType(type);
++        Object res = mh.invokeGeneric((String)args[0], (Object)args[1]);
++        //System.out.println(res);
++        assertEquals(Arrays.asList(args).toString(), res);
++    }
++
++
++    @Test @Ignore("known failure pending 6939861")
++    public void testBoxConversions() throws Throwable {
++        startTest("testBoxConversions");
++        countTest();
++        Integer[] args = { 1, 2 };
++        MethodHandle mh = callable(Object.class, int.class);
++        Object res; List resl;
++        res = resl = (List) mh.<List>invokeGeneric((int)args[0], (Object)args[1]);
++        //System.out.println(res);
++        assertEquals(Arrays.asList(args), res);
++    }
++
++}
+diff --git a/test/java/dyn/MethodHandlesTest.java b/test/java/dyn/MethodHandlesTest.java
+--- a/test/java/dyn/MethodHandlesTest.java
++++ b/test/java/dyn/MethodHandlesTest.java
+@@ -1472,7 +1472,7 @@
+         if (pos != 0)  return;  // can fold only at pos=0 for now
+         countTest();
+         MethodHandle target = ValueConversions.varargsList(1 + nargs);
+-        MethodHandle combine = ValueConversions.varargsList(fold);
++        MethodHandle combine = ValueConversions.varargsList(fold).asType(MethodType.genericMethodType(fold));
+         List<Object> argsToPass = Arrays.asList(randomArgs(nargs, Object.class));
+         if (verbosity >= 3)
+             System.out.println("fold "+target+" with "+combine);

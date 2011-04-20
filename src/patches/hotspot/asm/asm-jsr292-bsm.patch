@@ -1,0 +1,270 @@
+Make asm compatible with the output of this MLVM patch:
+  http://hg.openjdk.java.net/mlvm/mlvm/langtools/file/tip/indy-bsm-6964498.patch
+  http://hg.openjdk.java.net/jdk7/jdk7/hotspot/rev/083fde3b838e
+
+Change comment:
+  6964498: JSR 292 invokedynamic sites need local bootstrap methods
+  Summary: Add JVM_CONSTANT_InvokeDynamic records to constant pool to determine per-instruction BSMs.
+
+Apply this patch after asm-jsr292-ldc.patch.
+
+diff --git a/src/org/objectweb/asm/ClassReader.java b/src/org/objectweb/asm/ClassReader.java
+--- a/src/org/objectweb/asm/ClassReader.java
++++ b/src/org/objectweb/asm/ClassReader.java
+@@ -126,8 +126,10 @@
+      * strategy could be extended to all constant pool items, but its benefit
+      * would not be so great for these items (because they are much less
+      * expensive to parse than CONSTANT_Utf8 items).
++     * <p>
++     * We also use this array to cache members.
+      */
+-    private final String[] strings;
++    private final Object[] strings;
+ 
+     /**
+      * Maximum length of the strings contained in the constant pool of the
+@@ -166,7 +168,7 @@
+         // parses the constant pool
+         items = new int[readUnsignedShort(off + 8)];
+         int n = items.length;
+-        strings = new String[n];
++        strings = new Object[n];
+         int max = 0;
+         int index = off + 10;
+         for (int i = 1; i < n; ++i) {
+@@ -176,6 +178,7 @@
+                 case ClassWriter.FIELD:
+                 case ClassWriter.METH:
+                 case ClassWriter.IMETH:
++                case ClassWriter.INDY:
+                 case ClassWriter.INT:
+                 case ClassWriter.FLOAT:
+                 case ClassWriter.NAME_TYPE:
+@@ -301,6 +304,13 @@
+                             readUTF8(nameType, buf),
+                             readUTF8(nameType + 2, buf));
+                     break;
++                case ClassWriter.INDY:
++                    nameType = items[readUnsignedShort(index + 2)];
++                    item.set(tag,
++                            readMethodHandle(index, buf).encoding(),
++                            readUTF8(nameType, buf),
++                            readUTF8(nameType + 2, buf));
++                    break;
+                 case ClassWriter.INT:
+                     item.set(readInt(index));
+                     break;
+@@ -327,10 +337,10 @@
+                     break;
+ 
+                 case ClassWriter.UTF8: {
+-                    String s = strings[i];
++                    String s = (String) strings[i];
+                     if (s == null) {
+                         index = items[i];
+-                        s = strings[i] = readUTF(index + 2,
++                        strings[i] = s = readUTF(index + 2,
+                                 readUnsignedShort(index),
+                                 buf);
+                     }
+@@ -1406,7 +1416,12 @@
+                             String iowner;
+                             // INVOKEDYNAMIC is receiverless
+                             if (opcode == Opcodes.INVOKEDYNAMIC) {
+-                                iowner = Opcodes.INVOKEDYNAMIC_OWNER;
++                                if (readByte(cpIndex - 1) != ClassWriter.INDY) {
++                                    iowner = Opcodes.INVOKEDYNAMIC_OWNER;
++                                } else {
++                                    iowner = readMethodHandle(readUnsignedShort(cpIndex + 0), c).encoding();
++                                    cpIndex = items[readUnsignedShort(cpIndex + 2)];
++                                }
+                             } else {
+                                 iowner = readClass(cpIndex, c);
+                                 cpIndex = items[readUnsignedShort(cpIndex + 2)];
+@@ -1996,16 +2011,16 @@
+      */
+     public String readUTF8(int index, final char[] buf) {
+         int item = readUnsignedShort(index);
+-        return getUTF8(item, buf);
+-    }
+-
+-    private String getUTF8(int item, final char[] buf) {
+-        String s = strings[item];
++        String s = (String) strings[item];
+         if (s != null) {
+             return s;
+         }
+-        int index = items[item];
+-        return strings[item] = readUTF(index + 2, readUnsignedShort(index), buf);
++        strings[item] = s = getUTF8(items[item], buf);
++        return s;
++    }
++
++    private String getUTF8(int index, final char[] buf) {
++        return readUTF(index + 2, readUnsignedShort(index), buf);
+     }
+ 
+     /**
+@@ -2087,6 +2102,8 @@
+     public Object readConst(final int item, final char[] buf) {
+         int index = items[item];
+         if (index == 0)  return null;
++        Object obj = strings[item];
++        if (obj != null)  return obj;
+         int tag = b[index - 1];
+         switch (tag) {
+             case ClassWriter.INT:
+@@ -2104,7 +2121,7 @@
+             case ClassWriter.STR:
+                 return readUTF8(index, buf);
+             case ClassWriter.UTF8:
+-                return getUTF8(item, buf);
++                return strings[item] = getUTF8(index, buf);
+             case ClassWriter.FIELD:
+             case ClassWriter.METH:
+                 return getMemberConst(tag, index, buf);
+@@ -2116,17 +2133,36 @@
+                                   readUTF8(index + 2, buf));
+             case ClassWriter.MHANDLE:
+                 return getMethodHandle(index, buf);
++            case ClassWriter.INDY:
++                return getInvokeDynamic(index, buf);
+             default:
+                 return "<Unknown Item>";
+         }
+     }
+ 
++    private Member readMethodHandle(int item, char[] buf) {
++        Object mh = strings[item];
++        if (mh == null) {
++            strings[item] = mh = getMethodHandle(items[item], buf);
++        }
++        return (Member) mh;
++    }
++
+     private Object getMethodHandle(int index, char[] buf) {
+         return getMemberConst(Member.methodHandleTag(readByte(index)),
+                               items[readUnsignedShort(index + 1)],
+                               buf);
+     }
+ 
++    private Object getInvokeDynamic(int index, char[] buf) {
++        int bsmItem = readUnsignedShort(index + 0);
++        int nameTypeIndex = items[readUnsignedShort(index + 2)];
++        return new Member(readMethodHandle(bsmItem, buf),
++                          readUTF8(nameTypeIndex + 0, buf),
++                          readUTF8(nameTypeIndex + 2, buf),
++                          ClassWriter.INDY);
++    }
++
+     private Object getMemberConst(int tag, int index, char[] buf) {
+         String owner = readClass(index + 0, buf);
+         int nameTypeIndex = items[readUnsignedShort(index + 2)];
+@@ -2134,6 +2170,5 @@
+                           readUTF8(nameTypeIndex + 0, buf),
+                           readUTF8(nameTypeIndex + 2, buf),
+                           tag);
+-
+     }
+ }
+diff --git a/src/org/objectweb/asm/ClassWriter.java b/src/org/objectweb/asm/ClassWriter.java
+--- a/src/org/objectweb/asm/ClassWriter.java
++++ b/src/org/objectweb/asm/ClassWriter.java
+@@ -227,6 +227,11 @@
+     static final int MTYPE = Opcodes.CONSTANT_MethodType;
+  
+     /**
++     * The type of CONSTANT_InvokeDynamic constant pool items.
++     */
++    static final int INDY = Opcodes.CONSTANT_InvokeDynamic;
++ 
++    /**
+      * Normal type Item stored in the ClassWriter {@link ClassWriter#typeTable},
+      * instead of the constant pool, in order to avoid clashes with normal
+      * constant pool items in the ClassWriter constant pool's hash table.
+diff --git a/src/org/objectweb/asm/Item.java b/src/org/objectweb/asm/Item.java
+--- a/src/org/objectweb/asm/Item.java
++++ b/src/org/objectweb/asm/Item.java
+@@ -51,6 +51,7 @@
+      * {@link ClassWriter#STR}, {@link ClassWriter#CLASS},
+      * {@link ClassWriter#NAME_TYPE}, {@link ClassWriter#FIELD},
+      * {@link ClassWriter#METH}, {@link ClassWriter#IMETH},
++     * {@link ClassWriter#INDY},
+      * {@link ClassWriter#MTYPE}, or a result of {@link ClassWriter#methodHandleTag(int)}
+      * 
+      * Special Item types are used for Items that are stored in the ClassWriter
+diff --git a/src/org/objectweb/asm/Member.java b/src/org/objectweb/asm/Member.java
+--- a/src/org/objectweb/asm/Member.java
++++ b/src/org/objectweb/asm/Member.java
+@@ -45,9 +45,9 @@
+     // ------------------------------------------------------------------------
+ 
+     /**
+-     * The containing type.
++     * The containing type or member.
+      */
+-    private final Type owner;
++    private final Object owner;
+ 
+     /**
+      * The name of the member.
+@@ -112,6 +112,14 @@
+              tag);
+     }
+ 
++    public Member(Member owner, String name, String type, int tag) {
++        if (tag == 0)  badArg(tag);
++        this.owner = owner;
++        this.name = name;
++        this.type = Type.getType(type);
++        this.tag = tag;
++    }
++
+     // ------------------------------------------------------------------------
+     // Accessors
+     // ------------------------------------------------------------------------
+@@ -119,7 +127,7 @@
+     /**
+      * Returns the owner of this member, or null if there is none.
+      */
+-    public Type getOwner() {
++    public Object getOwner() {
+         return owner;
+     }
+ 
+@@ -226,9 +234,14 @@
+             else
+                 buf.append("<").append(modeName(mode)).append("> ");
+         }
+-        if (owner != null) {
+-            owner.getInternalName(buf);
++        if (owner instanceof Type) {
++            ((Type)owner).getInternalName(buf);
+             buf.append('.');
++        } else if (owner instanceof Member) {
++            buf.append('<');
++            ((Member)owner).encode(buf, pretty);
++            buf.append('>');
++            if (pretty)  buf.append(' ');
+         }
+         buf.append(name);
+         if (!pretty) {
+@@ -278,6 +291,7 @@
+             case Opcodes.CONSTANT_NameAndType:   return "NameAndType";
+             case Opcodes.CONSTANT_MethodHandle:  return "MethodHandle";
+             case Opcodes.CONSTANT_MethodType:    return "MethodType";
++            case Opcodes.CONSTANT_InvokeDynamic: return "InvokeDynamic";
+         }
+         if ((tag & 0xFF) == Opcodes.CONSTANT_MethodHandle) {
+             return "MethodHandle/"+modeName(methodHandleTagKind(tag));
+diff --git a/src/org/objectweb/asm/Opcodes.java b/src/org/objectweb/asm/Opcodes.java
+--- a/src/org/objectweb/asm/Opcodes.java
++++ b/src/org/objectweb/asm/Opcodes.java
+@@ -103,6 +103,7 @@
+     int CONSTANT_NameAndType = 12;
+     int CONSTANT_MethodHandle = 15;  // JSR 292
+     int CONSTANT_MethodType = 16;  // JSR 292
++    int CONSTANT_InvokeDynamic = 17;  // JSR 292
+ 
+     // CONSTANT_MethodHandle constant pool items have a subtype tag
+     int REF_getField = 1;

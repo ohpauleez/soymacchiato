@@ -1,0 +1,38 @@
+Sketch of changes necessary to allow non-perm oops into the code cache.
+This is useful as a way to directly address java.dyn.CallSite and java.dyn.MethodHandle objects for invokedynamic.
+
+Here is a test case:
+
+class NonPermCon {
+    public static void main(String... av) {
+        for (int i = 20000; i > 0; i--) {
+            test();
+            if (i <= 10)
+                System.gc();  // force error checks
+        }
+        System.out.println("must print: a=20000 b=0 hc=123");
+        System.out.println("does print: a="+a+" b="+b+" hc="+hc);
+    }
+
+    final int myhc;
+    NonPermCon(int myhc) { this.myhc = myhc; }
+    public int hashCode() { return myhc; }
+
+    static final Object CON = new NonPermCon(123);
+    static int a, b, hc;
+
+    static void test() {
+        if (CON instanceof NonPermCon)
+            ++a;
+        else
+            ++b;  // no code generated here, please
+        // this should be called repeatedly on the constant:
+        int hc1 = CON.hashCode();
+        if (hc == 0)  hc = hc1;
+        else if (hc1 != hc)  bad(hc, hc1);
+    }
+
+    static void bad(int hc0, int hc1) {
+        throw new RuntimeException("hc shift: "+hc0+" != "+hc1);
+    }
+}

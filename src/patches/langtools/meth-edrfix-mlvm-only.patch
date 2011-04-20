@@ -1,0 +1,56 @@
+For mlvm repository only:  javac -XDallowTransitionalJSR292=only accepts only the syntax mh.<T>invokeExact().
+This helps check invocations which have changed from my.<T>invokeExact() to (T) my.<T>invokeExact().
+Then, when builds can access the mode -XDallowTransitionalJSR292=no, we change to (T) my.invokeExact().
+This fancy dance seems necessary in order to let the javac tool be released asynchronously to the JDK code.
+
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Attr.java b/src/share/classes/com/sun/tools/javac/comp/Attr.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Attr.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Attr.java
+@@ -2160,6 +2160,8 @@
+                     else
+                         sym = (MethodSymbol)methsel.sym;
+                     MethodType oldType = sym.type.asMethodType();
++                    if (rs.requireTransitionalJSR292 && returnType.tsym != oldType.getReturnType().tsym)
++                        log.error(expr.pos(), "suspicious.cast.on.method.handle", returnType);
+                     Symbol newSym = rs.findPolymorphicSignatureInstance(sym.owner.type, sym.name, sym,
+                                                                         returnType,
+                                                                         oldType.argtypes);
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Resolve.java b/src/share/classes/com/sun/tools/javac/comp/Resolve.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Resolve.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Resolve.java
+@@ -70,6 +70,7 @@
+     public final boolean recognizeMethodHandles;
+     public final boolean recognizeInvokeDynamic;
+     public final boolean allowTransitionalJSR292;
++    public final boolean requireTransitionalJSR292;  // mlvm only: do not commit this line to OpenJDK
+     private final boolean debugResolve;
+ 
+     public static Resolve instance(Context context) {
+@@ -108,6 +109,7 @@
+         Options options = Options.instance(context);
+         debugResolve = options.get("debugresolve") != null;
+         allowTransitionalJSR292 = options.get("allowTransitionalJSR292") != null;
++        requireTransitionalJSR292 = "only".equals(options.get("allowTransitionalJSR292"));  // mlvm only: do not commit this line to OpenJDK
+         Target target = Target.instance(context);
+         recognizeMethodHandles = allowTransitionalJSR292 || target.hasMethodHandles();
+         recognizeInvokeDynamic = allowTransitionalJSR292 || target.hasInvokedynamic() && options.get("invokedynamic") != null;
+@@ -1004,6 +1006,7 @@
+      */
+     Type initialPolymorphicSignatureResultType(Env<AttrContext> env, List<Type> typeargtypes) {
+         if (!typeargtypes.isEmpty()) {
++            if (requireTransitionalJSR292)  return typeargtypes.head;  // mlvm only; skip warning
+             log.warning(env.tree.pos, "type.parameter.on.polymorphic.signature");
+             if (allowTransitionalJSR292) {
+                 return typeargtypes.head;
+diff --git a/src/share/classes/com/sun/tools/javac/resources/compiler.properties b/src/share/classes/com/sun/tools/javac/resources/compiler.properties
+--- a/src/share/classes/com/sun/tools/javac/resources/compiler.properties
++++ b/src/share/classes/com/sun/tools/javac/resources/compiler.properties
+@@ -132,6 +132,8 @@
+     MethodHandle invocations require -target 7 runtimes or better
+ compiler.warn.wrong.target.for.polymorphic.signature.definition=\
+     MethodHandle API building requires -target 7 runtimes or better; current is -target {0}
++compiler.err.suspicious.cast.on.method.handle=\
++    on method handle invocation, suspicious cast to {0}
+ 
+ compiler.err.invokedynamic.must.have.bootstrap.method=\
+     InvokeDynamic calls must be in scope of a @BootstrapMethod annotation

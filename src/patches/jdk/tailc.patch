@@ -1,0 +1,31 @@
+diff -r 827a93c4d06a make/java/java/FILES_java.gmk
+--- a/make/java/java/FILES_java.gmk	Thu May 14 10:58:07 2009 -0700
++++ b/make/java/java/FILES_java.gmk	Thu Jun 04 09:38:24 2009 +0200
+@@ -77,7 +77,8 @@ JAVA_JAVA_java = \
+     java/lang/Compiler.java \
+     java/lang/Throwable.java \
+         java/lang/Exception.java \
+-	    java/lang/IllegalAccessException.java \
++	    java/lang/TailCallException.java \
++      java/lang/IllegalAccessException.java \
+ 	    java/lang/InstantiationException.java \
+ 	    java/lang/ClassNotFoundException.java \
+ 	    java/lang/CloneNotSupportedException.java \
+diff -r 827a93c4d06a src/share/classes/java/lang/TailCallException.java
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/src/share/classes/java/lang/TailCallException.java	Thu Jun 04 09:38:24 2009 +0200
+@@ -0,0 +1,14 @@
++package java.lang;
++
++/* Indicates an error not being able to tail call. e.g because classloaders
++ * differ
++ */
++public class TailCallException extends RuntimeException {
++  public TailCallException() {
++    super();
++  }
++
++  public TailCallException(String s) {
++    super(s);
++  }
++}

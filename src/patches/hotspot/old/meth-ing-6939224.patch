@@ -1,0 +1,692 @@
+6939224: MethodHandle.invokeGeneric needs to perform the correct set of conversions
+Reviewed-by: never
+
+diff --git a/src/cpu/sparc/vm/stubRoutines_sparc.hpp b/src/cpu/sparc/vm/stubRoutines_sparc.hpp
+--- a/src/cpu/sparc/vm/stubRoutines_sparc.hpp
++++ b/src/cpu/sparc/vm/stubRoutines_sparc.hpp
+@@ -43,7 +43,7 @@
+ 
+ // MethodHandles adapters
+ enum method_handles_platform_dependent_constants {
+-  method_handles_adapters_code_size = 6000
++  method_handles_adapters_code_size = 12000
+ };
+ 
+ class Sparc {
+diff --git a/src/cpu/x86/vm/assembler_x86.cpp b/src/cpu/x86/vm/assembler_x86.cpp
+--- a/src/cpu/x86/vm/assembler_x86.cpp
++++ b/src/cpu/x86/vm/assembler_x86.cpp
+@@ -4993,19 +4993,22 @@
+       ttyLocker ttyl;
+       tty->print_cr("eip = 0x%08x", eip);
+ #ifndef PRODUCT
+-      tty->cr();
+-      findpc(eip);
+-      tty->cr();
+-#endif
+-      tty->print_cr("rax, = 0x%08x", rax);
+-      tty->print_cr("rbx, = 0x%08x", rbx);
++      if ((WizardMode || Verbose) && PrintMiscellaneous) {
++        tty->cr();
++        findpc(eip);
++        tty->cr();
++      }
++#endif
++      tty->print_cr("rax = 0x%08x", rax);
++      tty->print_cr("rbx = 0x%08x", rbx);
+       tty->print_cr("rcx = 0x%08x", rcx);
+       tty->print_cr("rdx = 0x%08x", rdx);
+       tty->print_cr("rdi = 0x%08x", rdi);
+       tty->print_cr("rsi = 0x%08x", rsi);
+-      tty->print_cr("rbp, = 0x%08x", rbp);
++      tty->print_cr("rbp = 0x%08x", rbp);
+       tty->print_cr("rsp = 0x%08x", rsp);
+       BREAKPOINT;
++      assert(false, "start up GDB");
+     }
+   } else {
+     ttyLocker ttyl;
+@@ -7671,11 +7674,19 @@
+   movptr(tmp, ExternalAddress((address) delayed_value_addr));
+ 
+ #ifdef ASSERT
+-  Label L;
+-  testptr(tmp, tmp);
+-  jccb(Assembler::notZero, L);
+-  hlt();
+-  bind(L);
++  { Label L;
++    testptr(tmp, tmp);
++    if (WizardMode) {
++      jcc(Assembler::notZero, L);
++      char* buf = new char[40];
++      sprintf(buf, "DelayedValue="INTPTR_FORMAT, delayed_value_addr[1]);
++      stop(buf);
++    } else {
++      jccb(Assembler::notZero, L);
++      hlt();
++    }
++    bind(L);
++  }
+ #endif
+ 
+   if (offset != 0)
+diff --git a/src/cpu/x86/vm/methodHandles_x86.cpp b/src/cpu/x86/vm/methodHandles_x86.cpp
+--- a/src/cpu/x86/vm/methodHandles_x86.cpp
++++ b/src/cpu/x86/vm/methodHandles_x86.cpp
+@@ -27,6 +27,14 @@
+ 
+ #define __ _masm->
+ 
++#ifdef PRODUCT
++#define BLOCK_COMMENT(str) /* nothing */
++#else
++#define BLOCK_COMMENT(str) __ block_comment(str)
++#endif
++
++#define BIND(label) bind(label); BLOCK_COMMENT(#label ":")
++
+ address MethodHandleEntry::start_compiled_entry(MacroAssembler* _masm,
+                                                 address interpreted_entry) {
+   // Just before the actual machine code entry point, allocate space
+@@ -64,6 +72,7 @@
+                            const char* error_message) {
+   // Verify that argslot lies within (rsp, rbp].
+   Label L_ok, L_bad;
++  BLOCK_COMMENT("{ verify_argslot");
+   __ cmpptr(argslot_reg, rbp);
+   __ jccb(Assembler::above, L_bad);
+   __ cmpptr(rsp, argslot_reg);
+@@ -71,6 +80,7 @@
+   __ bind(L_bad);
+   __ stop(error_message);
+   __ bind(L_ok);
++  BLOCK_COMMENT("} verify_argslot");
+ }
+ #endif
+ 
+@@ -80,16 +90,21 @@
+   // rbx: methodOop
+   // rcx: receiver method handle (must load from sp[MethodTypeForm.vmslots])
+   // rsi/r13: sender SP (must preserve; see prepare_to_jump_from_interpreted)
+-  // rdx: garbage temp, blown away
++  // rdx, rdi: garbage temp, blown away
+ 
+   Register rbx_method = rbx;
+   Register rcx_recv   = rcx;
+   Register rax_mtype  = rax;
+   Register rdx_temp   = rdx;
++  Register rdi_temp   = rdi;
+ 
+   // emit WrongMethodType path first, to enable jccb back-branch from main path
+   Label wrong_method_type;
+   __ bind(wrong_method_type);
++  Label invoke_generic_slow_path;
++  assert(methodOopDesc::intrinsic_id_size_in_bytes() == sizeof(u1), "");;
++  __ cmpb(Address(rbx_method, methodOopDesc::intrinsic_id_offset_in_bytes()), (int) vmIntrinsics::_invokeExact);
++  __ jcc(Assembler::notEqual, invoke_generic_slow_path);
+   __ push(rax_mtype);       // required mtype
+   __ push(rcx_recv);        // bad mh (1st stacked argument)
+   __ jump(ExternalAddress(Interpreter::throw_WrongMethodType_entry()));
+@@ -106,17 +121,68 @@
+       tem = rax_mtype;          // in case there is another indirection
+     }
+   }
+-  Register rbx_temp = rbx_method; // done with incoming methodOop
+ 
+   // given the MethodType, find out where the MH argument is buried
+   __ movptr(rdx_temp, Address(rax_mtype,
+-                              __ delayed_value(java_dyn_MethodType::form_offset_in_bytes, rbx_temp)));
+-  __ movl(rdx_temp, Address(rdx_temp,
+-                            __ delayed_value(java_dyn_MethodTypeForm::vmslots_offset_in_bytes, rbx_temp)));
+-  __ movptr(rcx_recv, __ argument_address(rdx_temp));
++                              __ delayed_value(java_dyn_MethodType::form_offset_in_bytes, rdi_temp)));
++  Register rdx_vmslots = rdx_temp;
++  __ movl(rdx_vmslots, Address(rdx_temp,
++                               __ delayed_value(java_dyn_MethodTypeForm::vmslots_offset_in_bytes, rdi_temp)));
++  __ movptr(rcx_recv, __ argument_address(rdx_vmslots));
+ 
+-  __ check_method_handle_type(rax_mtype, rcx_recv, rdx_temp, wrong_method_type);
+-  __ jump_to_method_handle_entry(rcx_recv, rdx_temp);
++  trace_method_handle(_masm, "invokeExact");
++
++  __ check_method_handle_type(rax_mtype, rcx_recv, rdi_temp, wrong_method_type);
++  __ jump_to_method_handle_entry(rcx_recv, rdi_temp);
++
++  // for invokeGeneric (only), apply argument and result conversions on the fly
++  __ bind(invoke_generic_slow_path);
++#ifdef ASSERT
++  { Label L;
++    __ cmpb(Address(rbx_method, methodOopDesc::intrinsic_id_offset_in_bytes()), (int) vmIntrinsics::_invokeGeneric);
++    __ jcc(Assembler::equal, L);
++    __ stop("bad methodOop::intrinsic_id");
++    __ bind(L);
++  }
++#endif //ASSERT
++  Register rbx_temp = rbx_method;  // don't need it now
++
++  // make room on the stack for another pointer:
++  Register rcx_argslot = rcx_recv;
++  __ lea(rcx_argslot, __ argument_address(rdx_vmslots, 1));
++  insert_arg_slots(_masm, 2 * stack_move_unit(), _INSERT_REF_MASK,
++                   rcx_argslot, rbx_temp, rdx_temp);
++
++  // load up an adapter from the calling type (Java weaves this)
++  __ movptr(rdx_temp, Address(rax_mtype,
++                              __ delayed_value(java_dyn_MethodType::form_offset_in_bytes, rdi_temp)));
++  Register rdx_adapter = rdx_temp;
++  // movptr(rdx_adapter, Address(rdx_temp, java_dyn_MethodTypeForm::genericInvoker_offset_in_bytes()));
++  // deal with old JDK versions:
++  __ lea(rdi_temp, Address(rdx_temp,
++                           __ delayed_value(java_dyn_MethodTypeForm::genericInvoker_offset_in_bytes, rdi_temp)));
++  __ cmpptr(rdi_temp, rdx_temp);
++  Label sorry_no_invoke_generic;
++  __ jccb(Assembler::below, sorry_no_invoke_generic);
++
++  __ movptr(rdx_adapter, Address(rdi_temp, 0));
++  __ testptr(rdx_adapter, rdx_adapter);
++  __ jccb(Assembler::zero, sorry_no_invoke_generic);
++  __ movptr(Address(rcx_argslot, 1 * Interpreter::stackElementSize), rdx_adapter);
++  // As a trusted first argument, pass the type being called, so the adapter knows
++  // the actual types of the arguments and return values.
++  // (Generic invokers are shared among form-families of method-type.)
++  __ movptr(Address(rcx_argslot, 0 * Interpreter::stackElementSize), rax_mtype);
++  // FIXME: assert that rdx_adapter is of the right method-type.
++  __ mov(rcx, rdx_adapter);
++  trace_method_handle(_masm, "invokeGeneric");
++  __ jump_to_method_handle_entry(rcx, rdi_temp);
++
++  __ bind(sorry_no_invoke_generic); // no invokeGeneric implementation available!
++  __ movptr(rcx_recv, Address(rcx_argslot, -1 * Interpreter::stackElementSize));  // recover original MH
++  __ push(rax_mtype);       // required mtype
++  __ push(rcx_recv);        // bad mh (1st stacked argument)
++  __ jump(ExternalAddress(Interpreter::throw_WrongMethodType_entry()));
+ 
+   return entry_point;
+ }
+@@ -164,11 +230,12 @@
+   //   for (rdx = rsp + size; rdx < argslot; rdx++)
+   //     rdx[-size] = rdx[0]
+   //   argslot -= size;
++  BLOCK_COMMENT("insert_arg_slots {");
+   __ mov(rdx_temp, rsp);                        // source pointer for copy
+   __ lea(rsp, Address(rsp, arg_slots, Address::times_ptr));
+   {
+     Label loop;
+-    __ bind(loop);
++    __ BIND(loop);
+     // pull one word down each time through the loop
+     __ movptr(rbx_temp, Address(rdx_temp, 0));
+     __ movptr(Address(rdx_temp, arg_slots, Address::times_ptr), rbx_temp);
+@@ -179,6 +246,7 @@
+ 
+   // Now move the argslot down, to point to the opened-up space.
+   __ lea(rax_argslot, Address(rax_argslot, arg_slots, Address::times_ptr));
++  BLOCK_COMMENT("} insert_arg_slots");
+ }
+ 
+ // Helper to remove argument slots from the stack.
+@@ -218,6 +286,7 @@
+   }
+ #endif
+ 
++  BLOCK_COMMENT("remove_arg_slots {");
+   // Pull up everything shallower than rax_argslot.
+   // Then remove the excess space on the stack.
+   // The stacked return address gets pulled up with everything else.
+@@ -229,7 +298,7 @@
+   __ lea(rdx_temp, Address(rax_argslot, -wordSize)); // source pointer for copy
+   {
+     Label loop;
+-    __ bind(loop);
++    __ BIND(loop);
+     // pull one word up each time through the loop
+     __ movptr(rbx_temp, Address(rdx_temp, 0));
+     __ movptr(Address(rdx_temp, arg_slots, Address::times_ptr), rbx_temp);
+@@ -242,12 +311,14 @@
+   __ lea(rsp, Address(rsp, arg_slots, Address::times_ptr));
+   // And adjust the argslot address to point at the deletion point.
+   __ lea(rax_argslot, Address(rax_argslot, arg_slots, Address::times_ptr));
++  BLOCK_COMMENT("} remove_arg_slots");
+ }
+ 
+ #ifndef PRODUCT
+ extern "C" void print_method_handle(oop mh);
+ void trace_method_handle_stub(const char* adaptername,
+                               oop mh,
++                              intptr_t* saved_regs,
+                               intptr_t* entry_sp,
+                               intptr_t* saved_sp,
+                               intptr_t* saved_bp) {
+@@ -256,9 +327,47 @@
+   intptr_t* base_sp = (intptr_t*) saved_bp[frame::interpreter_frame_monitor_block_top_offset];
+   printf("MH %s mh="INTPTR_FORMAT" sp=("INTPTR_FORMAT"+"INTX_FORMAT") stack_size="INTX_FORMAT" bp="INTPTR_FORMAT"\n",
+          adaptername, (intptr_t)mh, (intptr_t)entry_sp, (intptr_t)(saved_sp - entry_sp), (intptr_t)(base_sp - last_sp), (intptr_t)saved_bp);
+-  if (last_sp != saved_sp)
++  if (last_sp != saved_sp && last_sp != NULL)
+     printf("*** last_sp="INTPTR_FORMAT"\n", (intptr_t)last_sp);
+-  if (Verbose)  print_method_handle(mh);
++  if (Verbose) {
++    printf(" reg dump: ");
++    int saved_regs_count = (entry_sp-1) - saved_regs;
++    // 32 bit: rdi rsi rbp rsp; rbx rdx rcx (*) rax
++    int i;
++    for (i = 0; i <= saved_regs_count; i++) {
++      if (i > 0 && i % 4 == 0 && i != saved_regs_count)
++        printf("\n   + dump: ");
++      printf(" %d: "INTPTR_FORMAT, i, saved_regs[i]);
++    }
++    printf("\n");
++    int stack_dump_count = 16;
++    if (stack_dump_count < (int)(saved_bp + 2 - saved_sp))
++      stack_dump_count = (int)(saved_bp + 2 - saved_sp);
++    if (stack_dump_count > 64)  stack_dump_count = 48;
++    for (i = 0; i < stack_dump_count; i += 4) {
++      printf(" dump at SP[%d] "INTPTR_FORMAT": "INTPTR_FORMAT" "INTPTR_FORMAT" "INTPTR_FORMAT" "INTPTR_FORMAT"\n",
++             i, &entry_sp[i+0], entry_sp[i+0], entry_sp[i+1], entry_sp[i+2], entry_sp[i+3]);
++    }
++    print_method_handle(mh);
++  }
++}
++void MethodHandles::trace_method_handle(MacroAssembler* _masm, const char* adaptername) {
++  if (!TraceMethodHandles)  return;
++  BLOCK_COMMENT("trace_method_handle {");
++  __ push(rax);
++  __ lea(rax, Address(rsp, wordSize*6)); // entry_sp
++  __ pusha();
++  // arguments:
++  __ push(rbp);               // interpreter frame pointer
++  __ push(rsi);               // saved_sp
++  __ push(rax);               // entry_sp
++  __ push(rcx);               // mh
++  __ push(rcx);
++  __ movptr(Address(rsp, 0), (intptr_t) adaptername);
++  __ call_VM_leaf(CAST_FROM_FN_PTR(address, trace_method_handle_stub), 5);
++  __ popa();
++  __ pop(rax);
++  BLOCK_COMMENT("} trace_method_handle");
+ }
+ #endif //PRODUCT
+ 
+@@ -324,21 +433,9 @@
+   address interp_entry = __ pc();
+   if (UseCompressedOops)  __ unimplemented("UseCompressedOops");
+ 
+-#ifndef PRODUCT
+-  if (TraceMethodHandles) {
+-    __ push(rax); __ push(rbx); __ push(rcx); __ push(rdx); __ push(rsi); __ push(rdi);
+-    __ lea(rax, Address(rsp, wordSize*6)); // entry_sp
+-    // arguments:
+-    __ push(rbp);               // interpreter frame pointer
+-    __ push(rsi);               // saved_sp
+-    __ push(rax);               // entry_sp
+-    __ push(rcx);               // mh
+-    __ push(rcx);
+-    __ movptr(Address(rsp, 0), (intptr_t)entry_name(ek));
+-    __ call_VM_leaf(CAST_FROM_FN_PTR(address, trace_method_handle_stub), 5);
+-    __ pop(rdi); __ pop(rsi); __ pop(rdx); __ pop(rcx); __ pop(rbx); __ pop(rax);
+-  }
+-#endif //PRODUCT
++  trace_method_handle(_masm, entry_name(ek));
++
++  BLOCK_COMMENT(entry_name(ek));
+ 
+   switch ((int) ek) {
+   case _raise_exception:
+diff --git a/src/cpu/x86/vm/stubRoutines_x86_32.hpp b/src/cpu/x86/vm/stubRoutines_x86_32.hpp
+--- a/src/cpu/x86/vm/stubRoutines_x86_32.hpp
++++ b/src/cpu/x86/vm/stubRoutines_x86_32.hpp
+@@ -33,7 +33,7 @@
+ 
+ // MethodHandles adapters
+ enum method_handles_platform_dependent_constants {
+-  method_handles_adapters_code_size = 5000
++  method_handles_adapters_code_size = 10000
+ };
+ 
+ class x86 {
+diff --git a/src/cpu/x86/vm/stubRoutines_x86_64.hpp b/src/cpu/x86/vm/stubRoutines_x86_64.hpp
+--- a/src/cpu/x86/vm/stubRoutines_x86_64.hpp
++++ b/src/cpu/x86/vm/stubRoutines_x86_64.hpp
+@@ -35,7 +35,7 @@
+ 
+ // MethodHandles adapters
+ enum method_handles_platform_dependent_constants {
+-  method_handles_adapters_code_size = 13000
++  method_handles_adapters_code_size = 26000
+ };
+ 
+ class x86 {
+diff --git a/src/share/vm/classfile/javaClasses.cpp b/src/share/vm/classfile/javaClasses.cpp
+--- a/src/share/vm/classfile/javaClasses.cpp
++++ b/src/share/vm/classfile/javaClasses.cpp
+@@ -2424,12 +2424,15 @@
+ 
+ int java_dyn_MethodTypeForm::_vmslots_offset;
+ int java_dyn_MethodTypeForm::_erasedType_offset;
++int java_dyn_MethodTypeForm::_genericInvoker_offset;
+ 
+ void java_dyn_MethodTypeForm::compute_offsets() {
+   klassOop k = SystemDictionary::MethodTypeForm_klass();
+   if (k != NULL) {
+     compute_optional_offset(_vmslots_offset,    k, vmSymbols::vmslots_name(),    vmSymbols::int_signature(), true);
+     compute_optional_offset(_erasedType_offset, k, vmSymbols::erasedType_name(), vmSymbols::java_dyn_MethodType_signature(), true);
++    compute_optional_offset(_genericInvoker_offset, k, vmSymbols::genericInvoker_name(), vmSymbols::java_dyn_MethodHandle_signature(), true);
++    if (_genericInvoker_offset == 0)  _genericInvoker_offset = -1;  // set to explicit "empty" value
+   }
+ }
+ 
+@@ -2443,6 +2446,11 @@
+   return mtform->obj_field(_erasedType_offset);
+ }
+ 
++oop java_dyn_MethodTypeForm::genericInvoker(oop mtform) {
++  assert(mtform->klass() == SystemDictionary::MethodTypeForm_klass(), "MTForm only");
++  return mtform->obj_field(_genericInvoker_offset);
++}
++
+ 
+ // Support for java_dyn_CallSite
+ 
+diff --git a/src/share/vm/classfile/javaClasses.hpp b/src/share/vm/classfile/javaClasses.hpp
+--- a/src/share/vm/classfile/javaClasses.hpp
++++ b/src/share/vm/classfile/javaClasses.hpp
+@@ -1048,6 +1048,7 @@
+  private:
+   static int _vmslots_offset;           // number of argument slots needed
+   static int _erasedType_offset;        // erasedType = canonical MethodType
++  static int _genericInvoker_offset;    // genericInvoker = adapter for invokeGeneric
+ 
+   static void compute_offsets();
+ 
+@@ -1055,10 +1056,12 @@
+   // Accessors
+   static int            vmslots(oop mtform);
+   static oop            erasedType(oop mtform);
++  static oop            genericInvoker(oop mtform);
+ 
+   // Accessors for code generation:
+   static int vmslots_offset_in_bytes()          { return _vmslots_offset; }
+   static int erasedType_offset_in_bytes()       { return _erasedType_offset; }
++  static int genericInvoker_offset_in_bytes()   { return _genericInvoker_offset; }
+ };
+ 
+ 
+diff --git a/src/share/vm/classfile/systemDictionary.cpp b/src/share/vm/classfile/systemDictionary.cpp
+--- a/src/share/vm/classfile/systemDictionary.cpp
++++ b/src/share/vm/classfile/systemDictionary.cpp
+@@ -2361,8 +2361,11 @@
+     // Must create lots of stuff here, but outside of the SystemDictionary lock.
+     if (THREAD->is_Compiler_thread())
+       return NULL;              // do not attempt from within compiler
++    bool for_invokeGeneric = (name_id == vmSymbols::VM_SYMBOL_ENUM_NAME(invokeGeneric_name));
+     bool found_on_bcp = false;
+-    Handle mt = find_method_handle_type(signature(), accessing_klass, found_on_bcp, CHECK_NULL);
++    Handle mt = find_method_handle_type(signature(), accessing_klass,
++                                        for_invokeGeneric,
++                                        found_on_bcp, CHECK_NULL);
+     KlassHandle  mh_klass = SystemDictionaryHandles::MethodHandle_klass();
+     methodHandle m = methodOopDesc::make_invoke_method(mh_klass, name, signature,
+                                                        mt, CHECK_NULL);
+@@ -2393,6 +2396,7 @@
+ // consistent with this loader.
+ Handle SystemDictionary::find_method_handle_type(symbolHandle signature,
+                                                  KlassHandle accessing_klass,
++                                                 bool for_invokeGeneric,
+                                                  bool& return_bcp_flag,
+                                                  TRAPS) {
+   Handle class_loader, protection_domain;
+@@ -2448,10 +2452,26 @@
+                          vmSymbols::findMethodHandleType_name(),
+                          vmSymbols::findMethodHandleType_signature(),
+                          &args, CHECK_(empty));
++  Handle method_type(THREAD, (oop) result.get_jobject());
++
++  if (for_invokeGeneric) {
++    // call sun.dyn.MethodHandleNatives::notifyGenericMethodType(MethodType) -> void
++    JavaCallArguments args(Handle(THREAD, method_type()));
++    JavaValue no_result(T_VOID);
++    JavaCalls::call_static(&no_result,
++                           SystemDictionary::MethodHandleNatives_klass(),
++                           vmSymbols::notifyGenericMethodType_name(),
++                           vmSymbols::notifyGenericMethodType_signature(),
++                           &args, THREAD);
++    if (HAS_PENDING_EXCEPTION) {
++      // If the notification fails, just kill it.
++      CLEAR_PENDING_EXCEPTION;
++    }
++  }
+ 
+   // report back to the caller with the MethodType and the "on_bcp" flag
+   return_bcp_flag = is_on_bcp;
+-  return Handle(THREAD, (oop) result.get_jobject());
++  return method_type;
+ }
+ 
+ // Ask Java code to find or construct a method handle constant.
+@@ -2466,7 +2486,7 @@
+   Handle type;
+   if (signature->utf8_length() > 0 && signature->byte_at(0) == '(') {
+     bool ignore_is_on_bcp = false;
+-    type = find_method_handle_type(signature, caller, ignore_is_on_bcp, CHECK_(empty));
++    type = find_method_handle_type(signature, caller, false, ignore_is_on_bcp, CHECK_(empty));
+   } else {
+     SignatureStream ss(signature(), false);
+     if (!ss.is_done()) {
+diff --git a/src/share/vm/classfile/systemDictionary.hpp b/src/share/vm/classfile/systemDictionary.hpp
+--- a/src/share/vm/classfile/systemDictionary.hpp
++++ b/src/share/vm/classfile/systemDictionary.hpp
+@@ -471,6 +471,7 @@
+   // ask Java to compute a java.dyn.MethodType object for a given signature
+   static Handle    find_method_handle_type(symbolHandle signature,
+                                            KlassHandle accessing_klass,
++                                           bool for_invokeGeneric,
+                                            bool& return_bcp_flag,
+                                            TRAPS);
+   // ask Java to compute a java.dyn.MethodHandle object for a given CP entry
+diff --git a/src/share/vm/classfile/vmSymbols.hpp b/src/share/vm/classfile/vmSymbols.hpp
+--- a/src/share/vm/classfile/vmSymbols.hpp
++++ b/src/share/vm/classfile/vmSymbols.hpp
+@@ -246,6 +246,8 @@
+   /* internal up-calls made only by the JVM, via class sun.dyn.MethodHandleNatives: */            \
+   template(findMethodHandleType_name,                 "findMethodHandleType")                     \
+   template(findMethodHandleType_signature, "(Ljava/lang/Class;[Ljava/lang/Class;)Ljava/dyn/MethodType;") \
++  template(notifyGenericMethodType_name,              "notifyGenericMethodType")                  \
++  template(notifyGenericMethodType_signature,         "(Ljava/dyn/MethodType;)V")                 \
+   template(linkMethodHandleConstant_name,             "linkMethodHandleConstant")                 \
+   template(linkMethodHandleConstant_signature, "(Ljava/lang/Class;ILjava/lang/Class;Ljava/lang/String;Ljava/lang/Object;)Ljava/dyn/MethodHandle;") \
+   template(makeDynamicCallSite_name,                  "makeDynamicCallSite")                      \
+@@ -345,6 +347,7 @@
+   template(ptypes_name,                               "ptypes")                                   \
+   template(form_name,                                 "form")                                     \
+   template(erasedType_name,                           "erasedType")                               \
++  template(genericInvoker_name,                       "genericInvoker")                           \
+   template(append_name,                               "append")                                   \
+                                                                                                   \
+   /* non-intrinsic name/signature pairs: */                                                       \
+diff --git a/src/share/vm/interpreter/interpreterRuntime.cpp b/src/share/vm/interpreter/interpreterRuntime.cpp
+--- a/src/share/vm/interpreter/interpreterRuntime.cpp
++++ b/src/share/vm/interpreter/interpreterRuntime.cpp
+@@ -200,6 +200,7 @@
+ void InterpreterRuntime::note_trap(JavaThread* thread, int reason, TRAPS) {
+   assert(ProfileTraps, "call me only if profiling");
+   methodHandle trap_method(thread, method(thread));
++
+   if (trap_method.not_null()) {
+     methodDataHandle trap_mdo(thread, trap_method->method_data());
+     if (trap_mdo.is_null()) {
+diff --git a/src/share/vm/oops/constantPoolOop.cpp b/src/share/vm/oops/constantPoolOop.cpp
+--- a/src/share/vm/oops/constantPoolOop.cpp
++++ b/src/share/vm/oops/constantPoolOop.cpp
+@@ -466,6 +466,7 @@
+       bool ignore_is_on_bcp = false;
+       Handle value = SystemDictionary::find_method_handle_type(signature,
+                                                                klass,
++                                                               false,
+                                                                ignore_is_on_bcp,
+                                                                CHECK_NULL);
+       result_oop = value();
+diff --git a/src/share/vm/oops/methodOop.cpp b/src/share/vm/oops/methodOop.cpp
+--- a/src/share/vm/oops/methodOop.cpp
++++ b/src/share/vm/oops/methodOop.cpp
+@@ -809,11 +809,13 @@
+ 
+ bool methodOopDesc::is_method_handle_invoke_name(vmSymbols::SID name_sid) {
+   switch (name_sid) {
+-  case vmSymbols::VM_SYMBOL_ENUM_NAME(invoke_name):  // FIXME: remove this transitional form
+   case vmSymbols::VM_SYMBOL_ENUM_NAME(invokeExact_name):
+   case vmSymbols::VM_SYMBOL_ENUM_NAME(invokeGeneric_name):
+     return true;
+   }
++  if (AllowTransitionalJSR292
++      && name_sid == vmSymbols::VM_SYMBOL_ENUM_NAME(invoke_name))
++    return true;
+   return false;
+ }
+ 
+@@ -901,12 +903,16 @@
+   m->set_signature_index(_imcp_invoke_signature);
+   assert(is_method_handle_invoke_name(m->name()), "");
+   assert(m->signature() == signature(), "");
++  assert(m->is_method_handle_invoke(), "");
+ #ifdef CC_INTERP
+   ResultTypeFinder rtf(signature());
+   m->set_result_index(rtf.type());
+ #endif
+   m->compute_size_of_parameters(THREAD);
+   m->set_exception_table(Universe::the_empty_int_array());
++  m->init_intrinsic_id();
++  assert(m->intrinsic_id() == vmIntrinsics::_invokeExact ||
++         m->intrinsic_id() == vmIntrinsics::_invokeGeneric, "must be an invoker");
+ 
+   // Finally, set up its entry points.
+   assert(m->method_handle_type() == method_type(), "");
+@@ -1019,6 +1025,7 @@
+   assert(_intrinsic_id == vmIntrinsics::_none, "do this just once");
+   const uintptr_t max_id_uint = right_n_bits((int)(sizeof(_intrinsic_id) * BitsPerByte));
+   assert((uintptr_t)vmIntrinsics::ID_LIMIT <= max_id_uint, "else fix size");
++  assert(intrinsic_id_size_in_bytes() == sizeof(_intrinsic_id), "");
+ 
+   // the klass name is well-known:
+   vmSymbols::SID klass_id = klass_id_for_intrinsics(method_holder());
+@@ -1026,9 +1033,10 @@
+ 
+   // ditto for method and signature:
+   vmSymbols::SID  name_id = vmSymbols::find_sid(name());
+-  if (name_id  == vmSymbols::NO_SID)  return;
++  if (name_id == vmSymbols::NO_SID)  return;
+   vmSymbols::SID   sig_id = vmSymbols::find_sid(signature());
+-  if (sig_id   == vmSymbols::NO_SID)  return;
++  if (klass_id != vmSymbols::VM_SYMBOL_ENUM_NAME(java_dyn_MethodHandle)
++      && sig_id == vmSymbols::NO_SID)  return;
+   jshort flags = access_flags().as_short();
+ 
+   vmIntrinsics::ID id = vmIntrinsics::find_id(klass_id, name_id, sig_id, flags);
+@@ -1057,10 +1065,13 @@
+     if (is_static() || !is_native())  break;
+     switch (name_id) {
+     case vmSymbols::VM_SYMBOL_ENUM_NAME(invokeGeneric_name):
+-      id = vmIntrinsics::_invokeGeneric; break;
+-    default:
+-      if (is_method_handle_invoke_name(name()))
+-        id = vmIntrinsics::_invokeExact;
++      id = vmIntrinsics::_invokeGeneric;
++      break;
++    case vmSymbols::VM_SYMBOL_ENUM_NAME(invokeExact_name):
++      id = vmIntrinsics::_invokeExact;
++      break;
++    case vmSymbols::VM_SYMBOL_ENUM_NAME(invoke_name):
++      if (AllowTransitionalJSR292)  id = vmIntrinsics::_invokeExact;
+       break;
+     }
+     break;
+diff --git a/src/share/vm/oops/methodOop.hpp b/src/share/vm/oops/methodOop.hpp
+--- a/src/share/vm/oops/methodOop.hpp
++++ b/src/share/vm/oops/methodOop.hpp
+@@ -506,6 +506,8 @@
+   static int method_data_offset_in_bytes()       { return offset_of(methodOopDesc, _method_data); }
+   static int interpreter_invocation_counter_offset_in_bytes()
+                                                  { return offset_of(methodOopDesc, _interpreter_invocation_count); }
++  static int intrinsic_id_offset_in_bytes()      { return offset_of(methodOopDesc, _intrinsic_id); }
++  static int intrinsic_id_size_in_bytes()        { return sizeof(u1); }
+ 
+   // Static methods that are used to implement member methods where an exposed this pointer
+   // is needed due to possible GCs
+diff --git a/src/share/vm/prims/methodHandleWalk.cpp b/src/share/vm/prims/methodHandleWalk.cpp
+--- a/src/share/vm/prims/methodHandleWalk.cpp
++++ b/src/share/vm/prims/methodHandleWalk.cpp
+@@ -333,8 +333,7 @@
+         ArgToken arglist[2];
+         arglist[0] = arg;         // outgoing value
+         arglist[1] = ArgToken();  // sentinel
+-        assert(false, "I think the argument count must be 1 instead of 0");
+-        arg = make_invoke(NULL, boxer, Bytecodes::_invokevirtual, false, 0, &arglist[0], CHECK_(empty));
++        arg = make_invoke(NULL, boxer, Bytecodes::_invokevirtual, false, 1, &arglist[0], CHECK_(empty));
+         change_argument(src, arg_slot, T_OBJECT, arg);
+         break;
+       }
+@@ -1398,7 +1397,9 @@
+ 
+ extern "C"
+ void print_method_handle(oop mh) {
+-  if (java_dyn_MethodHandle::is_instance(mh)) {
++  if (!mh->is_oop()) {
++    tty->print_cr("*** not a method handle: "INTPTR_FORMAT, (intptr_t)mh);
++  } else if (java_dyn_MethodHandle::is_instance(mh)) {
+     //MethodHandlePrinter::print(mh);
+   } else {
+     tty->print("*** not a method handle: ");
+diff --git a/src/share/vm/prims/methodHandles.hpp b/src/share/vm/prims/methodHandles.hpp
+--- a/src/share/vm/prims/methodHandles.hpp
++++ b/src/share/vm/prims/methodHandles.hpp
+@@ -446,6 +446,8 @@
+                                RegisterOrConstant arg_slots,
+                                Register argslot_reg,
+                                Register temp_reg, Register temp2_reg, Register temp3_reg = noreg);
++
++  static void trace_method_handle(MacroAssembler* _masm, const char* adaptername) PRODUCT_RETURN;
+ };
+ 
+ 
+diff --git a/src/share/vm/runtime/sharedRuntime.cpp b/src/share/vm/runtime/sharedRuntime.cpp
+--- a/src/share/vm/runtime/sharedRuntime.cpp
++++ b/src/share/vm/runtime/sharedRuntime.cpp
+@@ -1518,8 +1518,13 @@
+ char* SharedRuntime::generate_wrong_method_type_message(JavaThread* thread,
+                                                         oopDesc* required,
+                                                         oopDesc* actual) {
++  if (TraceMethodHandles) {
++    tty->print_cr("WrongMethodType thread="PTR_FORMAT" req="PTR_FORMAT" act="PTR_FORMAT"",
++                  thread, required, actual);
++  }
+   assert(EnableMethodHandles, "");
+   oop singleKlass = wrong_method_type_is_for_single_argument(thread, required);
++  char* message = NULL;
+   if (singleKlass != NULL) {
+     const char* objName = "argument or return value";
+     if (actual != NULL) {
+@@ -1532,7 +1537,7 @@
+     Klass* targetKlass = Klass::cast(required->is_klass()
+                                      ? (klassOop)required
+                                      : java_lang_Class::as_klassOop(required));
+-    return generate_class_cast_message(objName, targetKlass->external_name());
++    message = generate_class_cast_message(objName, targetKlass->external_name());
+   } else {
+     // %%% need to get the MethodType string, without messing around too much
+     // Get a signature from the invoke instruction
+@@ -1564,9 +1569,13 @@
+       if (mhName[0] == '$')
+         mhName = actual_method->signature()->as_C_string();
+     }
+-    return generate_class_cast_message(mhName, targetType,
+-                                       " cannot be called as ");
++    message = generate_class_cast_message(mhName, targetType,
++                                          " cannot be called as ");
+   }
++  if (TraceMethodHandles) {
++    tty->print_cr("WrongMethodType => message=%s", message);
++  }
++  return message;
+ }
+ 
+ oop SharedRuntime::wrong_method_type_is_for_single_argument(JavaThread* thr,

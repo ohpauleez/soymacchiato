@@ -1,0 +1,1224 @@
+6980096: JSR 292 reflective lookup should throw checked exceptions
+Summary: Make NoAccessException be a checked exception.  Also remove JavaMethodHandle.
+Reviewed-by: twisti
+
+diff --git a/src/share/classes/java/dyn/CallSite.java b/src/share/classes/java/dyn/CallSite.java
+--- a/src/share/classes/java/dyn/CallSite.java
++++ b/src/share/classes/java/dyn/CallSite.java
+@@ -273,15 +273,19 @@
+     public final MethodHandle dynamicInvoker() {
+         if (this instanceof ConstantCallSite)
+             return getTarget();  // will not change dynamically
+-        MethodHandle getCSTarget = GET_TARGET;
+-        if (getCSTarget == null)
+-            GET_TARGET = getCSTarget = MethodHandles.Lookup.IMPL_LOOKUP.
+-                findVirtual(CallSite.class, "getTarget", MethodType.methodType(MethodHandle.class));
+-        MethodHandle getTarget = MethodHandleImpl.bindReceiver(IMPL_TOKEN, getCSTarget, this);
++        MethodHandle getTarget = MethodHandleImpl.bindReceiver(IMPL_TOKEN, GET_TARGET, this);
+         MethodHandle invoker = MethodHandles.exactInvoker(this.type());
+         return MethodHandles.foldArguments(invoker, getTarget);
+     }
+-    private static MethodHandle GET_TARGET = null;  // link this lazily, not eagerly
++    private static final MethodHandle GET_TARGET;
++    static {
++        try {
++            GET_TARGET = MethodHandles.Lookup.IMPL_LOOKUP.
++                findVirtual(CallSite.class, "getTarget", MethodType.methodType(MethodHandle.class));
++        } catch (NoAccessException ignore) {
++            throw new InternalError();
++        }
++    }
+ 
+     /** Implementation of {@link MethodHandleProvider} which returns {@code this.dynamicInvoker()}. */
+     public final MethodHandle asMethodHandle() { return dynamicInvoker(); }
+diff --git a/src/share/classes/java/dyn/MethodHandles.java b/src/share/classes/java/dyn/MethodHandles.java
+--- a/src/share/classes/java/dyn/MethodHandles.java
++++ b/src/share/classes/java/dyn/MethodHandles.java
+@@ -81,6 +81,14 @@
+      * Return a {@link Lookup lookup object} which is trusted minimally.
+      * It can only be used to create method handles to
+      * publicly accessible fields and methods.
++     * <p>
++     * As a matter of pure convention, the {@linkplain Lookup#lookupClass lookup class}
++     * of this lookup object will be {@link java.lang.Object}.
++     * <p>
++     * The lookup class can be changed to any other class {@code C} using an expression of the form
++     * {@linkplain Lookup#in <code>publicLookup().in(C.class)</code>}.
++     * Since all classes have equal access to public names,
++     * such a change would confer no new access rights.
+      */
+     public static Lookup publicLookup() {
+         return Lookup.PUBLIC_LOOKUP;
+@@ -90,9 +98,10 @@
+      * A <em>lookup object</em> is a factory for creating method handles,
+      * when the creation requires access checking.
+      * Method handles do not perform
+-     * access checks when they are called; this is a major difference
++     * access checks when they are called, but rather when they are created.
++     * (This is a major difference
+      * from reflective {@link Method}, which performs access checking
+-     * against every caller, on every call.
++     * against every caller, on every call.)
+      * Therefore, method handle access
+      * restrictions must be enforced when a method handle is created.
+      * The caller class against which those restrictions are enforced
+@@ -107,7 +116,7 @@
+      * It may then use this factory to create method handles on
+      * all of its methods, including private ones.
+      * It may also delegate the lookup (e.g., to a metaobject protocol)
+-     * by passing the {@code Lookup} object to other code.
++     * by passing the lookup object to other code.
+      * If this other code creates method handles, they will be access
+      * checked against the original lookup class, and not with any higher
+      * privileges.
+@@ -125,23 +134,28 @@
+      * It can also fail if a security manager is installed and refuses
+      * access.  In any of these cases, an exception will be
+      * thrown from the attempted lookup.
++     * <p>
+      * In general, the conditions under which a method handle may be
+      * created for a method {@code M} are exactly as restrictive as the conditions
+      * under which the lookup class could have compiled a call to {@code M}.
+-     * At least some of these error conditions are likely to be
+-     * represented by checked exceptions in the final version of this API.
++     * This rule is applied even if the Java compiler might have created
++     * an wrapper method to access a private method of another class
++     * in the same top-level declaration.
++     * For example, a lookup object created for a nested class {@code C.D}
++     * can access private members within other related classes such as
++     * {@code C}, {@code C.D.E}, or {@code C.B}.
+      */
+     public static final
+     class Lookup {
+         /** The class on behalf of whom the lookup is being performed. */
+         private final Class<?> lookupClass;
+ 
+-        /** The allowed sorts of members which may be looked up (public, etc.), with STRICT for package. */
++        /** The allowed sorts of members which may be looked up (public, etc.), with STATIC for package. */
+         private final int allowedModes;
+ 
+         private static final int
+             PUBLIC    = Modifier.PUBLIC,
+-            PACKAGE   = Modifier.STRICT,
++            PACKAGE   = Modifier.STATIC,
+             PROTECTED = Modifier.PROTECTED,
+             PRIVATE   = Modifier.PRIVATE,
+             ALL_MODES = (PUBLIC | PACKAGE | PROTECTED | PRIVATE),
+@@ -155,8 +169,10 @@
+         /** Which class is performing the lookup?  It is this class against
+          *  which checks are performed for visibility and access permissions.
+          *  <p>
+-         *  This value is null if and only if this lookup was produced
+-         *  by {@link MethodHandles#publicLookup}.
++         *  The class implies a maximum level of access permission,
++         *  but the permissions may be additionally limited by the bitmask
++         *  {@link #lookupModes}, which controls whether non-public members
++         *  can be accessed.
+          */
+         public Class<?> lookupClass() {
+             return lookupClass;
+@@ -168,10 +184,15 @@
+         }
+ 
+         /** Which types of members can this lookup object produce?
+-         *  The result is a bit-mask of the modifier bits PUBLIC, PROTECTED, PRIVATE, and STRICT.
+-         *  The modifier bit STRICT stands in for the (non-existent) package protection mode.
++         *  The result is a bit-mask of the {@link Modifier} bits
++         *  {@linkplain Modifier#PUBLIC PUBLIC (0x01)},
++         *  {@linkplain Modifier#PROTECTED PROTECTED (0x02)},
++         *  {@linkplain Modifier#PRIVATE PRIVATE (0x04)},
++         *  and {@linkplain Modifier#STATIC STATIC (0x08)}.
++         *  The modifier bit {@code STATIC} stands in for the package protection mode,
++         *  which does not have an explicit modifier bit.
+          */
+-        int lookupModes() {
++        public int lookupModes() {
+             return allowedModes & ALL_MODES;
+         }
+ 
+@@ -621,32 +642,32 @@
+ 
+         /// Helper methods, all package-private.
+ 
+-        MemberName resolveOrFail(Class<?> refc, String name, Class<?> type, boolean isStatic) {
++        MemberName resolveOrFail(Class<?> refc, String name, Class<?> type, boolean isStatic) throws NoAccessException {
+             checkSymbolicClass(refc);  // do this before attempting to resolve
+             int mods = (isStatic ? Modifier.STATIC : 0);
+             return IMPL_NAMES.resolveOrFail(new MemberName(refc, name, type, mods), true, lookupClassOrNull());
+         }
+ 
+-        MemberName resolveOrFail(Class<?> refc, String name, MethodType type, boolean isStatic) {
++        MemberName resolveOrFail(Class<?> refc, String name, MethodType type, boolean isStatic) throws NoAccessException {
+             checkSymbolicClass(refc);  // do this before attempting to resolve
+             int mods = (isStatic ? Modifier.STATIC : 0);
+             return IMPL_NAMES.resolveOrFail(new MemberName(refc, name, type, mods), true, lookupClassOrNull());
+         }
+ 
+         MemberName resolveOrFail(Class<?> refc, String name, MethodType type, boolean isStatic,
+-                                 boolean searchSupers, Class<?> specialCaller) {
++                                 boolean searchSupers, Class<?> specialCaller) throws NoAccessException {
+             checkSymbolicClass(refc);  // do this before attempting to resolve
+             int mods = (isStatic ? Modifier.STATIC : 0);
+             return IMPL_NAMES.resolveOrFail(new MemberName(refc, name, type, mods), searchSupers, specialCaller);
+         }
+ 
+-        void checkSymbolicClass(Class<?> refc) {
++        void checkSymbolicClass(Class<?> refc) throws NoAccessException {
+             Class<?> caller = lookupClassOrNull();
+             if (caller != null && !VerifyAccess.isClassAccessible(refc, caller))
+                 throw newNoAccessException("symbolic reference class is not public", new MemberName(refc), caller);
+         }
+ 
+-        void checkMethod(Class<?> refc, MemberName m, boolean wantStatic) {
++        void checkMethod(Class<?> refc, MemberName m, boolean wantStatic) throws NoAccessException {
+             String message;
+             if (m.isConstructor())
+                 message = "expected a method, not a constructor";
+@@ -659,7 +680,7 @@
+             throw newNoAccessException(message, m, lookupClass());
+         }
+ 
+-        void checkAccess(Class<?> refc, MemberName m) {
++        void checkAccess(Class<?> refc, MemberName m) throws NoAccessException {
+             int allowedModes = this.allowedModes;
+             if (allowedModes == TRUSTED)  return;
+             int mods = m.getModifiers();
+@@ -695,14 +716,14 @@
+             return "member is private to package";
+         }
+ 
+-        void checkSpecialCaller(Class<?> specialCaller) {
++        void checkSpecialCaller(Class<?> specialCaller) throws NoAccessException {
+             if (allowedModes == TRUSTED)  return;
+             if (!VerifyAccess.isSamePackageMember(specialCaller, lookupClass()))
+                 throw newNoAccessException("no private access for invokespecial",
+                                            new MemberName(specialCaller), lookupClass());
+         }
+ 
+-        MethodHandle restrictProtectedReceiver(MemberName method, MethodHandle mh) {
++        MethodHandle restrictProtectedReceiver(MemberName method, MethodHandle mh) throws NoAccessException {
+             // The accessing class only has the right to use a protected member
+             // on itself or a subclass.  Enforce that restriction, from JVMS 5.4.4, etc.
+             if (!method.isProtected() || method.isStatic()
+@@ -712,7 +733,7 @@
+             else
+                 return restrictReceiver(method, mh, lookupClass());
+         }
+-        MethodHandle restrictReceiver(MemberName method, MethodHandle mh, Class<?> caller) {
++        MethodHandle restrictReceiver(MemberName method, MethodHandle mh, Class<?> caller) throws NoAccessException {
+             assert(!method.isStatic());
+             Class<?> defc = method.getDeclaringClass();  // receiver type of mh is too wide
+             if (defc.isInterface() || !defc.isAssignableFrom(caller)) {
+@@ -898,11 +919,16 @@
+      * @return a method handle which always invokes the call site's target
+      */
+     public static
+-    MethodHandle dynamicInvoker(CallSite site) {
++    MethodHandle dynamicInvoker(CallSite site) throws NoAccessException {
+         MethodHandle getCSTarget = GET_TARGET;
+-        if (getCSTarget == null)
+-            GET_TARGET = getCSTarget = Lookup.IMPL_LOOKUP.
+-                findVirtual(CallSite.class, "getTarget", MethodType.methodType(MethodHandle.class));
++        if (getCSTarget == null) {
++            try {
++                GET_TARGET = getCSTarget = Lookup.IMPL_LOOKUP.
++                    findVirtual(CallSite.class, "getTarget", MethodType.methodType(MethodHandle.class));
++            } catch (NoAccessException ex) {
++                throw new InternalError();
++            }
++        }
+         MethodHandle getTarget = MethodHandleImpl.bindReceiver(IMPL_TOKEN, getCSTarget, site);
+         MethodHandle invoker = exactInvoker(site.type());
+         return foldArguments(invoker, getTarget);
+@@ -1260,17 +1286,20 @@
+      * <p>
+      * <b>Example:</b>
+      * <p><blockquote><pre>
+-     *   MethodHandle cat = MethodHandles.lookup().
+-     *     findVirtual(String.class, "concat", String.class, String.class);
+-     *   System.out.println(cat.&lt;String&gt;invokeExact("x", "y")); // xy
++     *   import static java.dyn.MethodHandles.*;
++     *   import static java.dyn.MethodType.*;
++     *   ...
++     *   MethodHandle cat = lookup().findVirtual(String.class,
++     *     "concat", methodType(String.class, String.class));
++     *   System.out.println((String) cat.invokeExact("x", "y")); // xy
+      *   MethodHandle d0 = dropArguments(cat, 0, String.class);
+-     *   System.out.println(d0.&lt;String&gt;invokeExact("x", "y", "z")); // xy
++     *   System.out.println((String) d0.invokeExact("x", "y", "z")); // yz
+      *   MethodHandle d1 = dropArguments(cat, 1, String.class);
+-     *   System.out.println(d1.&lt;String&gt;invokeExact("x", "y", "z")); // xz
++     *   System.out.println((String) d1.invokeExact("x", "y", "z")); // xz
+      *   MethodHandle d2 = dropArguments(cat, 2, String.class);
+-     *   System.out.println(d2.&lt;String&gt;invokeExact("x", "y", "z")); // yz
+-     *   MethodHandle d12 = dropArguments(cat, 1, String.class, String.class);
+-     *   System.out.println(d12.&lt;String&gt;invokeExact("w", "x", "y", "z")); // wz
++     *   System.out.println((String) d2.invokeExact("x", "y", "z")); // xy
++     *   MethodHandle d12 = dropArguments(cat, 1, int.class, boolean.class);
++     *   System.out.println((String) d12.invokeExact("x", 12, true, "z")); // xz
+      * </pre></blockquote>
+      * @param target the method handle to invoke after the argument is dropped
+      * @param valueTypes the type(s) of the argument to drop
+diff --git a/src/share/classes/java/dyn/MethodType.java b/src/share/classes/java/dyn/MethodType.java
+--- a/src/share/classes/java/dyn/MethodType.java
++++ b/src/share/classes/java/dyn/MethodType.java
+@@ -40,24 +40,37 @@
+  * returned by a method handle, or the arguments and return type passed
+  * and expected  by a method handle caller.  Method types must be properly
+  * matched between a method handle and all its callers,
+- * and the JVM's operations enforce this matching at all times.
++ * and the JVM's operations enforce this matching at, specifically
++ * during calls to {@link MethodHandle#invokeExact}
++ * and {@link MethodHandle#invokeGeneric}, and during execution
++ * of {@code invokedynamic} instructions.
+  * <p>
+  * The structure is a return type accompanied by any number of parameter types.
+- * The types (primitive, void, and reference) are represented by Class objects.
++ * The types (primitive, {@code void}, and reference) are represented by {@link Class} objects.
++ * (For ease of exposition, we treat {@code void} as if it were a type.
++ * In fact, it denotes the absence of a return type.)
+  * <p>
+- * All instances of <code>MethodType</code> are immutable.
++ * All instances of {@code MethodType} are immutable.
+  * Two instances are completely interchangeable if they compare equal.
+  * Equality depends on pairwise correspondence of the return and parameter types and on nothing else.
+  * <p>
+  * This type can be created only by factory methods.
+  * All factory methods may cache values, though caching is not guaranteed.
+  * <p>
+- * Note: Like classes and strings, method types can be represented directly
+- * as constants to be loaded by {@code ldc} bytecodes.
++ * {@code MethodType} objects are sometimes derived from bytecode instructions
++ * such as {@code invokedynamic}, specifically from the type descriptor strings associated
++ * with the instructions in a class file's constant pool.
++ * When this occurs, any classes named in the descriptor strings must be loaded.
++ * (But they need not be initialized.)
++ * This loading may occur at any time before the {@code MethodType} object is first derived.
++ * <p>
++ * Like classes and strings, method types can be represented directly
++ * in a class file's constant pool as constants to be loaded by {@code ldc} bytecodes.
++ * Loading such a constant causes its component classes to be loaded as necessary.
+  * @author John Rose, JSR 292 EG
+  */
+ public final
+-class MethodType {
++class MethodType implements java.lang.reflect.Type {
+     private final Class<?>   rtype;
+     private final Class<?>[] ptypes;
+     private MethodTypeForm form; // erased form, plus cached data about primitives
+@@ -636,11 +649,11 @@
+ 
+     /** Convenience method for {@link #methodType(java.lang.Class, java.lang.Class[])}.
+      * Find or create an instance of the given method type.
+-     * Any class or interface name embedded in the signature string
++     * Any class or interface name embedded in the descriptor string
+      * will be resolved by calling {@link ClassLoader#loadClass(java.lang.String)}
+      * on the given loader (or if it is null, on the system class loader).
+      * <p>
+-     * Note that it is possible to build method types which cannot be
++     * Note that it is possible to encounter method types which cannot be
+      * constructed by this method, because their component types are
+      * not all reachable from a common class loader.
+      * <p>
+@@ -662,8 +675,11 @@
+     }
+ 
+     /**
+-     * Create a bytecode signature representation of the type.
+-     * Note that this is not a strict inverse of
++     * Create a bytecode descriptor representation of the method type.
++     * <p>
++     * Note that this is not a strict inverse of {@link #fromMethodDescriptorString}.
++     * Two distinct classes which share a common name but have different class loaders
++     * will appear identical when viewed within descriptor strings.
+      * <p>
+      * This method is included for the benfit of applications that must
+      * generate bytecodes that process method handles and invokedynamic.
+diff --git a/src/share/classes/java/dyn/NoAccessException.java b/src/share/classes/java/dyn/NoAccessException.java
+--- a/src/share/classes/java/dyn/NoAccessException.java
++++ b/src/share/classes/java/dyn/NoAccessException.java
+@@ -36,7 +36,7 @@
+  * at the time of creation.
+  * @author John Rose, JSR 292 EG
+  */
+-public class NoAccessException extends RuntimeException {
++public class NoAccessException extends ReflectiveOperationException {
+     /**
+      * Constructs a {@code NoAccessException} with no detail message.
+      */
+diff --git a/src/share/classes/sun/dyn/BoundMethodHandle.java b/src/share/classes/sun/dyn/BoundMethodHandle.java
+--- a/src/share/classes/sun/dyn/BoundMethodHandle.java
++++ b/src/share/classes/sun/dyn/BoundMethodHandle.java
+@@ -48,8 +48,6 @@
+     private static final MemberName.Factory IMPL_NAMES = MemberName.getFactory(IMPL_TOKEN);
+ 
+     // Constructors in this class *must* be package scoped or private.
+-    // Exception:  JavaMethodHandle constructors are protected.
+-    // (The link between JMH and BMH is temporary.)
+ 
+     /** Bind a direct MH to its receiver (or first ref. argument).
+      *  The JVM will pre-dispatch the MH if it is not already static.
+@@ -122,55 +120,6 @@
+         assert(this instanceof JavaMethodHandle);
+     }
+ 
+-    /** Initialize the current object as a Java method handle.
+-     */
+-    protected BoundMethodHandle(String entryPointName, MethodType type, boolean matchArity) {
+-        super(Access.TOKEN, null);
+-        MethodHandle entryPoint
+-                = findJavaMethodHandleEntryPoint(this.getClass(),
+-                                        entryPointName, type, matchArity);
+-        MethodHandleImpl.initType(this, entryPoint.type().dropParameterTypes(0, 1));
+-        this.argument = this; // kludge; get rid of
+-        this.vmargslot = this.type().parameterSlotDepth(0);
+-        initTarget(entryPoint, 0);
+-        assert(this instanceof JavaMethodHandle);
+-    }
+-
+-    private static
+-    MethodHandle findJavaMethodHandleEntryPoint(Class<?> caller,
+-                                                String name,
+-                                                MethodType type,
+-                                                boolean matchArity) {
+-        if (matchArity)  type.getClass();  // elicit NPE
+-        List<MemberName> methods = IMPL_NAMES.getMethods(caller, true, name, null, caller);
+-        MethodType foundType = null;
+-        MemberName foundMethod = null;
+-        for (MemberName method : methods) {
+-            if (method.getDeclaringClass() == MethodHandle.class)
+-                continue;  // ignore methods inherited from MH class itself
+-            MethodType mtype = method.getMethodType();
+-            if (type != null && type.parameterCount() != mtype.parameterCount())
+-                continue;
+-            else if (foundType == null)
+-                foundType = mtype;
+-            else if (foundType != mtype)
+-                throw newIllegalArgumentException("more than one method named "+name+" in "+caller.getName());
+-            // discard overrides
+-            if (foundMethod == null)
+-                foundMethod = method;
+-            else if (foundMethod.getDeclaringClass().isAssignableFrom(method.getDeclaringClass()))
+-                foundMethod = method;
+-        }
+-        if (foundMethod == null)
+-            throw newIllegalArgumentException("no method named "+name+" in "+caller.getName());
+-        MethodHandle entryPoint = MethodHandleImpl.findMethod(IMPL_TOKEN, foundMethod, true, caller);
+-        if (type != null) {
+-            MethodType epType = type.insertParameterTypes(0, entryPoint.type().parameterType(0));
+-            entryPoint = MethodHandles.convertArguments(entryPoint, epType);
+-        }
+-        return entryPoint;
+-    }
+-
+     /** Make sure the given {@code argument} can be used as {@code argnum}-th
+      *  parameter of the given method handle {@code mh}, which must be a reference.
+      *  <p>
+diff --git a/src/share/classes/sun/dyn/CallSiteImpl.java b/src/share/classes/sun/dyn/CallSiteImpl.java
+--- a/src/share/classes/sun/dyn/CallSiteImpl.java
++++ b/src/share/classes/sun/dyn/CallSiteImpl.java
+@@ -26,6 +26,7 @@
+ package sun.dyn;
+ 
+ import java.dyn.*;
++import static sun.dyn.MemberName.uncaughtException;
+ 
+ /**
+  * Parts of CallSite known to the JVM.
+@@ -80,11 +81,18 @@
+ 
+     // This method is private in CallSite because it touches private fields in CallSite.
+     // These private fields (vmmethod, vmindex) are specific to the JVM.
+-    private static final MethodHandle PRIVATE_INITIALIZE_CALL_SITE =
++    private static final MethodHandle PRIVATE_INITIALIZE_CALL_SITE;
++    static {
++        try {
++            PRIVATE_INITIALIZE_CALL_SITE =
+             MethodHandleImpl.IMPL_LOOKUP.findVirtual(CallSite.class, "initializeFromJVM",
+                 MethodType.methodType(void.class,
+                                       String.class, MethodType.class,
+                                       MemberName.class, int.class));
++        } catch (NoAccessException ex) {
++            throw uncaughtException(ex);
++        }
++    }
+ 
+     public static void setCallSiteTarget(Access token, CallSite site, MethodHandle target) {
+         Access.check(token);
+diff --git a/src/share/classes/sun/dyn/FilterGeneric.java b/src/share/classes/sun/dyn/FilterGeneric.java
+--- a/src/share/classes/sun/dyn/FilterGeneric.java
++++ b/src/share/classes/sun/dyn/FilterGeneric.java
+@@ -25,12 +25,8 @@
+ 
+ package sun.dyn;
+ 
+-import java.dyn.JavaMethodHandle;
+-import java.dyn.MethodHandle;
+-import java.dyn.MethodType;
+-import java.dyn.NoAccessException;
+-import java.lang.reflect.Constructor;
+-import java.lang.reflect.InvocationTargetException;
++import java.dyn.*;
++import java.lang.reflect.*;
+ import static sun.dyn.MemberName.newIllegalArgumentException;
+ 
+ /**
+@@ -119,7 +115,7 @@
+ 
+     static MethodHandle make(Kind kind, int pos, MethodHandle filter, MethodHandle target) {
+         FilterGeneric fgen = of(kind, pos, filter.type(), target.type());
+-        return fgen.makeInstance(kind, pos, filter, target);
++        return fgen.makeInstance(kind, pos, filter, target).asMethodHandle();
+     }
+ 
+     /** Return the adapter information for this target and filter type. */
+diff --git a/src/share/classes/sun/dyn/FilterOneArgument.java b/src/share/classes/sun/dyn/FilterOneArgument.java
+--- a/src/share/classes/sun/dyn/FilterOneArgument.java
++++ b/src/share/classes/sun/dyn/FilterOneArgument.java
+@@ -25,9 +25,8 @@
+ 
+ package sun.dyn;
+ 
+-import java.dyn.JavaMethodHandle;
+-import java.dyn.MethodHandle;
+-import java.dyn.MethodType;
++import java.dyn.*;
++import static sun.dyn.MemberName.uncaughtException;
+ 
+ /**
+  * Unary function composition, useful for many small plumbing jobs.
+@@ -51,8 +50,16 @@
+         return target.invokeExact(filteredArgument);
+     }
+ 
+-    private static final MethodHandle INVOKE =
+-        MethodHandleImpl.IMPL_LOOKUP.findVirtual(FilterOneArgument.class, "invoke", MethodType.genericMethodType(1));
++    private static final MethodHandle INVOKE;
++    static {
++        try {
++            INVOKE =
++                MethodHandleImpl.IMPL_LOOKUP.findVirtual(FilterOneArgument.class, "invoke",
++                                                         MethodType.genericMethodType(1));
++        } catch (NoAccessException ex) {
++            throw uncaughtException(ex);
++        }
++    }
+ 
+     protected FilterOneArgument(MethodHandle filter, MethodHandle target) {
+         super(INVOKE);
+diff --git a/src/share/classes/sun/dyn/FromGeneric.java b/src/share/classes/sun/dyn/FromGeneric.java
+--- a/src/share/classes/sun/dyn/FromGeneric.java
++++ b/src/share/classes/sun/dyn/FromGeneric.java
+@@ -25,15 +25,9 @@
+ 
+ package sun.dyn;
+ 
+-import java.dyn.JavaMethodHandle;
+-import java.dyn.MethodHandle;
+-import java.dyn.MethodHandles;
+-import java.dyn.MethodType;
+-import java.dyn.NoAccessException;
+-import java.lang.reflect.Constructor;
+-import java.lang.reflect.InvocationTargetException;
+-import sun.dyn.util.ValueConversions;
+-import sun.dyn.util.Wrapper;
++import java.dyn.*;
++import java.lang.reflect.*;
++import sun.dyn.util.*;
+ 
+ /**
+  * Adapters which mediate between incoming calls which are generic
+diff --git a/src/share/classes/sun/dyn/Invokers.java b/src/share/classes/sun/dyn/Invokers.java
+--- a/src/share/classes/sun/dyn/Invokers.java
++++ b/src/share/classes/sun/dyn/Invokers.java
+@@ -25,10 +25,7 @@
+ 
+ package sun.dyn;
+ 
+-import java.dyn.MethodHandle;
+-import java.dyn.MethodHandles;
+-import java.dyn.MethodType;
+-
++import java.dyn.*;
+ 
+ /**
+  * Construction and caching of often-used invokers.
+@@ -63,8 +60,11 @@
+     public MethodHandle exactInvoker() {
+         MethodHandle invoker = exactInvoker;
+         if (invoker != null)  return invoker;
+-        invoker = MethodHandleImpl.IMPL_LOOKUP.findVirtual(MethodHandle.class, "invoke", targetType);
+-        if (invoker == null)  throw new InternalError("JVM cannot find invoker for "+targetType);
++        try {
++            invoker = MethodHandleImpl.IMPL_LOOKUP.findVirtual(MethodHandle.class, "invoke", targetType);
++        } catch (NoAccessException ex) {
++            throw new InternalError("JVM cannot find invoker for "+targetType);
++        }
+         assert(invokerType(targetType) == invoker.type());
+         exactInvoker = invoker;
+         return invoker;
+diff --git a/src/share/classes/java/dyn/JavaMethodHandle.java b/src/share/classes/sun/dyn/JavaMethodHandle.java
+rename from src/share/classes/java/dyn/JavaMethodHandle.java
+rename to src/share/classes/sun/dyn/JavaMethodHandle.java
+--- a/src/share/classes/java/dyn/JavaMethodHandle.java
++++ b/src/share/classes/sun/dyn/JavaMethodHandle.java
+@@ -23,8 +23,9 @@
+  * questions.
+  */
+ 
+-package java.dyn;
++package sun.dyn;
+ 
++import java.dyn.*;
+ import sun.dyn.Access;
+ 
+ /**
+@@ -168,70 +169,4 @@
+     protected JavaMethodHandle(MethodHandle entryPoint) {
+         super(entryPoint);
+     }
+-
+-    /**
+-     * Create a method handle whose entry point is a non-static method
+-     * visible in the exact (most specific) class of
+-     * the newly constructed object.
+-     * <p>
+-     * The method is specified by name and type, as if via this expression:
+-     * {@code MethodHandles.lookup().findVirtual(this.getClass(), name, type)}.
+-     * The class defining the method might be an anonymous inner class.
+-     * <p>
+-     * The method handle type of {@code this} (i.e, the fully constructed object)
+-     * will be the given method handle type.
+-     * A call to {@code this} will invoke the selected method.
+-     * The receiver argument will be bound to {@code this} on every method
+-     * handle invocation.
+-     * <p>
+-     * <i>Rationale:</i>
+-     * Although this constructor may seem to be a mere luxury,
+-     * it is not subsumed by the more general constructor which
+-     * takes any {@code MethodHandle} as the entry point argument.
+-     * In order to convert an entry point name to a method handle,
+-     * the self-class of the object is required (in order to do
+-     * the lookup).  The self-class, in turn, is generally not
+-     * available at the time of the constructor invocation,
+-     * due to the rules of Java and the JVM verifier.
+-     * One cannot call {@code this.getClass()}, because
+-     * the value of {@code this} is inaccessible at the point
+-     * of the constructor call.  (Changing this would require
+-     * change to the Java language, verifiers, and compilers.)
+-     * In particular, this constructor allows {@code JavaMethodHandle}s
+-     * to be created in combination with the anonymous inner class syntax.
+-     * @param entryPointName the name of the entry point method
+-     * @param type (optional) the desired type of the method handle
+-     */
+-    protected JavaMethodHandle(String entryPointName, MethodType type) {
+-        super(entryPointName, type, true);
+-
+-    }
+-
+-    /**
+-     * Create a method handle whose entry point is a non-static method
+-     * visible in the exact (most specific) class of
+-     * the newly constructed object.
+-     * <p>
+-     * The method is specified only by name.
+-     * There must be exactly one method of that name visible in the object class,
+-     * either inherited or locally declared.
+-     * (That is, the method must not be overloaded.)
+-     * <p>
+-     * The method handle type of {@code this} (i.e, the fully constructed object)
+-     * will be the same as the type of the selected non-static method.
+-     * The receiver argument will be bound to {@code this} on every method
+-     * handle invocation.
+-     * <p>ISSUE: This signature wildcarding feature does not correspond to
+-     * any MethodHandles.Lookup API element.  Can we eliminate it?
+-     * Alternatively, it is useful for naming non-overloaded methods.
+-     * Shall we make type arguments optional in the Lookup methods,
+-     * throwing an error in cases of ambiguity?
+-     * <p>
+-     * For this method's rationale, see the documentation
+-     * for {@link #JavaMethodHandle(String,MethodType)}.
+-     * @param entryPointName the name of the entry point method
+-     */
+-    protected JavaMethodHandle(String entryPointName) {
+-        super(entryPointName, (MethodType) null, false);
+-    }
+ }
+diff --git a/src/share/classes/sun/dyn/MemberName.java b/src/share/classes/sun/dyn/MemberName.java
+--- a/src/share/classes/sun/dyn/MemberName.java
++++ b/src/share/classes/sun/dyn/MemberName.java
+@@ -521,6 +521,11 @@
+         if (lookupClass != null)  message += ", from " + lookupClass.getName();
+         return new NoAccessException(message);
+     }
++    public static Error uncaughtException(Exception ex) {
++        Error err = new InternalError("uncaught exception");
++        err.initCause(ex);
++        return err;
++    }
+ 
+     /** Actually making a query requires an access check. */
+     public static Factory getFactory(Access token) {
+@@ -641,7 +646,7 @@
+          *  If lookup fails or access is not permitted, a {@linkplain NoAccessException} is thrown.
+          *  Otherwise a fresh copy of the given member is returned, with modifier bits filled in.
+          */
+-        public MemberName resolveOrFail(MemberName m, boolean searchSupers, Class<?> lookupClass) {
++        public MemberName resolveOrFail(MemberName m, boolean searchSupers, Class<?> lookupClass) throws NoAccessException {
+             MemberName result = resolveOrNull(m, searchSupers, lookupClass);
+             if (result != null)
+                 return result;
+diff --git a/src/share/classes/sun/dyn/MethodHandleImpl.java b/src/share/classes/sun/dyn/MethodHandleImpl.java
+--- a/src/share/classes/sun/dyn/MethodHandleImpl.java
++++ b/src/share/classes/sun/dyn/MethodHandleImpl.java
+@@ -25,11 +25,8 @@
+ 
+ package sun.dyn;
+ 
+-import java.dyn.JavaMethodHandle;
+-import java.dyn.MethodHandle;
+-import java.dyn.MethodHandles;
++import java.dyn.*;
+ import java.dyn.MethodHandles.Lookup;
+-import java.dyn.MethodType;
+ import java.util.logging.Level;
+ import java.util.logging.Logger;
+ import sun.dyn.util.VerifyType;
+@@ -46,6 +43,7 @@
+ import sun.misc.Unsafe;
+ import static sun.dyn.MemberName.newIllegalArgumentException;
+ import static sun.dyn.MemberName.newNoAccessException;
++import static sun.dyn.MemberName.uncaughtException;
+ 
+ /**
+  * Base class for method handles, containing JVM-specific fields and logic.
+@@ -173,7 +171,7 @@
+      */
+     public static
+     MethodHandle findMethod(Access token, MemberName method,
+-            boolean doDispatch, Class<?> lookupClass) {
++            boolean doDispatch, Class<?> lookupClass) throws NoAccessException {
+         Access.check(token);  // only trusted calls
+         MethodType mtype = method.getMethodType();
+         if (!method.isStatic()) {
+@@ -320,7 +318,7 @@
+             try {
+                 VARARGS_INVOKE = IMPL_LOOKUP.findVirtual(AllocateObject.class, "invoke_V", MethodType.genericMethodType(0, true));
+             } catch (NoAccessException ex) {
+-                throw new InternalError("");
++                throw uncaughtException(ex);
+             }
+         }
+         // Corresponding generic constructor types:
+@@ -416,9 +414,7 @@
+                 f = c.getDeclaredField(field.getName());
+                 return unsafe.staticFieldBase(f);
+             } catch (Exception ee) {
+-                Error e = new InternalError();
+-                e.initCause(ee);
+-                throw e;
++                throw uncaughtException(ee);
+             }
+         }
+ 
+@@ -473,10 +469,8 @@
+             MethodHandle mh;
+             try {
+                 mh = IMPL_LOOKUP.findVirtual(FieldAccessor.class, name, type);
+-            } catch (NoAccessException ee) {
+-                Error e = new InternalError("name,type="+name+type);
+-                e.initCause(ee);
+-                throw e;
++            } catch (NoAccessException ex) {
++                throw uncaughtException(ex);
+             }
+             if (evclass != vclass || (!isStatic && ecclass != cclass)) {
+                 MethodType strongType = FieldAccessor.ftype(cclass, vclass, isSetter, isStatic);
+@@ -543,10 +537,8 @@
+             MethodHandle mh;
+             try {
+                 mh = IMPL_LOOKUP.findStatic(FieldAccessor.class, name, type);
+-            } catch (NoAccessException ee) {
+-                Error e = new InternalError("name,type="+name+type);
+-                e.initCause(ee);
+-                throw e;
++            } catch (NoAccessException ex) {
++                throw uncaughtException(ex);
+             }
+             if (caclass != null) {
+                 MethodType strongType = FieldAccessor.atype(caclass, isSetter);
+@@ -1031,7 +1023,7 @@
+             try {
+                 VARARGS_INVOKE = IMPL_LOOKUP.findVirtual(GuardWithTest.class, "invoke_V", MethodType.genericMethodType(0, true));
+             } catch (NoAccessException ex) {
+-                throw new InternalError("");
++                throw uncaughtException(ex);
+             }
+         }
+     }
+@@ -1167,7 +1159,7 @@
+             try {
+                 VARARGS_INVOKE = IMPL_LOOKUP.findVirtual(GuardWithCatch.class, "invoke_V", MethodType.genericMethodType(0, true));
+             } catch (NoAccessException ex) {
+-                throw new InternalError("");
++                throw uncaughtException(ex);
+             }
+         }
+     }
+@@ -1207,9 +1199,16 @@
+         return AdapterMethodHandle.makeRetypeRaw(token, type, THROW_EXCEPTION);
+     }
+ 
+-    static final MethodHandle THROW_EXCEPTION
++    static final MethodHandle THROW_EXCEPTION;
++    static {
++        try {
++            THROW_EXCEPTION
+             = IMPL_LOOKUP.findStatic(MethodHandleImpl.class, "throwException",
+                     MethodType.methodType(Empty.class, Throwable.class));
++        } catch (NoAccessException ex) {
++            throw new RuntimeException(ex);
++        }
++    }
+     static <T extends Throwable> Empty throwException(T t) throws T { throw t; }
+ 
+     public static String getNameString(Access token, MethodHandle target) {
+diff --git a/src/share/classes/sun/dyn/MethodHandleNatives.java b/src/share/classes/sun/dyn/MethodHandleNatives.java
+--- a/src/share/classes/sun/dyn/MethodHandleNatives.java
++++ b/src/share/classes/sun/dyn/MethodHandleNatives.java
+@@ -25,9 +25,7 @@
+ 
+ package sun.dyn;
+ 
+-import java.dyn.CallSite;
+-import java.dyn.MethodHandle;
+-import java.dyn.MethodType;
++import java.dyn.*;
+ import java.dyn.MethodHandles.Lookup;
+ import java.lang.reflect.AccessibleObject;
+ import java.lang.reflect.Field;
+@@ -324,18 +322,24 @@
+      */
+     static MethodHandle linkMethodHandleConstant(Class<?> callerClass, int refKind,
+                                                  Class<?> defc, String name, Object type) {
+-        Lookup lookup = IMPL_LOOKUP.in(callerClass);
+-        switch (refKind) {
+-        case REF_getField:          return lookup.findGetter(       defc, name, (Class<?>)   type );
+-        case REF_getStatic:         return lookup.findStaticGetter( defc, name, (Class<?>)   type );
+-        case REF_putField:          return lookup.findSetter(       defc, name, (Class<?>)   type );
+-        case REF_putStatic:         return lookup.findStaticSetter( defc, name, (Class<?>)   type );
+-        case REF_invokeVirtual:     return lookup.findVirtual(      defc, name, (MethodType) type );
+-        case REF_invokeStatic:      return lookup.findStatic(       defc, name, (MethodType) type );
+-        case REF_invokeSpecial:     return lookup.findSpecial(      defc, name, (MethodType) type, callerClass );
+-        case REF_newInvokeSpecial:  return lookup.findConstructor(  defc,       (MethodType) type );
+-        case REF_invokeInterface:   return lookup.findVirtual(      defc, name, (MethodType) type );
++        try {
++            Lookup lookup = IMPL_LOOKUP.in(callerClass);
++            switch (refKind) {
++            case REF_getField:          return lookup.findGetter(       defc, name, (Class<?>)   type );
++            case REF_getStatic:         return lookup.findStaticGetter( defc, name, (Class<?>)   type );
++            case REF_putField:          return lookup.findSetter(       defc, name, (Class<?>)   type );
++            case REF_putStatic:         return lookup.findStaticSetter( defc, name, (Class<?>)   type );
++            case REF_invokeVirtual:     return lookup.findVirtual(      defc, name, (MethodType) type );
++            case REF_invokeStatic:      return lookup.findStatic(       defc, name, (MethodType) type );
++            case REF_invokeSpecial:     return lookup.findSpecial(      defc, name, (MethodType) type, callerClass );
++            case REF_newInvokeSpecial:  return lookup.findConstructor(  defc,       (MethodType) type );
++            case REF_invokeInterface:   return lookup.findVirtual(      defc, name, (MethodType) type );
++            }
++            throw new IllegalArgumentException("bad MethodHandle constant "+name+" : "+type);
++        } catch (NoAccessException ex) {
++            Error err = new IncompatibleClassChangeError();
++            err.initCause(ex);
++            throw err;
+         }
+-        throw new IllegalArgumentException("bad MethodHandle constant "+name+" : "+type);
+     }
+ }
+diff --git a/src/share/classes/sun/dyn/SpreadGeneric.java b/src/share/classes/sun/dyn/SpreadGeneric.java
+--- a/src/share/classes/sun/dyn/SpreadGeneric.java
++++ b/src/share/classes/sun/dyn/SpreadGeneric.java
+@@ -25,11 +25,7 @@
+ 
+ package sun.dyn;
+ 
+-import java.dyn.JavaMethodHandle;
+-import java.dyn.MethodHandle;
+-import java.dyn.MethodHandles;
+-import java.dyn.MethodType;
+-import java.dyn.NoAccessException;
++import java.dyn.*;
+ import java.lang.reflect.Constructor;
+ import java.lang.reflect.InvocationTargetException;
+ import java.util.ArrayList;
+diff --git a/src/share/classes/sun/dyn/ToGeneric.java b/src/share/classes/sun/dyn/ToGeneric.java
+--- a/src/share/classes/sun/dyn/ToGeneric.java
++++ b/src/share/classes/sun/dyn/ToGeneric.java
+@@ -25,11 +25,7 @@
+ 
+ package sun.dyn;
+ 
+-import java.dyn.JavaMethodHandle;
+-import java.dyn.MethodHandle;
+-import java.dyn.MethodHandles;
+-import java.dyn.MethodType;
+-import java.dyn.NoAccessException;
++import java.dyn.*;
+ import java.lang.reflect.Constructor;
+ import java.lang.reflect.InvocationTargetException;
+ import sun.dyn.util.ValueConversions;
+diff --git a/src/share/classes/sun/dyn/util/ValueConversions.java b/src/share/classes/sun/dyn/util/ValueConversions.java
+--- a/src/share/classes/sun/dyn/util/ValueConversions.java
++++ b/src/share/classes/sun/dyn/util/ValueConversions.java
+@@ -34,6 +34,7 @@
+ import sun.dyn.Access;
+ import sun.dyn.AdapterMethodHandle;
+ import sun.dyn.MethodHandleImpl;
++import static sun.dyn.MemberName.uncaughtException;
+ 
+ public class ValueConversions {
+     private static final Access IMPL_TOKEN = Access.getToken();
+@@ -148,11 +149,16 @@
+         // look up the method
+         String name = "unbox" + wrap.simpleName() + (raw ? "Raw" : "");
+         MethodType type = unboxType(wrap, raw);
+-        if (!exact)
+-            // actually, type is wrong; the Java method takes Object
+-            mh = IMPL_LOOKUP.findStatic(ValueConversions.class, name, type.erase());
+-        else
++        if (!exact) {
++            try {
++                // actually, type is wrong; the Java method takes Object
++                mh = IMPL_LOOKUP.findStatic(ValueConversions.class, name, type.erase());
++            } catch (NoAccessException ex) {
++                mh = null;
++            }
++        } else {
+             mh = retype(type, unbox(wrap, !exact, raw));
++        }
+         if (mh != null) {
+             cache.put(wrap, mh);
+             return mh;
+@@ -280,10 +286,15 @@
+         // look up the method
+         String name = "box" + wrap.simpleName() + (raw ? "Raw" : "");
+         MethodType type = boxType(wrap, raw);
+-        if (exact)
+-            mh = IMPL_LOOKUP.findStatic(ValueConversions.class, name, type);
+-        else
++        if (exact) {
++            try {
++                mh = IMPL_LOOKUP.findStatic(ValueConversions.class, name, type);
++            } catch (NoAccessException ex) {
++                mh = null;
++            }
++        } else {
+             mh = retype(type.erase(), box(wrap, !exact, raw));
++        }
+         if (mh != null) {
+             cache.put(wrap, mh);
+             return mh;
+@@ -394,10 +405,15 @@
+         // look up the method
+         String name = "reboxRaw" + wrap.simpleName();
+         MethodType type = reboxType(wrap);
+-        if (exact)
+-            mh = IMPL_LOOKUP.findStatic(ValueConversions.class, name, type);
+-        else
++        if (exact) {
++            try {
++                mh = IMPL_LOOKUP.findStatic(ValueConversions.class, name, type);
++            } catch (NoAccessException ex) {
++                mh = null;
++            }
++        } else {
+             mh = retype(IDENTITY.type(), rebox(wrap, !exact));
++        }
+         if (mh != null) {
+             cache.put(wrap, mh);
+             return mh;
+@@ -474,7 +490,11 @@
+                 mh = EMPTY;
+                 break;
+             case INT: case LONG: case FLOAT: case DOUBLE:
+-                mh = IMPL_LOOKUP.findStatic(ValueConversions.class, "zero"+wrap.simpleName(), type);
++                try {
++                    mh = IMPL_LOOKUP.findStatic(ValueConversions.class, "zero"+wrap.simpleName(), type);
++                } catch (NoAccessException ex) {
++                    mh = null;
++                }
+                 break;
+         }
+         if (mh != null) {
+@@ -549,8 +569,8 @@
+             ZERO_OBJECT = IMPL_LOOKUP.findStatic(ValueConversions.class, "zeroObject", zeroObjectType);
+             IGNORE = IMPL_LOOKUP.findStatic(ValueConversions.class, "ignore", ignoreType);
+             EMPTY = IMPL_LOOKUP.findStatic(ValueConversions.class, "empty", ignoreType.dropParameterTypes(0, 1));
+-        } catch (RuntimeException ex) {
+-            throw ex;
++        } catch (Exception ex) {
++            throw uncaughtException(ex);
+         }
+     }
+ 
+diff --git a/test/java/dyn/JavaDocExamples.java b/test/java/dyn/JavaDocExamples.java
+new file mode 100644
+--- /dev/null
++++ b/test/java/dyn/JavaDocExamples.java
+@@ -0,0 +1,128 @@
++/*
++ * Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Oracle designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Oracle in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++/* @test
++ * @summary example code used in javadoc for java.dyn API
++ * @compile -XDallowTransitionalJSR292=no JavaDocExamples.java
++ * @run junit/othervm -XX:+UnlockExperimentalVMOptions -XX:+EnableMethodHandles test.java.dyn.JavaDocExamples
++ */
++
++/*
++---- To run outside jtreg:
++$ $JAVA7X_HOME/bin/javac -cp $JUNIT4_JAR -d /tmp/Classes \
++   $DAVINCI/sources/jdk/test/java/dyn/JavaDocExamples.java
++$ $JAVA7X_HOME/bin/java   -cp $JUNIT4_JAR:/tmp/Classes \
++   -XX:+UnlockExperimentalVMOptions -XX:+EnableMethodHandles \
++   -Dtest.java.dyn.JavaDocExamples.verbosity=1 \
++     test.java.dyn.JavaDocExamples
++----
++*/
++
++package test.java.dyn;
++
++import java.dyn.*;
++import static java.dyn.MethodHandles.*;
++import static java.dyn.MethodType.*;
++
++import java.lang.reflect.*;
++import java.util.*;
++
++import org.junit.*;
++import static org.junit.Assert.*;
++import static org.junit.Assume.*;
++
++
++/**
++ * @author jrose
++ */
++public class JavaDocExamples {
++    /** Wrapper for running the JUnit tests in this module.
++     *  Put JUnit on the classpath!
++     */
++    public static void main(String... ignore) {
++        org.junit.runner.JUnitCore.runClasses(JavaDocExamples.class);
++    }
++    // How much output?
++    static int verbosity = Integer.getInteger("test.java.dyn.JavaDocExamples.verbosity", 0);
++
++{}
++static final private Lookup LOOKUP = lookup();
++// static final private MethodHandle CONCAT_1 = LOOKUP.findVirtual(String.class,
++//     "concat", methodType(String.class, String.class));
++// static final private MethodHandle HASHCODE_1 = LOOKUP.findVirtual(Object.class,
++//     "hashCode", methodType(int.class));
++
++// form required if NoAccessException is intercepted:
++static final private MethodHandle CONCAT_2, HASHCODE_2;
++static {
++  try {
++    CONCAT_2 = LOOKUP.findVirtual(String.class,
++      "concat", methodType(String.class, String.class));
++    HASHCODE_2 = LOOKUP.findVirtual(Object.class,
++      "hashCode", methodType(int.class));
++   } catch (NoAccessException ex) {
++     throw new RuntimeException(ex);
++   }
++}
++{}
++
++    @Test public void testFindVirtual() throws Throwable {
++{}
++MethodHandle CONCAT_3 = LOOKUP.findVirtual(String.class,
++  "concat", methodType(String.class, String.class));
++MethodHandle HASHCODE_3 = LOOKUP.findVirtual(Object.class,
++  "hashCode", methodType(int.class));
++//assertEquals("xy", (String) CONCAT_1.invokeExact("x", "y"));
++assertEquals("xy", (String) CONCAT_2.<String>invokeExact("x", "y"));
++assertEquals("xy", (String) CONCAT_3.<String>invokeExact("x", "y"));
++//assertEquals("xy".hashCode(), (int) HASHCODE_1.<int>invokeExact((Object)"xy"));
++assertEquals("xy".hashCode(), (int) HASHCODE_2.<int>invokeExact((Object)"xy"));
++assertEquals("xy".hashCode(), (int) HASHCODE_3.<int>invokeExact((Object)"xy"));
++{}
++    }
++    @Test public void testDropArguments() throws Throwable {
++        {{
++{} /// JAVADOC
++MethodHandle cat = lookup().findVirtual(String.class,
++  "concat", methodType(String.class, String.class));
++cat = cat.asType(methodType(Object.class, String.class, String.class)); /*(String)*/
++assertEquals("xy", /*(String)*/ cat.invokeExact("x", "y"));
++MethodHandle d0 = dropArguments(cat, 0, String.class);
++assertEquals("yz", /*(String)*/ d0.invokeExact("x", "y", "z"));
++MethodHandle d1 = dropArguments(cat, 1, String.class);
++assertEquals("xz", /*(String)*/ d1.invokeExact("x", "y", "z"));
++MethodHandle d2 = dropArguments(cat, 2, String.class);
++assertEquals("xy", /*(String)*/ d2.invokeExact("x", "y", "z"));
++MethodHandle d12 = dropArguments(cat, 1, int.class, boolean.class);
++assertEquals("xz", /*(String)*/ d12.invokeExact("x", 12, true, "z"));
++            }}
++    }
++
++    static void assertEquals(Object exp, Object act) {
++        if (verbosity > 0)
++            System.out.println("result: "+act);
++        Assert.assertEquals(exp, act);
++    }
++}
+diff --git a/test/java/dyn/MethodHandlesTest.java b/test/java/dyn/MethodHandlesTest.java
+--- a/test/java/dyn/MethodHandlesTest.java
++++ b/test/java/dyn/MethodHandlesTest.java
+@@ -449,7 +449,7 @@
+         countTest(positive);
+         MethodType type = MethodType.methodType(ret, params);
+         MethodHandle target = null;
+-        RuntimeException noAccess = null;
++        Exception noAccess = null;
+         try {
+             if (verbosity >= 4)  System.out.println("lookup via "+lookup+" of "+defc+" "+name+type);
+             target = lookup.findStatic(defc, name, type);
+@@ -513,7 +513,7 @@
+         String methodName = name.substring(1 + name.indexOf('/'));  // foo/bar => foo
+         MethodType type = MethodType.methodType(ret, params);
+         MethodHandle target = null;
+-        RuntimeException noAccess = null;
++        Exception noAccess = null;
+         try {
+             if (verbosity >= 4)  System.out.println("lookup via "+lookup+" of "+defc+" "+name+type);
+             target = lookup.findVirtual(defc, methodName, type);
+@@ -567,7 +567,7 @@
+         countTest(positive);
+         MethodType type = MethodType.methodType(ret, params);
+         MethodHandle target = null;
+-        RuntimeException noAccess = null;
++        Exception noAccess = null;
+         try {
+             if (verbosity >= 4)  System.out.println("lookup via "+lookup+" of "+defc+" "+name+type);
+             target = lookup.findSpecial(defc, name, type, specialCaller);
+@@ -623,7 +623,7 @@
+         MethodType type = MethodType.methodType(ret, params);
+         Object receiver = randomArg(defc);
+         MethodHandle target = null;
+-        RuntimeException noAccess = null;
++        Exception noAccess = null;
+         try {
+             if (verbosity >= 4)  System.out.println("lookup via "+lookup+" of "+defc+" "+name+type);
+             target = lookup.bind(receiver, methodName, type);
+@@ -688,7 +688,7 @@
+         MethodType type = MethodType.methodType(ret, params);
+         Method rmethod = null;
+         MethodHandle target = null;
+-        RuntimeException noAccess = null;
++        Exception noAccess = null;
+         try {
+             rmethod = defc.getDeclaredMethod(name, params);
+         } catch (NoSuchMethodException ex) {
+@@ -1088,7 +1088,11 @@
+             if (rtype != Object.class)
+                 pfx = rtype.getSimpleName().substring(0, 1).toLowerCase();
+             String name = pfx+"id";
+-            return PRIVATE.findStatic(Callee.class, name, type);
++            try {
++                return PRIVATE.findStatic(Callee.class, name, type);
++            } catch (Exception ex) {
++                throw new RuntimeException(ex);
++            }
+         }
+     }
+ 
+@@ -1818,8 +1822,13 @@
+         testCastFailure("unbox/return", 11000);
+     }
+ 
+-    static class Surprise extends JavaMethodHandle {
+-        Surprise() { super("value"); }
++    static class Surprise implements MethodHandleProvider {
++        public MethodHandle asMethodHandle() {
++            return VALUE.bindTo(this);
++        }
++        public MethodHandle asMethodHandle(MethodType type) {
++            return asMethodHandle().asType(type);
++        }
+         Object value(Object x) {
+             trace("value", x);
+             if (boo != null)  return boo;
+@@ -1834,22 +1840,32 @@
+         static Object  refIdentity(Object x)  { trace("ref.x", x); return x; }
+         static Integer boxIdentity(Integer x) { trace("box.x", x); return x; }
+         static int     intIdentity(int x)     { trace("int.x", x); return x; }
+-        static MethodHandle REF_IDENTITY = PRIVATE.findStatic(
+-                Surprise.class, "refIdentity",
+-                    MethodType.methodType(Object.class, Object.class));
+-        static MethodHandle BOX_IDENTITY = PRIVATE.findStatic(
+-                Surprise.class, "boxIdentity",
+-                    MethodType.methodType(Integer.class, Integer.class));
+-        static MethodHandle INT_IDENTITY = PRIVATE.findStatic(
+-                Surprise.class, "intIdentity",
+-                    MethodType.methodType(int.class, int.class));
++        static MethodHandle VALUE, REF_IDENTITY, BOX_IDENTITY, INT_IDENTITY;
++        static {
++            try {
++                VALUE = PRIVATE.findVirtual(
++                    Surprise.class, "value",
++                        MethodType.methodType(Object.class, Object.class));
++                REF_IDENTITY = PRIVATE.findStatic(
++                    Surprise.class, "refIdentity",
++                        MethodType.methodType(Object.class, Object.class));
++                BOX_IDENTITY = PRIVATE.findStatic(
++                    Surprise.class, "boxIdentity",
++                        MethodType.methodType(Integer.class, Integer.class));
++                INT_IDENTITY = PRIVATE.findStatic(
++                    Surprise.class, "intIdentity",
++                        MethodType.methodType(int.class, int.class));
++            } catch (Exception ex) {
++                throw new RuntimeException(ex);
++            }
++        }
+     }
+ 
+     void testCastFailure(String mode, int okCount) throws Throwable {
+         countTest(false);
+         if (verbosity > 2)  System.out.println("mode="+mode);
+         Surprise boo = new Surprise();
+-        MethodHandle identity = Surprise.REF_IDENTITY, surprise = boo;
++        MethodHandle identity = Surprise.REF_IDENTITY, surprise0 = boo.asMethodHandle(), surprise = surprise0;
+         if (mode.endsWith("/return")) {
+             if (mode.equals("unbox/return")) {
+                 // fail on return to ((Integer)surprise).intValue
+@@ -1875,7 +1891,7 @@
+                 identity = MethodHandles.filterArguments(callee, identity);
+             }
+         }
+-        assertNotSame(mode, surprise, boo);
++        assertNotSame(mode, surprise, surprise0);
+         identity = MethodHandles.convertArguments(identity, MethodType.genericMethodType(1));
+         surprise = MethodHandles.convertArguments(surprise, MethodType.genericMethodType(1));
+         Object x = 42;

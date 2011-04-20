@@ -1,0 +1,897 @@
+6979327: method handle invocation should use casts instead of type parameters to specify return type
+Summary: Use cast-based target typing instead of type parameter syntax to specify types of method handle calls.
+Reviewed-by: mcimadamore
+
+Allow new versions of javac to compile old versions of JSR 292 code.
+Allow new versions of the JSR 292 code to omit type parameters from polymorphic signatures.
+Instead, casts will perform the same function, with a clearer meaning and cleaner syntax.
+When the old versions of JSR 292 code have gone away, we will kill the flag 'allowTransitionalJSR292'.
+
+Local definitions:
+ "new version of javac" = version which requires @PolymorphicSignature annotations in java.dyn.MethodHandle.
+ "old version of JSR 292 code" = version in which java.dyn.MethodHandle lacks @PolymorphicSignature annotations or uses type parameters.
+
+diff --git a/src/share/classes/com/sun/tools/javac/code/Source.java b/src/share/classes/com/sun/tools/javac/code/Source.java
+--- a/src/share/classes/com/sun/tools/javac/code/Source.java
++++ b/src/share/classes/com/sun/tools/javac/code/Source.java
+@@ -171,11 +171,10 @@
+     public boolean allowUnderscoresInLiterals() {
+         return compareTo(JDK1_7) >= 0;
+     }
+-    public boolean allowStringsInSwitch() {
++    public boolean allowExoticIdentifiers() {
+         return compareTo(JDK1_7) >= 0;
+     }
+-    // JSR 292: recognize @PolymorphicSignature on java/dyn names
+-    public boolean allowPolymorphicSignature() {
++    public boolean allowStringsInSwitch() {
+         return compareTo(JDK1_7) >= 0;
+     }
+     public static SourceVersion toSourceVersion(Source source) {
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Attr.java b/src/share/classes/com/sun/tools/javac/comp/Attr.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Attr.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Attr.java
+@@ -1162,6 +1162,7 @@
+ 
+     public void visitExec(JCExpressionStatement tree) {
+         attribExpr(tree.expr, env);
++        tree.expr = pushSignaturePolymorphicReturnType(syms.voidType, tree.expr);
+         result = null;
+     }
+ 
+@@ -1419,23 +1420,22 @@
+                               restype.tsym);
+             }
+ 
+-            // as a special case, MethodHandle.<T>invoke(abc) and InvokeDynamic.<T>foo(abc)
+-            // has type <T>, and T can be a primitive type.
+-            if (tree.meth.getTag() == JCTree.SELECT && !typeargtypes.isEmpty()) {
+-              JCFieldAccess mfield = (JCFieldAccess) tree.meth;
+-              if ((mfield.selected.type.tsym != null &&
+-                   (mfield.selected.type.tsym.flags() & POLYMORPHIC_SIGNATURE) != 0)
+-                  ||
+-                  (mfield.sym != null &&
+-                   (mfield.sym.flags() & POLYMORPHIC_SIGNATURE) != 0)) {
+-                  assert types.isSameType(restype, typeargtypes.head) : mtype;
+-                  assert mfield.selected.type == syms.methodHandleType
+-                      || mfield.selected.type == syms.invokeDynamicType;
+-                  typeargtypesNonRefOK = true;
+-              }
++            // Special case logic for JSR 292 types.
++            if (rs.allowTransitionalJSR292 && tree.meth.getTag() == JCTree.SELECT && !typeargtypes.isEmpty()) {
++                JCFieldAccess mfield = (JCFieldAccess) tree.meth;
++                // MethodHandle.<T>invoke(abc) and InvokeDynamic.<T>foo(abc)
++                // has type <T>, and T can be a primitive type.
++                if (mfield.selected.type.tsym == syms.invokeDynamicType.tsym && rs.recognizeInvokeDynamic) {
++                    typeargtypesNonRefOK = true;
++                } else if (mfield.selected.type.tsym == syms.methodHandleType.tsym && rs.recognizeMethodHandles) {
++                    if (mfield.sym != null && rs.isPolymorphicSignatureInstance(mfield.sym))
++                        typeargtypesNonRefOK = true;  // invokeExact, invokeGeneric
++                    else if (methName == names.invoke)
++                        typeargtypesNonRefOK = true;  // older logic that doesn't use annotations
++                }
+             }
+ 
+-            if (!typeargtypesNonRefOK) {
++            if (!(rs.allowTransitionalJSR292 && typeargtypesNonRefOK)) {
+                 chk.checkRefTypes(tree.typeargs, typeargtypes);
+             }
+ 
+@@ -2004,12 +2004,36 @@
+         Type clazztype = attribType(tree.clazz, env);
+         chk.validate(tree.clazz, env);
+         Type exprtype = attribExpr(tree.expr, env, Infer.anyPoly);
++        tree.expr = pushSignaturePolymorphicReturnType(clazztype, tree.expr);
+         Type owntype = chk.checkCastable(tree.expr.pos(), exprtype, clazztype);
+         if (exprtype.constValue() != null)
+             owntype = cfolder.coerce(exprtype, owntype);
+         result = check(tree, capture(owntype), VAL, pkind, pt);
+     }
+ 
++    // A cast or occurrence as an expression statement can affect the linkage of some method calls.
++    JCExpression pushSignaturePolymorphicReturnType(Type returnType, JCExpression expr) {
++        // JSR 292:  Link some calls according to return type as indicated by a cast.
++        if (expr.getTag() == JCTree.APPLY) {
++            JCExpression meth = ((JCMethodInvocation)expr).meth;
++            if (meth.getTag() == JCTree.SELECT) {
++                JCFieldAccess methsel = (JCFieldAccess)meth;
++                if (rs.isPolymorphicSignatureInstance(methsel.sym)) {
++                    MethodSymbol sym = (MethodSymbol) methsel.sym;
++                    MethodType oldType = sym.type.asMethodType();
++                    Symbol newSym = rs.findPolymorphicSignatureInstance(sym.owner.type, sym.name, sym,
++                                                                        returnType,
++                                                                        oldType.argtypes);
++                    if (!rs.isPolymorphicSignatureInstance(newSym))
++                        throw new AssertionError("can't split poly sym: "+sym);
++                    methsel.sym = newSym;
++                    expr.type = returnType;
++                }
++            }
++        }
++        return expr;
++    }
++
+     public void visitTypeTest(JCInstanceOf tree) {
+         Type exprtype = chk.checkNullOrRefType(
+             tree.expr.pos(), attribExpr(tree.expr, env));
+diff --git a/src/share/classes/com/sun/tools/javac/comp/MemberEnter.java b/src/share/classes/com/sun/tools/javac/comp/MemberEnter.java
+--- a/src/share/classes/com/sun/tools/javac/comp/MemberEnter.java
++++ b/src/share/classes/com/sun/tools/javac/comp/MemberEnter.java
+@@ -769,11 +769,17 @@
+                 && types.isSameType(c.type, syms.deprecatedType))
+                 s.flags_field |= Flags.DEPRECATED;
+             // Internally to java.dyn, a @PolymorphicSignature annotation
+-            // translates to a classfile attribute.
++            // acts like a classfile attribute.
+             if (!c.type.isErroneous()
+                 && types.isSameType(c.type, syms.polymorphicSignatureType)) {
++                if (!target.hasMethodHandles()) {
++                    // Somebody is compiling JDK7 source code to a JDK6 target.
++                    // Make it a strict warning, since it is unlikely but important.
++                    log.strictWarning(env.tree.pos(), "wrong.target.for.polymorphic.signature.definition", target.name);
++                }
++                // Pull the flag through for better diagnostics, even on a bad target.
+                 s.flags_field |= Flags.POLYMORPHIC_SIGNATURE;
+-            }
++              }
+             if (!annotated.add(a.type.tsym))
+                 log.error(a.pos, "duplicate.annotation");
+         }
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Resolve.java b/src/share/classes/com/sun/tools/javac/comp/Resolve.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Resolve.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Resolve.java
+@@ -67,7 +67,9 @@
+     JCDiagnostic.Factory diags;
+     public final boolean boxingEnabled; // = source.allowBoxing();
+     public final boolean varargsEnabled; // = source.allowVarargs();
+-    public final boolean allowPolymorphicSignature;
++    public final boolean recognizeMethodHandles;
++    public final boolean recognizeInvokeDynamic;
++    public final boolean allowTransitionalJSR292;
+     private final boolean debugResolve;
+ 
+     public static Resolve instance(Context context) {
+@@ -105,7 +107,10 @@
+         varargsEnabled = source.allowVarargs();
+         Options options = Options.instance(context);
+         debugResolve = options.get("debugresolve") != null;
+-        allowPolymorphicSignature = source.allowPolymorphicSignature() || options.get("invokedynamic") != null;
++        allowTransitionalJSR292 = options.get("allowTransitionalJSR292") != null;
++        Target target = Target.instance(context);
++        recognizeMethodHandles = allowTransitionalJSR292 || target.hasMethodHandles();
++        recognizeInvokeDynamic = allowTransitionalJSR292 || target.hasInvokedynamic() && options.get("invokedynamic") != null;
+     }
+ 
+     /** error symbols, which are returned when resolution fails
+@@ -252,6 +257,7 @@
+         else {
+             Symbol s2 = ((MethodSymbol)sym).implementation(site.tsym, types, true);
+             return (s2 == null || s2 == sym ||
++                    isPolymorphicSignatureGeneric(s2) ||  // sym=invokeExact(Object[]) s2=invokeExact(Object...)
+                     !types.isSubSignature(types.memberType(site, s2), types.memberType(site, sym)));
+         }
+     }
+@@ -301,7 +307,6 @@
+                         boolean useVarargs,
+                         Warner warn)
+         throws Infer.InferenceException {
+-        assert ((m.flags() & (POLYMORPHIC_SIGNATURE|HYPOTHETICAL)) != POLYMORPHIC_SIGNATURE);
+         if (useVarargs && (m.flags() & VARARGS) == 0) return null;
+         Type mt = types.memberType(site, m);
+ 
+@@ -578,13 +583,15 @@
+         if (sym.kind == ERR) return bestSoFar;
+         if (!sym.isInheritedIn(site.tsym, types)) return bestSoFar;
+         assert sym.kind < AMBIGUOUS;
+-        if ((sym.flags() & POLYMORPHIC_SIGNATURE) != 0 && allowPolymorphicSignature) {
++        if (isPolymorphicSignatureGeneric(sym) && recognizeMethodHandles) {
+             assert(site.tag == CLASS);
+             // Never match a MethodHandle.invoke directly.
+             if (useVarargs | allowBoxing | operator)
+                 return bestSoFar;
+             // Supply an exactly-typed implicit method instead.
+-            sym = findPolymorphicSignatureInstance(env, sym.owner.type, sym.name, (MethodSymbol) sym, argtypes, typeargtypes);
++            Type restype = initialPolymorphicSignatureResultType(env, typeargtypes);
++            sym = findPolymorphicSignatureInstance(sym.owner.type, sym.name, (MethodSymbol) sym, restype, argtypes);
++            assert null != instantiate(env, site, sym, argtypes, typeargtypes, false, false, Warner.noWarnings);
+         }
+         try {
+             if (rawInstantiate(env, site, sym, argtypes, typeargtypes,
+@@ -757,12 +764,13 @@
+                       boolean useVarargs,
+                       boolean operator) {
+         Symbol bestSoFar = methodNotFound;
+-        if ((site.tsym.flags() & POLYMORPHIC_SIGNATURE) != 0 &&
+-            allowPolymorphicSignature &&
++        if (isPolymorphicSignatureGeneric(site.tsym) && recognizeInvokeDynamic &&
+             site.tag == CLASS &&
+             !(useVarargs | allowBoxing | operator)) {
+             // supply an exactly-typed implicit method in java.dyn.InvokeDynamic
+-            bestSoFar = findPolymorphicSignatureInstance(env, site, name, null, argtypes, typeargtypes);
++            Type restype = initialPolymorphicSignatureResultType(env, typeargtypes);
++            bestSoFar = findPolymorphicSignatureInstance(site, name, null, restype, argtypes);
++            assert null != instantiate(env, site, bestSoFar, argtypes, typeargtypes, false, false, Warner.noWarnings);
+         }
+         return findMethod(env,
+                           site,
+@@ -908,43 +916,35 @@
+     /** Find or create an implicit method of exactly the given type (after erasure).
+      *  Searches in a side table, not the main scope of the site.
+      *  This emulates the lookup process required by JSR 292 in JVM.
+-     *  @param env       The current environment.
+-     *  @param site      The original type from where the selection
+-     *                   takes place.
++     *  @param site      The original type from where the selection takes place.
+      *  @param name      The method's name.
+-     *  @param argtypes  The method's value arguments.
+-     *  @param typeargtypes The method's type arguments
++     *  @param spMethod  A template for the implicit method, or null.
++     *  @param restype   The required return type.
++     *  @param argtypes  The required argument types.
+      */
+-    Symbol findPolymorphicSignatureInstance(Env<AttrContext> env,
+-                                            Type site,
++    Symbol findPolymorphicSignatureInstance(Type site,
+                                             Name name,
+                                             MethodSymbol spMethod,  // sig. poly. method or null if none
+-                                            List<Type> argtypes,
+-                                            List<Type> typeargtypes) {
+-        assert allowPolymorphicSignature;
++                                            Type restype,
++                                            List<Type> argtypes) {
++        assert (recognizeMethodHandles || recognizeInvokeDynamic);
+         //assert site == syms.invokeDynamicType || site == syms.methodHandleType : site;
+         ClassSymbol c = (ClassSymbol) site.tsym;
+         Scope implicit = c.members().next;
+         if (implicit == null) {
+             c.members().next = implicit = new Scope(c);
+         }
+-        Type restype;
+-        if (typeargtypes.isEmpty()) {
+-            restype = syms.objectType;
+-        } else {
+-            restype = typeargtypes.head;
+-            if (!typeargtypes.tail.isEmpty())
+-                return methodNotFound;
+-        }
+         List<Type> paramtypes = Type.map(argtypes, implicitArgType);
+         long flags;
+         List<Type> exType;
+         if (spMethod != null) {
++            assert spMethod.owner == site.tsym;
+             exType = spMethod.getThrownTypes();
+             flags = spMethod.flags() & AccessFlags;
+         } else {
+             // make it throw all exceptions
+-            //assert(site == syms.invokeDynamicType);
++            assert recognizeInvokeDynamic;
++            assert site == syms.invokeDynamicType;
+             exType = List.of(syms.throwableType);
+             flags = PUBLIC | STATIC;
+         }
+@@ -972,7 +972,7 @@
+         }
+         assert argumentsAcceptable(argtypes, types.memberType(site, m).getParameterTypes(),
+                                    false, false, Warner.noWarnings);
+-        assert null != instantiate(env, site, m, argtypes, typeargtypes, false, false, Warner.noWarnings);
++        assert isPolymorphicSignatureInstance(m);
+         return m;
+     }
+     //where
+@@ -989,6 +989,29 @@
+             return argType;
+         }
+ 
++    /** Recognize if this symbol was marked @PolymorphicSignature in the source. */
++    public boolean isPolymorphicSignatureGeneric(Symbol sym) {
++        return ((sym.flags() & (POLYMORPHIC_SIGNATURE | HYPOTHETICAL)) == POLYMORPHIC_SIGNATURE);
++    }
++    /** Recognize if this symbol was split from a @PolymorphicSignature symbol in the source. */
++    public boolean isPolymorphicSignatureInstance(Symbol sym) {
++        return ((sym.flags() & (POLYMORPHIC_SIGNATURE | HYPOTHETICAL)) == (POLYMORPHIC_SIGNATURE | HYPOTHETICAL));
++    }
++
++    /** Compute a provisional return type for a polymorphic signature call.
++     *  This is just Object.  It might be retroactively changed by Attr.pushSignaturePolymorphicReturnType.
++     *  Decode <T> in foo.<T>invoke(bar), for JSR 292 EDR only.
++     */
++    Type initialPolymorphicSignatureResultType(Env<AttrContext> env, List<Type> typeargtypes) {
++        if (!typeargtypes.isEmpty()) {
++            log.warning(env.tree.pos, "type.parameter.on.polymorphic.signature");
++            if (allowTransitionalJSR292) {
++                return typeargtypes.head;
++            }
++        }
++        return syms.objectType;
++    }
++
+     /** Load toplevel or member class with given fully qualified name and
+      *  verify that it is accessible.
+      *  @param env       The current environment.
+@@ -1367,6 +1390,14 @@
+             methodResolutionCache.put(steps.head, sym);
+             steps = steps.tail;
+         }
++        if (allowTransitionalJSR292 &&  // old logic that doesn't use annotations
++            sym.kind >= AMBIGUOUS &&
++            (site == syms.invokeDynamicType ||
++             site == syms.methodHandleType && name == names.invoke)) {
++            // lookup failed; supply an exactly-typed implicit method
++            sym = findPolymorphicSignatureInstance(site, name, null, initialPolymorphicSignatureResultType(env, typeargtypes), argtypes);
++            env.info.varArgs = false;
++        }
+         if (sym.kind >= AMBIGUOUS) {//if nothing is found return the 'first' error
+             MethodResolutionPhase errPhase =
+                     firstErroneousResolutionPhase();
+@@ -1374,6 +1405,12 @@
+                     pos, site, name, true, argtypes, typeargtypes);
+             env.info.varArgs = errPhase.isVarargsRequired;
+         }
++        if (isPolymorphicSignatureGeneric(sym)) {
++            // Should have expanded this sym already.  Oops.
++            // Somebody is compiling JDK7 source code to a JDK6 target.
++            // Make it a strict warning, since it is unlikely but important.
++            log.strictWarning(pos, "wrong.target.for.polymorphic.signature");
++        }
+         return sym;
+     }
+ 
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java b/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
+@@ -1098,12 +1098,6 @@
+                 }
+             },
+ 
+-            new AttributeReader(names.PolymorphicSignature, V45_3/*S.B.V51*/, CLASS_OR_MEMBER_ATTRIBUTE) {
+-                void read(Symbol sym, int attrLen) {
+-                    sym.flags_field |= POLYMORPHIC_SIGNATURE;
+-                }
+-            },
+-
+ 
+             // The following attributes for a Code attribute are not currently handled
+             // StackMapTable
+@@ -1289,6 +1283,9 @@
+                     sym.flags_field |= PROPRIETARY;
+                 else
+                     proxies.append(proxy);
++                if (majorVersion >= V51.major && proxy.type.tsym == syms.polymorphicSignatureType.tsym) {
++                    sym.flags_field |= POLYMORPHIC_SIGNATURE;
++                }
+             }
+             annotate.later(new AnnotationCompleter(sym, proxies.toList()));
+         }
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/ClassWriter.java b/src/share/classes/com/sun/tools/javac/jvm/ClassWriter.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/ClassWriter.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/ClassWriter.java
+@@ -651,13 +651,6 @@
+             endAttr(alenIdx);
+             acount++;
+         }
+-        if ((flags & POLYMORPHIC_SIGNATURE) != 0) {
+-            if (target.majorVersion < 51)
+-                throw new AssertionError("PolymorphicSignature attributes in java/dyn must be written with -target 7 (required major version is 51, current is"+target.majorVersion+")");
+-            int alenIdx = writeAttr(names.PolymorphicSignature);
+-            endAttr(alenIdx);
+-            acount++;
+-        }
+         return acount;
+     }
+ 
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/Target.java b/src/share/classes/com/sun/tools/javac/jvm/Target.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Target.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/Target.java
+@@ -259,6 +259,14 @@
+         return compareTo(JDK1_7) >= 0;
+     }
+ 
++    /** Does the VM support polymorphic method handle invocation?
++     *  Affects the linkage information output to the classfile.
++     *  An alias for {@code hasInvokedynamic}, since all the JSR 292 features appear together.
++     */
++    public boolean hasMethodHandles() {
++        return hasInvokedynamic();
++    }
++
+     /** Although we may not have support for class literals, should we
+      *  avoid initializing the class that the literal refers to?
+      *  See 4468823
+diff --git a/src/share/classes/com/sun/tools/javac/main/Main.java b/src/share/classes/com/sun/tools/javac/main/Main.java
+--- a/src/share/classes/com/sun/tools/javac/main/Main.java
++++ b/src/share/classes/com/sun/tools/javac/main/Main.java
+@@ -282,6 +282,13 @@
+             }
+         }
+ 
++        // phase this out with JSR 292 PFD
++        if ("no".equals(options.get("allowTransitionalJSR292"))) {
++            options.put("allowTransitionalJSR292", null);
++        } else if (target.hasInvokedynamic() && options.get("allowTransitionalJSR292") == null) {
++            options.put("allowTransitionalJSR292", "allowTransitionalJSR292");
++        }
++
+         // handle this here so it works even if no other options given
+         String showClass = options.get("showClass");
+         if (showClass != null) {
+diff --git a/src/share/classes/com/sun/tools/javac/parser/Scanner.java b/src/share/classes/com/sun/tools/javac/parser/Scanner.java
+--- a/src/share/classes/com/sun/tools/javac/parser/Scanner.java
++++ b/src/share/classes/com/sun/tools/javac/parser/Scanner.java
+@@ -108,6 +108,10 @@
+      */
+     private boolean allowUnderscoresInLiterals;
+ 
++    /** Allow exotic identifiers.
++     */
++    private boolean allowExoticIdentifiers;
++
+     /** The source language setting.
+      */
+     private Source source;
+@@ -181,6 +185,7 @@
+         allowBinaryLiterals = source.allowBinaryLiterals();
+         allowHexFloats = source.allowHexFloats();
+         allowUnderscoresInLiterals = source.allowBinaryLiterals();
++        allowExoticIdentifiers = source.allowExoticIdentifiers();  // for invokedynamic
+     }
+ 
+     private static final boolean hexFloatsWork = hexFloatsWork();
+@@ -1010,6 +1015,10 @@
+                 case '#':
+                     scanChar();
+                     if (ch == '\"') {
++                        if (!allowExoticIdentifiers) {
++                            lexError("unsupported.exotic.id", source.name);
++                            allowExoticIdentifiers = true;
++                        }
+                         scanChar();
+                         if (ch == '\"')
+                             lexError(pos, "empty.bytecode.ident");
+diff --git a/src/share/classes/com/sun/tools/javac/resources/compiler.properties b/src/share/classes/com/sun/tools/javac/resources/compiler.properties
+--- a/src/share/classes/com/sun/tools/javac/resources/compiler.properties
++++ b/src/share/classes/com/sun/tools/javac/resources/compiler.properties
+@@ -126,6 +126,13 @@
+ compiler.err.no.superclass=\
+     {0} has no superclass
+ 
++compiler.warn.type.parameter.on.polymorphic.signature=\
++    change obsolete notation for MethodHandle invocations from x.<T>invoke(y) to (T)x.invoke(y)
++compiler.warn.wrong.target.for.polymorphic.signature=\
++    MethodHandle invocations require -target 7 runtimes or better
++compiler.warn.wrong.target.for.polymorphic.signature.definition=\
++    MethodHandle API building requires -target 7 runtimes or better; current is -target {0}
++
+ compiler.err.concrete.inheritance.conflict=\
+     methods {0} from {1} and {2} from {3} are inherited with the same signature
+ 
+@@ -1238,6 +1245,10 @@
+     underscores in literals are not supported in -source {0}\n\
+ (use -source 7 or higher to enable underscores in literals)
+ 
++compiler.err.unsupported.exotic.id=\
++    exotic identifiers #"___" are not supported in -source {0}\n\
++(use -source 7 or higher to enable exotic identifiers)
++
+ compiler.err.automatic.resource.management.not.supported.in.source=\
+     automatic resource management is not supported in -source {0}\n\
+ (use -source 7 or higher to enable automatic resource management)
+diff --git a/src/share/classes/com/sun/tools/javac/util/Names.java b/src/share/classes/com/sun/tools/javac/util/Names.java
+--- a/src/share/classes/com/sun/tools/javac/util/Names.java
++++ b/src/share/classes/com/sun/tools/javac/util/Names.java
+@@ -103,7 +103,6 @@
+     public final Name RuntimeInvisibleTypeAnnotations;
+     public final Name RuntimeVisibleParameterAnnotations;
+     public final Name RuntimeInvisibleParameterAnnotations;
+-    public final Name PolymorphicSignature;
+     public final Name Value;
+     public final Name EnclosingMethod;
+     public final Name desiredAssertionStatus;
+@@ -116,6 +115,7 @@
+     public final Name value;
+     public final Name getMessage;
+     public final Name getClass;
++    public final Name invoke;  //allowTransitionalJSR292 only
+     public final Name TYPE;
+     public final Name TYPE_USE;
+     public final Name TYPE_PARAMETER;
+@@ -215,7 +215,6 @@
+         RuntimeInvisibleTypeAnnotations = fromString("RuntimeInvisibleTypeAnnotations");
+         RuntimeVisibleParameterAnnotations = fromString("RuntimeVisibleParameterAnnotations");
+         RuntimeInvisibleParameterAnnotations = fromString("RuntimeInvisibleParameterAnnotations");
+-        PolymorphicSignature = fromString("PolymorphicSignature");
+         Value = fromString("Value");
+         EnclosingMethod = fromString("EnclosingMethod");
+ 
+@@ -230,6 +229,7 @@
+         value = fromString("value");
+         getMessage = fromString("getMessage");
+         getClass = fromString("getClass");
++        invoke = fromString("invoke");  //allowTransitionalJSR292 only
+ 
+         TYPE = fromString("TYPE");
+         TYPE_USE = fromString("TYPE_USE");
+diff --git a/test/tools/javac/meth/InvokeDyn.java b/test/tools/javac/meth/InvokeDyn.java
+--- a/test/tools/javac/meth/InvokeDyn.java
++++ b/test/tools/javac/meth/InvokeDyn.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -28,7 +28,7 @@
+  * @author jrose
+  *
+  * @library ..
+- * @compile -source 7 -target 7 InvokeDyn.java
++ * @compile -source 7 -target 7 -XDinvokedynamic -XDallowTransitionalJSR292=no InvokeDyn.java
+  */
+ //No: @run main/othervm -XX:+EnableInvokeDynamic meth.InvokeDyn
+ 
+@@ -44,16 +44,21 @@
+ 
+ package meth;
+ 
+-import java.dyn.InvokeDynamic;
++import java.dyn.*;
+ 
+ public class InvokeDyn {
++    class CS extends CallSite {
++        CS(Object x, Object y, Object z) { throw new RuntimeException(); }
++    }
++    @BootstrapMethod(CS.class)  //note: requires 6964498
+     void test() throws Throwable {
+         Object x = "hello";
+-        InvokeDynamic.greet(x, "world", 123);
+-        InvokeDynamic.greet(x, "mundus", 456);
+-        InvokeDynamic.greet(x, "kosmos", 789);
+-        InvokeDynamic.<String>cogitate(10.11121, 3.14);
+-        InvokeDynamic.<void>#"yow: what I mean to say is, please treat this one specially"(null);
+-        InvokeDynamic.<int>invoke("goodbye");
++        Object ojunk; int ijunk;
++        ojunk = InvokeDynamic.greet(x, "world", 123);
++        ojunk = InvokeDynamic.greet(x, "mundus", 456);
++        ojunk = InvokeDynamic.greet(x, "kosmos", 789);
++        ojunk = (String) InvokeDynamic.cogitate(10.11121, 3.14);
++        InvokeDynamic.#"yow: what I mean to say is, please treat this one specially"(null);
++        ijunk = (int) InvokeDynamic.invoke("goodbye");
+     }
+ }
+diff --git a/test/tools/javac/meth/InvokeMH.java b/test/tools/javac/meth/InvokeMH.java
+--- a/test/tools/javac/meth/InvokeMH.java
++++ b/test/tools/javac/meth/InvokeMH.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -27,7 +27,7 @@
+  * @summary Generate call sites for method handle
+  * @author jrose
+  *
+- * @compile -source 7 -target 7 InvokeMH.java
++ * @compile -source 7 -target 7 -XDallowTransitionalJSR292=no InvokeMH.java
+  */
+ 
+ /*
+@@ -57,20 +57,17 @@
+         Object k = "kosmos";
+         mh_SiO.invokeExact((String)k, 789);
+         o = mh_SiO.invokeExact((String)null, 000);
+-        o = mh_SiO.<Object>invokeExact("arda", -123);
++        o = (Object) mh_SiO.invokeExact("arda", -123);
+ 
+         // sig = ()String
+-        s = mh_vS.<String>invokeExact();
++        s = (String) mh_vS.invokeExact();
+ 
+         // sig = ()int
+-        i = mh_vi.<int>invokeExact();
+-        o = mh_vi.<int>invokeExact();
+-        //s = mh_vi.<int>invokeExact(); //BAD
+-        mh_vi.<int>invokeExact();
++        i = (int) mh_vi.invokeExact();
++        o = (int) mh_vi.invokeExact();
+ 
+         // sig = ()void
+-        //o = mh_vv.<void>invokeExact(); //BAD
+-        mh_vv.<void>invokeExact();
++        mh_vv.invokeExact();
+     }
+ 
+     void testGen(MethodHandle mh_SiO,
+@@ -80,24 +77,23 @@
+         Object o; String s; int i;  // for return type testing
+ 
+         // next five must have sig = (*,*)*
+-        mh_SiO.invokeGeneric((Object)"world", (Object)123);
+-        mh_SiO.<void>invokeGeneric((Object)"mundus", (Object)456);
++        o = mh_SiO.invokeGeneric((Object)"world", (Object)123);
++        mh_SiO.invokeGeneric((Object)"mundus", (Object)456);
+         Object k = "kosmos";
+-        mh_SiO.invokeGeneric(k, 789);
++        o = mh_SiO.invokeGeneric(k, 789);
+         o = mh_SiO.invokeGeneric(null, 000);
+-        o = mh_SiO.<Object>invokeGeneric("arda", -123);
++        o = mh_SiO.invokeGeneric("arda", -123);
+ 
+         // sig = ()String
+         o = mh_vS.invokeGeneric();
+ 
+         // sig = ()int
+-        i = mh_vi.<int>invokeGeneric();
+-        o = mh_vi.invokeGeneric();
+-        //s = mh_vi.<int>invokeGeneric(); //BAD
+-        mh_vi.<void>invokeGeneric();
++        i = (int) mh_vi.invokeGeneric();
++        o = (int) mh_vi.invokeGeneric();
++        mh_vi.invokeGeneric();
+ 
+         // sig = ()void
+-        //o = mh_vv.<void>invokeGeneric(); //BAD
++        mh_vv.invokeGeneric();
+         o = mh_vv.invokeGeneric();
+     }
+ }
+diff --git a/test/tools/javac/meth/MakeNegTests.sh b/test/tools/javac/meth/MakeNegTests.sh
+deleted file mode 100644
+--- a/test/tools/javac/meth/MakeNegTests.sh
++++ /dev/null
+@@ -1,98 +0,0 @@
+-#!/bin/sh
+-
+-#
+-# Copyright (c) 2008, 2009, Oracle and/or its affiliates. All rights reserved.
+-# DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+-#
+-# This code is free software; you can redistribute it and/or modify it
+-# under the terms of the GNU General Public License version 2 only, as
+-# published by the Free Software Foundation.
+-#
+-# This code is distributed in the hope that it will be useful, but WITHOUT
+-# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+-# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+-# version 2 for more details (a copy is included in the LICENSE file that
+-# accompanied this code).
+-#
+-# You should have received a copy of the GNU General Public License version
+-# 2 along with this work; if not, write to the Free Software Foundation,
+-# Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+-#
+-# Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+-# or visit www.oracle.com if you need additional information or have any
+-# questions.
+-#
+-
+-# @test
+-# @bug 6754038
+-# @summary Verify correct rejection of strongly typed return values
+-# @run shell MakeNegTests.sh
+-
+-default_template=InvokeMH.java
+-javacflags='-source 7 -target 7'
+-# the rest of this file is a generic "//BAD"-line tester
+-
+-: ${TESTSRC=.} ${TESTCLASSES=.}
+-javac="${TESTJAVA+${TESTJAVA}/bin/}javac"
+-
+-verbose=false quiet=false
+-
+-main() {
+-  case "${@-}" in
+-  *.java*)
+-    for template in "$@"; do
+-      expand_and_test "$template"
+-    done;;
+-  *) expand_and_test "${TESTSRC}/$default_template";;
+-  esac
+-}
+-
+-expand_and_test() {
+-  template=$1
+-  expand "$@"
+-  testneg "$@"
+-}
+-
+-expand() {
+-  template=$1
+-  badlines=` grep -n < "$template" '//BAD' `
+-  badcount=` echo "$badlines" | wc -l `
+-  [ $badcount -gt 0 ] || { echo "No negative test cases in $template"; exit 1; }
+-  $quiet || echo "Expanding $badcount negative test cases from $template:"
+-  $quiet || echo "$badlines"
+-  badnums=` echo "$badlines" | sed 's/:.*//' `
+-  casestem=` getcasestem "$template" `
+-  tclassname=` basename "$template" .java `
+-  rm -f "$casestem"*.java
+-  for badnum in $badnums; do
+-    casefile="$casestem"${badnum}.java
+-    cclassname=` basename "$casefile" .java `
+-    sed < "$template" > "$casefile" "
+-      s|@compile|@compile/fail|
+-      / @[a-z]/s|@|##|
+-      ${badnum}s:^ *[/*]*:    :
+-      s/${tclassname}/${cclassname}/g
+-    "
+-    $verbose && diff -u "$template" "$casefile"
+-  done
+-}
+-
+-getcasestem() {
+-  echo `basename $1` | sed 's/\.java$//;s/_BAD[0-9]*$//;s/$/_BAD/'
+-}
+-
+-testneg() {
+-  template=$1
+-  for casefile in ` getcasestem "$template" `*.java; do
+-    $quiet || echo -------- $javac $javacflags "$casefile"
+-    $javac $javacflags "$casefile" > "$casefile".errlog 2>&1 && {
+-      echo "*** Compilation unexpectedly succeeded:  $casefile"
+-      exit 1
+-    }
+-    $quiet || echo "Compilation failed as expected"
+-    $quiet || head ` $verbose || echo -3 ` < "$casefile".errlog
+-    rm "$casefile".errlog
+-  done
+-}
+-
+-main "$@"
+diff --git a/test/tools/javac/quid/MakeNegTests.sh b/test/tools/javac/quid/MakeNegTests.sh
+deleted file mode 100644
+--- a/test/tools/javac/quid/MakeNegTests.sh
++++ /dev/null
+@@ -1,97 +0,0 @@
+-#!/bin/sh
+-
+-#
+-# Copyright (c) 2008, 2009, Oracle and/or its affiliates. All rights reserved.
+-# DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+-#
+-# This code is free software; you can redistribute it and/or modify it
+-# under the terms of the GNU General Public License version 2 only, as
+-# published by the Free Software Foundation.
+-#
+-# This code is distributed in the hope that it will be useful, but WITHOUT
+-# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+-# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+-# version 2 for more details (a copy is included in the LICENSE file that
+-# accompanied this code).
+-#
+-# You should have received a copy of the GNU General Public License version
+-# 2 along with this work; if not, write to the Free Software Foundation,
+-# Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+-#
+-# Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+-# or visit www.oracle.com if you need additional information or have any
+-# questions.
+-#
+-
+-# @test
+-# @bug 6746458
+-# @summary Verify correct rejection of illegal quoted identifiers.
+-# @run shell MakeNegTests.sh
+-
+-default_template=QuotedIdent.java
+-# the rest of this file is a generic "//BAD"-line tester
+-
+-: ${TESTSRC=.} ${TESTCLASSES=.}
+-javac="${TESTJAVA+${TESTJAVA}/bin/}javac"
+-
+-verbose=false quiet=false
+-
+-main() {
+-  case "${@-}" in
+-  *.java*)
+-    for template in "$@"; do
+-      expand_and_test "$template"
+-    done;;
+-  *) expand_and_test "${TESTSRC}/$default_template";;
+-  esac
+-}
+-
+-expand_and_test() {
+-  template=$1
+-  expand "$@"
+-  testneg "$@"
+-}
+-
+-expand() {
+-  template=$1
+-  badlines=` grep -n < "$template" '//BAD' `
+-  badcount=` echo "$badlines" | wc -l `
+-  [ $badcount -gt 0 ] || { echo "No negative test cases in $template"; exit 1; }
+-  $quiet || echo "Expanding $badcount negative test cases from $template:"
+-  $quiet || echo "$badlines"
+-  badnums=` echo "$badlines" | sed 's/:.*//' `
+-  casestem=` getcasestem "$template" `
+-  tclassname=` basename "$template" .java `
+-  rm "$casestem"*.java
+-  for badnum in $badnums; do
+-    casefile="$casestem"${badnum}.java
+-    cclassname=` basename "$casefile" .java `
+-    sed < "$template" > "$casefile" "
+-      s|@compile|@compile/fail|
+-      / @[a-z]/s|@|##|
+-      ${badnum}s:^ *[/*]*:    :
+-      s/${tclassname}/${cclassname}/g
+-    "
+-    $verbose && diff -u "$template" "$casefile"
+-  done
+-}
+-
+-getcasestem() {
+-  echo `basename $1` | sed 's/.*\///;s/\.java$//;s/_BAD[0-9]*$//;s/$/_BAD/'
+-}
+-
+-testneg() {
+-  template=$1
+-  for casefile in ` getcasestem "$template" `*.java; do
+-    $quiet || echo -------- $javac "$casefile"
+-    $javac "$casefile" > "$casefile".errlog 2>&1 && {
+-      echo "*** Compilation unexpectedly succeeded:  $casefile"
+-      exit 1
+-    }
+-    $quiet || echo "Compilation failed as expected"
+-    $quiet || head ` $verbose || echo -3 ` < "$casefile".errlog
+-    rm "$casefile".errlog
+-  done
+-}
+-
+-main "$@"
+diff --git a/test/tools/javac/quid/QuotedIdent.java b/test/tools/javac/quid/QuotedIdent.java
+--- a/test/tools/javac/quid/QuotedIdent.java
++++ b/test/tools/javac/quid/QuotedIdent.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2009, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -31,6 +31,7 @@
+  *      (The filename, directory name, or volume label syntax is incorrect)
+  *
+  * @library ..
++ * @compile -source 7 -target 7 -XDinvokedynamic QuotedIdent.java
+  * @run main quid.QuotedIdent
+  */
+ 
+@@ -119,7 +120,7 @@
+         s = #"int".class.getName();
+         check(31, s, QuotedIdent.class.getName()+"$int");
+ 
+-        Class x86 = Class.forName(QuotedIdent.class.getName()+"$*86");
++        Class<?> x86 = Class.forName(QuotedIdent.class.getName()+"$*86");
+         if (x86 != #"*86".class)
+             check(32, "reflected "+x86, "static "+#"*86".class);
+ 
+diff --git a/test/tools/javac/quid/QuotedIdent2.java b/test/tools/javac/quid/QuotedIdent2.java
+--- a/test/tools/javac/quid/QuotedIdent2.java
++++ b/test/tools/javac/quid/QuotedIdent2.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2009, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -31,6 +31,7 @@
+  *      (The filename, directory name, or volume label syntax is incorrect)
+  *
+  * @library ..
++ * @compile -source 7 -target 7 -XDinvokedynamic QuotedIdent.java
+  * @run main quid.QuotedIdent2
+  */
+ /*
+@@ -72,7 +73,7 @@
+         s = QuotedIdent.#"int".class.getName();
+         check(31, s, QuotedIdent.class.getName()+"$int");
+ 
+-        Class x86 = Class.forName(QuotedIdent.class.getName()+"$*86");
++        Class<?> x86 = Class.forName(QuotedIdent.class.getName()+"$*86");
+         if (x86 != #"*86".class)
+             check(32, "reflected "+x86, "static "+#"*86".class);
+ 

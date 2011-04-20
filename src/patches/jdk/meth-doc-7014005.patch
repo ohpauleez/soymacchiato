@@ -1,0 +1,120 @@
+7014005: JSR 292 javadoc needs to conform to style conventions
+Summary: javadoc style corrections; minimal changes to non-style content
+Reviewed-by: ?
+
+diff --git a/src/share/classes/java/lang/invoke/CallSite.java b/src/share/classes/java/lang/invoke/CallSite.java
+--- a/src/share/classes/java/lang/invoke/CallSite.java
++++ b/src/share/classes/java/lang/invoke/CallSite.java
+@@ -111,7 +111,7 @@
+     }
+ 
+     /**
+-     * Make a blank call site object, possibly equipped with an initial target method handle.
++     * Make a call site object equipped with an initial target method handle.
+      * @param target the method handle which will be the initial target of the call site
+      * @throws NullPointerException if the proposed target is null
+      */
+diff --git a/src/share/classes/java/lang/invoke/MethodHandles.java b/src/share/classes/java/lang/invoke/MethodHandles.java
+--- a/src/share/classes/java/lang/invoke/MethodHandles.java
++++ b/src/share/classes/java/lang/invoke/MethodHandles.java
+@@ -1140,6 +1140,7 @@
+      * Produces a method handle which will invoke any method handle of the
+      * given {@code type} on a standard set of {@code Object} type arguments
+      * and a single trailing {@code Object[]} array.
++     * <em>(FIXME: This isn't right yet.)</em>
+      * The resulting invoker will be a method handle with the following
+      * arguments:
+      * <ul>
+@@ -1160,9 +1161,7 @@
+      * <p>
+      * Before invoking its target, the invoker will spread the varargs array, apply
+      * reference casts as necessary, and unbox and widen primitive arguments.
+-     * The return value of the invoker will be an {@code Object} reference,
+-     * boxing a primitive value if the original type returns a primitive,
+-     * and always null if the original type returns void.
++     * Similarly, the return value will be converted as necessary.
+      * <p>
+      * This method is equivalent to the following code (though it may be more efficient):
+      * <p><blockquote><pre>
+@@ -1233,9 +1232,7 @@
+      * <p>
+      * Before invoking its target, the invoker will apply reference casts as
+      * necessary and unbox and widen primitive arguments, as if by {@link #convertArguments convertArguments}.
+-     * The return value of the invoker will be an {@code Object} reference,
+-     * boxing a primitive value if the original type returns a primitive,
+-     * and always null if the original type returns void.
++     * Similarly, the return value will be converted as necessary.
+      * <p>
+      * This method is equivalent to the following code (though it may be more efficient):
+      * <p><blockquote><pre>
+diff --git a/src/share/classes/java/lang/invoke/package-info.java b/src/share/classes/java/lang/invoke/package-info.java
+--- a/src/share/classes/java/lang/invoke/package-info.java
++++ b/src/share/classes/java/lang/invoke/package-info.java
+@@ -123,8 +123,7 @@
+  * when these constants are resolved.
+  * <p>
+  * The method handle itself will have a type and behavior determined by the subtag as follows:
+- * <code>
+- * <table border=1 cellpadding=5 summary="CONSTANT_MethodHandle subtypes">
++ * <table border=1 cellpadding=5 summary="CONSTANT_MethodHandle subtypes" style="font-family: monospace;">
+  * <tr><th>N</th><th>subtag name</th><th>member</th><th>MH type</th><th>bytecode behavior</th><th>lookup expression</th></tr>
+  * <tr><td>1</td><td>REF_getField</td><td>C.f:T</td><td>(C)T</td><td>getfield C.f:T</td>
+  *               <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findGetter findGetter(C.class,"f",T.class)}</td></tr>
+@@ -145,7 +144,6 @@
+  * <tr><td>9</td><td>REF_invokeInterface</td><td>C.m(A*)T</td><td>(C,A*)T</td><td>invokeinterface C.m(A*)T</td>
+  *               <td>{@linkplain java.lang.invoke.MethodHandles.Lookup#findVirtual findVirtual(C.class,"m",MT)}</td></tr>
+  * </table>
+- * </code>
+  * Here, the type {@code C} is taken from the {@code CONSTANT_Class} reference associated
+  * with the {@code CONSTANT_NameAndType} descriptor.
+  * The field name {@code f} or method name {@code m} is taken from the {@code CONSTANT_NameAndType}
+@@ -315,7 +313,7 @@
+  * just before its first invocation.
+  * There is no way to undo the effect of a completed bootstrap method call.
+  *
+- * <h3><a name="bsmattr">the {@code BootstrapMethods} attribute </h3>
++ * <h3><a name="bsmattr"></a>the {@code BootstrapMethods} attribute </h3>
+  * Each {@code CONSTANT_InvokeDynamic} entry contains an index which references
+  * a bootstrap method specifier; all such specifiers are contained in a separate array.
+  * This array is defined by a class attribute named {@code BootstrapMethods}.
+@@ -338,7 +336,7 @@
+  * Every other index must refer to a valid operand of an
+  * {@code ldc_w} or {@code ldc2_w} instruction (tag 3..8 or 15..16).
+  *
+- * <h3><a name="args">static arguments to the bootstrap method</h3>
++ * <h3><a name="args"></a>static arguments to the bootstrap method</h3>
+  * An {@code invokedynamic} instruction specifies at least three arguments
+  * to pass to its bootstrap method:
+  * The caller class (expressed as a {@link java.lang.invoke.MethodHandles.Lookup Lookup object},
+@@ -360,7 +358,6 @@
+  * Before the bootstrap method is invoked, each index is used to compute an {@code Object}
+  * reference to the indexed value in the constant pool.
+  * The valid constant pool entries are listed in this table:
+- * <code>
+  * <table border=1 cellpadding=5 summary="Static argument types">
+  * <tr><th>entry type</th><th>argument type</th><th>argument value</th></tr>
+  * <tr><td>CONSTANT_String</td><td><code>java.lang.String</code></td><td>the indexed string literal</td></tr>
+@@ -372,7 +369,6 @@
+  * <tr><td>CONSTANT_MethodHandle</td><td><code>java.lang.invoke.MethodHandle</code></td><td>the indexed method handle constant</td></tr>
+  * <tr><td>CONSTANT_MethodType</td><td><code>java.lang.invoke.MethodType</code></td><td>the indexed method type constant</td></tr>
+  * </table>
+- * </code>
+  * <p>
+  * If a given {@code invokedynamic} instruction specifies no static arguments,
+  * the instruction's bootstrap method will be invoked on three arguments,
+@@ -395,7 +391,6 @@
+  * Given these rules, here are examples of legal bootstrap method declarations,
+  * given various numbers {@code N} of extra arguments.
+  * The first rows (marked {@code *}) will work for any number of extra arguments.
+- * <code>
+  * <table border=1 cellpadding=5 summary="Static argument types">
+  * <tr><th>N</th><th>sample bootstrap method</th></tr>
+  * <tr><td>*</td><td><code>CallSite bootstrap(Lookup caller, String name, MethodType type, Object... args)</code></td></tr>
+@@ -408,7 +403,6 @@
+  * <tr><td>2</td><td><code>CallSite bootstrap(Lookup caller, String name, MethodType type, String... args)</code></td></tr>
+  * <tr><td>2</td><td><code>CallSite bootstrap(Lookup caller, String name, MethodType type, String x, int y)</code></td></tr>
+  * </table>
+- * </code>
+  * The last example assumes that the extra arguments are of type
+  * {@code CONSTANT_String} and {@code CONSTANT_Integer}, respectively.
+  * The second-to-last example assumes that all extra arguments are of type

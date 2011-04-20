@@ -1,0 +1,2108 @@
+6939203: JSR 292 needs method handle constants
+Summary: Syntax for method handle constants.
+This is a supplement to the JVM's support for CONSTANT_MethodHandle.
+Status: Prototype only.  Parser supports the most likely syntax option: Foo#bar.
+If closures and method handles converge, this is a reasonable condidate; if not, another can be chosen.
+Targets a JVM which supports JSR 292 proposed classfile format extensions (CONSTANT_MethodHandle, etc.).
+
+diff --git a/src/share/classes/com/sun/source/tree/MemberReferenceTree.java b/src/share/classes/com/sun/source/tree/MemberReferenceTree.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/com/sun/source/tree/MemberReferenceTree.java
+@@ -0,0 +1,55 @@
++/*
++ * Copyright 2010 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.  Sun designates this
++ * particular file as subject to the "Classpath" exception as provided
++ * by Sun in the LICENSE file that accompanied this code.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++
++package com.sun.source.tree;
++
++/**
++ * A tree node for a member reference expression.
++ *
++ * For example:
++ * <pre>
++ *   <em>expression</em> . &amp; <em>identifier</em>
++ * </pre>
++ *
++ * @see JSR 292
++ *
++ * @author John R. Rose
++ * @since 1.7
++ */
++public interface MemberReferenceTree extends ExpressionTree {
++    /** What kind of reference is this? */
++    public enum ReferenceMode {
++        /** simple field reference x.&id; expr = x.id */
++        GET,
++        /** field reference for setting x.&amp;=id; expr = x.id*/
++        SET,
++        /** method reference x.&amp;id(T...); expr = (x.id((T)&gt;any&lt;, ...)*/
++        INVOKE,
++        /** constructor reference new &amp;id(T...); expr = (new id((T)&gt;any&lt;, ...)*/
++        NEW
++    }
++    ReferenceMode getMode();
++    ExpressionTree getSelection();
++}
+diff --git a/src/share/classes/com/sun/source/tree/Tree.java b/src/share/classes/com/sun/source/tree/Tree.java
+--- a/src/share/classes/com/sun/source/tree/Tree.java
++++ b/src/share/classes/com/sun/source/tree/Tree.java
+@@ -134,6 +134,11 @@
+         MEMBER_SELECT(MemberSelectTree.class),
+ 
+         /**
++         * Used for instances of {@link MemberReferenceTree}.
++         */
++        MEMBER_REFERENCE(MemberReferenceTree.class),
++
++        /**
+          * Used for instances of {@link ForLoopTree}.
+          */
+         FOR_LOOP(ForLoopTree.class),
+diff --git a/src/share/classes/com/sun/source/tree/TreeVisitor.java b/src/share/classes/com/sun/source/tree/TreeVisitor.java
+--- a/src/share/classes/com/sun/source/tree/TreeVisitor.java
++++ b/src/share/classes/com/sun/source/tree/TreeVisitor.java
+@@ -89,6 +89,7 @@
+     R visitParenthesized(ParenthesizedTree node, P p);
+     R visitReturn(ReturnTree node, P p);
+     R visitMemberSelect(MemberSelectTree node, P p);
++    R visitMemberReference(MemberReferenceTree node, P p);
+     R visitEmptyStatement(EmptyStatementTree node, P p);
+     R visitSwitch(SwitchTree node, P p);
+     R visitSynchronized(SynchronizedTree node, P p);
+diff --git a/src/share/classes/com/sun/source/util/SimpleTreeVisitor.java b/src/share/classes/com/sun/source/util/SimpleTreeVisitor.java
+--- a/src/share/classes/com/sun/source/util/SimpleTreeVisitor.java
++++ b/src/share/classes/com/sun/source/util/SimpleTreeVisitor.java
+@@ -208,6 +208,10 @@
+         return defaultAction(node, p);
+     }
+ 
++    public R visitMemberReference(MemberReferenceTree node, P p) {
++        return defaultAction(node, p);
++    }
++
+     public R visitIdentifier(IdentifierTree node, P p) {
+         return defaultAction(node, p);
+     }
+diff --git a/src/share/classes/com/sun/source/util/TreeScanner.java b/src/share/classes/com/sun/source/util/TreeScanner.java
+--- a/src/share/classes/com/sun/source/util/TreeScanner.java
++++ b/src/share/classes/com/sun/source/util/TreeScanner.java
+@@ -332,6 +332,10 @@
+         return scan(node.getExpression(), p);
+     }
+ 
++    public R visitMemberReference(MemberReferenceTree node, P p) {
++        return scan(node.getSelection(), p);
++    }
++
+     public R visitIdentifier(IdentifierTree node, P p) {
+         return null;
+     }
+diff --git a/src/share/classes/com/sun/tools/javac/code/Attribute.java b/src/share/classes/com/sun/tools/javac/code/Attribute.java
+--- a/src/share/classes/com/sun/tools/javac/code/Attribute.java
++++ b/src/share/classes/com/sun/tools/javac/code/Attribute.java
+@@ -128,6 +128,13 @@
+         }
+     }
+ 
++    /** The value for an annotation element of type java.dyn.MethodHandle,
++     *  or its type, represented as a Symbol or signature string.
++     */
++    public static abstract class Member extends Attribute {
++        Member() { super(null); throw new UnsupportedOperationException("NYI"); }
++    }
++
+     /** A compound annotation element value, the type of which is an
+      *  attribute interface.
+      */
+diff --git a/src/share/classes/com/sun/tools/javac/code/Type.java b/src/share/classes/com/sun/tools/javac/code/Type.java
+--- a/src/share/classes/com/sun/tools/javac/code/Type.java
++++ b/src/share/classes/com/sun/tools/javac/code/Type.java
+@@ -68,6 +68,9 @@
+     /** Constant type: no type at all. */
+     public static final JCNoType noType = new JCNoType(NONE);
+ 
++    /** Constant type: placeholder for an unknown type or unknown parameter types. */
++    public static final Type unknownType = new JCNoType(UNKNOWN);
++
+     /** If this switch is turned on, the names of type variables
+      *  and anonymous classes are printed with hashcodes appended.
+      */
+@@ -332,6 +335,10 @@
+         return tag < VOID;
+     }
+ 
++    public boolean isUnknown() {
++        return tag == UNKNOWN;
++    }
++
+     /**
+      * Does this type contain occurrences of type t?
+      */
+diff --git a/src/share/classes/com/sun/tools/javac/code/Types.java b/src/share/classes/com/sun/tools/javac/code/Types.java
+--- a/src/share/classes/com/sun/tools/javac/code/Types.java
++++ b/src/share/classes/com/sun/tools/javac/code/Types.java
+@@ -98,6 +98,15 @@
+     }
+     // </editor-fold>
+ 
++    /** Is this type list a place-holder created by the parser to refer to an unknown list of types? */
++    public boolean isUnknown(List<Type> ts) {
++        if (ts.head != null && ts.head.isUnknown()) {
++            assert(ts.tail.isEmpty());
++            return true;
++        }
++        return false;
++    }
++
+     // <editor-fold defaultstate="collapsed" desc="upperBound">
+     /**
+      * The "rvalue conversion".<br>
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Annotate.java b/src/share/classes/com/sun/tools/javac/comp/Annotate.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Annotate.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Annotate.java
+@@ -251,6 +251,33 @@
+             VarSymbol enumerator = (VarSymbol) sym;
+             return new Attribute.Enum(expected, enumerator);
+         }
++        if (expected.tsym == syms.methodHandleType.tsym ||
++            expected.tsym == syms.methodTypeType.tsym) {
++            attr.attribExpr(tree, env, expected);
++            JCExpression mhref;
++            if (expected.tsym == syms.methodTypeType.tsym) {
++                mhref = null;
++                if (tree.getTag() == JCTree.APPLY) {
++                    JCMethodInvocation call = (JCMethodInvocation) tree;
++                    Symbol sym = TreeInfo.symbol(call.meth);
++                    if (sym.owner == syms.methodHandleType.tsym &&
++                        sym.name == names.type &&
++                        call.args.isEmpty() &&
++                        call.meth.getTag() == JCTree.SELECT) {
++                        mhref = ((JCFieldAccess)call.meth).selected;
++                    }
++                }
++            } else {
++                mhref = tree;
++            }
++            if (mhref == null || mhref.getTag() != JCTree.REFERENCE ||
++                TreeInfo.nonstaticSelect(mhref)) {
++                log.error(tree.pos(), "member.reference.annotation.must.be.constant");
++                return new Attribute.Error(expected);
++            }
++            // FIXME: recode the member reference as an annotation
++            throw new UnsupportedOperationException("NYI: MH or MT as annotation value");
++        }
+         if (!expected.isErroneous())
+             log.error(tree.pos(), "annotation.value.not.allowable.type");
+         return new Attribute.Error(attr.attribExpr(tree, env, expected));
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Attr.java b/src/share/classes/com/sun/tools/javac/comp/Attr.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Attr.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Attr.java
+@@ -423,6 +423,12 @@
+         return attribTree(tree, env, VAL, Type.noType);
+     }
+ 
++    /** Derived visitor method: attribute an expression tree as a variable.
++     */
++    Type attribVar(JCTree tree, Env<AttrContext> env) {
++        return attribTree(tree, env, VAR, Type.noType);
++    }
++
+     /** Derived visitor method: attribute a type tree.
+      */
+     Type attribType(JCTree tree, Env<AttrContext> env) {
+@@ -1630,7 +1636,8 @@
+                 }
+             }
+         } else if (!clazztype.tsym.isInterface() &&
+-                   clazztype.getEnclosingType().tag == CLASS) {
++                   clazztype.getEnclosingType().tag == CLASS &&
++                   !isMemberRefExpr(tree)) {
+             // Check for the existence of an apropos outer instance
+             rs.resolveImplicitThis(tree.pos(), env, clazztype);
+         }
+@@ -1965,7 +1972,7 @@
+ 
+     public void visitAssignop(JCAssignOp tree) {
+         // Attribute arguments.
+-        Type owntype = attribTree(tree.lhs, env, VAR, Type.noType);
++        Type owntype = attribVar(tree.lhs, env);
+         Type operand = attribExpr(tree.rhs, env);
+         // Find operator.
+         Symbol operator = tree.operator = rs.resolveBinaryOperator(
+@@ -1989,7 +1996,7 @@
+     public void visitUnary(JCUnary tree) {
+         // Attribute arguments.
+         Type argtype = (JCTree.PREINC <= tree.getTag() && tree.getTag() <= JCTree.POSTDEC)
+-            ? attribTree(tree.arg, env, VAR, Type.noType)
++            ? attribVar(tree.arg, env)
+             : chk.checkNonVoid(tree.arg.pos(), attribExpr(tree.arg, env));
+ 
+         // Find operator.
+@@ -2191,6 +2198,64 @@
+         result = checkId(tree, env1.enclClass.sym.type, sym, env, pkind, pt, varArgs);
+     }
+ 
++    public void visitReference(JCMemberReference tree) {
++        Env<AttrContext> localEnv = env.dup(tree, env.info.dup());
++        JCExpression expr = tree.expr;
++        Symbol sym = null;
++        switch (tree.mode) {
++            case GET:
++                attribExpr(expr, localEnv);
++                sym = TreeInfo.symbol(expr);
++                break;
++            case SET:
++                attribVar(expr, localEnv);
++                sym = TreeInfo.symbol(expr);
++                break;
++            case INVOKE:
++                JCMethodInvocation apply = (JCMethodInvocation) expr;
++                attribExpr(apply, localEnv);
++                sym = TreeInfo.symbol(apply.meth);
++                break;
++            case NEW:
++                JCNewClass newobj = (JCNewClass) expr;
++                attribExpr(newobj, localEnv);
++                sym = newobj.constructor;
++                break;
++            default: throw new AssertionError();
++        }
++        // the symbol is resolved
++        assert sym != null;
++        tree.sym = sym;
++        // FIXME: Instantiate MH<R(A...)> with type parameters from sym.
++        result = check(tree, syms.methodHandleType, VAL, pkind, pt);
++    }
++
++    /** See if this visited tree is the subject of an enclosing member reference.
++     *  Depends on stacked environments for both APPLY and REFERENCE expressions.
++     *  This expensive call is only used if a we are thinking of issuing
++     *  an error because of an unbound use of a non-static symbol.
++     *  If it is going to serve as a member reference, we'll just
++     *  avoid binding the method handle.
++     *  So String.&length() is of type (String)int,
++     *  while "foo".&length() is of type ()int.
++     */
++    private boolean isMemberRefExpr(JCExpression tree) {
++        JCExpression lookFor = tree;
++        for (Env<AttrContext> ep = env; ep != null; ep = ep.next) {
++            switch (ep.tree.getTag()) {
++            case JCTree.APPLY:
++                JCMethodInvocation app = (JCMethodInvocation) ep.tree;
++                if (app.meth == lookFor)
++                    lookFor = app;
++                break;
++            case JCTree.REFERENCE:
++                JCMemberReference memref = (JCMemberReference) ep.tree;
++                return memref.expr == lookFor;
++            }
++        }
++        return false;
++    }
++
+     public void visitSelect(JCFieldAccess tree) {
+         // Determine the expected kind of the qualifier expression.
+         int skind = 0;
+@@ -2286,6 +2351,7 @@
+                 // Check if type-qualified fields or methods are static (JLS)
+                 if ((sym.flags() & STATIC) == 0 &&
+                     sym.name != names._super &&
++                    !isMemberRefExpr(tree) &&
+                     (sym.kind == VAR || sym.kind == MTH)) {
+                     rs.access(rs.new StaticError(sym),
+                               tree.pos(), site, sym.name, true);
+@@ -2712,6 +2778,8 @@
+                           sym, site,
+                           Type.toString(pt.getParameterTypes()));
+             owntype = types.createErrorType(site);
++        } else if (types.isUnknown(argtypes)) {
++            // Wildcard argument list for method reference Foo.&bar(...).
+         } else {
+             // System.out.println("call   : " + env.tree);
+             // System.out.println("method : " + owntype);
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Lower.java b/src/share/classes/com/sun/tools/javac/comp/Lower.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Lower.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Lower.java
+@@ -2400,6 +2400,10 @@
+     }
+ 
+     public void visitNewClass(JCNewClass tree) {
++        result = lowerNewClass(tree, false);
++    }
++
++    private JCExpression lowerNewClass(JCNewClass tree, boolean isMemberRef) {
+         ClassSymbol c = (ClassSymbol)tree.constructor.owner;
+ 
+         // Box arguments, if necessary
+@@ -2430,6 +2434,8 @@
+             if (tree.encl != null) {
+                 thisArg = attr.makeNullCheck(translate(tree.encl));
+                 thisArg.type = tree.encl.type;
++            } else if (isMemberRef) {
++                thisArg = null;  // leave it unbound
+             } else if ((c.owner.kind & (MTH | VAR)) != 0) {
+                 // local class
+                 thisArg = makeThis(tree.pos(), c.type.getEnclosingType().tsym);
+@@ -2437,9 +2443,15 @@
+                 // nested class
+                 thisArg = makeOwnerThis(tree.pos(), c, false);
+             }
+-            tree.args = tree.args.prepend(thisArg);
++            if (isMemberRef) {
++                tree.encl = thisArg;
++            } else {
++                tree.args = tree.args.prepend(thisArg);
++                tree.encl = null;
++            }
++        } else {
++            tree.encl = null;
+         }
+-        tree.encl = null;
+ 
+         // If we have an anonymous class, create its flat version, rather
+         // than the class or interface following new.
+@@ -2450,7 +2462,7 @@
+         } else {
+             tree.clazz = access(c, tree.clazz, enclOp, false);
+         }
+-        result = tree;
++        return tree;
+     }
+ 
+     // Simplify conditionals with known constant controlling expressions.
+@@ -2610,6 +2622,7 @@
+     List<JCExpression> boxArgs(List<Type> parameters, List<JCExpression> _args, Type varargsElement) {
+         List<JCExpression> args = _args;
+         if (parameters.isEmpty()) return args;
++        if (TreeInfo.isDummy(args))  return args;
+         boolean anyChanges = false;
+         ListBuffer<JCExpression> result = new ListBuffer<JCExpression>();
+         while (parameters.tail.nonEmpty()) {
+@@ -3353,6 +3366,15 @@
+             result = access(tree.sym, tree, enclOp, qualifiedSuperAccess);
+     }
+ 
++    public void visitReference(JCMemberReference tree) {
++        if (tree.expr.getTag() == JCTree.NEWCLASS) {
++            tree.expr = lowerNewClass((JCNewClass) tree.expr, true);
++        } else {
++            tree.expr = translate(tree.expr);
++        }
++        result = tree;
++    }
++
+     public void visitLetExpr(LetExpr tree) {
+         tree.defs = translateVarDefs(tree.defs);
+         tree.expr = translate(tree.expr, tree.type);
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Resolve.java b/src/share/classes/com/sun/tools/javac/comp/Resolve.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Resolve.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Resolve.java
+@@ -306,6 +306,10 @@
+         assert ((m.flags() & (POLYMORPHIC_SIGNATURE|HYPOTHETICAL)) != POLYMORPHIC_SIGNATURE);
+         if (useVarargs && (m.flags() & VARARGS) == 0) return null;
+         Type mt = types.memberType(site, m);
++        if (types.isUnknown(argtypes)) {
++            // Wildcard argument list for Foo.&bar(...).
++            return mt;
++        }
+ 
+         // tvars is the list of formal type variables for which type arguments
+         // need to inferred.
+diff --git a/src/share/classes/com/sun/tools/javac/comp/TransTypes.java b/src/share/classes/com/sun/tools/javac/comp/TransTypes.java
+--- a/src/share/classes/com/sun/tools/javac/comp/TransTypes.java
++++ b/src/share/classes/com/sun/tools/javac/comp/TransTypes.java
+@@ -174,7 +174,18 @@
+     <T extends JCTree> List<T> translateArgs(List<T> _args,
+                                            List<Type> parameters,
+                                            Type varargsElement) {
+-        if (parameters.isEmpty()) return _args;
++        if (parameters.isEmpty()) {
++            assert _args.isEmpty();
++            return _args;
++        }
++        if (TreeInfo.isDummy(_args)) {
++            assert varargsElement == null;
++            return _args;
++        }
++        assert (varargsElement == null
++                ? _args.length() == parameters.length()
++                : _args.length() >= parameters.length() - 1)
++                : ">> " + _args + parameters;
+         List<T> args = _args;
+         while (parameters.tail.nonEmpty()) {
+             args.head = translate(args.head, parameters.head);
+@@ -583,8 +594,6 @@
+             argtypes = argtypes.tail.tail;
+         if (tree.varargsElement != null)
+             tree.varargsElement = types.erasure(tree.varargsElement);
+-        else
+-            assert tree.args.length() == argtypes.length();
+         tree.args = translateArgs(tree.args, argtypes, tree.varargsElement);
+ 
+         // Insert casts of method invocation results as needed.
+@@ -725,6 +734,11 @@
+         }
+     }
+ 
++    public void visitReference(JCMemberReference tree) {
++        tree.expr = translate(tree.expr, null);
++        result = tree;
++    }
++
+     public void visitTypeArray(JCArrayTypeTree tree) {
+         tree.elemtype = translate(tree.elemtype, null);
+         tree.type = erasure(tree.type);
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/CRTable.java b/src/share/classes/com/sun/tools/javac/jvm/CRTable.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/CRTable.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/CRTable.java
+@@ -473,6 +473,12 @@
+             result = sr;
+         }
+ 
++        public void visitReference(JCMemberReference tree) {
++            SourceRange sr = new SourceRange(startPos(tree), endPos(tree));
++            sr.mergeWith(csp(tree.expr));
++            result = sr;
++        }
++
+         public void visitIdent(JCIdent tree) {
+             SourceRange sr = new SourceRange(startPos(tree), endPos(tree));
+             result = sr;
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/Gen.java b/src/share/classes/com/sun/tools/javac/jvm/Gen.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Gen.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/Gen.java
+@@ -24,6 +24,7 @@
+  */
+ 
+ package com.sun.tools.javac.jvm;
++import com.sun.source.tree.MemberReferenceTree.ReferenceMode;
+ import java.util.*;
+ 
+ import javax.lang.model.element.ElementKind;
+@@ -39,7 +40,9 @@
+ import com.sun.tools.javac.code.Type.*;
+ import com.sun.tools.javac.jvm.Code.*;
+ import com.sun.tools.javac.jvm.Items.*;
++import com.sun.tools.javac.jvm.Pool.*;
+ import com.sun.tools.javac.tree.JCTree.*;
++import java.lang.ref.Reference;
+ 
+ import static com.sun.tools.javac.code.Flags.*;
+ import static com.sun.tools.javac.code.Kinds.*;
+@@ -1116,7 +1119,7 @@
+         List<JCCase> cases = tree.cases;
+         if (cases.isEmpty()) {
+             // We are seeing:  switch <sel> {}
+-            sel.load().drop();
++            sel.exec();
+             if (genCrt)
+                 code.crt.put(TreeInfo.skipParens(tree.selector),
+                              CRT_FLOW_CONTROLLER, startpcCrt, code.curPc());
+@@ -1574,6 +1577,10 @@
+             public void visitSelect(JCFieldAccess tree)
+                 { super.visitSelect(tree);
+                   if (tree.sym.kind == VAR) complexity+=1; }
++            public void visitReference(JCMemberReference tree)
++                { scan(tree.getBase());
++                  complexity+=1; }
++
+             public void visitIdent(JCIdent tree) {
+                 if (tree.sym.kind == VAR) {
+                     complexity+=1;
+@@ -1625,7 +1632,7 @@
+                 ((JCUnary) e).setTag(JCTree.PREDEC);
+                 break;
+         }
+-        genExpr(tree.expr, tree.expr.type).drop();
++        genExpr(tree.expr, tree.expr.type).drop();  // S.B. exec().
+     }
+ 
+     public void visitBreak(JCBreak tree) {
+@@ -1672,6 +1679,14 @@
+  *************************************************************************/
+ 
+     public void visitApply(JCMethodInvocation tree) {
++        // Special case for foo.&bar.type():  It's a constant.
++        {
++            JCExpression mtbase = TreeInfo.methodHandleType(tree);
++            if (mtbase != null && mtbase.getTag() == JCTree.REFERENCE) {
++                visitReference((JCMemberReference) mtbase, true);
++                return;
++            }
++        }
+         setTypeAnnotationPositions(tree.pos);
+         // Generate code for method.
+         Item m = genExpr(tree.meth, methodType);
+@@ -2125,6 +2140,7 @@
+     }
+ 
+     public void visitIdent(JCIdent tree) {
++        assert !TreeInfo.isDummy(tree);  // don't codegen dummy nodes
+         Symbol sym = tree.sym;
+         if (tree.name == names._this || tree.name == names._super) {
+             Item res = tree.name == names._this
+@@ -2183,9 +2199,7 @@
+             // We are seeing a variable that is constant but its selecting
+             // expression is not.
+             if ((sym.flags() & STATIC) != 0) {
+-                if (!selectSuper && (ssym == null || ssym.kind != TYP))
+-                    base = base.load();
+-                base.drop();
++                base.exec();
+             } else {
+                 base.load();
+                 genNullCheck(tree.selected.pos());
+@@ -2200,9 +2214,7 @@
+             if (!accessSuper)
+                 sym = binaryQualifier(sym, tree.selected.type);
+             if ((sym.flags() & STATIC) != 0) {
+-                if (!selectSuper && (ssym == null || ssym.kind != TYP))
+-                    base = base.load();
+-                base.drop();
++                base.exec();
+                 result = items.makeStaticItem(sym);
+             } else {
+                 base.load();
+@@ -2219,6 +2231,96 @@
+         }
+     }
+ 
++    public void visitReference(JCMemberReference tree) {
++        visitReference(tree, false);
++    }
++
++    private int computeRefKind(JCMemberReference tree) {
++        boolean isStatic = tree.sym.isStatic();
++        switch (tree.mode) {
++            case GET:
++                return MemberReference.fieldRefKind(isStatic, false);
++            case SET:
++                return MemberReference.fieldRefKind(isStatic, true);
++            case INVOKE:
++            {
++                boolean isInterface = tree.sym.owner.isInterface();
++                int refKind = MemberReference.methodRefKind(isStatic, isInterface);
++                if (refKind != ClassFile.REF_invokeVirtual)
++                    return refKind;
++                if ((tree.sym.flags() & PRIVATE) != 0)
++                    return ClassFile.REF_invokeSpecial;
++                JCExpression base = tree.getBase();
++                if (base != null) {
++                    Symbol bsym = TreeInfo.symbol(base);
++                    // Are we selecting via super?
++                    if (bsym != null && bsym.name == names._super)
++                        return ClassFile.REF_invokeSpecial;
++                }
++                return ClassFile.REF_invokeVirtual;
++            }
++            case NEW:
++                // JVM always supplies a freshly built receiver
++                return ClassFile.REF_newInvokeSpecial;
++            default:
++                throw new AssertionError();
++        }
++    }
++
++    private void visitReference(JCMemberReference tree, boolean forType) {
++        //System.out.println("Gen: "+tree+(forType?".type()":""));
++        Symbol refSym = tree.sym;
++        JCExpression base = tree.getBase();
++        final boolean isStatic = refSym.isStatic();
++        switch (tree.mode) {
++            case GET:
++                refSym = binaryQualifier(refSym, base.type);
++                refSym = (Symbol) Pool.delegateSymbol((VarSymbol)refSym);
++                break;
++            case SET:
++                refSym = binaryQualifier(refSym, base.type);
++                refSym = (Symbol) Pool.delegateSymbol((VarSymbol)refSym);
++                break;
++            case INVOKE:
++                refSym = binaryQualifier(refSym, base.type);
++                refSym = (Symbol) Pool.delegateSymbol((MethodSymbol)refSym);
++                break;
++            case NEW:
++                refSym = (Symbol) Pool.delegateSymbol((MethodSymbol)refSym);
++                break;
++            default:
++                throw new AssertionError();
++        }
++        if (base != null && !TreeInfo.nonstaticBase(base)) {
++            base = null;  // ignore a type prefix, e.g., String.valueOf
++        }
++        if (base != null && (forType || refSym.isStatic())) {
++            // Evaluate the expression and then ignore it.
++            if (base.getTag() != JCTree.IDENT) {
++                //System.out.println("  executable base: "+base);
++                genExpr(base, base.type).exec();
++            }
++            base = null;
++        }
++        if (forType) {
++            TypeReference refValue = new TypeReference(tree.getType(types, syms));
++            result = items.makeImmediateItem(syms.methodTypeType, refValue);
++        } else {
++            MemberReference refValue = new MemberReference(computeRefKind(tree), refSym);
++            Item con = items.makeImmediateItem(syms.methodHandleType, refValue);
++            if (base == null) {
++                result = con;  // it's just the pure constant
++            } else {
++                // Execute conMH.bindTo(baseExpr)
++                //System.out.println("Gen: bound MH base="+base);
++                con.load();
++                genExpr(base, base.type).load();
++                callMethod(tree.pos(), syms.methodHandleType, names.bindTo, List.of(syms.objectType), false);
++                result = items.makeStackItem(syms.methodHandleType);
++            }
++        }
++    }
++
+     public void visitLiteral(JCLiteral tree) {
+         if (tree.type.tag == TypeTags.BOT) {
+             code.emitop0(aconst_null);
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/Items.java b/src/share/classes/com/sun/tools/javac/jvm/Items.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Items.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/Items.java
+@@ -225,6 +225,10 @@
+          */
+         void drop() {}
+ 
++        /** Execute the item only for side effects, if any.
++         */
++        void exec() { load().drop(); }
++
+         /** Generate code to stash a copy of top of stack - of typecode toscode -
+          *  under this item.
+          */
+@@ -367,6 +371,10 @@
+             return stackItem[typecode];
+         }
+ 
++        void exec() {
++            // load().drop() ==> aload; pop; ==> nop
++        }
++
+         public String toString() {
+             return isSuper ? "super" : "this";
+         }
+@@ -399,6 +407,10 @@
+             return stackItem[typecode];
+         }
+ 
++        void exec() {
++            // Xload().drop() ==> Xload; popN; ==> nop
++        }
++
+         void store() {
+             if (reg <= 3)
+                 code.emitop0(istore_0 + Code.truncate(typecode) * 4 + reg);
+@@ -714,6 +726,11 @@
+             lhs.store();
+         }
+ 
++        void exec() {
++            // load().drop() ==> {dupN; Xstore;} popN; ==> Xstore
++            drop();
++        }
++
+         void stash(int toscode) {
+             assert false;
+         }
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/Pool.java b/src/share/classes/com/sun/tools/javac/jvm/Pool.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Pool.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/Pool.java
+@@ -123,6 +123,8 @@
+             return new Method((MethodSymbol)value);
+         else if (value instanceof VarSymbol)
+             return new Variable((VarSymbol)value);
++        else if (value instanceof DelegatedSymbol)
++            return value;
+         else
+             throw new AssertionError();
+     }
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/Target.java b/src/share/classes/com/sun/tools/javac/jvm/Target.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Target.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/Target.java
+@@ -259,6 +259,12 @@
+         return compareTo(JDK1_7) >= 0;
+     }
+ 
++    /** Does the VM support method handle literals (ldc/CONSTANT_MethodHandle)?
++     */
++    public boolean hasMethodHandleLiterals() {
++        return compareTo(JDK1_7) >= 0;
++    }
++
+     /** Although we may not have support for class literals, should we
+      *  avoid initializing the class that the literal refers to?
+      *  See 4468823
+diff --git a/src/share/classes/com/sun/tools/javac/parser/JavacParser.java b/src/share/classes/com/sun/tools/javac/parser/JavacParser.java
+--- a/src/share/classes/com/sun/tools/javac/parser/JavacParser.java
++++ b/src/share/classes/com/sun/tools/javac/parser/JavacParser.java
+@@ -25,6 +25,7 @@
+ 
+ package com.sun.tools.javac.parser;
+ 
++import com.sun.source.tree.MemberReferenceTree.ReferenceMode;
+ import java.util.*;
+ 
+ import com.sun.tools.javac.tree.*;
+@@ -139,6 +140,7 @@
+         this.keepLineMap = keepLineMap;
+         this.errorTree = F.Erroneous();
+         this.debugJSR308 = fac.options.get("TA:parser") != null;
++        this.allowMethodHandleLiterals = fac.options.get("methodHandleLiterals") != null;
+     }
+ 
+     /** Switch: debug output for type-annotations operations
+@@ -181,6 +183,10 @@
+      */
+     boolean allowTypeAnnotations;
+ 
++    /** Switch: give experimental assist to JSR 292 "ldc CONSTANT_MethodHandle"?
++     */
++    boolean allowMethodHandleLiterals;
++
+     /** Switch: should we keep docComments?
+      */
+     boolean keepDocComments;
+@@ -884,7 +890,7 @@
+      *                 | Literal
+      *                 | [TypeArguments] THIS [Arguments]
+      *                 | [TypeArguments] SUPER SuperSuffix
+-     *                 | NEW [TypeArguments] Creator
++     *                 | ["#"] NEW [TypeArguments] Creator
+      *                 | [Annotations] Ident { "." Ident }
+      *                   [ [Annotations] "[" ( "]" BracketsOpt "." CLASS | Expression "]" )
+      *                   | Arguments
+@@ -897,6 +903,7 @@
+      *                 | BasicType
+      *  TypeNoParams3  = Ident { "." Ident } BracketsOpt
+      *  Selector       = "." [TypeArguments] Ident [Arguments]
++     *                 | MemberReferenceSuffix
+      *                 | "." THIS
+      *                 | "." [TypeArguments] SUPER SuperSuffix
+      *                 | "." NEW [TypeArguments] InnerCreator
+@@ -990,6 +997,7 @@
+                     case DOUBLELITERAL: case CHARLITERAL: case STRINGLITERAL:
+                     case TRUE: case FALSE: case NULL:
+                     case NEW: case IDENTIFIER: case ASSERT: case ENUM:
++                    case HASH:
+                     case BYTE: case SHORT: case CHAR: case INT:
+                     case LONG: case FLOAT: case DOUBLE: case BOOLEAN: case VOID:
+                         JCExpression t1 = term3();
+@@ -1033,10 +1041,30 @@
+                 mode = EXPR;
+                 S.nextToken();
+                 if (S.token() == LT) typeArgs = typeArguments();
+-                t = creator(pos, typeArgs);
++                t = creator(pos, typeArgs, -1);
+                 typeArgs = null;
+             } else return illegal();
+             break;
++        case HASH:
++            if (allowMethodHandleLiterals && typeArgs == null && (mode & EXPR) != 0) {
++                int crefpos = pos;
++                mode = EXPR;
++                S.nextToken();
++                pos = S.pos();
++                switch (S.token()) {
++                case NEW:
++                    S.nextToken();
++                    if (S.token() == LT) typeArgs = typeArguments();
++                    t = creator(pos, typeArgs, crefpos);
++                    typeArgs = null;
++                    break;
++                default:
++                    // Except for #new T(), require a base expression Base#x.
++                    // Do not bother to support things like #x or #123 or #this.
++                    return illegal();
++                }
++            } else return illegal();
++            break;
+         case MONKEYS_AT:
+ 
+             // only annotated targetting class literals or cast types are valid
+@@ -1137,9 +1165,11 @@
+                             int pos1 = S.pos();
+                             S.nextToken();
+                             if (S.token() == LT) typeArgs = typeArguments();
+-                            t = innerCreator(pos1, typeArgs, t);
++                            t = innerCreator(pos1, typeArgs, t, -1);
+                             typeArgs = null;
+                             break loop;
++                        default:
++                            break;
+                         }
+                     }
+                     // typeArgs saved for next loop iteration.
+@@ -1150,6 +1180,12 @@
+                     typeAnnotationsPushedBack = annos;
+                     break loop;
+                 default:
++                    if (atMemberReferenceSuffix()) {
++                        mode = EXPR;
++                        if (typeArgs != null) return illegal();
++                        t = memberReferenceSuffix(S.pos(), t);
++                        break loop;
++                    }
+                     break loop;
+                 }
+             }
+@@ -1225,13 +1261,16 @@
+                     int pos2 = S.pos();
+                     S.nextToken();
+                     if (S.token() == LT) typeArgs = typeArguments();
+-                    t = innerCreator(pos2, typeArgs, t);
++                    t = innerCreator(pos2, typeArgs, t, -1);
+                     typeArgs = null;
+                 } else {
+                     t = toP(F.at(pos1).Select(t, ident()));
+                     t = argumentsOpt(typeArgs, typeArgumentsOpt(t));
+                     typeArgs = null;
+                 }
++            } else if ((mode & EXPR) != 0 && atMemberReferenceSuffix()) {
++                if (typeArgs != null) return illegal();
++                t = memberReferenceSuffix(pos1, t);
+             } else {
+                 if (!annos.isEmpty()) {
+                     if (permitTypeAnnotationsPushBack)
+@@ -1253,11 +1292,15 @@
+     }
+ 
+     /** SuperSuffix = Arguments | "." [TypeArguments] Ident [Arguments]
++     *              | MemberReferenceSuffix
+      */
+     JCExpression superSuffix(List<JCExpression> typeArgs, JCExpression t) {
+         S.nextToken();
+         if (S.token() == LPAREN || typeArgs != null) {
+             t = arguments(typeArgs, t);
++        } else if (atMemberReferenceSuffix()) {
++            if (typeArgs != null) return illegal();
++            t = memberReferenceSuffix(S.pos(), t);
+         } else {
+             int pos = S.pos();
+             accept(DOT);
+@@ -1503,9 +1546,96 @@
+         return t;
+     }
+ 
++    /** Is it valid to call memberReferenceSuffix? */
++    boolean atMemberReferenceSuffix() {
++        if (!allowMethodHandleLiterals)
++            // Nothing to see here!
++            return false;
++        switch (S.token()) {
++        case HASH: case HASHEQ: return true;
++        }
++        return false;
++    }
++
++    /**
++     * MemberReferenceSuffix = "#" Ident
++     *                       | "#=" Ident
++     *                       | "#" [TypeArguments] Ident MethodParameterTypes
++     *                       | "#" NEW [TypeArguments] InnerCreator
++     */
++    JCExpression memberReferenceSuffix(int pos1, JCExpression t) {
++        assert atMemberReferenceSuffix();
++        assert allowMethodHandleLiterals;
++        // This syntax is intentionally ugly.
++        // It is a prototype for experimentation with method handle constants.
++        ReferenceMode refMode;
++        mode = EXPR;
++        int pos2 = S.pos();
++        switch (S.token()) {
++        case HASH:
++            refMode = null; break;
++        case HASHEQ:
++            refMode = ReferenceMode.SET; break;
++        default:  throw new AssertionError();
++        }
++        S.nextToken();
++        List<JCExpression> typeArgs = null;
++        if (S.token() == NEW) {
++            if (refMode != null)  return illegal();
++            int newpos = S.pos();
++            S.nextToken();
++            if (S.token() == LT) typeArgs = typeArguments();
++            return innerCreator(newpos, typeArgs, t, pos1);
++        }
++        if (S.token() == LT) {
++            if (refMode != null)  return illegal();
++            typeArgs = typeArguments();
++            refMode = ReferenceMode.INVOKE;
++        }
++        t = toP(F.at(pos1).Select(t, ident()));
++        if (S.token() == LPAREN) {
++            if (refMode != null && refMode != ReferenceMode.INVOKE)
++                return illegal();
++            refMode = ReferenceMode.INVOKE;
++            int pos3 = S.pos();
++            List<JCExpression> types = methodParameterTypes();
++            t = toP(F.at(pos3).Apply(typeArgs, t, types));
++        } else if (refMode == null) {
++            refMode = ReferenceMode.GET;
++        }
++        return toP(F.at(pos2).Reference(refMode, t));
++    }
++
++    /** MethodParameterTypes = "(" [ typeList | "..." ] ")"
++     */
++    List<JCExpression> methodParameterTypes() {
++        accept(LPAREN);
++        ListBuffer<JCExpression> ts = new ListBuffer<JCExpression>();
++        switch (S.token()) {
++        case RPAREN:
++            break;
++        case ELLIPSIS:
++            S.nextToken();
++            JCExpression noType = F.at(S.pos()).TypeIdent(Type.unknownType.tag);
++            ts.append(F.at(S.pos()).Dummy(noType));
++            break;
++        default:
++            for (;;) {
++                ts.append(F.at(S.pos()).Dummy(parseType()));
++                if (S.token() != COMMA)
++                    break;
++                S.nextToken();
++            }
++            break;
++        }
++        accept(RPAREN);
++        return ts.toList();
++    }
++
+     /** Creator = [Annotations] Qualident [TypeArguments] ( ArrayCreatorRest | ClassCreatorRest )
+      */
+-    JCExpression creator(int newpos, List<JCExpression> typeArgs) {
++    JCExpression creator(int newpos, List<JCExpression> typeArgs, int crefpos) {
++        boolean isConstructorReference = (crefpos != -1);
+ 
+         List<JCTypeAnnotation> newAnnotations = typeAnnotationsOpt();
+ 
+@@ -1558,7 +1688,9 @@
+             }
+             return e;
+         } else if (S.token() == LPAREN) {
+-            JCNewClass newClass = classCreatorRest(newpos, null, typeArgs, t);
++            List<JCExpression> arguments =
++                isConstructorReference ? methodParameterTypes() : arguments();
++            JCNewClass newClass = classCreatorRest(newpos, null, typeArgs, t, arguments);
+             if (newClass.def != null) {
+                 assert newClass.def.mods.annotations.isEmpty();
+                 if (newAnnotations.nonEmpty()) {
+@@ -1566,6 +1698,12 @@
+                     newClass.def.mods.annotations = List.convert(JCAnnotation.class, newAnnotations);
+                 }
+             }
++            if (isConstructorReference) {
++                if (newClass.getClassBody() != null)
++                    // FIXME: bind the captured references into the MH, and retype to named super
++                    throw new UnsupportedOperationException("NYI: anonymous class in MH literal");
++                return toP(F.at(crefpos).Reference(ReferenceMode.NEW, newClass));
++            }
+             return newClass;
+         } else {
+             reportSyntaxError(S.pos(), "expected2",
+@@ -1577,7 +1715,8 @@
+ 
+     /** InnerCreator = Ident [TypeArguments] ClassCreatorRest
+      */
+-    JCExpression innerCreator(int newpos, List<JCExpression> typeArgs, JCExpression encl) {
++    JCExpression innerCreator(int newpos, List<JCExpression> typeArgs, JCExpression encl, int crefpos) {
++        boolean isConstructorReference = (crefpos != -1);
+         JCExpression t = toP(F.at(S.pos()).Ident(ident()));
+         if (S.token() == LT) {
+             int oldmode = mode;
+@@ -1586,7 +1725,15 @@
+             t = typeArguments(t);
+             mode = oldmode;
+         }
+-        return classCreatorRest(newpos, encl, typeArgs, t);
++        List<JCExpression> arguments = isConstructorReference ? methodParameterTypes() : arguments();
++        JCNewClass newClass = classCreatorRest(newpos, encl, typeArgs, t, arguments);
++        if (isConstructorReference) {
++            if (newClass.getClassBody() != null)
++                // FIXME: bind the captured references into the MH, and retype to named super
++                throw new UnsupportedOperationException("NYI: anonymous class in MH literal");
++            return toP(F.at(crefpos).Reference(ReferenceMode.NEW, newClass));
++        }
++        return newClass;
+     }
+ 
+     /** ArrayCreatorRest = [Annotations] "[" ( "]" BracketsOpt ArrayInitializer
+@@ -1658,9 +1805,9 @@
+     JCNewClass classCreatorRest(int newpos,
+                                   JCExpression encl,
+                                   List<JCExpression> typeArgs,
+-                                  JCExpression t)
++                                  JCExpression t,
++                                  List<JCExpression> args)
+     {
+-        List<JCExpression> args = arguments();
+         JCClassDecl body = null;
+         if (S.token() == LBRACE) {
+             int pos = S.pos();
+@@ -2971,14 +3118,14 @@
+             typeAnnotationsPushedBack = null;
+             checkVarargs();
+             mods.flags |= Flags.VARARGS;
+-            // insert var arg type annotations
++            // insert var type type annotations
+             if (varargsAnnos != null && varargsAnnos.nonEmpty())
+                 type = F.at(S.pos()).AnnotatedType(varargsAnnos, type);
+             type = to(F.at(S.pos()).TypeArray(type));
+ 
+             S.nextToken();
+         } else {
+-            // if not a var arg, then typeAnnotationsPushedBack should be null
++            // if not a var type, then typeAnnotationsPushedBack should be null
+             if (typeAnnotationsPushedBack != null
+                     && !typeAnnotationsPushedBack.isEmpty()) {
+                 reportSyntaxError(typeAnnotationsPushedBack.head.pos,
+diff --git a/src/share/classes/com/sun/tools/javac/parser/Scanner.java b/src/share/classes/com/sun/tools/javac/parser/Scanner.java
+--- a/src/share/classes/com/sun/tools/javac/parser/Scanner.java
++++ b/src/share/classes/com/sun/tools/javac/parser/Scanner.java
+@@ -65,6 +65,7 @@
+         final Names names;
+         final Source source;
+         final Keywords keywords;
++        final Options options;
+ 
+         /** Create a new scanner factory. */
+         protected Factory(Context context) {
+@@ -73,6 +74,7 @@
+             this.names = Names.instance(context);
+             this.source = Source.instance(context);
+             this.keywords = Keywords.instance(context);
++            this.options = Options.instance(context);
+         }
+ 
+         public Scanner newScanner(CharSequence input) {
+@@ -108,6 +110,10 @@
+      */
+     private boolean allowUnderscoresInLiterals;
+ 
++    /** Give experimental assist to JSR 292 "ldc CONSTANT_MethodHandle".
++     */
++    private boolean allowMethodHandleLiterals;
++
+     /** The source language setting.
+      */
+     private Source source;
+@@ -181,6 +187,7 @@
+         allowBinaryLiterals = source.allowBinaryLiterals();
+         allowHexFloats = source.allowHexFloats();
+         allowUnderscoresInLiterals = source.allowBinaryLiterals();
++        allowMethodHandleLiterals = fac.options.get("methodHandleLiterals") != null;
+     }
+ 
+     private static final boolean hexFloatsWork = hexFloatsWork();
+@@ -693,8 +700,11 @@
+      *  to token.
+      */
+     private void scanOperator() {
++        scanOperator((char)0);
++    }
++    private boolean scanOperator(char firstChar) {
+         while (true) {
+-            putChar(ch);
++            putChar(firstChar != 0 ? firstChar : ch);
+             Name newname = names.fromChars(sbuf, 0, sp);
+             if (keywords.key(newname) == IDENTIFIER) {
+                 sp--;
+@@ -702,9 +712,13 @@
+             }
+             name = newname;
+             token = keywords.key(newname);
+-            scanChar();
++            if (firstChar != 0)
++                firstChar = 0;  // keep current ch
++            else                // else get new ch:
++                scanChar();
+             if (!isSpecial(ch)) break;
+         }
++        return true;
+     }
+ 
+     /**
+@@ -1023,6 +1037,7 @@
+                         } else {
+                             lexError(pos, "unclosed.bytecode.ident");
+                         }
++                    } else if (allowMethodHandleLiterals && scanOperator('#')) {
+                     } else {
+                         lexError("illegal.char", String.valueOf((int)'#'));
+                     }
+diff --git a/src/share/classes/com/sun/tools/javac/parser/Token.java b/src/share/classes/com/sun/tools/javac/parser/Token.java
+--- a/src/share/classes/com/sun/tools/javac/parser/Token.java
++++ b/src/share/classes/com/sun/tools/javac/parser/Token.java
+@@ -149,6 +149,8 @@
+     GTGTEQ(">>="),
+     GTGTGTEQ(">>>="),
+     MONKEYS_AT("@"),
++    HASH("#"),
++    HASHEQ("#="),
+     CUSTOM;
+ 
+     Token() {
+diff --git a/src/share/classes/com/sun/tools/javac/tree/JCTree.java b/src/share/classes/com/sun/tools/javac/tree/JCTree.java
+--- a/src/share/classes/com/sun/tools/javac/tree/JCTree.java
++++ b/src/share/classes/com/sun/tools/javac/tree/JCTree.java
+@@ -37,6 +37,7 @@
+ import com.sun.tools.javac.util.JCDiagnostic.DiagnosticPosition;
+ import com.sun.tools.javac.util.List;
+ import com.sun.tools.javac.code.*;
++import com.sun.tools.javac.code.Type.MethodType;
+ import com.sun.tools.javac.code.Scope;
+ import com.sun.tools.javac.code.Symbol.*;
+ import com.sun.source.tree.*;
+@@ -216,9 +217,13 @@
+      */
+     public static final int SELECT = INDEXED + 1;
+ 
++    /** Member references, of type Reference.
++     */
++    public static final int REFERENCE = SELECT + 1;
++
+     /** Simple identifiers, of type Ident.
+      */
+-    public static final int IDENT = SELECT + 1;
++    public static final int IDENT = REFERENCE + 1;
+ 
+     /** Literals, of type Literal.
+      */
+@@ -1672,6 +1677,159 @@
+     }
+ 
+     /**
++     * Selects a member expression.
++     * @param expr prototype expression, one of x.y, x.y = (void), x.y(type...)
++     * @param sym symbol of the selected class or null
++     */
++    public static class JCMemberReference extends JCExpression implements MemberReferenceTree {
++        public ReferenceMode mode;
++        public JCExpression expr;
++        public Symbol sym;
++        protected JCMemberReference(ReferenceMode mode, JCExpression expr, Symbol sym) {
++            this.mode = mode;
++            this.expr = expr;
++            this.sym = sym;
++            assert isValid() : this;
++        }
++        @Override
++        public void accept(Visitor v) { v.visitReference(this); }
++
++        public Kind getKind() { return Kind.MEMBER_REFERENCE; }
++        @Override
++        public ReferenceMode getMode() { return mode; }
++        @Override
++        public JCExpression getSelection() { return expr; }
++        @Override
++        public <R,D> R accept(TreeVisitor<R,D> v, D d) {
++            return v.visitMemberReference(this, d);
++        }
++        @Override
++        public int getTag() {
++            return REFERENCE;
++        }
++
++        /** Utility method: Determine if this method handle will take a receiver argument
++         *  in addition to the required arguments of its type signature.
++         */
++        public boolean hasUnboundReceiver() {
++            return (!sym.isStatic() && // static members have no receiver
++                    mode != ReferenceMode.NEW && // a reified constructor makes its own receiver
++                    !TreeInfo.nonstaticBase(getBase()));
++        }
++
++        /** Utility method: Determine the method handle type of this expression.
++         *  The type may have a receiver argument inserted, if the receiver is unbound.
++         */
++        public MethodType getType(Types types, Symtab syms) {
++            JCExpression base = getBase();
++            Type refType = sym.externalType(types);
++            MethodType type;
++            switch (mode) {
++            case GET:
++                // Foo#var is of type () => var.type
++                type = new MethodType(List.<Type>nil(), refType,
++                                      List.<Type>nil(), syms.methodClass);
++                break;
++            case SET:
++                // Foo#=var is of type (var.type) =>
++                type = new MethodType(List.of(refType), syms.voidType,
++                                      List.<Type>nil(), syms.methodClass);
++                break;
++            case INVOKE:
++                // Foo#fun(...) is of type (...) => fun().type
++                type = (MethodType) refType.asMethodType().clone();
++                break;
++            case NEW:
++                // #new Foo(...) is of type (...) => Foo
++                // Outer.#new Foo(...) is of type (Outer, ...) => Foo
++                type = (MethodType) refType.asMethodType().clone();
++                assert type.restype == syms.voidType;
++                type.restype = sym.owner.type;
++                break;
++            default:  throw new AssertionError();
++            }
++            if (hasUnboundReceiver()) {
++                // Insert a parameter for the receiver type.
++                Type rtype = (base != null) ? base.type : sym.owner.type;
++                type.argtypes = type.argtypes.prepend(rtype);
++            }
++            return type;
++        }
++
++        /** Utility method: Get the base expression of this reference.
++         *  For example, {@code String.valueOf} has a type name base,
++         *  while {@code "foo".valueOf} has a expression base {@code "foo"}.
++         *  Note that the base can be an expression independently
++         *  of whether the member (method or field) is static or not.
++         *  If the member is static, an expression base is evaluated and ignored.
++         *  If the member is non-static, and if an expression base is present,
++         *  the method handle must be partially applied to the base,
++         *  using {@linkplain MethodHandle#bind}.
++         */
++        public JCExpression getBase() {
++            assert isValid() : this;
++            switch (mode) {
++            case GET:
++            case SET:
++                switch (expr.getTag()) {
++                case SELECT:
++                    return ((JCFieldAccess)expr).selected;
++                }
++                break;
++            case INVOKE:
++                switch (expr.getTag()) {
++                case APPLY:
++                    JCExpression meth = ((JCMethodInvocation)expr).meth;
++                    switch (meth.getTag()) {
++                    case JCTree.SELECT:
++                        return ((JCFieldAccess)meth).selected;
++                    }
++                }
++                break;
++            case NEW:
++                switch (expr.getTag()) {
++                case NEWCLASS:
++                    return ((JCNewClass)expr).encl;
++                }
++                break;
++            }
++            throw new AssertionError();
++        }
++
++        static boolean failing;  // to avoid infinite regress when !isValid
++        public boolean isValid() {
++            if (failing)  return true; // allow assert failures to print
++            switch (expr.getTag()) {
++            case SELECT:
++                switch (mode) {
++                case GET: case SET:
++                    return true;
++                }
++                break;
++            case APPLY:
++                switch (mode) {
++                case INVOKE:
++                    JCMethodInvocation inv = (JCMethodInvocation) expr;
++                    if (inv.args.isEmpty() || TreeInfo.isDummy(inv.args))
++                        return true;
++                }
++                break;
++            case NEWCLASS:
++                switch (mode) {
++                case NEW:
++                    JCNewClass newobj = (JCNewClass) expr;
++                    List<JCExpression> args = newobj.args;
++                    if (args.isEmpty() || TreeInfo.isDummy(args))
++                        return true;
++                }
++                break;
++            }
++            failing = true;
++            return false;
++        }
++    }
++
++    /**
+      * An identifier
+      * @param idname the name
+      * @param sym the symbol
+@@ -2215,6 +2373,7 @@
+         public void visitTypeTest(JCInstanceOf that)         { visitTree(that); }
+         public void visitIndexed(JCArrayAccess that)         { visitTree(that); }
+         public void visitSelect(JCFieldAccess that)          { visitTree(that); }
++        public void visitReference(JCMemberReference that)   { visitTree(that); }
+         public void visitIdent(JCIdent that)                 { visitTree(that); }
+         public void visitLiteral(JCLiteral that)             { visitTree(that); }
+         public void visitTypeIdent(JCPrimitiveTypeTree that) { visitTree(that); }
+diff --git a/src/share/classes/com/sun/tools/javac/tree/Pretty.java b/src/share/classes/com/sun/tools/javac/tree/Pretty.java
+--- a/src/share/classes/com/sun/tools/javac/tree/Pretty.java
++++ b/src/share/classes/com/sun/tools/javac/tree/Pretty.java
+@@ -25,6 +25,7 @@
+ 
+ package com.sun.tools.javac.tree;
+ 
++import com.sun.source.tree.MemberReferenceTree.ReferenceMode;
+ import java.io.*;
+ import java.util.*;
+ 
+@@ -817,21 +818,33 @@
+     }
+ 
+     public void visitApply(JCMethodInvocation tree) {
++        printApply(tree, null);
++    }
++    private void printApply(JCMethodInvocation tree, String memRefOp) {
+         try {
+             if (!tree.typeargs.isEmpty()) {
+                 if (tree.meth.getTag() == JCTree.SELECT) {
+                     JCFieldAccess left = (JCFieldAccess)tree.meth;
+                     printExpr(left.selected);
+-                    print(".<");
++                    if (memRefOp != null)
++                        print(memRefOp+"<");
++                    else
++                        print(".<");
+                     printExprs(tree.typeargs);
+                     print(">" + left.name);
+                 } else {
++                    if (memRefOp != null)
++                        print(memRefOp);
+                     print("<");
+                     printExprs(tree.typeargs);
+                     print(">");
+                     printExpr(tree.meth);
+                 }
++            } else if (memRefOp != null && tree.meth.getTag() == JCTree.SELECT) {
++                printSelect((JCFieldAccess) tree.meth, memRefOp);
+             } else {
++                if (memRefOp != null)
++                    print(memRefOp);
+                 printExpr(tree.meth);
+             }
+             print("(");
+@@ -843,10 +856,19 @@
+     }
+ 
+     public void visitNewClass(JCNewClass tree) {
++        printNewClass(tree, null);
++    }
++
++    private void printNewClass(JCNewClass tree, String memRefOp) {
+         try {
+             if (tree.encl != null) {
+                 printExpr(tree.encl);
+-                print(".");
++                if (memRefOp != null)
++                    print(memRefOp);
++                else
++                    print(".");
++            } else if (memRefOp != null) {
++                print(memRefOp);
+             }
+             print("new ");
+             if (!tree.typeargs.isEmpty()) {
+@@ -855,6 +877,8 @@
+                 print(">");
+             }
+             printExpr(tree.clazz);
++            if (memRefOp != null)
++                print(memRefOp);
+             print("(");
+             printExprs(tree.args);
+             print(")");
+@@ -1015,6 +1039,10 @@
+ 
+     public void visitTypeCast(JCTypeCast tree) {
+         try {
++            if (TreeInfo.isDummy(tree)) {
++                printExpr(tree.clazz);
++                return;
++            }
+             open(prec, TreeInfo.prefixPrec);
+             print("(");
+             printExpr(tree.clazz);
+@@ -1050,9 +1078,43 @@
+     }
+ 
+     public void visitSelect(JCFieldAccess tree) {
++        printSelect(tree, null);
++    }
++    private void printSelect(JCFieldAccess tree, String memRefOp) {
+         try {
+             printExpr(tree.selected, TreeInfo.postfixPrec);
+-            print("." + tree.name);
++            if (memRefOp != null)
++                print(memRefOp + tree.name);
++            else
++                print("." + tree.name);
++        } catch (IOException e) {
++            throw new UncheckedIOException(e);
++        }
++    }
++
++    public void visitReference(JCMemberReference tree) {
++        try {
++            if (!tree.isValid()) {
++                print("(");
++                print (tree.mode == ReferenceMode.SET ? "#=" : "#");
++                printExpr(tree.expr, TreeInfo.postfixPrec);
++                print(")");
++                return;
++            }
++            switch (tree.mode) {
++            case GET:
++                printSelect((JCFieldAccess) tree.expr, "#");
++                break;
++            case SET:
++                printSelect((JCFieldAccess) tree.expr, "#=");
++                break;
++            case INVOKE:
++                printApply((JCMethodInvocation) tree.expr, "#");
++                break;
++            case NEW:
++                printNewClass((JCNewClass) tree.expr, "#");
++                break;
++            }
+         } catch (IOException e) {
+             throw new UncheckedIOException(e);
+         }
+@@ -1132,6 +1194,9 @@
+                 case TypeTags.VOID:
+                     print("void");
+                     break;
++                case TypeTags.UNKNOWN:
++                    print("...");
++                    break;
+                 default:
+                     print("error");
+                     break;
+diff --git a/src/share/classes/com/sun/tools/javac/tree/TreeCopier.java b/src/share/classes/com/sun/tools/javac/tree/TreeCopier.java
+--- a/src/share/classes/com/sun/tools/javac/tree/TreeCopier.java
++++ b/src/share/classes/com/sun/tools/javac/tree/TreeCopier.java
+@@ -297,6 +297,12 @@
+         return M.at(t.pos).Select(selected, t.name);
+     }
+ 
++    public JCTree visitMemberReference(MemberReferenceTree node, P p) {
++        JCMemberReference t = (JCMemberReference) node;
++        JCExpression expr = copy(t.expr, p);
++        return M.at(t.pos).Reference(t.mode, expr);
++    }
++
+     public JCTree visitEmptyStatement(EmptyStatementTree node, P p) {
+         JCSkip t = (JCSkip) node;
+         return M.at(t.pos).Skip();
+diff --git a/src/share/classes/com/sun/tools/javac/tree/TreeInfo.java b/src/share/classes/com/sun/tools/javac/tree/TreeInfo.java
+--- a/src/share/classes/com/sun/tools/javac/tree/TreeInfo.java
++++ b/src/share/classes/com/sun/tools/javac/tree/TreeInfo.java
+@@ -646,12 +646,69 @@
+         }
+     }
+ 
++    /** Return true if this is a dummy node from TreeMaker.Dummy. */
++    public static boolean isDummy(JCTree tree) {
++        if (tree == null)  return false;
++        if (tree.getTag() == JCTree.TYPECAST) {
++            JCExpression arg = ((JCTypeCast) tree).expr;
++            if (arg.getTag() == JCTree.IDENT) {
++                Name name = ((JCIdent) arg).sym.name;
++                return name == name.table.names.any;
++            }
++        }
++        return false;
++    }
++
++    /** Return true if this is a list of dummy nodes. */
++    public static boolean isDummy(List<? extends JCTree> trees) {
++        if (trees == null || trees.isEmpty())  return false;
++        if (!isDummy(trees.head))  return false;
++        assert allDummies(trees);
++        return true;
++    }
++    private static boolean allDummies(List<? extends JCTree> trees) {
++        for (JCTree tree : trees) {
++            if (!isDummy(tree))  return false;
++        }
++        return true;
++    }
++
+     /** Return true if this is a nonstatic selection. */
+     public static boolean nonstaticSelect(JCTree tree) {
+         tree = skipParens(tree);
+-        if (tree.getTag() != JCTree.SELECT) return false;
+-        JCFieldAccess s = (JCFieldAccess) tree;
+-        Symbol e = symbol(s.selected);
++        switch (tree.getTag()) {
++        case JCTree.SELECT:
++            return nonstaticBase(((JCFieldAccess) tree).selected);
++        case JCTree.REFERENCE:
++            return nonstaticBase(((JCMemberReference) tree).getBase());
++        }
++        return false;
++    }
++
++    /** If this tree is of the form x.type(), where x is a method handle,
++     *  return x.  Otherwise return null.
++     */
++    public static JCExpression methodHandleType(JCExpression tree) {
++        if (tree.getTag() == JCTree.APPLY) {
++            JCMethodInvocation call = (JCMethodInvocation) tree;
++            if (call.args.isEmpty() && call.meth.getTag() == JCTree.SELECT) {
++                JCFieldAccess meth = (JCFieldAccess) call.meth;
++                Symbol sym = meth.sym;
++                Names names;
++                if (sym != null &&
++                    sym.name == (names = sym.name.table.names).type &&
++                    sym.owner.getQualifiedName() == names.java_dyn_MethodHandle) {
++                    return skipParens(meth.selected);
++                }
++            }
++        }
++        return null;
++    }
++    
++    /** Return true if this is the base of a nonstatic selection. */
++    public static boolean nonstaticBase(JCTree base) {
++        if (base == null)  return false;  // null is as good as a missing nonstatic base
++        Symbol e = symbol(base);
+         return e == null || (e.kind != Kinds.PCK && e.kind != Kinds.TYP);
+     }
+ 
+diff --git a/src/share/classes/com/sun/tools/javac/tree/TreeMaker.java b/src/share/classes/com/sun/tools/javac/tree/TreeMaker.java
+--- a/src/share/classes/com/sun/tools/javac/tree/TreeMaker.java
++++ b/src/share/classes/com/sun/tools/javac/tree/TreeMaker.java
+@@ -414,6 +414,12 @@
+         return tree;
+     }
+ 
++    public JCMemberReference Reference(JCMemberReference.ReferenceMode mode, JCExpression t) {
++        JCMemberReference tree = new JCMemberReference(mode, t, null);
++        tree.pos = pos;
++        return tree;
++    }
++
+     public JCIdent Ident(Name name) {
+         JCIdent tree = new JCIdent(name, null);
+         tree.pos = pos;
+@@ -542,6 +548,17 @@
+             .setType(sym.type);
+     }
+ 
++    /** Create a dummy expression of a given type.
++     *  After the type expression is verified, it will pass silently
++     *  through resolve and attribute phases.
++     */
++    public JCExpression Dummy(JCExpression type) {
++        JCIdent id = Ident(syms.errSymbol);
++        JCTypeCast dummy = TypeCast(type, id);
++        assert TreeInfo.isDummy(dummy);
++        return dummy;
++    }
++
+     /** Create a selection node from a qualifier tree and a symbol.
+      *  @param base   The qualifier tree.
+      */
+diff --git a/src/share/classes/com/sun/tools/javac/tree/TreeScanner.java b/src/share/classes/com/sun/tools/javac/tree/TreeScanner.java
+--- a/src/share/classes/com/sun/tools/javac/tree/TreeScanner.java
++++ b/src/share/classes/com/sun/tools/javac/tree/TreeScanner.java
+@@ -257,6 +257,10 @@
+         scan(tree.selected);
+     }
+ 
++    public void visitReference(JCMemberReference tree) {
++        scan(tree.expr);
++    }
++
+     public void visitIdent(JCIdent tree) {
+     }
+ 
+diff --git a/src/share/classes/com/sun/tools/javac/tree/TreeTranslator.java b/src/share/classes/com/sun/tools/javac/tree/TreeTranslator.java
+--- a/src/share/classes/com/sun/tools/javac/tree/TreeTranslator.java
++++ b/src/share/classes/com/sun/tools/javac/tree/TreeTranslator.java
+@@ -344,6 +344,11 @@
+         result = tree;
+     }
+ 
++    public void visitReference(JCMemberReference tree) {
++        tree.expr = translate(tree.expr);
++        result = tree;
++    }
++
+     public void visitIdent(JCIdent tree) {
+         result = tree;
+     }
+diff --git a/src/share/classes/com/sun/tools/javac/util/Names.java b/src/share/classes/com/sun/tools/javac/util/Names.java
+--- a/src/share/classes/com/sun/tools/javac/util/Names.java
++++ b/src/share/classes/com/sun/tools/javac/util/Names.java
+@@ -74,6 +74,7 @@
+     public final Name serialVersionUID;
+     public final Name java_lang_Enum;
+     public final Name java_dyn_MethodHandle;
++    public final Name java_dyn_MethodType;
+     public final Name java_dyn_InvokeDynamic;
+     public final Name package_info;
+     public final Name ConstantValue;
+@@ -116,6 +117,8 @@
+     public final Name value;
+     public final Name getMessage;
+     public final Name getClass;
++    public final Name bindTo;
++    public final Name type;
+     public final Name invoke;  //allowTransitionalJSR292 only
+     public final Name arguments;
+     public final Name TYPE;
+@@ -185,6 +188,7 @@
+         java_io_Serializable = fromString("java.io.Serializable");
+         java_lang_Enum = fromString("java.lang.Enum");
+         java_dyn_MethodHandle = fromString("java.dyn.MethodHandle");
++        java_dyn_MethodType = fromString("java.dyn.MethodType");
+         java_dyn_InvokeDynamic = fromString("java.dyn.InvokeDynamic");
+         package_info = fromString("package-info");
+         serialVersionUID = fromString("serialVersionUID");
+@@ -230,6 +234,8 @@
+         value = fromString("value");
+         getMessage = fromString("getMessage");
+         getClass = fromString("getClass");
++        bindTo = fromString("bindTo");
++        type = fromString("type");
+         invoke = fromString("invoke");  //allowTransitionalJSR292 only
+         arguments = fromString("arguments");
+ 
+diff --git a/test/tools/javac/meth/MHLiterals.java b/test/tools/javac/meth/MHLiterals.java
+new file mode 100644
+--- /dev/null
++++ b/test/tools/javac/meth/MHLiterals.java
+@@ -0,0 +1,404 @@
++/*
++ * Copyright 2010 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++
++/*
++ * @test
++ * @bug 6754038
++ * @summary MethodHandle and MethodType literals
++ * @author jrose
++ *
++ * @compile -source 7 -XDmethodHandleLiterals -target 7 MHLiterals.java
++ */
++
++/*
++ * Standalone testing:
++ * <code>
++ * $ cd $MY_REPO_DIR/langtools
++ * $ (cd make; make)
++ * $ ./dist/bootstrap/bin/javac -XDmethodHandleLiterals -d dist test/tools/javac/meth/MHLiterals.java
++ * $ javap -c -classpath dist meth.InvokeMH
++ * </code>
++ */
++
++package meth;
++
++public class MHLiterals {
++    static String lastm;
++    static void lastm(String x) { assertEqual(lastm, x); }
++    static boolean assertEqual(Object x, Object y) {
++        if (x == y || x != null && x.equals(y))  return true;
++        System.out.println("*** FAILED assertEqual: "+x+" != "+y);
++        Thread.dumpStack();
++        return false;
++    }
++
++    public void m1(int x, int y) { lastm = "m1"; }
++    public void m2() { lastm = "m2()"; }
++    public void m2(int x) { lastm = "m2(I)"; }
++    public void m2(String x) { lastm = "m2(String)"; }
++    public String m2(Object x) { return lastm = "m2(Object)"; }  // different return type
++    static void m3() { lastm = "m3()"; }  // static method
++    public void m4() { }
++
++    static final int v0_INIT = 1000;
++    protected int v0 = v0_INIT;  // inherited into Vars
++    public String toString() { return getClass().getSimpleName()+"/v0="+v0; }
++
++    static int nextse, lastse;
++    static void lastse(int x) { assertEqual(lastse, x); }
++    static <T> T se(T x, int se) { lastse = se; return x; }
++
++    static final Object OBJECT = "(Object)";
++
++    static void staticTest(MHLiterals self) throws Throwable {
++        // Unbound and bound forms; ellipsis matching for non-overloads:
++        MHLiterals#m1(int,int).<void>invokeExact(self,1,2); lastm("m1");
++        self#m1(int,int).<void>invokeExact(1,2); lastm("m1");
++        self#m1(...).<void>invokeExact(1,2); lastm("m1");
++        // Overloaded method selection:
++        MHLiterals#m2().<void>invokeExact(self); lastm("m2()");
++        MHLiterals#m2(int).<void>invokeExact(self,1); lastm("m2(I)");
++        MHLiterals#m2(String).<void>invokeExact(self,""); lastm("m2(String)");
++        MHLiterals#m2(Object).<String>invokeExact(self,OBJECT); lastm("m2(Object)");
++        // Static method selection:
++        MHLiterals#m3().<void>invokeExact(); lastm("m3()");
++        se(self,nextse)#m3().<void>invokeExact(); lastm("m3()"); lastse(nextse++);
++    }
++
++    void nonStaticTest() throws Throwable {
++        // Unbound and bound forms; ellipsis matching for non-overloads:
++        MHLiterals#m1(int,int).<void>invokeExact(this,1,2); lastm("m1");
++        this#m1(int,int).<void>invokeExact(1,2); lastm("m1");
++        this#m1(...).<void>invokeExact(1,2); lastm("m1");
++        // Overloaded method selection:
++        MHLiterals#m2().<void>invokeExact(this); lastm("m2()");
++        MHLiterals#m2(int).<void>invokeExact(this,1); lastm("m2(I)");
++        MHLiterals#m2(String).<void>invokeExact(this,""); lastm("m2(String)");
++        MHLiterals#m2(Object).<String>invokeExact(this,OBJECT); lastm("m2(Object)");
++        // Static method selection:
++        MHLiterals#m3().<void>invokeExact(); lastm("m3()");
++        se(this,nextse)#m3().<void>invokeExact(); lastm("m3()"); lastse(nextse++);
++    }
++
++    static void typeTest(MHLiterals self) {
++        // Unbound and bound forms; ellipsis matching for non-overloads:
++        assertType(MHLiterals#m1(int,int).type(),  void.class, MHLiterals.class, int.class, int.class);
++        assertType(self#m1(int,int).type(),        void.class,                   int.class, int.class);
++        assertType(self#m1(...).type(),            void.class,                   int.class, int.class);
++        // Overloaded method selection:
++        assertType(MHLiterals#m2().type(),         void.class,   MHLiterals.class);
++        assertType(MHLiterals#m2(int).type(),      void.class,   MHLiterals.class, int.class);
++        assertType(MHLiterals#m2(String).type(),   void.class,   MHLiterals.class, String.class);
++        assertType(MHLiterals#m2(Object).type(),   String.class, MHLiterals.class, Object.class);
++        // Static method selection:
++        assertType(MHLiterals#m3().type(),             void.class);
++        assertType(se(self,nextse)#m3().type(), void.class); lastse(nextse++);
++        // Inherited methods must have narrowed receivers:
++        assertType(Sub#m1(...).type(),             void.class, Sub.class, int.class, int.class);
++        assertType(Sub#m3().type(),                void.class);  // static
++        assertType(Sub#m4().type(),                void.class, Sub.class);
++    }
++
++    static void assertType(java.dyn.MethodType mt, Class<?> rt, Class<?>... pt) {
++        boolean ok = assertEqual(mt.returnType(), rt);
++        ok &= assertEqual(mt.parameterCount(), pt.length);
++        for (int i = 0; i < pt.length; i++)
++            ok &= assertEqual(mt.parameterType(i), pt[i]);
++        if (!ok)  System.out.println("*** TYPE: "+mt);
++    }
++
++    static class Sub extends MHLiterals {
++        //inherit m3, m4, some m2
++        public void m1(int x, int y) { lastm = "m1/Sub"; }  // full override
++        public void m2(String x) { lastm = "m2(String)/Sub"; }  // partial override
++
++        static final int V0_DELTA = 5000000;
++        { v0 += V0_DELTA; }  //inherit int v0
++
++        void nonStaticSubTest() throws Throwable {
++            // Unbound and bound forms; ellipsis matching for non-overloads:
++            this#m1(int,int).<void>invokeExact(1,2); lastm("m1/Sub");
++            this#m1(...).<void>invokeExact(1,2); lastm("m1/Sub");
++            // invokespecial versions:
++            super#m1(int,int).<void>invokeExact(1,2); lastm("m1");
++            super#m1(...).<void>invokeExact(1,2); lastm("m1");
++            // Overloaded method selection, with inheritance:
++            Sub#m2().<void>invokeExact(this); lastm("m2()");
++            Sub#m2(int).<void>invokeExact(this,1); lastm("m2(I)");
++            Sub#m2(String).<void>invokeExact(this,""); lastm("m2(String)/Sub");
++            Sub#m2(Object).<String>invokeExact(this,OBJECT); lastm("m2(Object)");
++            // Static method selection:
++            Sub#m3().<void>invokeExact(); lastm("m3()");
++            se(this,nextse)#m3().<void>invokeExact(); lastm("m3()"); lastse(nextse++);
++        }
++    }
++
++    static void staticSubTest(Sub self) throws Throwable {
++        // Unbound and bound forms; ellipsis matching for non-overloads:
++        self#m1(int,int).<void>invokeExact(1,2); lastm("m1/Sub");
++        self#m1(...).<void>invokeExact(1,2); lastm("m1/Sub");
++        // Overloaded method selection, with inheritance:
++        self#m2().<void>invokeExact(); lastm("m2()");
++        self#m2(int).<void>invokeExact(1); lastm("m2(I)");
++        self#m2(String).<void>invokeExact(""); lastm("m2(String)/Sub");
++        self#m2(Object).<String>invokeExact(OBJECT); lastm("m2(Object)");
++        // Static method selection:
++        Sub#m3().<void>invokeExact(); lastm("m3()");
++        se(self,nextse)#m3().<void>invokeExact(); lastm("m3()"); lastse(nextse++);
++    }
++
++    interface Int {
++        // for testing with invokeinterface
++        void m1(int x, int y);
++        void m2();
++        void m2(int x);
++        void m2(String x);
++        String m2(Object x);
++        // for testing constant reference:
++        String c1 = "c1";
++    }
++
++    static class Impl extends MHLiterals implements Int { }
++
++    static void interfaceTest(Int self) throws Throwable {
++        // Unbound and bound forms; ellipsis matching for non-overloads:
++        Int#m1(int,int).<void>invokeExact(self,1,2); lastm("m1");
++        self#m1(int,int).<void>invokeExact(1,2); lastm("m1");
++        self#m1(...).<void>invokeExact(1,2); lastm("m1");
++        // Overloaded method selection:
++        Int#m2().<void>invokeExact(self); lastm("m2()");
++        Int#m2(int).<void>invokeExact(self,1); lastm("m2(I)");
++        Int#m2(String).<void>invokeExact(self,""); lastm("m2(String)");
++        Int#m2(Object).<String>invokeExact(self,OBJECT); lastm("m2(Object)");
++        // Constant value:
++        assertEqual( Int#c1.<String>invokeExact(), Int.c1 );
++        assertEqual( se(self,nextse)#c1.<String>invokeExact(), Int.c1 ); lastse(nextse++);
++    }
++
++    /*non-static*/ class Nest {
++        void nonStaticNestTest() throws Throwable {
++            // Unbound and bound forms; ellipsis matching for non-overloads:
++            MHLiterals.this#m1(int,int).<void>invokeExact(1,2); lastm("m1");
++            MHLiterals.this#m1(...).<void>invokeExact(1,2); lastm("m1");
++            // Overloaded method selection, with inheritance:
++            MHLiterals.this#m2().<void>invokeExact(); lastm("m2()");
++            MHLiterals.this#m2(int).<void>invokeExact(1); lastm("m2(I)");
++            MHLiterals.this#m2(String).<void>invokeExact(""); lastm("m2(String)");
++            MHLiterals.this#m2(Object).<String>invokeExact(OBJECT); lastm("m2(Object)");
++            // Static method selection:
++            MHLiterals#m3().<void>invokeExact(); lastm("m3()");
++            se(MHLiterals.this,nextse)#m3().<void>invokeExact(); lastm("m3()"); lastse(nextse++);
++        }
++
++        // Note: Because all member references must be qualified, there
++        // is no need to test unqualified uplevel references like " #m2() ".
++
++        int v4 = 444;
++        public String toString() { return MHLiterals.this+"."+getClass().getSimpleName()+",v4="+v4; }
++
++        // hazard which should be avoided by MHLiteral#m3:
++        public float m1(int x, int y) { throw new RuntimeException("do not call"); }
++    }
++
++    static String nextstr = "10";
++    static void nextstr() { nextstr = ""+(Integer.parseInt(nextstr)+1); }
++    static void nextstr(String x) { assertEqual(x, nextstr); nextstr(); }
++    static int nextint = 10000;
++    static void nextint(int x) { assertEqual(x, nextint++); }
++
++    static class Vars extends MHLiterals {
++        String v1 = "garbage";
++        static String v2 = "v2";
++
++        public String toString() { return super.toString()+",v1="+v1; }
++        Vars(String v1, int v0_delta) { super(v0_delta); this.v1 = v1; }
++
++        void nonStaticGetterTest() throws Throwable {
++            // Unbound and bound forms:
++            assertEqual( Vars#v1.<String>invokeExact(this), this.v1 ); 
++            assertEqual( this#v1.<String>invokeExact(), this.v1 );
++            assertEqual( Vars#v2.<String>invokeExact(), Vars.v2 ); 
++            assertEqual( se(this,nextse)#v2.<String>invokeExact(), Vars.v2 );  lastse(nextse++);
++            // Inheritance:
++            assertEqual( Vars#v0.<int>invokeExact(this), this.v0++ );
++            assertEqual( MHLiterals#v0.<int>invokeExact((MHLiterals)this), this.v0++ );
++        }
++
++        void nonStaticSetterTest() throws Throwable {
++            // Unbound and bound forms:
++            Vars#=v1.<void>invokeExact(this,nextstr); nextstr(this.v1);
++            this#=v1.<void>invokeExact(nextstr); nextstr(this.v1);
++            Vars#=v2.<void>invokeExact(nextstr); nextstr(Vars.v2); 
++            se(this,nextse)#=v2.<void>invokeExact(nextstr); nextstr(Vars.v2);  lastse(nextse++);
++            // Inheritance:
++            Vars#=v0.<void>invokeExact(this, nextint); nextint(this.v0);
++            MHLiterals#=v0.<void>invokeExact((MHLiterals)this, nextint); nextint(this.v0);
++        }
++    }
++
++    static void staticGetterTest(Vars self) throws Throwable {
++        // Unbound and bound forms:
++        assertEqual( Vars#v1.<String>invokeExact(self), self.v1 ); 
++        assertEqual( self#v1.<String>invokeExact(), self.v1 );
++        assertEqual( Vars#v2.<String>invokeExact(), Vars.v2 ); 
++        assertEqual( se(self,nextse)#v2.<String>invokeExact(), Vars.v2 );  lastse(nextse++);
++        // Inheritance:
++        assertEqual( Vars#v0.<int>invokeExact(self), self.v0++ );
++        assertEqual( MHLiterals#v0.<int>invokeExact((MHLiterals)self), self.v0++ );
++    }
++
++    static void staticSetterTest(Vars self) throws Throwable {
++        // Unbound and bound forms:
++        Vars#=v1.<void>invokeExact(self,nextstr); nextstr(self.v1);
++        self#=v1.<void>invokeExact(nextstr); nextstr(self.v1);
++        Vars#=v2.<void>invokeExact(nextstr); nextstr(Vars.v2); 
++        se(self,nextse)#=v2.<void>invokeExact(nextstr); nextstr(Vars.v2);  lastse(nextse++);
++        // Inheritance:
++        Vars#=v0.<void>invokeExact(self, nextint); nextint(self.v0);
++        MHLiterals#=v0.<void>invokeExact((MHLiterals)self, nextint); nextint(self.v0);
++    }
++
++    static void varTypeTest(Vars self) {
++        // Getters (bound and unbound):
++        assertType(Vars#v1.type(),  String.class, Vars.class);
++        assertType(self#v1.type(),  String.class);
++        assertType(Vars#v2.type(),  String.class);
++        assertType(se(self,nextse)#v2.type(), String.class);  lastse(nextse++);
++        // Inheritance:
++        assertType(Vars#v0.type(),       int.class, Vars.class);
++        assertType(MHLiterals#v0.type(), int.class, MHLiterals.class);
++
++        // Setters (bound and unbound):
++        assertType(Vars#=v1.type(), void.class, Vars.class, String.class);
++        assertType(self#=v1.type(), void.class,             String.class);
++        assertType(Vars#=v2.type(), void.class,             String.class);
++        assertType(se(self,nextse)#=v2.type(), void.class, String.class);  lastse(nextse++);
++        // Inheritance:
++        assertType(Vars#=v0.type(),       void.class, Vars.class,       int.class);
++        assertType(MHLiterals#=v0.type(), void.class, MHLiterals.class, int.class);
++    }
++
++    // override of hashcode:
++    public int hashCode() { return super.hashCode() + 1; }
++
++    void testObjectMethod() throws Throwable {
++        int idHash = System.identityHashCode(this);
++        assertEqual(super.hashCode(),                      idHash); // invokespecial
++        assertEqual(super#hashCode().<int>invokeExact(),  idHash); // invokespecial
++        assertEqual(this.hashCode(),                                   idHash+1);
++        assertEqual(this#hashCode().<int>invokeExact(),               idHash+1);
++        assertEqual(MHLiterals#hashCode().<int>invokeExact(this),     idHash+1);
++        assertEqual(Object#hashCode().<int>invokeExact((Object)this), idHash+1);
++        // Check some types also:
++        assertType(super#hashCode().type(),      int.class);
++        assertType(this#hashCode().type(),       int.class);
++        assertType(MHLiterals#hashCode().type(), int.class, MHLiterals.class);
++        assertType(Object#hashCode().type(),     int.class, Object.class);
++    }
++
++    MHLiterals(int x) { v0 += x; }
++    MHLiterals() { this(0); }
++
++    static void testConstructors() throws Throwable {
++        MHLiterals self123 = new MHLiterals(123);
++        assertObject(new MHLiterals(), 0);  // can't fail
++        assertObject(#new MHLiterals().<MHLiterals>invokeExact(), 0);
++        assertType(#new MHLiterals().type(), MHLiterals.class);
++
++        self123 = #new MHLiterals(int).<MHLiterals>invokeExact(123);
++        assertObject(self123, 123);
++        assertEqual(self123.toString(), new MHLiterals(123).toString());
++        assertType(#new MHLiterals(int).type(), MHLiterals.class, int.class);
++
++        assertObject(new Sub(), Sub.V0_DELTA);  // can't fail
++        Sub sself = #new Sub().<Sub>invokeExact();
++        assertObject(sself, Sub.V0_DELTA);
++        assertEqual(sself.toString(), new Sub().toString());
++        assertType(#new Sub().type(), Sub.class);
++
++        final int V0_DELTA = 99;
++        assertObject(new MHLiterals.Vars("v1",V0_DELTA), V0_DELTA);  // can't fail
++        Vars vself = #new MHLiterals.Vars(...).<Vars>invokeExact("v1",V0_DELTA);
++        assertObject(vself, V0_DELTA);
++        assertEqual(vself.toString(), new MHLiterals.Vars("v1",V0_DELTA).toString());
++        assertType(#new MHLiterals.Vars(...).type(), Vars.class, String.class, int.class);
++
++        String nselfStr = self123.new Nest().toString();
++        Nest nself = self123#new Nest().<Nest>invokeExact();
++        assertClass(nself, Nest.class);
++        assertEqual(nself.toString(), nselfStr);
++        nself = #new MHLiterals.Nest().<Nest>invokeExact(self123);  // explicit outer argument
++        assertEqual(nself.toString(), nselfStr);
++        nself = #new Nest().<Nest>invokeExact(self123);  // explicit outer argument
++        assertEqual(nself.toString(), nselfStr);
++
++        // Constructor for an anonymous class.  NYI.
++        // Needs to bind the resulting MH to each implicit constructor argument,
++        // and then return the named supertype, not the anonymous subtype.
++        final int c333 = new Integer(333).intValue();
++        //assertObject(#new Sub() { { v0 += c333; } }.<Sub>invokeGeneric(), 333);
++    }
++
++    static void assertObject(MHLiterals x, int arg) {
++        if (!(MHLiterals.class.isAssignableFrom(x.getClass())))
++            assertClass(x, MHLiterals.class);
++        if (!assertEqual(x.v0, v0_INIT + arg))
++            System.out.println("*** OBJECT: "+x);
++    }
++    static void assertClass(Object x, Class<?> y) {
++        boolean ok = assertEqual(x.getClass(), y);
++        if (!ok)  System.out.println("*** OBJECT: "+x);
++    }
++
++    public static void main(String... av) throws Throwable {
++        MHLiterals self = new MHLiterals();
++        System.out.println("self="+self);
++        staticTest(self);
++        self.nonStaticTest();
++        typeTest(self);
++        self.testObjectMethod();
++
++        Sub sself = new Sub();
++        System.out.println("sself="+sself);
++        staticSubTest(sself);
++        sself.nonStaticSubTest();
++
++        Int iself = new Impl();
++        System.out.println("iself="+iself);
++        interfaceTest(iself);
++
++        Nest nself = self.new Nest();
++        System.out.println("nself="+nself);
++        nself.nonStaticNestTest();
++
++        Vars vself = new Vars("v1",0);
++        System.out.println("vself="+vself);
++        staticGetterTest(vself);
++        vself.nonStaticGetterTest();
++        staticSetterTest(vself);
++        vself.nonStaticSetterTest();
++        varTypeTest(vself);
++
++        testConstructors();
++    }
++}

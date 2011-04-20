@@ -1,0 +1,700 @@
+6817525: turn on method handle functionality by default for JSR 292
+Summary: After appropriate testing, we need to turn on EnableMethodHandles and EnableInvokeDynamic by default.
+Reviewed-by: never, kvn, jrose, phh
+
+diff --git a/src/cpu/sparc/vm/cppInterpreter_sparc.cpp b/src/cpu/sparc/vm/cppInterpreter_sparc.cpp
+--- a/src/cpu/sparc/vm/cppInterpreter_sparc.cpp
++++ b/src/cpu/sparc/vm/cppInterpreter_sparc.cpp
+@@ -1188,8 +1188,8 @@
+   __ st_ptr(O2, XXX_STATE(_stack));                // PREPUSH
+ 
+   __ lduh(max_stack, O3);                      // Full size expression stack
+-  guarantee(!EnableMethodHandles, "no support yet for java.lang.invoke.MethodHandle"); //6815692
+-  //6815692//if (EnableMethodHandles)
++  guarantee(!EnableInvokeDynamic, "no support yet for java.lang.invoke.MethodHandle"); //6815692
++  //6815692//if (EnableInvokeDynamic)
+   //6815692//  __ inc(O3, methodOopDesc::extra_stack_entries());
+   __ sll(O3, LogBytesPerWord, O3);
+   __ sub(O2, O3, O3);
+diff --git a/src/cpu/sparc/vm/interp_masm_sparc.cpp b/src/cpu/sparc/vm/interp_masm_sparc.cpp
+--- a/src/cpu/sparc/vm/interp_masm_sparc.cpp
++++ b/src/cpu/sparc/vm/interp_masm_sparc.cpp
+@@ -743,12 +743,12 @@
+   if (index_size == sizeof(u2)) {
+     get_2_byte_integer_at_bcp(bcp_offset, cache, tmp, Unsigned);
+   } else if (index_size == sizeof(u4)) {
+-    assert(EnableInvokeDynamic, "giant index used only for EnableInvokeDynamic");
++    assert(EnableInvokeDynamic, "giant index used only for JSR 292");
+     get_4_byte_integer_at_bcp(bcp_offset, cache, tmp);
+     assert(constantPoolCacheOopDesc::decode_secondary_index(~123) == 123, "else change next line");
+     xor3(tmp, -1, tmp);  // convert to plain index
+   } else if (index_size == sizeof(u1)) {
+-    assert(EnableMethodHandles, "tiny index used only for EnableMethodHandles");
++    assert(EnableInvokeDynamic, "tiny index used only for JSR 292");
+     ldub(Lbcp, bcp_offset, tmp);
+   } else {
+     ShouldNotReachHere();
+diff --git a/src/cpu/sparc/vm/interpreter_sparc.cpp b/src/cpu/sparc/vm/interpreter_sparc.cpp
+--- a/src/cpu/sparc/vm/interpreter_sparc.cpp
++++ b/src/cpu/sparc/vm/interpreter_sparc.cpp
+@@ -262,7 +262,7 @@
+ // Method handle invoker
+ // Dispatch a method of the form java.lang.invoke.MethodHandles::invoke(...)
+ address InterpreterGenerator::generate_method_handle_entry(void) {
+-  if (!EnableMethodHandles) {
++  if (!EnableInvokeDynamic) {
+     return generate_abstract_entry();
+   }
+ 
+diff --git a/src/cpu/sparc/vm/templateTable_sparc.cpp b/src/cpu/sparc/vm/templateTable_sparc.cpp
+--- a/src/cpu/sparc/vm/templateTable_sparc.cpp
++++ b/src/cpu/sparc/vm/templateTable_sparc.cpp
+@@ -334,8 +334,8 @@
+ void TemplateTable::fast_aldc(bool wide) {
+   transition(vtos, atos);
+ 
+-  if (!EnableMethodHandles) {
+-    // We should not encounter this bytecode if !EnableMethodHandles.
++  if (!EnableInvokeDynamic) {
++    // We should not encounter this bytecode if !EnableInvokeDynamic.
+     // The verifier will stop it.  However, if we get past the verifier,
+     // this will stop the thread in a reasonable way, without crashing the JVM.
+     __ call_VM(noreg, CAST_FROM_FN_PTR(address,
+diff --git a/src/cpu/x86/vm/interp_masm_x86_32.cpp b/src/cpu/x86/vm/interp_masm_x86_32.cpp
+--- a/src/cpu/x86/vm/interp_masm_x86_32.cpp
++++ b/src/cpu/x86/vm/interp_masm_x86_32.cpp
+@@ -215,7 +215,7 @@
+   if (index_size == sizeof(u2)) {
+     load_unsigned_short(reg, Address(rsi, bcp_offset));
+   } else if (index_size == sizeof(u4)) {
+-    assert(EnableInvokeDynamic, "giant index used only for EnableInvokeDynamic");
++    assert(EnableInvokeDynamic, "giant index used only for JSR 292");
+     movl(reg, Address(rsi, bcp_offset));
+     // Check if the secondary index definition is still ~x, otherwise
+     // we have to change the following assembler code to calculate the
+@@ -223,7 +223,7 @@
+     assert(constantPoolCacheOopDesc::decode_secondary_index(~123) == 123, "else change next line");
+     notl(reg);  // convert to plain index
+   } else if (index_size == sizeof(u1)) {
+-    assert(EnableMethodHandles, "tiny index used only for EnableMethodHandles");
++    assert(EnableInvokeDynamic, "tiny index used only for JSR 292");
+     load_unsigned_byte(reg, Address(rsi, bcp_offset));
+   } else {
+     ShouldNotReachHere();
+diff --git a/src/cpu/x86/vm/interp_masm_x86_64.cpp b/src/cpu/x86/vm/interp_masm_x86_64.cpp
+--- a/src/cpu/x86/vm/interp_masm_x86_64.cpp
++++ b/src/cpu/x86/vm/interp_masm_x86_64.cpp
+@@ -213,7 +213,7 @@
+   if (index_size == sizeof(u2)) {
+     load_unsigned_short(index, Address(r13, bcp_offset));
+   } else if (index_size == sizeof(u4)) {
+-    assert(EnableInvokeDynamic, "giant index used only for EnableInvokeDynamic");
++    assert(EnableInvokeDynamic, "giant index used only for JSR 292");
+     movl(index, Address(r13, bcp_offset));
+     // Check if the secondary index definition is still ~x, otherwise
+     // we have to change the following assembler code to calculate the
+@@ -221,7 +221,7 @@
+     assert(constantPoolCacheOopDesc::decode_secondary_index(~123) == 123, "else change next line");
+     notl(index);  // convert to plain index
+   } else if (index_size == sizeof(u1)) {
+-    assert(EnableMethodHandles, "tiny index used only for EnableMethodHandles");
++    assert(EnableInvokeDynamic, "tiny index used only for JSR 292");
+     load_unsigned_byte(index, Address(r13, bcp_offset));
+   } else {
+     ShouldNotReachHere();
+diff --git a/src/cpu/x86/vm/interpreter_x86_32.cpp b/src/cpu/x86/vm/interpreter_x86_32.cpp
+--- a/src/cpu/x86/vm/interpreter_x86_32.cpp
++++ b/src/cpu/x86/vm/interpreter_x86_32.cpp
+@@ -233,7 +233,7 @@
+ // Method handle invoker
+ // Dispatch a method of the form java.lang.invoke.MethodHandles::invoke(...)
+ address InterpreterGenerator::generate_method_handle_entry(void) {
+-  if (!EnableMethodHandles) {
++  if (!EnableInvokeDynamic) {
+     return generate_abstract_entry();
+   }
+ 
+diff --git a/src/cpu/x86/vm/interpreter_x86_64.cpp b/src/cpu/x86/vm/interpreter_x86_64.cpp
+--- a/src/cpu/x86/vm/interpreter_x86_64.cpp
++++ b/src/cpu/x86/vm/interpreter_x86_64.cpp
+@@ -320,7 +320,7 @@
+ // Method handle invoker
+ // Dispatch a method of the form java.lang.invoke.MethodHandles::invoke(...)
+ address InterpreterGenerator::generate_method_handle_entry(void) {
+-  if (!EnableMethodHandles) {
++  if (!EnableInvokeDynamic) {
+     return generate_abstract_entry();
+   }
+ 
+diff --git a/src/cpu/x86/vm/templateInterpreter_x86_32.cpp b/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
+--- a/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
++++ b/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
+@@ -1527,7 +1527,7 @@
+ 
+   if (interpreter_frame != NULL) {
+ #ifdef ASSERT
+-    if (!EnableMethodHandles)
++    if (!EnableInvokeDynamic)
+       // @@@ FIXME: Should we correct interpreter_frame_sender_sp in the calling sequences?
+       // Probably, since deoptimization doesn't work yet.
+       assert(caller->unextended_sp() == interpreter_frame->interpreter_frame_sender_sp(), "Frame not properly walkable");
+diff --git a/src/cpu/x86/vm/templateInterpreter_x86_64.cpp b/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
+--- a/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
++++ b/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
+@@ -1541,7 +1541,7 @@
+          tempcount* Interpreter::stackElementWords + popframe_extra_args;
+   if (interpreter_frame != NULL) {
+ #ifdef ASSERT
+-    if (!EnableMethodHandles)
++    if (!EnableInvokeDynamic)
+       // @@@ FIXME: Should we correct interpreter_frame_sender_sp in the calling sequences?
+       // Probably, since deoptimization doesn't work yet.
+       assert(caller->unextended_sp() == interpreter_frame->interpreter_frame_sender_sp(), "Frame not properly walkable");
+diff --git a/src/cpu/x86/vm/templateTable_x86_32.cpp b/src/cpu/x86/vm/templateTable_x86_32.cpp
+--- a/src/cpu/x86/vm/templateTable_x86_32.cpp
++++ b/src/cpu/x86/vm/templateTable_x86_32.cpp
+@@ -392,8 +392,8 @@
+ void TemplateTable::fast_aldc(bool wide) {
+   transition(vtos, atos);
+ 
+-  if (!EnableMethodHandles) {
+-    // We should not encounter this bytecode if !EnableMethodHandles.
++  if (!EnableInvokeDynamic) {
++    // We should not encounter this bytecode if !EnableInvokeDynamic.
+     // The verifier will stop it.  However, if we get past the verifier,
+     // this will stop the thread in a reasonable way, without crashing the JVM.
+     __ call_VM(noreg, CAST_FROM_FN_PTR(address,
+diff --git a/src/cpu/x86/vm/templateTable_x86_64.cpp b/src/cpu/x86/vm/templateTable_x86_64.cpp
+--- a/src/cpu/x86/vm/templateTable_x86_64.cpp
++++ b/src/cpu/x86/vm/templateTable_x86_64.cpp
+@@ -405,8 +405,8 @@
+ void TemplateTable::fast_aldc(bool wide) {
+   transition(vtos, atos);
+ 
+-  if (!EnableMethodHandles) {
+-    // We should not encounter this bytecode if !EnableMethodHandles.
++  if (!EnableInvokeDynamic) {
++    // We should not encounter this bytecode if !EnableInvokeDynamic.
+     // The verifier will stop it.  However, if we get past the verifier,
+     // this will stop the thread in a reasonable way, without crashing the JVM.
+     __ call_VM(noreg, CAST_FROM_FN_PTR(address,
+diff --git a/src/share/vm/classfile/classFileParser.cpp b/src/share/vm/classfile/classFileParser.cpp
+--- a/src/share/vm/classfile/classFileParser.cpp
++++ b/src/share/vm/classfile/classFileParser.cpp
+@@ -152,7 +152,7 @@
+             "Class file version does not support constant tag %u in class file %s",
+             tag, CHECK);
+         }
+-        if (!EnableMethodHandles) {
++        if (!EnableInvokeDynamic) {
+           classfile_parse_error(
+             "This JVM does not support constant tag %u in class file %s",
+             tag, CHECK);
+@@ -260,7 +260,7 @@
+             verify_legal_utf8((unsigned char*)utf8_buffer, utf8_length, CHECK);
+           }
+ 
+-          if (AnonymousClasses && has_cp_patch_at(index)) {
++          if (EnableInvokeDynamic && has_cp_patch_at(index)) {
+             Handle patch = clear_cp_patch_at(index);
+             guarantee_property(java_lang_String::is_instance(patch()),
+                                "Illegal utf8 patch at %d in class file %s",
+@@ -443,7 +443,7 @@
+           int ref_index = cp->method_handle_index_at(index);
+           check_property(
+             valid_cp_range(ref_index, length) &&
+-                EnableMethodHandles,
++                EnableInvokeDynamic,
+               "Invalid constant pool index %u in class file %s",
+               ref_index, CHECK_(nullHandle));
+           constantTag tag = cp->tag_at(ref_index);
+@@ -487,7 +487,7 @@
+           check_property(
+             valid_cp_range(ref_index, length) &&
+                 cp->tag_at(ref_index).is_utf8() &&
+-                EnableMethodHandles,
++                EnableInvokeDynamic,
+               "Invalid constant pool index %u in class file %s",
+               ref_index, CHECK_(nullHandle));
+         }
+@@ -522,7 +522,7 @@
+ 
+   if (_cp_patches != NULL) {
+     // need to treat this_class specially...
+-    assert(AnonymousClasses, "");
++    assert(EnableInvokeDynamic, "");
+     int this_class_index;
+     {
+       cfs->guarantee_more(8, CHECK_(nullHandle));  // flags, this_class, super_class, infs_len
+@@ -677,7 +677,7 @@
+ 
+ 
+ void ClassFileParser::patch_constant_pool(constantPoolHandle cp, int index, Handle patch, TRAPS) {
+-  assert(AnonymousClasses, "");
++  assert(EnableInvokeDynamic, "");
+   BasicType patch_type = T_VOID;
+   switch (cp->tag_at(index).value()) {
+ 
+@@ -2103,7 +2103,7 @@
+     _has_vanilla_constructor = true;
+   }
+ 
+-  if (EnableMethodHandles && (m->is_method_handle_invoke() ||
++  if (EnableInvokeDynamic && (m->is_method_handle_invoke() ||
+                               m->is_method_handle_adapter())) {
+     THROW_MSG_(vmSymbols::java_lang_VirtualMachineError(),
+                "Method handle invokers must be defined internally to the VM", nullHandle);
+@@ -2771,7 +2771,7 @@
+   // This is not particularly nice, but since there is no way to express
+   // a native wordSize field in Java, we must do it at this level.
+ 
+-  if (!EnableMethodHandles)  return;
++  if (!EnableInvokeDynamic)  return;
+ 
+   int word_sig_index = 0;
+   const int cp_size = cp->length();
+@@ -3191,15 +3191,15 @@
+     }
+ 
+     // adjust the vmentry field declaration in java.lang.invoke.MethodHandle
+-    if (EnableMethodHandles && class_name == vmSymbols::java_lang_invoke_MethodHandle() && class_loader.is_null()) {
++    if (EnableInvokeDynamic && class_name == vmSymbols::java_lang_invoke_MethodHandle() && class_loader.is_null()) {
+       java_lang_invoke_MethodHandle_fix_pre(cp, fields, &fac, CHECK_(nullHandle));
+     }
+     if (AllowTransitionalJSR292 &&
+-        EnableMethodHandles && class_name == vmSymbols::java_dyn_MethodHandle() && class_loader.is_null()) {
++        EnableInvokeDynamic && class_name == vmSymbols::java_dyn_MethodHandle() && class_loader.is_null()) {
+       java_lang_invoke_MethodHandle_fix_pre(cp, fields, &fac, CHECK_(nullHandle));
+     }
+     if (AllowTransitionalJSR292 &&
+-        EnableMethodHandles && class_name == vmSymbols::sun_dyn_MethodHandleImpl() && class_loader.is_null()) {
++        EnableInvokeDynamic && class_name == vmSymbols::sun_dyn_MethodHandleImpl() && class_loader.is_null()) {
+       // allow vmentry field in MethodHandleImpl also
+       java_lang_invoke_MethodHandle_fix_pre(cp, fields, &fac, CHECK_(nullHandle));
+     }
+diff --git a/src/share/vm/classfile/classFileParser.hpp b/src/share/vm/classfile/classFileParser.hpp
+--- a/src/share/vm/classfile/classFileParser.hpp
++++ b/src/share/vm/classfile/classFileParser.hpp
+@@ -231,11 +231,11 @@
+   char* skip_over_field_signature(char* signature, bool void_ok, unsigned int length, TRAPS);
+ 
+   bool is_anonymous() {
+-    assert(AnonymousClasses || _host_klass.is_null(), "");
++    assert(EnableInvokeDynamic || _host_klass.is_null(), "");
+     return _host_klass.not_null();
+   }
+   bool has_cp_patch_at(int index) {
+-    assert(AnonymousClasses, "");
++    assert(EnableInvokeDynamic, "");
+     assert(index >= 0, "oob");
+     return (_cp_patches != NULL
+             && index < _cp_patches->length()
+@@ -258,7 +258,7 @@
+   // constant pool construction, but in later versions they can.
+   // %%% Let's phase out the old is_klass_reference.
+   bool is_klass_reference(constantPoolHandle cp, int index) {
+-    return ((LinkWellKnownClasses || AnonymousClasses)
++    return ((LinkWellKnownClasses || EnableInvokeDynamic)
+             ? cp->tag_at(index).is_klass_or_reference()
+             : cp->tag_at(index).is_klass_reference());
+   }
+diff --git a/src/share/vm/classfile/javaClasses.cpp b/src/share/vm/classfile/javaClasses.cpp
+--- a/src/share/vm/classfile/javaClasses.cpp
++++ b/src/share/vm/classfile/javaClasses.cpp
+@@ -2322,7 +2322,7 @@
+ 
+ void java_lang_invoke_MethodHandle::compute_offsets() {
+   klassOop k = SystemDictionary::MethodHandle_klass();
+-  if (k != NULL && EnableMethodHandles) {
++  if (k != NULL && EnableInvokeDynamic) {
+     bool allow_super = false;
+     if (AllowTransitionalJSR292)  allow_super = true;  // temporary, to access java.dyn.MethodHandleImpl
+     compute_offset(_type_offset,      k, vmSymbols::type_name(),      vmSymbols::java_lang_invoke_MethodType_signature(), allow_super);
+@@ -2337,7 +2337,7 @@
+ 
+ void java_lang_invoke_MemberName::compute_offsets() {
+   klassOop k = SystemDictionary::MemberName_klass();
+-  if (k != NULL && EnableMethodHandles) {
++  if (k != NULL && EnableInvokeDynamic) {
+     compute_offset(_clazz_offset,     k, vmSymbols::clazz_name(),     vmSymbols::class_signature());
+     compute_offset(_name_offset,      k, vmSymbols::name_name(),      vmSymbols::string_signature());
+     compute_offset(_type_offset,      k, vmSymbols::type_name(),      vmSymbols::object_signature());
+@@ -2349,14 +2349,14 @@
+ 
+ void java_lang_invoke_DirectMethodHandle::compute_offsets() {
+   klassOop k = SystemDictionary::DirectMethodHandle_klass();
+-  if (k != NULL && EnableMethodHandles) {
++  if (k != NULL && EnableInvokeDynamic) {
+     compute_offset(_vmindex_offset,   k, vmSymbols::vmindex_name(),   vmSymbols::int_signature(),    true);
+   }
+ }
+ 
+ void java_lang_invoke_BoundMethodHandle::compute_offsets() {
+   klassOop k = SystemDictionary::BoundMethodHandle_klass();
+-  if (k != NULL && EnableMethodHandles) {
++  if (k != NULL && EnableInvokeDynamic) {
+     compute_offset(_vmargslot_offset, k, vmSymbols::vmargslot_name(), vmSymbols::int_signature(),    true);
+     compute_offset(_argument_offset,  k, vmSymbols::argument_name(),  vmSymbols::object_signature(), true);
+   }
+@@ -2364,7 +2364,7 @@
+ 
+ void java_lang_invoke_AdapterMethodHandle::compute_offsets() {
+   klassOop k = SystemDictionary::AdapterMethodHandle_klass();
+-  if (k != NULL && EnableMethodHandles) {
++  if (k != NULL && EnableInvokeDynamic) {
+     compute_offset(_conversion_offset, k, vmSymbols::conversion_name(), vmSymbols::int_signature(), true);
+   }
+ }
+@@ -2982,7 +2982,7 @@
+   java_lang_System::compute_offsets();
+   java_lang_Thread::compute_offsets();
+   java_lang_ThreadGroup::compute_offsets();
+-  if (EnableMethodHandles) {
++  if (EnableInvokeDynamic) {
+     java_lang_invoke_MethodHandle::compute_offsets();
+     java_lang_invoke_MemberName::compute_offsets();
+     java_lang_invoke_DirectMethodHandle::compute_offsets();
+@@ -2990,8 +2990,6 @@
+     java_lang_invoke_AdapterMethodHandle::compute_offsets();
+     java_lang_invoke_MethodType::compute_offsets();
+     java_lang_invoke_MethodTypeForm::compute_offsets();
+-  }
+-  if (EnableInvokeDynamic) {
+     java_lang_invoke_CallSite::compute_offsets();
+   }
+   java_security_AccessControlContext::compute_offsets();
+diff --git a/src/share/vm/classfile/systemDictionary.cpp b/src/share/vm/classfile/systemDictionary.cpp
+--- a/src/share/vm/classfile/systemDictionary.cpp
++++ b/src/share/vm/classfile/systemDictionary.cpp
+@@ -1017,7 +1017,7 @@
+   }
+ 
+   if (host_klass.not_null() && k.not_null()) {
+-    assert(AnonymousClasses, "");
++    assert(EnableInvokeDynamic, "");
+     // If it's anonymous, initialize it now, since nobody else will.
+     k->set_host_klass(host_klass());
+ 
+@@ -1940,7 +1940,7 @@
+   }
+   Symbol* backup_symbol = NULL;  // symbol to try if the current symbol fails
+   if (init_opt == SystemDictionary::Pre_JSR292) {
+-    if (!EnableMethodHandles)  try_load = false;  // do not bother to load such classes
++    if (!EnableInvokeDynamic)  try_load = false;  // do not bother to load such classes
+     if (AllowTransitionalJSR292) {
+       backup_symbol = find_backup_class_name(symbol);
+       if (try_load && PreferTransitionalJSR292) {
+@@ -2038,25 +2038,15 @@
+   instanceKlass::cast(WK_KLASS(FinalReference_klass))->set_reference_type(REF_FINAL);
+   instanceKlass::cast(WK_KLASS(PhantomReference_klass))->set_reference_type(REF_PHANTOM);
+ 
+-  WKID meth_group_start = WK_KLASS_ENUM_NAME(MethodHandle_klass);
+-  WKID meth_group_end   = WK_KLASS_ENUM_NAME(WrongMethodTypeException_klass);
+-  initialize_wk_klasses_until(meth_group_start, scan, CHECK);
+-  if (EnableMethodHandles) {
+-    initialize_wk_klasses_through(meth_group_end, scan, CHECK);
+-  }
+-  if (_well_known_klasses[meth_group_start] == NULL) {
+-    // Skip the rest of the method handle classes, if MethodHandle is not loaded.
+-    scan = WKID(meth_group_end+1);
+-  }
+-  WKID indy_group_start = WK_KLASS_ENUM_NAME(Linkage_klass);
+-  WKID indy_group_end   = WK_KLASS_ENUM_NAME(CallSite_klass);
+-  initialize_wk_klasses_until(indy_group_start, scan, CHECK);
++  // JSR 292 classes
++  WKID jsr292_group_start = WK_KLASS_ENUM_NAME(MethodHandle_klass);
++  WKID jsr292_group_end   = WK_KLASS_ENUM_NAME(CallSite_klass);
++  initialize_wk_klasses_until(jsr292_group_start, scan, CHECK);
+   if (EnableInvokeDynamic) {
+-    initialize_wk_klasses_through(indy_group_end, scan, CHECK);
+-  }
+-  if (_well_known_klasses[indy_group_start] == NULL) {
+-    // Skip the rest of the dynamic typing classes, if Linkage is not loaded.
+-    scan = WKID(indy_group_end+1);
++    initialize_wk_klasses_through(jsr292_group_end, scan, CHECK);
++  } else {
++    // Skip the JSR 292 classes, if not enabled.
++    scan = WKID(jsr292_group_end + 1);
+   }
+ 
+   initialize_wk_klasses_until(WKID_LIMIT, scan, CHECK);
+@@ -2407,7 +2397,7 @@
+                                                       Symbol* signature,
+                                                       KlassHandle accessing_klass,
+                                                       TRAPS) {
+-  if (!EnableMethodHandles)  return NULL;
++  if (!EnableInvokeDynamic)  return NULL;
+   vmSymbols::SID name_id = vmSymbols::find_sid(name);
+   assert(name_id != vmSymbols::NO_SID, "must be a known name");
+   unsigned int hash  = invoke_method_table()->compute_hash(signature, name_id);
+diff --git a/src/share/vm/classfile/systemDictionary.hpp b/src/share/vm/classfile/systemDictionary.hpp
+--- a/src/share/vm/classfile/systemDictionary.hpp
++++ b/src/share/vm/classfile/systemDictionary.hpp
+@@ -207,7 +207,7 @@
+ 
+   enum InitOption {
+     Pre,                        // preloaded; error if not present
+-    Pre_JSR292,                 // preloaded if EnableMethodHandles
++    Pre_JSR292,                 // preloaded if EnableInvokeDynamic
+ 
+     // Order is significant.  Options before this point require resolve_or_fail.
+     // Options after this point will use resolve_or_null instead.
+diff --git a/src/share/vm/interpreter/linkResolver.cpp b/src/share/vm/interpreter/linkResolver.cpp
+--- a/src/share/vm/interpreter/linkResolver.cpp
++++ b/src/share/vm/interpreter/linkResolver.cpp
+@@ -176,7 +176,7 @@
+ 
+ void LinkResolver::lookup_method_in_klasses(methodHandle& result, KlassHandle klass, Symbol* name, Symbol* signature, TRAPS) {
+   methodOop result_oop = klass->uncached_lookup_method(name, signature);
+-  if (EnableMethodHandles && result_oop != NULL) {
++  if (EnableInvokeDynamic && result_oop != NULL) {
+     switch (result_oop->intrinsic_id()) {
+     case vmIntrinsics::_invokeExact:
+     case vmIntrinsics::_invokeGeneric:
+@@ -214,7 +214,7 @@
+                                           KlassHandle klass, Symbol* name, Symbol* signature,
+                                           KlassHandle current_klass,
+                                           TRAPS) {
+-  if (EnableMethodHandles &&
++  if (EnableInvokeDynamic &&
+       klass() == SystemDictionary::MethodHandle_klass() &&
+       methodOopDesc::is_method_handle_invoke_name(name)) {
+     if (!THREAD->is_Compiler_thread() && !MethodHandles::enabled()) {
+diff --git a/src/share/vm/oops/constantPoolKlass.cpp b/src/share/vm/oops/constantPoolKlass.cpp
+--- a/src/share/vm/oops/constantPoolKlass.cpp
++++ b/src/share/vm/oops/constantPoolKlass.cpp
+@@ -286,6 +286,6 @@
+   assert(obj->is_constantPool(), "should be constant pool");
+   constantPoolOop cp = (constantPoolOop) obj;
+-  if (AnonymousClasses && cp->has_pseudo_string() && cp->tags() != NULL) {
++  if (EnableInvokeDynamic && cp->has_pseudo_string() && cp->tags() != NULL) {
+     oop* base = (oop*)cp->base();
+     for (int i = 0; i < cp->length(); ++i, ++base) {
+       if (cp->tag_at(i).is_string()) {
+diff --git a/src/share/vm/oops/constantPoolOop.hpp b/src/share/vm/oops/constantPoolOop.hpp
+--- a/src/share/vm/oops/constantPoolOop.hpp
++++ b/src/share/vm/oops/constantPoolOop.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 1997, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 1997, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -429,7 +429,7 @@
+ 
+   // A "pseudo-string" is an non-string oop that has found is way into
+   // a String entry.
+-  // Under AnonymousClasses this can happen if the user patches a live
++  // Under EnableInvokeDynamic this can happen if the user patches a live
+   // object into a CONSTANT_String entry of an anonymous class.
+   // Method oops internally created for method handles may also
+   // use pseudo-strings to link themselves to related metaobjects.
+@@ -442,7 +442,7 @@
+   }
+ 
+   void pseudo_string_at_put(int which, oop x) {
+-    assert(AnonymousClasses, "");
++    assert(EnableInvokeDynamic, "");
+     set_pseudo_string();        // mark header
+     assert(tag_at(which).is_string() || tag_at(which).is_unresolved_string(), "Corrupted constant pool");
+     string_at_put(which, x);    // this works just fine
+diff --git a/src/share/vm/oops/instanceKlass.hpp b/src/share/vm/oops/instanceKlass.hpp
+--- a/src/share/vm/oops/instanceKlass.hpp
++++ b/src/share/vm/oops/instanceKlass.hpp
+@@ -182,7 +182,7 @@
+   // Protection domain.
+   oop             _protection_domain;
+   // Host class, which grants its access privileges to this class also.
+-  // This is only non-null for an anonymous class (AnonymousClasses enabled).
++  // This is only non-null for an anonymous class (JSR 292 enabled).
+   // The host class is either named, or a previously loaded anonymous class.
+   klassOop        _host_klass;
+   // Class signers.
+diff --git a/src/share/vm/oops/klass.cpp b/src/share/vm/oops/klass.cpp
+--- a/src/share/vm/oops/klass.cpp
++++ b/src/share/vm/oops/klass.cpp
+@@ -500,7 +500,7 @@
+   if (oop_is_instance()) {
+     instanceKlass* ik = (instanceKlass*) this;
+     if (ik->is_anonymous()) {
+-      assert(AnonymousClasses, "");
++      assert(EnableInvokeDynamic, "");
+       intptr_t hash = ik->java_mirror()->identity_hash();
+       char     hash_buf[40];
+       sprintf(hash_buf, "/" UINTX_FORMAT, (uintx)hash);
+diff --git a/src/share/vm/oops/methodOop.hpp b/src/share/vm/oops/methodOop.hpp
+--- a/src/share/vm/oops/methodOop.hpp
++++ b/src/share/vm/oops/methodOop.hpp
+@@ -607,7 +607,7 @@
+   // method handles want to be able to push a few extra values (e.g., a bound receiver), and
+   // invokedynamic sometimes needs to push a bootstrap method, call site, and arglist,
+   // all without checking for a stack overflow
+-  static int extra_stack_entries() { return (EnableMethodHandles ? (int)MethodHandlePushLimit : 0) + (EnableInvokeDynamic ? 3 : 0); }
++  static int extra_stack_entries() { return EnableInvokeDynamic ? (int) MethodHandlePushLimit + 3 : 0; }
+   static int extra_stack_words();  // = extra_stack_entries() * Interpreter::stackElementSize()
+ 
+   // RedefineClasses() support:
+diff --git a/src/share/vm/prims/methodHandles.cpp b/src/share/vm/prims/methodHandles.cpp
+--- a/src/share/vm/prims/methodHandles.cpp
++++ b/src/share/vm/prims/methodHandles.cpp
+@@ -112,7 +112,7 @@
+ // MethodHandles::generate_adapters
+ //
+ void MethodHandles::generate_adapters() {
+-  if (!EnableMethodHandles || SystemDictionary::MethodHandle_klass() == NULL)  return;
++  if (!EnableInvokeDynamic || SystemDictionary::MethodHandle_klass() == NULL)  return;
+ 
+   assert(_adapter_code == NULL, "generate only once");
+ 
+@@ -143,7 +143,7 @@
+ 
+ void MethodHandles::set_enabled(bool z) {
+   if (_enabled != z) {
+-    guarantee(z && EnableMethodHandles, "can only enable once, and only if -XX:+EnableMethodHandles");
++    guarantee(z && EnableInvokeDynamic, "can only enable once, and only if -XX:+EnableInvokeDynamic");
+     _enabled = z;
+   }
+ }
+@@ -2579,7 +2579,6 @@
+   {CC"getMembers",              CC"("CLS""STRG""STRG"I"CLS"I["MEM")I",  FN_PTR(MHN_getMembers)}
+ };
+ 
+-// More entry points specifically for EnableInvokeDynamic.
+ // FIXME: Remove methods2 after AllowTransitionalJSR292 is removed.
+ static JNINativeMethod methods2[] = {
+   {CC"registerBootstrap",       CC"("CLS MH")V",                FN_PTR(MHN_registerBootstrap)},
+@@ -2618,10 +2617,8 @@
+ JVM_ENTRY(void, JVM_RegisterMethodHandleMethods(JNIEnv *env, jclass MHN_class)) {
+   assert(MethodHandles::spot_check_entry_names(), "entry enum is OK");
+ 
+-  // note: this explicit warning-producing stuff will be replaced by auto-detection of the JSR 292 classes
+-
+-  if (!EnableMethodHandles) {
+-    warning("JSR 292 method handles are disabled in this JVM.  Use -XX:+UnlockExperimentalVMOptions -XX:+EnableMethodHandles to enable.");
++  if (!EnableInvokeDynamic) {
++    warning("JSR 292 is disabled in this JVM.  Use -XX:+UnlockDiagnosticVMOptions -XX:+EnableInvokeDynamic to enable.");
+     return;  // bind nothing
+   }
+ 
+@@ -2702,11 +2699,6 @@
+     MethodHandles::set_enabled(true);
+   }
+ 
+-  if (!EnableInvokeDynamic) {
+-    warning("JSR 292 invokedynamic is disabled in this JVM.  Use -XX:+UnlockExperimentalVMOptions -XX:+EnableInvokeDynamic to enable.");
+-    return;  // bind nothing
+-  }
+-
+   if (AllowTransitionalJSR292) {
+     ThreadToNativeFromVM ttnfv(thread);
+ 
+diff --git a/src/share/vm/prims/unsafe.cpp b/src/share/vm/prims/unsafe.cpp
+--- a/src/share/vm/prims/unsafe.cpp
++++ b/src/share/vm/prims/unsafe.cpp
+@@ -1560,7 +1560,7 @@
+         }
+       }
+     }
+-    if (AnonymousClasses) {
++    if (EnableInvokeDynamic) {
+       env->RegisterNatives(unsafecls, anonk_methods, sizeof(anonk_methods)/sizeof(JNINativeMethod));
+       if (env->ExceptionOccurred()) {
+         if (PrintMiscellaneous && (Verbose || WizardMode)) {
+diff --git a/src/share/vm/runtime/arguments.cpp b/src/share/vm/runtime/arguments.cpp
+--- a/src/share/vm/runtime/arguments.cpp
++++ b/src/share/vm/runtime/arguments.cpp
+@@ -2974,21 +2974,28 @@
+   }
+ #endif // PRODUCT
+ 
+-  if (EnableInvokeDynamic && !EnableMethodHandles) {
+-    if (!FLAG_IS_DEFAULT(EnableMethodHandles)) {
+-      warning("forcing EnableMethodHandles true because EnableInvokeDynamic is true");
++  // Transitional
++  if (EnableMethodHandles || AnonymousClasses) {
++    if (!EnableInvokeDynamic && !FLAG_IS_DEFAULT(EnableInvokeDynamic)) {
++      warning("EnableMethodHandles and AnonymousClasses are obsolete.  Keeping EnableInvokeDynamic disabled.");
++    } else {
++      EnableInvokeDynamic = true;
+     }
+-    EnableMethodHandles = true;
+   }
+-  if (EnableMethodHandles && !AnonymousClasses) {
+-    if (!FLAG_IS_DEFAULT(AnonymousClasses)) {
+-      warning("forcing AnonymousClasses true because EnableMethodHandles is true");
++
++  // JSR 292 is not supported before 1.7
++  if (!JDK_Version::is_gte_jdk17x_version()) {
++    if (EnableInvokeDynamic) {
++      if (!FLAG_IS_DEFAULT(EnableInvokeDynamic)) {
++        warning("JSR 292 is not supported before 1.7.  Disabling support.");
++      }
++      EnableInvokeDynamic = false;
+     }
+-    AnonymousClasses = true;
+   }
+-  if ((EnableMethodHandles || AnonymousClasses) && ScavengeRootsInCode == 0) {
++
++  if (EnableInvokeDynamic && ScavengeRootsInCode == 0) {
+     if (!FLAG_IS_DEFAULT(ScavengeRootsInCode)) {
+-      warning("forcing ScavengeRootsInCode non-zero because EnableMethodHandles or AnonymousClasses is true");
++      warning("forcing ScavengeRootsInCode non-zero because EnableInvokeDynamic is true");
+     }
+     ScavengeRootsInCode = 1;
+   }
+diff --git a/src/share/vm/runtime/globals.hpp b/src/share/vm/runtime/globals.hpp
+--- a/src/share/vm/runtime/globals.hpp
++++ b/src/share/vm/runtime/globals.hpp
+@@ -3693,11 +3693,15 @@
+           "Skip assert() and verify() which page-in unwanted shared "       \
+           "objects. ")                                                      \
+                                                                             \
++  diagnostic(bool, EnableInvokeDynamic, true,                               \
++          "support JSR 292 (method handles, invokedynamic, "                \
++          "anonymous classes")                                              \
++                                                                            \
+   product(bool, AnonymousClasses, false,                                    \
+-          "support sun.misc.Unsafe.defineAnonymousClass")                   \
++          "support sun.misc.Unsafe.defineAnonymousClass (deprecated)")      \
+                                                                             \
+   experimental(bool, EnableMethodHandles, false,                            \
+-          "support method handles (true by default under JSR 292)")         \
++          "support method handles (deprecated)")                            \
+                                                                             \
+   diagnostic(intx, MethodHandlePushLimit, 3,                                \
+           "number of additional stack slots a method handle may push")      \
+@@ -3714,9 +3718,6 @@
+   experimental(bool, TrustFinalNonStaticFields, false,                      \
+           "trust final non-static declarations for constant folding")       \
+                                                                             \
+-  experimental(bool, EnableInvokeDynamic, false,                            \
+-          "recognize the invokedynamic instruction")                        \
+-                                                                            \
+   experimental(bool, AllowTransitionalJSR292, true,                         \
+           "recognize pre-PFD formats of invokedynamic")                     \
+                                                                             \
+diff --git a/src/share/vm/runtime/sharedRuntime.cpp b/src/share/vm/runtime/sharedRuntime.cpp
+--- a/src/share/vm/runtime/sharedRuntime.cpp
++++ b/src/share/vm/runtime/sharedRuntime.cpp
+@@ -1682,7 +1682,7 @@
+     tty->print_cr("WrongMethodType thread="PTR_FORMAT" req="PTR_FORMAT" act="PTR_FORMAT"",
+                   thread, required, actual);
+   }
+-  assert(EnableMethodHandles, "");
++  assert(EnableInvokeDynamic, "");
+   oop singleKlass = wrong_method_type_is_for_single_argument(thread, required);
+   char* message = NULL;
+   if (singleKlass != NULL) {
+diff --git a/src/share/vm/runtime/thread.cpp b/src/share/vm/runtime/thread.cpp
+--- a/src/share/vm/runtime/thread.cpp
++++ b/src/share/vm/runtime/thread.cpp
+@@ -3229,7 +3229,7 @@
+       warning("java.lang.ArithmeticException has not been initialized");
+       warning("java.lang.StackOverflowError has not been initialized");
+     }
+-    }
++  }
+ 
+   // See        : bugid 4211085.
+   // Background : the static initializer of java.lang.Compiler tries to read

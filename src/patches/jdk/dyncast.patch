@@ -1,0 +1,38 @@
+0000000: writing libraries in Java for non-Java languages requires permissive Dynamic type
+
+diff --git a/src/share/native/common/check_code.c b/src/share/native/common/check_code.c
+--- a/src/share/native/common/check_code.c
++++ b/src/share/native/common/check_code.c
+@@ -243,6 +243,7 @@
+     fullinfo_type throwable_info; /* fullinfo for java/lang/Throwable */
+     fullinfo_type cloneable_info; /* fullinfo for java/lang/Cloneable */
+     fullinfo_type serializable_info; /* fullinfo for java/io/Serializable */
++    fullinfo_type dynamic_info; /* fullinfo for java/dyn/Dynamic */
+ 
+     fullinfo_type currentclass_info; /* fullinfo for context->class */
+     fullinfo_type superclass_info;   /* fullinfo for superclass */
+@@ -767,6 +768,8 @@
+             make_class_info_from_name(context, "java/lang/Cloneable");
+         context->serializable_info =
+             make_class_info_from_name(context, "java/io/Serializable");
++        context->dynamic_info =
++            make_class_info_from_name(context, "java/dyn/Dynamic");
+ 
+         context->currentclass_info = make_loadable_class_info(context, cb);
+ 
+@@ -3782,6 +3802,15 @@
+                 return target;
+         }
+         return value;
++    } else if (for_assignment && target == context->dynamic_info) {
++      /* Special case:  Any reference type converts to interface Dynamic.
++       * The new verifier does not need this special case, because it
++       * treats all interface types this way.
++       * N.B. Make sure Dynamic actually resolves to an interface.
++       */
++      jclass cb = object_fullinfo_to_classclass(context, target);
++      if (cb && JVM_IsInterface(env, cb))
++          return target;
+     }
+     if (GET_INDIRECTION(value) > 0 || GET_INDIRECTION(target) > 0) {
+         /* At least one is an array.  Neither is java/lang/Object or NULL.

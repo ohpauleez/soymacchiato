@@ -1,0 +1,28 @@
+diff --git a/src/share/classes/sun/dyn/anon/AnonymousClassLoader.java b/src/share/classes/sun/dyn/anon/AnonymousClassLoader.java
+--- a/src/share/classes/sun/dyn/anon/AnonymousClassLoader.java
++++ b/src/share/classes/sun/dyn/anon/AnonymousClassLoader.java
+@@ -26,9 +26,9 @@
+ package sun.dyn.anon;
+ 
+ import java.io.IOException;
++import java.io.InputStream;
+ import java.lang.reflect.InvocationTargetException;
+ import java.lang.reflect.Method;
+-import sun.misc.IOUtils;
+ 
+ /**
+  * Anonymous class loader.  Will load any valid classfile, producing
+@@ -285,6 +285,12 @@
+         if (contentLength < 0)
+             throw new IOException("invalid content length "+contentLength);
+ 
+-        return IOUtils.readFully(connection.getInputStream(), contentLength, true);
++        InputStream input = connection.getInputStream();
++        byte[] result = new byte[contentLength];
++        for (int fill = 0, len; fill < contentLength; fill += len) {
++            len = input.read(result, fill, contentLength - fill);
++            if (len <= 0)  throw new InternalError("wrong class file length");
++        }
++        return result;
+     }
+ }

@@ -1,0 +1,1309 @@
+6964498: JSR 292 invokedynamic sites need local bootstrap methods
+Summary: Add JVM_CONSTANT_InvokeDynamic records to constant pool to determine per-instruction BSMs.
+Reviewed-by: ?
+
+diff --git a/src/share/classes/com/sun/tools/classfile/ClassTranslator.java b/src/share/classes/com/sun/tools/classfile/ClassTranslator.java
+--- a/src/share/classes/com/sun/tools/classfile/ClassTranslator.java
++++ b/src/share/classes/com/sun/tools/classfile/ClassTranslator.java
+@@ -25,18 +25,7 @@
+ 
+ package com.sun.tools.classfile;
+ 
+-import com.sun.tools.classfile.ConstantPool.CONSTANT_Class_info;
+-import com.sun.tools.classfile.ConstantPool.CONSTANT_Double_info;
+-import com.sun.tools.classfile.ConstantPool.CONSTANT_Fieldref_info;
+-import com.sun.tools.classfile.ConstantPool.CONSTANT_Float_info;
+-import com.sun.tools.classfile.ConstantPool.CONSTANT_Integer_info;
+-import com.sun.tools.classfile.ConstantPool.CONSTANT_InterfaceMethodref_info;
+-import com.sun.tools.classfile.ConstantPool.CONSTANT_Long_info;
+-import com.sun.tools.classfile.ConstantPool.CONSTANT_Methodref_info;
+-import com.sun.tools.classfile.ConstantPool.CONSTANT_NameAndType_info;
+-import com.sun.tools.classfile.ConstantPool.CONSTANT_String_info;
+-import com.sun.tools.classfile.ConstantPool.CONSTANT_Utf8_info;
+-import com.sun.tools.classfile.ConstantPool.CPInfo;
++import com.sun.tools.classfile.ConstantPool.*;
+ import java.util.Map;
+ 
+ /**
+@@ -361,4 +350,43 @@
+         return info;
+     }
+ 
++    public CPInfo visitMethodHandle(CONSTANT_MethodHandle_info info, Map<Object, Object> translations) {
++        CONSTANT_MethodHandle_info info2 = (CONSTANT_MethodHandle_info) translations.get(info);
++        if (info2 == null) {
++            ConstantPool cp2 = translate(info.cp, translations);
++            if (cp2 == info.cp)
++                info2 = info;
++            else
++                info2 = new CONSTANT_MethodHandle_info(cp2, info.ref_kind, info.member_index);
++            translations.put(info, info2);
++        }
++        return info;
++    }
++
++    public CPInfo visitMethodType(CONSTANT_MethodType_info info, Map<Object, Object> translations) {
++        CONSTANT_MethodType_info info2 = (CONSTANT_MethodType_info) translations.get(info);
++        if (info2 == null) {
++            ConstantPool cp2 = translate(info.cp, translations);
++            if (cp2 == info.cp)
++                info2 = info;
++            else
++                info2 = new CONSTANT_MethodType_info(cp2, info.signature_index);
++            translations.put(info, info2);
++        }
++        return info;
++    }
++
++    public CPInfo visitInvokeDynamic(CONSTANT_InvokeDynamic_info info, Map<Object, Object> translations) {
++        CONSTANT_InvokeDynamic_info info2 = (CONSTANT_InvokeDynamic_info) translations.get(info);
++        if (info2 == null) {
++            ConstantPool cp2 = translate(info.cp, translations);
++            if (cp2 == info.cp)
++                info2 = info;
++            else
++                info2 = new CONSTANT_InvokeDynamic_info(cp2, info.bootstrap_method_index, info.name_and_type_index);
++            translations.put(info, info2);
++        }
++        return info;
++    }
++
+ }
+diff --git a/src/share/classes/com/sun/tools/classfile/ClassWriter.java b/src/share/classes/com/sun/tools/classfile/ClassWriter.java
+--- a/src/share/classes/com/sun/tools/classfile/ClassWriter.java
++++ b/src/share/classes/com/sun/tools/classfile/ClassWriter.java
+@@ -292,6 +292,23 @@
+             return 1;
+         }
+ 
++        public Integer visitMethodHandle(CONSTANT_MethodHandle_info info, ClassOutputStream out) {
++            out.writeByte(info.ref_kind);
++            out.writeShort(info.member_index);
++            return 1;
++        }
++
++        public Integer visitMethodType(CONSTANT_MethodType_info info, ClassOutputStream out) {
++            out.writeShort(info.signature_index);
++            return 1;
++        }
++
++        public Integer visitInvokeDynamic(CONSTANT_InvokeDynamic_info info, ClassOutputStream out) {
++            out.writeShort(info.bootstrap_method_index);
++            out.writeShort(info.name_and_type_index);
++            return 1;
++        }
++
+         protected Integer writeRef(CPRefInfo info, ClassOutputStream out) {
+             out.writeShort(info.class_index);
+             out.writeShort(info.name_and_type_index);
+diff --git a/src/share/classes/com/sun/tools/classfile/ConstantPool.java b/src/share/classes/com/sun/tools/classfile/ConstantPool.java
+--- a/src/share/classes/com/sun/tools/classfile/ConstantPool.java
++++ b/src/share/classes/com/sun/tools/classfile/ConstantPool.java
+@@ -114,6 +114,19 @@
+     public static final int CONSTANT_Methodref = 10;
+     public static final int CONSTANT_InterfaceMethodref = 11;
+     public static final int CONSTANT_NameAndType = 12;
++    public static final int CONSTANT_MethodHandle = 15;  // JSR 292
++    public static final int CONSTANT_MethodType = 16;  // JSR 292
++    public static final int CONSTANT_InvokeDynamic = 17;  // JSR 292
++
++    public static final int REF_getField = 1;
++    public static final int REF_getStatic = 2;
++    public static final int REF_putField = 3;
++    public static final int REF_putStatic = 4;
++    public static final int REF_invokeVirtual = 5;
++    public static final int REF_invokeStatic = 6;
++    public static final int REF_invokeSpecial = 7;
++    public static final int REF_newInvokeSpecial = 8;
++    public static final int REF_invokeInterface = 9;
+ 
+     ConstantPool(ClassReader cr) throws IOException, InvalidEntry {
+         int count = cr.readUnsignedShort();
+@@ -167,6 +180,18 @@
+                 pool[i] = new CONSTANT_Utf8_info(cr);
+                 break;
+ 
++            case CONSTANT_MethodHandle:
++                pool[i] = new CONSTANT_MethodHandle_info(this, cr);
++                break;
++
++            case CONSTANT_MethodType:
++                pool[i] = new CONSTANT_MethodType_info(this, cr);
++                break;
++
++            case CONSTANT_InvokeDynamic:
++                pool[i] = new CONSTANT_InvokeDynamic_info(this, cr);
++                break;
++
+             default:
+                 throw new InvalidEntry(i, tag);
+             }
+@@ -284,6 +309,9 @@
+         R visitMethodref(CONSTANT_Methodref_info info, P p);
+         R visitString(CONSTANT_String_info info, P p);
+         R visitUtf8(CONSTANT_Utf8_info info, P p);
++        R visitMethodHandle(CONSTANT_MethodHandle_info info, P p);
++        R visitMethodType(CONSTANT_MethodType_info info, P p);
++        R visitInvokeDynamic(CONSTANT_InvokeDynamic_info info, P p);
+     }
+ 
+     public static abstract class CPInfo {
+@@ -729,5 +757,128 @@
+         public final String value;
+     }
+ 
++    public static class CONSTANT_MethodHandle_info extends CPInfo {
++        CONSTANT_MethodHandle_info(ConstantPool cp, ClassReader cr) throws IOException {
++            super(cp);
++            ref_kind     = cr.readUnsignedByte();
++            member_index = cr.readUnsignedShort();
++        }
++
++        public CONSTANT_MethodHandle_info(ConstantPool cp, int ref_kind, int member_index) {
++            super(cp);
++            this.ref_kind     = ref_kind;
++            this.member_index = member_index;
++        }
++
++        public int getTag() {
++            return CONSTANT_MethodHandle;
++        }
++
++        public int byteLength() {
++            return 4;
++        }
++
++        @Override
++        public String toString() {
++            return "CONSTANT_MethodHandle_info[ref_kind: " + ref_kind + ", member_index: " + member_index + "]";
++        }
++
++        public <R, D> R accept(Visitor<R, D> visitor, D data) {
++            return visitor.visitMethodHandle(this, data);
++        }
++
++        public final int ref_kind;
++        public final int member_index;
++
++        public CPRefInfo getCPRefInfo() throws ConstantPoolException {
++            int expected = CONSTANT_Methodref;
++            int actual = cp.get(member_index).getTag();
++            // allow these tag types also:
++            switch (actual) {
++            case CONSTANT_Fieldref:
++            case CONSTANT_InterfaceMethodref:
++                expected = actual;
++            }
++            return (CPRefInfo) cp.get(member_index, expected);
++        }
++    }
++
++    public static class CONSTANT_MethodType_info extends CPInfo {
++        CONSTANT_MethodType_info(ConstantPool cp, ClassReader cr) throws IOException {
++            super(cp);
++            signature_index = cr.readUnsignedShort();
++        }
++
++        public CONSTANT_MethodType_info(ConstantPool cp, int signature_index) {
++            super(cp);
++            this.signature_index = signature_index;
++        }
++
++        public int getTag() {
++            return CONSTANT_MethodType;
++        }
++
++        public int byteLength() {
++            return 3;
++        }
++
++        @Override
++        public String toString() {
++            return "CONSTANT_MethodType_info[signature_index: " + signature_index + "]";
++        }
++
++        public <R, D> R accept(Visitor<R, D> visitor, D data) {
++            return visitor.visitMethodType(this, data);
++        }
++
++        public final int signature_index;
++
++        public String getType() throws ConstantPoolException {
++            return cp.getUTF8Value(signature_index);
++        }
++    }
++
++    public static class CONSTANT_InvokeDynamic_info extends CPInfo {
++        CONSTANT_InvokeDynamic_info(ConstantPool cp, ClassReader cr) throws IOException {
++            super(cp);
++            bootstrap_method_index = cr.readUnsignedShort();
++            name_and_type_index    = cr.readUnsignedShort();
++        }
++
++        public CONSTANT_InvokeDynamic_info(ConstantPool cp, int bootstrap_method_index, int name_and_type_index) {
++            super(cp);
++            this.bootstrap_method_index = bootstrap_method_index;
++            this.name_and_type_index    = name_and_type_index;
++        }
++
++        public int getTag() {
++            return CONSTANT_InvokeDynamic;
++        }
++
++        public int byteLength() {
++            return 5;
++        }
++
++        @Override
++        public String toString() {
++            return "CONSTANT_InvokeDynamic_info[bootstrap_method_index: " + bootstrap_method_index + ", name_and_type_index: " + name_and_type_index + "]";
++        }
++
++        public <R, D> R accept(Visitor<R, D> visitor, D data) {
++            return visitor.visitInvokeDynamic(this, data);
++        }
++
++        public final int bootstrap_method_index;
++        public final int name_and_type_index;
++
++        public CONSTANT_MethodHandle_info getBootstrapMethodInfo() throws ConstantPoolException {
++            if (bootstrap_method_index == 0)  return null;  //allowTransitionalJSR292
++            return ((CONSTANT_MethodHandle_info) cp.get(bootstrap_method_index, CONSTANT_MethodHandle));
++        }
++
++        public CONSTANT_NameAndType_info getNameAndTypeInfo() throws ConstantPoolException {
++            return cp.getNameAndTypeInfo(name_and_type_index);
++        }
++    }
+ 
+ }
+diff --git a/src/share/classes/com/sun/tools/classfile/Dependencies.java b/src/share/classes/com/sun/tools/classfile/Dependencies.java
+--- a/src/share/classes/com/sun/tools/classfile/Dependencies.java
++++ b/src/share/classes/com/sun/tools/classfile/Dependencies.java
+@@ -651,6 +651,18 @@
+                 return null;
+             }
+ 
++            public Void visitMethodHandle(CONSTANT_MethodHandle_info info, Void p) {
++                return null;
++            }
++
++            public Void visitMethodType(CONSTANT_MethodType_info info, Void p) {
++                return null;
++            }
++
++            public Void visitInvokeDynamic(CONSTANT_InvokeDynamic_info info, Void p) {
++                return null;
++            }
++
+             private Void visitRef(CPRefInfo info, Void p) {
+                 try {
+                     visitClass(info.getClassInfo(), p);
+diff --git a/src/share/classes/com/sun/tools/javac/code/Symbol.java b/src/share/classes/com/sun/tools/javac/code/Symbol.java
+--- a/src/share/classes/com/sun/tools/javac/code/Symbol.java
++++ b/src/share/classes/com/sun/tools/javac/code/Symbol.java
+@@ -1323,6 +1323,43 @@
+         }
+     }
+ 
++    /**
++     * A method handle reference in the constant pool.
++     * This has the same content as the original symbol,
++     * plus a referenceKind parameter which describes how the member
++     * will be accessed by the method handle reference.
++     */
++    public static class MemberReferenceSymbol extends DelegatedSymbol {
++        public int referenceKind;  // e.g., ClassFile.REF_invokeStatic, etc.
++
++        public MemberReferenceSymbol(int referenceKind, Symbol member) {
++            super(member);
++            this.referenceKind = referenceKind;
++        }
++
++        public int getReferenceKind() { return referenceKind; }
++        public Symbol getMember() { return other; }
++    }
++
++    /**
++     * A resolved invokedynamic expression.
++     * Owner is always java.dyn.InvokeDynamic.
++     */
++    public static class InvokeDynamicSymbol extends DelegatedSymbol {
++        public MemberReferenceSymbol bootstrapMethod;
++
++        public InvokeDynamicSymbol(MemberReferenceSymbol bootstrapMethod, MethodSymbol callMethod) {
++            super(callMethod);
++            this.bootstrapMethod = bootstrapMethod;
++        }
++
++        public MemberReferenceSymbol getBootstrapMethod() { return bootstrapMethod; }
++        public MethodSymbol getCallMethod() { return (MethodSymbol) other; }
++        public InvokeDynamicSymbol changeCallMethod(MethodSymbol callMethod) {
++            return new InvokeDynamicSymbol(bootstrapMethod, callMethod);
++        }
++    }
++
+     /** A class for predefined operators.
+      */
+     public static class OperatorSymbol extends MethodSymbol {
+diff --git a/src/share/classes/com/sun/tools/javac/code/Symtab.java b/src/share/classes/com/sun/tools/javac/code/Symtab.java
+--- a/src/share/classes/com/sun/tools/javac/code/Symtab.java
++++ b/src/share/classes/com/sun/tools/javac/code/Symtab.java
+@@ -119,9 +119,11 @@
+     public final Type stringBuilderType;
+     public final Type cloneableType;
+     public final Type serializableType;
++    public final Type methodTypeType;
+     public final Type methodHandleType;
+     public final Type polymorphicSignatureType;
+     public final Type invokeDynamicType;
++    public final Type bootstrapMethodType;
+     public final Type throwableType;
+     public final Type errorType;
+     public final Type illegalArgumentExceptionType;
+@@ -412,9 +414,11 @@
+         cloneableType = enterClass("java.lang.Cloneable");
+         throwableType = enterClass("java.lang.Throwable");
+         serializableType = enterClass("java.io.Serializable");
++        methodTypeType = enterClass("java.dyn.MethodType");
+         methodHandleType = enterClass("java.dyn.MethodHandle");
+         polymorphicSignatureType = enterClass("java.dyn.MethodHandle$PolymorphicSignature");
+         invokeDynamicType = enterClass("java.dyn.InvokeDynamic");
++        bootstrapMethodType = enterClass("java.dyn.BootstrapMethod");
+         errorType = enterClass("java.lang.Error");
+         illegalArgumentExceptionType = enterClass("java.lang.IllegalArgumentException");
+         exceptionType = enterClass("java.lang.Exception");
+@@ -458,6 +462,7 @@
+         synthesizeEmptyInterfaceIfMissing(cloneableType);
+         synthesizeEmptyInterfaceIfMissing(serializableType);
+         synthesizeEmptyInterfaceIfMissing(polymorphicSignatureType);
++        synthesizeEmptyInterfaceIfMissing(bootstrapMethodType);
+         synthesizeBoxTypeIfMissing(doubleType);
+         synthesizeBoxTypeIfMissing(floatType);
+         synthesizeBoxTypeIfMissing(voidType);
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Attr.java b/src/share/classes/com/sun/tools/javac/comp/Attr.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Attr.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Attr.java
+@@ -1421,6 +1421,23 @@
+             }
+ 
+             // Special case logic for JSR 292 types.
++            if (rs.recognizeInvokeDynamic && tree.meth.getTag() == JCTree.SELECT) {
++                JCFieldAccess mfield = (JCFieldAccess) tree.meth;
++                // InvokeDynamic requires an enclosing annotation @BootstrapMethod.
++                if (mfield.selected.type == syms.invokeDynamicType) {
++                    Symbol bsm = resolveBootstrapMethod(tree);
++                    if (!(bsm instanceof MemberReferenceSymbol)) {
++                        if (!bsm.type.isErroneous()) {
++                            if (rs.allowTransitionalJSR292)
++                                log.warning(tree.pos(), "invokedynamic.must.have.bootstrap.method");
++                            else
++                                log.error(tree.pos(), "invokedynamic.must.have.bootstrap.method");
++                        }
++                        bsm = null;
++                    }
++                    mfield.sym = new InvokeDynamicSymbol((MemberReferenceSymbol) bsm, (MethodSymbol) mfield.sym);
++                }
++            }
+             if (rs.allowTransitionalJSR292 && tree.meth.getTag() == JCTree.SELECT && !typeargtypes.isEmpty()) {
+                 JCFieldAccess mfield = (JCFieldAccess) tree.meth;
+                 // MethodHandle.<T>invoke(abc) and InvokeDynamic.<T>foo(abc)
+@@ -1471,6 +1488,121 @@
+             return (typeargtypes == null) ? mt : (Type)new ForAll(typeargtypes, mt);
+         }
+ 
++    /**
++     * Resolve the bootstrap method for an invokedynamic site.
++     * The method is specified by @BootstrapMethod annotation on the
++     * InvokeDynamic's type parameter, or else on an enclosing definition.
++     * Return noSymbol or errSymbol on failure.
++     */
++    Symbol resolveBootstrapMethod(JCMethodInvocation tree) {
++        assert rs.recognizeInvokeDynamic;
++        Attribute.Compound bsm = findBootstrapMethod(env);  // look it up in the environment
++        if (bsm == null)  return syms.noSymbol;
++        assert bsm.type.tsym == syms.bootstrapMethodType.tsym;
++        int bsmPos = tree.pos;  //FIXME: put this on the @BootstrapMethod anno.
++
++        // Extract the following:
++        // - class containing bootstrap method
++        // - name of bootstrap method (or null string, for new & <init>)
++        // - argument types of bootstrap method
++        MethodSymbol[] attrSyms = bootstrapMethodAnnotationSyms();
++        if (attrSyms == null)  return syms.noSymbol;  // no structure to decode
++        Object[] values = new Object[attrSyms.length];
++        for (int i = 0; i < attrSyms.length; i++) {
++            Attribute m = bsm.member(attrSyms[i].name);
++            if (m == null)  m = attrSyms[i].defaultValue;
++            values[i] = (m == null) ? null : m.getValue();
++        }
++        ClassType classValue = (values[0] instanceof ClassType) ? (ClassType) values[0] : null;
++        String    nameValue  = (values[1] instanceof String)    ? (String)    values[1] : null;
++        List<?>   argsValue  = (values[2] instanceof List<?>)   ? (List<?>)   values[2] : null;
++        Name methName = null;
++        if (nameValue != null)
++            methName = nameValue.equals("") ? names.init : names.fromString(nameValue);
++        List<JCExpression> sampleArgs = null;
++        if (argsValue != null) {
++            ListBuffer<JCExpression> buf = new ListBuffer<JCExpression>();
++            for (Object ta : argsValue) {
++                if (ta instanceof Attribute) {
++                    Object tval = ((Attribute)ta).getValue();
++                    if (tval instanceof Type) {
++                        Type t = (Type) tval;
++                        buf.append(make.at(bsmPos).ZeroLiteral(t));
++                        continue;
++                    }
++                }
++                // If something goes wrong, fall through here.
++                buf = null;
++                break;
++            }
++            if (buf != null)  sampleArgs = buf.toList();
++        }
++        if (classValue == null || methName == null || sampleArgs == null)
++            return syms.noSymbol;
++        boolean isConstructor = (methName == names.init);
++        JCExpression bootm;
++        if (!isConstructor)
++            bootm = make.at(bsmPos).Apply(null,
++                                          make.Select(make.Type(classValue), methName),
++                                          sampleArgs);
++        else
++            bootm = make.at(bsmPos).NewClass(null, null,
++                                             make.Type(classValue),
++                                             sampleArgs, null);
++        Env<AttrContext> localEnv = env.enclosing(JCTree.CLASSDEF);
++        localEnv = localEnv.dup(tree, localEnv.info.dup());
++        Type bsmtype = attribExpr(make.TypeCast(syms.objectType, bootm), localEnv);
++        if (bsmtype.isErroneous())  return syms.errSymbol;
++        Symbol bootsym;
++        if (!isConstructor)
++            bootsym = TreeInfo.symbol(((JCMethodInvocation)bootm).meth);
++        else
++            bootsym = ((JCNewClass)bootm).constructor;
++        if (!(bootsym instanceof MethodSymbol))  return bootsym;
++        //System.out.println("resolved bsm: "+bootsym);
++        assert isConstructor == bootsym.isConstructor();
++        int refKind = isConstructor ? ClassFile.REF_newInvokeSpecial : ClassFile.REF_invokeStatic;
++        return new MemberReferenceSymbol(refKind, bootsym);
++    }
++    /** Find a default @BootstrapMethod on an enclosing declaration, method, or class. */
++    private Attribute.Compound findBootstrapMethod(Env<AttrContext> innerEnv) {
++        assert rs.recognizeInvokeDynamic;
++        // Look in the enclosing scopes for a default @BootstrapMethod annotation.
++        for (Env<AttrContext> env = innerEnv; env.outer != null; env = env.outer) {
++            Attribute.Compound bsm;
++            if (env.tree.getTag() == JCTree.VARDEF) {
++                bsm = ((JCVariableDecl) env.tree).sym.attribute(syms.bootstrapMethodType.tsym);
++                if (bsm != null)  return bsm;
++            }
++            if (env.enclMethod != null) {
++                bsm = env.enclMethod.sym.attribute(syms.bootstrapMethodType.tsym);
++                if (bsm != null)  return bsm;
++            }
++            bsm = env.enclClass.sym.attribute(syms.bootstrapMethodType.tsym);
++            if (bsm != null)  return bsm;
++        }
++        return null;
++    }
++    /** Symbols needed for destructuring a @BootstrapMethod annotation. */
++    private MethodSymbol[] bootstrapMethodAnnotationSyms() {
++        assert rs.recognizeInvokeDynamic;
++        if (bootstrapMethodAnnotationSyms == null) {
++            Scope members = syms.bootstrapMethodType.tsym.members();
++            Name[] elems = { names.value, names._name, names.arguments };
++            MethodSymbol[] syms = new MethodSymbol[elems.length];
++            for (int i = 0; i < elems.length; i++) {
++                Scope.Entry e = members.lookup(elems[i]);
++                if (e.sym instanceof MethodSymbol)
++                    syms[i] = (MethodSymbol) e.sym;
++                else
++                    return null;
++            }
++            bootstrapMethodAnnotationSyms = syms;
++        }
++        return bootstrapMethodAnnotationSyms;
++    }
++    private MethodSymbol[] bootstrapMethodAnnotationSyms;  // cache for decoding @BootstrapMethod
++
+     public void visitNewClass(JCNewClass tree) {
+         Type owntype = types.createErrorType(tree.type);
+ 
+@@ -2019,14 +2151,24 @@
+             if (meth.getTag() == JCTree.SELECT) {
+                 JCFieldAccess methsel = (JCFieldAccess)meth;
+                 if (rs.isPolymorphicSignatureInstance(methsel.sym)) {
+-                    MethodSymbol sym = (MethodSymbol) methsel.sym;
++                    MethodSymbol sym;
++                    InvokeDynamicSymbol indysym = null;
++                    if (methsel.sym instanceof InvokeDynamicSymbol)
++                        indysym = (InvokeDynamicSymbol)methsel.sym;
++                    if (indysym != null)
++                        sym = indysym.getCallMethod();
++                    else
++                        sym = (MethodSymbol)methsel.sym;
+                     MethodType oldType = sym.type.asMethodType();
+                     Symbol newSym = rs.findPolymorphicSignatureInstance(sym.owner.type, sym.name, sym,
+                                                                         returnType,
+                                                                         oldType.argtypes);
+                     if (!rs.isPolymorphicSignatureInstance(newSym))
+                         throw new AssertionError("can't split poly sym: "+sym);
+-                    methsel.sym = newSym;
++                    if (indysym != null)
++                        methsel.sym = indysym.changeCallMethod((MethodSymbol) newSym);
++                    else
++                        methsel.sym = (MethodSymbol) newSym;
+                     expr.type = returnType;
+                 }
+             }
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/ClassFile.java b/src/share/classes/com/sun/tools/javac/jvm/ClassFile.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/ClassFile.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/ClassFile.java
+@@ -81,6 +81,20 @@
+     public final static int CONSTANT_InterfaceMethodref = 11;
+     public final static int CONSTANT_NameandType = 12;
+ 
++    public final static int CONSTANT_MethodHandle = 15;
++    public final static int CONSTANT_MethodType = 16;
++    public final static int CONSTANT_InvokeDynamic = 17;
++
++    public final static int REF_getField = 1;
++    public final static int REF_getStatic = 2;
++    public final static int REF_putField = 3;
++    public final static int REF_putStatic = 4;
++    public final static int REF_invokeVirtual = 5;
++    public final static int REF_invokeStatic = 6;
++    public final static int REF_invokeSpecial = 7;
++    public final static int REF_newInvokeSpecial = 8;
++    public final static int REF_invokeInterface = 9;
++
+     public final static int MAX_PARAMETERS = 0xff;
+     public final static int MAX_DIMENSIONS = 0xff;
+     public final static int MAX_CODE = 0xffff;
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java b/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
+@@ -48,6 +48,7 @@
+ import com.sun.tools.javac.code.Symbol.*;
+ import com.sun.tools.javac.code.Symtab;
+ import com.sun.tools.javac.file.BaseFileObject;
++import com.sun.tools.javac.jvm.Pool.*;
+ import com.sun.tools.javac.util.*;
+ 
+ import static com.sun.tools.javac.code.Flags.*;
+@@ -426,6 +427,15 @@
+                 bp = bp + 8;
+                 i++;
+                 break;
++            case CONSTANT_MethodHandle:
++                bp = bp + 3;
++                break;
++            case CONSTANT_MethodType:
++                bp = bp + 2;
++                break;
++            case CONSTANT_InvokeDynamic:
++                bp = bp + 4;
++                break;
+             default:
+                 throw badClassFile("bad.const.pool.tag.at",
+                                    Byte.toString(tag),
+@@ -487,6 +497,43 @@
+         case CONSTANT_Double:
+             poolObj[i] = new Double(getDouble(index + 1));
+             break;
++        case CONSTANT_MethodHandle: {
++            byte refKind = buf[index+1];
++            int refIndex = getChar(index+2);
++            Symbol member = null;
++            switch (refKind) {
++            case REF_getField:
++            case REF_getStatic:
++            case REF_putField:
++            case REF_putStatic:
++                member = (VarSymbol)readPool(refIndex);
++                break;
++            case REF_invokeVirtual:
++            case REF_invokeStatic:
++            case REF_invokeSpecial:
++            case REF_newInvokeSpecial:
++            case REF_invokeInterface:
++                member = (MethodSymbol)readPool(refIndex);
++                break;
++            default:
++                throw badClassFile("bad.const.pool.tag",
++                        "CONSTANT_MethodHandle/"+Byte.toString(refKind));
++            }
++            poolObj[i] = new MemberReference(refKind, member);
++            break;
++        }
++        case CONSTANT_MethodType: {
++            Type sigType = readType(getChar(index + 1));
++            poolObj[i] = new TypeReference(sigType.asMethodType());
++            break;
++        }
++        case CONSTANT_InvokeDynamic: {
++            MemberReference bsm  = (MemberReference) readPool(getChar(index + 1));
++            NameAndType     nt   = (NameAndType)     readPool(getChar(index + 3));
++            MethodSymbol    call = new MethodSymbol(0, nt.name, nt.type, syms.invokeDynamicType.tsym);
++            poolObj[i] = new InvokeDynamic(bsm, call);
++            break;
++        }
+         default:
+             throw badClassFile("bad.const.pool.tag", Byte.toString(tag));
+         }
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/ClassWriter.java b/src/share/classes/com/sun/tools/javac/jvm/ClassWriter.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/ClassWriter.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/ClassWriter.java
+@@ -529,6 +529,23 @@
+                 if (type.tag == CLASS) enterInner((ClassSymbol)type.tsym);
+                 poolbuf.appendByte(CONSTANT_Class);
+                 poolbuf.appendChar(pool.put(xClassName(type)));
++            } else if (value instanceof Pool.MemberReference) {
++                Pool.MemberReference ref = (Pool.MemberReference)value;
++                poolbuf.appendByte(CONSTANT_MethodHandle);
++                poolbuf.appendByte(ref.refKind);
++                poolbuf.appendChar(pool.put(ref.member));
++            } else if (value instanceof Pool.TypeReference) {
++                Pool.TypeReference ref = (Pool.TypeReference)value;
++                poolbuf.appendByte(CONSTANT_MethodType);
++                poolbuf.appendChar(pool.put(typeSig(ref.type)));
++            } else if (value instanceof Pool.InvokeDynamic) {
++                Pool.InvokeDynamic indy = (Pool.InvokeDynamic)value;
++                poolbuf.appendByte(CONSTANT_InvokeDynamic);
++                if (indy.bootstrapMethod == null) //allowTransitionalJSR292 only
++                    poolbuf.appendChar(0);
++                else
++                    poolbuf.appendChar(pool.put(indy.bootstrapMethod));
++                poolbuf.appendChar(pool.put(nameType(indy.callMethod)));
+             } else {
+                 assert false : "writePool " + value;
+             }
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/Code.java b/src/share/classes/com/sun/tools/javac/jvm/Code.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Code.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/Code.java
+@@ -898,6 +898,8 @@
+         if (o instanceof Double) return syms.doubleType;
+         if (o instanceof ClassSymbol) return syms.classType;
+         if (o instanceof Type.ArrayType) return syms.classType;
++        if (o instanceof Pool.MemberReference) return syms.methodHandleType;
++        if (o instanceof Pool.TypeReference) return syms.methodTypeType;
+         throw new AssertionError(o);
+     }
+ 
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/Gen.java b/src/share/classes/com/sun/tools/javac/jvm/Gen.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Gen.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/Gen.java
+@@ -2200,7 +2200,8 @@
+                 makeImmediateItem(sym.type, ((VarSymbol) sym).getConstValue());
+         } else if (allowInvokedynamic && sym.kind == MTH && ssym == syms.invokeDynamicType.tsym) {
+             base.drop();
+-            result = items.makeDynamicItem(sym);
++            assert sym == null || sym instanceof InvokeDynamicSymbol;
++            result = items.makeDynamicItem((InvokeDynamicSymbol) sym);
+         } else {
+             if (!accessSuper)
+                 sym = binaryQualifier(sym, tree.selected.type);
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/Items.java b/src/share/classes/com/sun/tools/javac/jvm/Items.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Items.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/Items.java
+@@ -140,10 +140,9 @@
+     }
+ 
+     /** Make an item representing a dynamically invoked method.
+-     *  @param member   The represented symbol.
+      */
+-    Item makeDynamicItem(Symbol member) {
+-        return new DynamicItem(member);
++    Item makeDynamicItem(InvokeDynamicSymbol indy) {
++        return new DynamicItem(indy);
+     }
+ 
+     /** Make an item representing an instance variable or method.
+@@ -467,8 +466,8 @@
+     /** An item representing a dynamic call site.
+      */
+     class DynamicItem extends StaticItem {
+-        DynamicItem(Symbol member) {
+-            super(member);
++        DynamicItem(InvokeDynamicSymbol indy) {
++            super(indy);
+             assert member.owner == syms.invokeDynamicType.tsym;
+         }
+ 
+@@ -483,10 +482,13 @@
+ 
+         Item invoke() {
+             // assert target.hasNativeInvokeDynamic();
+-            MethodType mtype = (MethodType)member.erasure(types);
++            InvokeDynamicSymbol indy = (InvokeDynamicSymbol) member;
++            MethodType mtype = (MethodType)indy.erasure(types);
+             int rescode = Code.typecode(mtype.restype);
+-            ClassFile.NameAndType descr = new ClassFile.NameAndType(member.name, mtype);
+-            code.emitInvokedynamic(pool.put(descr), mtype);
++            if (indy.getBootstrapMethod() == null) //allowTransitionalJSR292 only
++                code.emitInvokedynamic(pool.put(new ClassFile.NameAndType(indy.name, mtype)), mtype);
++            else
++                code.emitInvokedynamic(pool.put(new Pool.InvokeDynamic(indy)), mtype);
+             return stackItem[rescode];
+         }
+ 
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/Pool.java b/src/share/classes/com/sun/tools/javac/jvm/Pool.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Pool.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/Pool.java
+@@ -25,9 +25,13 @@
+ 
+ package com.sun.tools.javac.jvm;
+ 
++import com.sun.tools.javac.code.Flags;
++import com.sun.tools.javac.code.Kinds;
+ import java.util.*;
+ 
++import com.sun.tools.javac.code.Symbol;
+ import com.sun.tools.javac.code.Symbol.*;
++import com.sun.tools.javac.code.Type;
+ 
+ /** An internal structure that corresponds to the constant pool of a classfile.
+  *
+@@ -96,10 +100,8 @@
+      *  package.  Return the object's index in the pool.
+      */
+     public int put(Object value) {
+-        if (value instanceof MethodSymbol)
+-            value = new Method((MethodSymbol)value);
+-        else if (value instanceof VarSymbol)
+-            value = new Variable((VarSymbol)value);
++        if (value instanceof Symbol && !(value instanceof ClassSymbol))
++            value = delegateSymbol((Symbol) value);
+ //      assert !(value instanceof Type.TypeVar);
+         Integer index = indices.get(value);
+         if (index == null) {
+@@ -116,6 +118,28 @@
+         return index.intValue();
+     }
+ 
++    static Object delegateSymbol(Symbol value) {
++        if (value instanceof MethodSymbol)
++            return new Method((MethodSymbol)value);
++        else if (value instanceof VarSymbol)
++            return new Variable((VarSymbol)value);
++        else
++            throw new AssertionError();
++    }
++
++    static boolean symbolsEqual(Symbol a, Symbol b) {
++        return
++            a.name == b.name &&
++            a.owner == b.owner &&
++            a.type.equals(b.type);
++    }
++    static int symbolHash(Symbol a) {
++        return
++            a.name.hashCode() * 33 +
++            a.owner.hashCode() * 9 +
++            a.type.hashCode();
++    }
++
+     /** Return the given object's index in the pool,
+      *  or -1 if object is not in there.
+      */
+@@ -133,16 +157,10 @@
+         public boolean equals(Object other) {
+             if (!(other instanceof Method)) return false;
+             MethodSymbol o = ((Method)other).m;
+-            return
+-                o.name == m.name &&
+-                o.owner == m.owner &&
+-                o.type.equals(m.type);
++            return symbolsEqual(o, m);
+         }
+         public int hashCode() {
+-            return
+-                m.name.hashCode() * 33 +
+-                m.owner.hashCode() * 9 +
+-                m.type.hashCode();
++            return symbolHash(m);
+         }
+     }
+ 
+@@ -155,16 +173,142 @@
+         public boolean equals(Object other) {
+             if (!(other instanceof Variable)) return false;
+             VarSymbol o = ((Variable)other).v;
+-            return
+-                o.name == v.name &&
+-                o.owner == v.owner &&
+-                o.type.equals(v.type);
++            return symbolsEqual(o, v);
++        }
++        public int hashCode() {
++            return symbolHash(v);
++        }
++    }
++
++    static class TypeReference {
++        Type.MethodType type;
++        TypeReference(Type.MethodType type) {
++            this.type = type;
++        }
++        public boolean equals(Object other) {
++            if (!(other instanceof TypeReference)) return false;
++            return this.type.equals(((TypeReference)other).type);
++        }
++        public int hashCode() {
++            return type.hashCode();
++        }
++    }
++
++    static class MemberReference {
++        int refKind;  // e.g., ClassFile.REF_invokeStatic, etc.
++        Symbol member;
++        MemberReference(int refKind, Symbol member) {
++            this.refKind = refKind;
++            this.member = member;
++            assert isConsistent();
++        }
++        MemberReference(MemberReferenceSymbol refSym) {
++            this(refSym.getReferenceKind(), refSym.getMember());
++        }
++        static MemberReference from(MemberReferenceSymbol value) {
++            return value == null ? null : new MemberReference(value);
++        }
++
++        public boolean equals(Object other) {
++            if (!(other instanceof MemberReference)) return false;
++            MemberReference mr = (MemberReference) other;
++            return mr.refKind == refKind &&
++                symbolsEqual(mr.member, member);
+         }
+         public int hashCode() {
+             return
+-                v.name.hashCode() * 33 +
+-                v.owner.hashCode() * 9 +
+-                v.type.hashCode();
++                refKind * 65 +
++                symbolHash(member);
++        }
++
++        public static int fieldRefKind(boolean isStatic, boolean isSetter) {
++            if (!isSetter)
++                return isStatic ? ClassFile.REF_getStatic : ClassFile.REF_getField;
++            else
++                return isStatic ? ClassFile.REF_putStatic : ClassFile.REF_putField;
++        }
++        public static int methodRefKind(boolean isStatic, boolean isInterface) {
++            if (isStatic)
++                return ClassFile.REF_invokeStatic;
++            else if (isInterface)
++                return ClassFile.REF_invokeInterface;
++            else
++                return ClassFile.REF_invokeVirtual;
++        }
++        public static int specialRefKind(boolean isConstructor) {
++            if (!isConstructor)
++                return ClassFile.REF_invokeSpecial;
++            else
++                return ClassFile.REF_newInvokeSpecial;
++        }
++        private boolean isConsistent() {
++            // Check consistency of reference kind and symbol.
++            // Methods invoked, fields get/put; static must match, etc.
++            // This code is used when assertions are enabled.
++            boolean isStatic = member.isStatic();
++            int expectedRefKind;
++            switch (member.kind) {
++            case Kinds.VAR:
++                expectedRefKind = fieldRefKind(isStatic, false);
++                if (refKind == expectedRefKind)
++                    return true;
++                if ((member.flags() & Flags.FINAL) == 0) {
++                    // Could be a field setter.
++                    if (refKind == fieldRefKind(isStatic, true))
++                        return true;
++                }
++                break;
++            case Kinds.MTH:
++                if (member.isConstructor())
++                    return (refKind == specialRefKind(true));
++                expectedRefKind = methodRefKind(isStatic, member.owner.isInterface());
++                if (refKind == expectedRefKind)
++                    return true;
++                if (expectedRefKind == ClassFile.REF_invokeVirtual
++                         && refKind == ClassFile.REF_invokeSpecial)
++                    return true;  // assume access is OK
++                break;
++            }
++            return false;
++        }
++    }
++
++    /** A class for the properties of an invokedynamic instruction.
++     */
++    static class InvokeDynamic {
++        MemberReference bootstrapMethod;
++        MethodSymbol    callMethod;
++
++        InvokeDynamic(MemberReference bootstrapMethod, MethodSymbol callMethod) {
++            this.bootstrapMethod = bootstrapMethod;
++            this.callMethod = callMethod;
++        }
++
++        InvokeDynamic(InvokeDynamicSymbol value) {
++            this(MemberReference.from(value.getBootstrapMethod()), value.getCallMethod());
++        }
++
++        MemberReference getBootstrapMethod() {
++            return bootstrapMethod;
++        }
++
++        MethodSymbol getCallMethod() {
++            return callMethod;
++        }
++
++        public boolean equals(Object other) {
++            if (!(other instanceof InvokeDynamic)) return false;
++            InvokeDynamic indy = (InvokeDynamic) other;
++            if (bootstrapMethod == null)
++                return indy.bootstrapMethod == null &&
++                    symbolsEqual(callMethod, indy.callMethod);
++            return
++                bootstrapMethod.equals(indy.bootstrapMethod) &&
++                symbolsEqual(callMethod, indy.callMethod);
++        }
++
++        public int hashCode() {
++            return (bootstrapMethod == null ? 0 : bootstrapMethod.hashCode() << 8) ^ symbolHash(callMethod);
+         }
+     }
+ }
+diff --git a/src/share/classes/com/sun/tools/javac/parser/JavacParser.java b/src/share/classes/com/sun/tools/javac/parser/JavacParser.java
+--- a/src/share/classes/com/sun/tools/javac/parser/JavacParser.java
++++ b/src/share/classes/com/sun/tools/javac/parser/JavacParser.java
+@@ -1186,8 +1186,7 @@
+                     return illegal(pos);
+                 }
+             } else {
+-                // Support the corner case of myMethodHandle.<void>invoke() by passing
+-                // a void type (like other primitive types) to the next phase.
++                // Treat void like a primitive type in the parser.
+                 // The error will be reported in Attr.attribTypes or Attr.visitApply.
+                 JCPrimitiveTypeTree ti = to(F.at(pos).TypeIdent(TypeTags.VOID));
+                 S.nextToken();
+diff --git a/src/share/classes/com/sun/tools/javac/resources/compiler.properties b/src/share/classes/com/sun/tools/javac/resources/compiler.properties
+--- a/src/share/classes/com/sun/tools/javac/resources/compiler.properties
++++ b/src/share/classes/com/sun/tools/javac/resources/compiler.properties
+@@ -133,6 +133,11 @@
+ compiler.warn.wrong.target.for.polymorphic.signature.definition=\
+     MethodHandle API building requires -target 7 runtimes or better; current is -target {0}
+ 
++compiler.err.invokedynamic.must.have.bootstrap.method=\
++    InvokeDynamic calls must be in scope of a @BootstrapMethod annotation
++compiler.warn.invokedynamic.must.have.bootstrap.method=\
++    InvokeDynamic calls must be in scope of a @BootstrapMethod annotation (registerBootstrapMethod is deprecated)
++
+ compiler.err.concrete.inheritance.conflict=\
+     methods {0} from {1} and {2} from {3} are inherited with the same signature
+ 
+diff --git a/src/share/classes/com/sun/tools/javac/tree/TreeMaker.java b/src/share/classes/com/sun/tools/javac/tree/TreeMaker.java
+--- a/src/share/classes/com/sun/tools/javac/tree/TreeMaker.java
++++ b/src/share/classes/com/sun/tools/javac/tree/TreeMaker.java
+@@ -751,6 +751,27 @@
+         return result;
+     }
+ 
++    /** Make a zero or null of the given type. */
++    public JCExpression ZeroLiteral(Type type) {
++        JCExpression zero;
++        switch (type.tag) {
++        case BOOLEAN:
++            zero = Literal(Boolean.FALSE);
++            break;
++        case CLASS:
++        case ARRAY:
++            zero = Literal(BOT, null);
++            break;
++        default:
++            if (type.tag < CLASS) {
++                zero = Literal(INT, Integer.valueOf(0));
++                break;
++            }
++            throw new AssertionError(type);
++        }
++        return TypeCast(type, zero);
++    }
++
+     class AnnotationBuilder implements Attribute.Visitor {
+         JCExpression result = null;
+         public void visitConstant(Attribute.Constant v) {
+diff --git a/src/share/classes/com/sun/tools/javac/util/Names.java b/src/share/classes/com/sun/tools/javac/util/Names.java
+--- a/src/share/classes/com/sun/tools/javac/util/Names.java
++++ b/src/share/classes/com/sun/tools/javac/util/Names.java
+@@ -116,6 +116,7 @@
+     public final Name getMessage;
+     public final Name getClass;
+     public final Name invoke;  //allowTransitionalJSR292 only
++    public final Name arguments;
+     public final Name TYPE;
+     public final Name TYPE_USE;
+     public final Name TYPE_PARAMETER;
+@@ -230,6 +231,7 @@
+         getMessage = fromString("getMessage");
+         getClass = fromString("getClass");
+         invoke = fromString("invoke");  //allowTransitionalJSR292 only
++        arguments = fromString("arguments");
+ 
+         TYPE = fromString("TYPE");
+         TYPE_USE = fromString("TYPE_USE");
+diff --git a/src/share/classes/com/sun/tools/javap/ConstantWriter.java b/src/share/classes/com/sun/tools/javap/ConstantWriter.java
+--- a/src/share/classes/com/sun/tools/javap/ConstantWriter.java
++++ b/src/share/classes/com/sun/tools/javap/ConstantWriter.java
+@@ -128,6 +128,27 @@
+                 return 1;
+             }
+ 
++            public Integer visitMethodHandle(CONSTANT_MethodHandle_info info, Void p) {
++                print("#" + info.ref_kind + ":#" + info.member_index);
++                tab();
++                println("//  " + stringValue(info));
++                return 1;
++            }
++
++            public Integer visitMethodType(CONSTANT_MethodType_info info, Void p) {
++                print("#" + info.signature_index);
++                tab();
++                println("//  " + stringValue(info));
++                return 1;
++            }
++
++            public Integer visitInvokeDynamic(CONSTANT_InvokeDynamic_info info, Void p) {
++                print("#" + info.bootstrap_method_index + ":#" + info.name_and_type_index);
++                tab();
++                println("//  " + stringValue(info));
++                return 1;
++            }
++
+         };
+         println("Constant pool:");
+         indent(+1);
+@@ -207,8 +228,14 @@
+                 return "InterfaceMethod";
+             case CONSTANT_NameAndType:
+                 return "NameAndType";
++            case CONSTANT_MethodHandle:
++                return "MethodHandle";
++            case CONSTANT_MethodType:
++                return "MethodType";
++            case CONSTANT_InvokeDynamic:
++                return "InvokeDynamic";
+             default:
+-                return "(unknown tag)";
++                return "(unknown tag "+ tag + ")";
+         }
+     }
+ 
+@@ -327,6 +354,34 @@
+             return sb.toString();
+         }
+ 
++        public String visitMethodHandle(CONSTANT_MethodHandle_info info, Void p) {
++            try {
++                return refKindName(info.ref_kind)+" "+stringValue(info.getCPRefInfo());
++            } catch (ConstantPoolException e) {
++                return report(e);
++            }
++        }
++
++        public String visitMethodType(CONSTANT_MethodType_info info, Void p) {
++            try {
++                return info.getType();
++            } catch (ConstantPoolException e) {
++                return report(e);
++            }
++        }
++
++        public String visitInvokeDynamic(CONSTANT_InvokeDynamic_info info, Void p) {
++            try {
++                String callee = stringValue(info.getNameAndTypeInfo());
++                CPInfo bsm = info.getBootstrapMethodInfo();
++                if (bsm == null)
++                    return callee+" {bootstrap=null}";
++                return callee+" {bootstrap="+stringValue(info.getBootstrapMethodInfo())+"}";
++            } catch (ConstantPoolException e) {
++                return report(e);
++            }
++        }
++
+         String visitRef(CPRefInfo info, Void p) {
+             String cn = getCheckedClassName(info);
+             String nat;
+@@ -347,6 +402,21 @@
+         }
+     }
+ 
++    String refKindName(int ref_kind) {
++        switch (ref_kind) {
++        case REF_getField: return "getField";
++        case REF_getStatic: return "getStatic";
++        case REF_putField: return "putField";
++        case REF_putStatic: return "putStatic";
++        case REF_invokeVirtual: return "invokeVirtual";
++        case REF_invokeStatic: return "invokeStatic";
++        case REF_invokeSpecial: return "invokeSpecial";
++        case REF_newInvokeSpecial: return "newInvokeSpecial";
++        case REF_invokeInterface: return "invokeInterface";
++        }
++        return "(unknown kind "+ref_kind+")";
++    }
++
+ 
+     /* If name is a valid binary name, return it; otherwise quote it. */
+     private static String checkName(String name) {
+diff --git a/test/tools/javac/meth/IndyLocalBootstrap.java b/test/tools/javac/meth/IndyLocalBootstrap.java
+new file mode 100644
+--- /dev/null
++++ b/test/tools/javac/meth/IndyLocalBootstrap.java
+@@ -0,0 +1,144 @@
++/*
++ * Copyright 2010 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ */
++
++/*
++ * @test
++ * @bug 6964498
++ * @summary Test localized bootstrap methods
++ * @author jrose
++ *
++ * @library ..
++ * @compile -source 7 -target 7 IndyLocalBootstrap.java
++ */
++//Not yet: @run main/othervm -XX:+EnableInvokeDynamic meth.IndyLocalBootstrap
++
++/*
++ * Standalone testing:
++ * <code>
++ * $ cd $MY_REPO_DIR/langtools
++ * $ (cd make; make)
++ * $ ./dist/bootstrap/bin/javac -d dist test/tools/javac/meth/IndyLocalBootstrap.java
++ * $ ./dist/bootstrap/bin/javap -c -classpath dist meth.IndyLocalBootstrap
++ * </code>
++ */
++
++package meth;
++
++import java.dyn.*;
++
++class IndyLocalBootstrap {
++    public static void main(String... args) throws Throwable {
++        new IndyLocalBootstrap().run(args);
++    }
++    void run(String... args) throws Throwable {
++        System.out.println("starting");
++        Foo.doFoo1();
++        System.out.println("one test done");
++        Foo.doFoo2();
++        System.out.println("last one");
++        doFoo3();
++        System.out.println("all done");
++        if (args.length > 0)
++            BadCases.doBad1();
++    }
++
++    @BootstrapMethod(value=IndyLocalBootstrap.class, name="classBSM")
++    static class Foo {
++        static Object doFoo1() throws Throwable {
++            return InvokeDynamic.foo2(2); //use classBSM
++        }
++
++        @BootstrapMethod(FancySite.class)
++        static void doFoo2() throws Throwable {
++            InvokeDynamic.<void>foo2("three"); //use FancySite
++        }
++    }
++
++    // /* //BAD
++    static //*/
++    private Object classBSM(Object caller, Object name, Object type) {
++        return new FancySite((Class)caller, (String)name, (MethodType)type, "IndyLocalBootstrap.classBSM");
++    }
++
++    private static class FancySite extends CallSite {
++        // Save some random parameters:
++        final String name;
++        final String whence;
++        private FancySite(Class<?> caller, String name, MethodType type) {
++            this(caller, name, type, "FancySite.<init>");
++        }
++        private FancySite(Class<?> caller, String name, MethodType type, String whence) {
++            this.name = name;
++            this.whence = whence;
++            MethodHandle handler = handler_MH.bindTo(this);  // = this#handler(...)
++            setTarget(MethodHandles.collectArguments(handler, type));
++        }
++
++        private Object handler(Object... args) {
++            System.out.println("Fancy call (BSM from "+whence+") "+name+getTarget().type()+" "+java.util.Arrays.asList(args));
++            return null;
++        }
++
++        private static final MethodHandle handler_MH;
++        static {
++            MethodHandles.Lookup lookup = MethodHandles.lookup();
++            handler_MH = // FancySite#handler(...)
++                lookup.findVirtual(lookup.lookupClass(), "handler",
++                    MethodType.methodType(Object.class, Object[].class));
++        }
++
++        // test inner class access to privates
++        private static CallSite make(Class<?> caller, String name, MethodType type) {
++            return new FancySite(caller, name, type, "FancySite.make");
++        }
++    }
++
++    static Object doFoo3() throws Throwable {
++        @BootstrapMethod(value=IndyLocalBootstrap.FancySite.class, name="make")
++        Object junk = InvokeDynamic.foo3();
++        return junk;
++    }
++
++    @BootstrapMethod(value=IndyLocalBootstrap.class, name="classBSM")
++    static class BadCases {
++        static Object doBad1() throws Throwable {
++            try {
++                @BootstrapMethod(value=java.util.Arrays.class, name="asList")
++                Object junk = InvokeDynamic.bad1();
++                throw new RuntimeException("unexpected return: "+junk);
++            } catch (ClassCastException ex) {
++                return ex;  // should reach here!
++            }
++        }
++
++        //@BootstrapMethod(value=String.class, name="no.such.method") //BAD
++        static void doBad2() throws Throwable {
++            InvokeDynamic.bad2();
++        }
++
++        //@BootstrapMethod(value=String.class, name="toString") //BAD
++        static void doBad3() throws Throwable {
++            InvokeDynamic.bad3();
++        }
++    }
++}

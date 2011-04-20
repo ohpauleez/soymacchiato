@@ -1,0 +1,16 @@
+6981777: implement JSR 292 EG adjustments from summer 2010
+Summary: Small bug fix to make "raw" adapters work for JDK changes under 6981777
+Reviewed-by: twisti
+
+diff --git a/src/share/vm/prims/methodHandles.cpp b/src/share/vm/prims/methodHandles.cpp
+--- a/src/share/vm/prims/methodHandles.cpp
++++ b/src/share/vm/prims/methodHandles.cpp
+@@ -975,6 +975,8 @@
+   assert(src != T_VOID && dst != T_VOID, "should not be here");
+   if (src == dst)  return true;
+   if (type2size[src] != type2size[dst])  return false;
++  if (src == T_OBJECT || dst == T_OBJECT)  return false;
++  if (raw)  return true;  // bitwise reinterpretation; caller guarantees safety
+   // allow reinterpretation casts for integral widening
+   if (is_subword_type(src)) { // subwords can fit in int or other subwords
+     if (dst == T_INT)         // any subword fits in an int

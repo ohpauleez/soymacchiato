@@ -1,0 +1,209 @@
+pushed to jdk7
+6912063: inlining parameters need to be adjusted for some uses of the JVM
+Summary: Put all inline-related switches into product mode, to allow tuning by dynamic language implementors.
+Reviewed-by: twisti, kvn
+
+diff --git a/src/share/vm/opto/bytecodeInfo.cpp b/src/share/vm/opto/bytecodeInfo.cpp
+--- a/src/share/vm/opto/bytecodeInfo.cpp
++++ b/src/share/vm/opto/bytecodeInfo.cpp
+@@ -27,11 +27,16 @@
+ 
+ //=============================================================================
+ //------------------------------InlineTree-------------------------------------
+-InlineTree::InlineTree( Compile* c, const InlineTree *caller_tree, ciMethod* callee, JVMState* caller_jvms, int caller_bci, float site_invoke_ratio )
++InlineTree::InlineTree( Compile* c,
++                        const InlineTree *caller_tree, ciMethod* callee,
++                        JVMState* caller_jvms, int caller_bci,
++                        float site_invoke_ratio, int site_depth_adjust)
+ : C(c), _caller_jvms(caller_jvms),
+   _caller_tree((InlineTree*)caller_tree),
+   _method(callee), _site_invoke_ratio(site_invoke_ratio),
+-  _count_inline_bcs(method()->code_size()) {
++  _site_depth_adjust(site_depth_adjust),
++  _count_inline_bcs(method()->code_size())
++{
+   NOT_PRODUCT(_count_inlines = 0;)
+   if (_caller_jvms != NULL) {
+     // Keep a private copy of the caller_jvms:
+@@ -40,7 +45,7 @@
+     assert(!caller_jvms->should_reexecute(), "there should be no reexecute bytecode with inlining");
+   }
+   assert(_caller_jvms->same_calls_as(caller_jvms), "consistent JVMS");
+-  assert((caller_tree == NULL ? 0 : caller_tree->inline_depth() + 1) == inline_depth(), "correct (redundant) depth parameter");
++  assert((caller_tree == NULL ? 0 : caller_tree->stack_depth() + 1) == stack_depth(), "correct (redundant) depth parameter");
+   assert(caller_bci == this->caller_bci(), "correct (redundant) bci parameter");
+   if (UseOldInlining) {
+     // Update hierarchical counts, count_inline_bcs() and count_inlines()
+@@ -52,10 +57,13 @@
+   }
+ }
+ 
+-InlineTree::InlineTree(Compile* c, ciMethod* callee_method, JVMState* caller_jvms, float site_invoke_ratio)
++InlineTree::InlineTree(Compile* c, ciMethod* callee_method, JVMState* caller_jvms,
++                       float site_invoke_ratio, int site_depth_adjust)
+ : C(c), _caller_jvms(caller_jvms), _caller_tree(NULL),
+   _method(callee_method), _site_invoke_ratio(site_invoke_ratio),
+-  _count_inline_bcs(method()->code_size()) {
++  _site_depth_adjust(site_depth_adjust),
++  _count_inline_bcs(method()->code_size())
++{
+   NOT_PRODUCT(_count_inlines = 0;)
+   assert(!UseOldInlining, "do not use for old stuff");
+ }
+@@ -269,10 +277,13 @@
+     return msg;
+   }
+ 
+-  bool is_accessor = InlineAccessors && callee_method->is_accessor();
++  if (InlineAccessors && callee_method->is_accessor()) {
++    // accessor methods are not subject to any of the following limits.
++    return NULL;
++  }
+ 
+   // suppress a few checks for accessors and trivial methods
+-  if (!is_accessor && callee_method->code_size() > MaxTrivialSize) {
++  if (callee_method->code_size() > MaxTrivialSize) {
+ 
+     // don't inline into giant methods
+     if (C->unique() > (uint)NodeCountInliningCutoff) {
+@@ -291,7 +302,7 @@
+     }
+   }
+ 
+-  if (!C->do_inlining() && InlineAccessors && !is_accessor) {
++  if (!C->do_inlining() && InlineAccessors) {
+     return "not an accessor";
+   }
+   if( inline_depth() > MaxInlineLevel ) {
+@@ -464,7 +475,30 @@
+   if (old_ilt != NULL) {
+     return old_ilt;
+   }
+-  InlineTree *ilt = new InlineTree( C, this, callee_method, caller_jvms, caller_bci, recur_frequency );
++  int new_depth_adjust = 0;
++  if (caller_jvms->method() != NULL) {
++    if ((caller_jvms->method()->name() == ciSymbol::invoke_name() &&
++         caller_jvms->method()->holder()->name() == ciSymbol::java_dyn_MethodHandle())
++        || caller_jvms->method()->holder()->name() == ciSymbol::java_dyn_InvokeDynamic())
++      /* @@@ FIXME:
++    if (caller_jvms->method()->is_method_handle_adapter())
++      */
++      new_depth_adjust -= 1;  // don't count actions in MH or indy adapter frames
++    else if (callee_method->is_method_handle_invoke()) {
++      new_depth_adjust -= 1;  // don't count method handle calls from java.dyn implem
++    }
++    if (new_depth_adjust != 0 && PrintInlining) {
++      stringStream nm1; caller_jvms->method()->print_name(&nm1);
++      stringStream nm2; callee_method->print_name(&nm2);
++      tty->print_cr("discounting inlining depth from %s to %s", nm1.base(), nm2.base());
++    }
++    if (new_depth_adjust != 0 && C->log()) {
++      int id1 = C->log()->identify(caller_jvms->method());
++      int id2 = C->log()->identify(callee_method);
++      C->log()->elem("inline_depth_discount caller='%d' callee='%d'", id1, id2);
++    }
++  }
++  InlineTree *ilt = new InlineTree(C, this, callee_method, caller_jvms, caller_bci, recur_frequency, _site_depth_adjust + new_depth_adjust);
+   _subtrees.append( ilt );
+ 
+   NOT_PRODUCT( _count_inlines += 1; )
+@@ -490,7 +524,7 @@
+   Compile* C = Compile::current();
+ 
+   // Root of inline tree
+-  InlineTree *ilt = new InlineTree(C, NULL, C->method(), NULL, -1, 1.0F);
++  InlineTree *ilt = new InlineTree(C, NULL, C->method(), NULL, -1, 1.0F, 0);
+ 
+   return ilt;
+ }
+diff --git a/src/share/vm/opto/doCall.cpp b/src/share/vm/opto/doCall.cpp
+--- a/src/share/vm/opto/doCall.cpp
++++ b/src/share/vm/opto/doCall.cpp
+@@ -43,7 +43,9 @@
+ }
+ #endif
+ 
+-CallGenerator* Compile::call_generator(ciMethod* call_method, int vtable_index, bool call_is_virtual, JVMState* jvms, bool allow_inline, float prof_factor) {
++CallGenerator* Compile::call_generator(ciMethod* call_method, int vtable_index, bool call_is_virtual,
++                                       JVMState* jvms, bool allow_inline,
++                                       float prof_factor) {
+   CallGenerator* cg;
+ 
+   // Dtrace currently doesn't work unless all calls are vanilla
+@@ -116,7 +118,7 @@
+         // TO DO:  When UseOldInlining is removed, copy the ILT code elsewhere.
+         float site_invoke_ratio = prof_factor;
+         // Note:  ilt is for the root of this parse, not the present call site.
+-        ilt = new InlineTree(this, jvms->method(), jvms->caller(), site_invoke_ratio);
++        ilt = new InlineTree(this, jvms->method(), jvms->caller(), site_invoke_ratio, 0);
+       }
+       WarmCallInfo scratch_ci;
+       if (!UseOldInlining)
+diff --git a/src/share/vm/opto/parse.hpp b/src/share/vm/opto/parse.hpp
+--- a/src/share/vm/opto/parse.hpp
++++ b/src/share/vm/opto/parse.hpp
+@@ -39,6 +39,7 @@
+   // Always between 0.0 and 1.0.  Represents the percentage of the method's
+   // total execution time used at this call site.
+   const float _site_invoke_ratio;
++  const int   _site_depth_adjust;
+   float compute_callee_frequency( int caller_bci ) const;
+ 
+   GrowableArray<InlineTree*> _subtrees;
+@@ -50,7 +51,8 @@
+              ciMethod* callee_method,
+              JVMState* caller_jvms,
+              int caller_bci,
+-             float site_invoke_ratio);
++             float site_invoke_ratio,
++             int site_depth_adjust);
+   InlineTree *build_inline_tree_for_callee(ciMethod* callee_method,
+                                            JVMState* caller_jvms,
+                                            int caller_bci);
+@@ -61,14 +63,15 @@
+ 
+   InlineTree *caller_tree()       const { return _caller_tree;  }
+   InlineTree* callee_at(int bci, ciMethod* m) const;
+-  int         inline_depth()      const { return _caller_jvms ? _caller_jvms->depth() : 0; }
++  int         inline_depth()      const { return stack_depth() + _site_depth_adjust; }
++  int         stack_depth()       const { return _caller_jvms ? _caller_jvms->depth() : 0; }
+ 
+ public:
+   static InlineTree* build_inline_tree_root();
+   static InlineTree* find_subtree_from_root(InlineTree* root, JVMState* jvms, ciMethod* callee, bool create_if_not_found = false);
+ 
+   // For temporary (stack-allocated, stateless) ilts:
+-  InlineTree(Compile* c, ciMethod* callee_method, JVMState* caller_jvms, float site_invoke_ratio);
++  InlineTree(Compile* c, ciMethod* callee_method, JVMState* caller_jvms, float site_invoke_ratio, int site_depth_adjust);
+ 
+   // InlineTree enum
+   enum InlineStyle {
+diff --git a/src/share/vm/runtime/globals.hpp b/src/share/vm/runtime/globals.hpp
+--- a/src/share/vm/runtime/globals.hpp
++++ b/src/share/vm/runtime/globals.hpp
+@@ -2644,10 +2644,10 @@
+   notproduct(intx, MaxSubklassPrintSize, 4,                                 \
+           "maximum number of subklasses to print when printing klass")      \
+                                                                             \
+-  develop(intx, MaxInlineLevel, 9,                                          \
++  product(intx, MaxInlineLevel, 9,                                          \
+           "maximum number of nested calls that are inlined")                \
+                                                                             \
+-  develop(intx, MaxRecursiveInlineLevel, 1,                                 \
++  product(intx, MaxRecursiveInlineLevel, 1,                                 \
+           "maximum number of nested recursive calls that are inlined")      \
+                                                                             \
+   product_pd(intx, InlineSmallCode,                                         \
+@@ -2660,10 +2660,10 @@
+   product_pd(intx, FreqInlineSize,                                          \
+           "maximum bytecode size of a frequent method to be inlined")       \
+                                                                             \
+-  develop(intx, MaxTrivialSize, 6,                                          \
++  product(intx, MaxTrivialSize, 6,                                          \
+           "maximum bytecode size of a trivial method to be inlined")        \
+                                                                             \
+-  develop(intx, MinInliningThreshold, 250,                                  \
++  product(intx, MinInliningThreshold, 250,                                  \
+           "min. invocation count a method needs to have to be inlined")     \
+                                                                             \
+   develop(intx, AlignEntryCode, 4,                                          \

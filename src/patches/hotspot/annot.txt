@@ -1,0 +1,13 @@
+6711908: JVM needs direct access to some annotations
+Summary: Add annotation extraction code to class file parser.
+
+http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=6711908
+
+Features:
+- skips most annotations, including unknown ones
+- looks for hardwired annotations significant to the VM
+- initial annotation type will be sun.misc.CompilerAdvice
+
+The initial version of the patch has the check for annotation type faked.
+
+The interfaces will be VM private, at least to start with.

@@ -1,0 +1,32 @@
+# base = 020e67783308 in http://hg.openjdk.java.net/bsd-port/bsd-port/hotspot [2011-04-09]
+# Let's try using bsd-port as a patch base, since it works with all of Solaris, Linux, Windows, Mac/BSD.
+
+snowleopard.patch               #-/snowleopard #+gcc42
+bsd.patch                       #+020e67783308
+
+# pushed to jdk7/hotspot-comp; will be deleted when they get to bsd-port:
+indy-notrans-6981791.patch      #-/meth #+020e67783308
+meth-err-7012087.patch          #-/meth #+020e67783308
+meth-ci-7009600.patch           #-/meth #+020e67783308
+meth-ver-6987991.patch          #-/meth #+020e67783308
+
+# review pending before push to hotspot-comp:
+
+# non-pushed files are under review or development, or merely experimental:
+meth-conv-6939861.patch         #-/meth #+020e67783308
+meth.patch                      #-/meth #+020e67783308
+
+meth.proj.patch                 #-/meth #+projects
+anonk.proj.patch                #-/anonk #+projects
+
+# Keep these separate, for debugging and review:
+annot.patch     #+annot         #-/annot #+d1605aabd0a1 #+jdk7-b30 #-testable
+inti.patch      #+inti          #-/inti #+d1605aabd0a1 #+jdk7-b30 #-buildable
+callcc_old.patch #+callcc_old   #-/callcc_old #+d6d1af32c5f9 #-testable
+continuation.patch  #+continuation #-/continuation #+4afae810a801
+tailc.patch     #+tailc-lazy    #-/tailc #-tailc-eager
+tailc-eager.patch #+tailc-lazy  #-/tailc #-tailc-lazy
+hotswap.patch   #+hotswap       #-/hotswap
+hotswaplight.patch   #+hotswaplight       #-/hotswaplight
+
+coro.patch    	#+coro        	#-/coro #+aca9fccf1724

@@ -1,0 +1,29 @@
+There is a recurrent problem building javac in some environments.
+It is an import ambiguity, apparently due to small differences in compile-time classpath.
+Here is what the error looks like:
+|----------
+|.../langtools/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java:896: reference to Version is ambiguous,
+|    both class com.sun.tools.javac.jvm.ClassFile.Version in com.sun.tools.javac.jvm.ClassFile
+|    and class com.sun.tools.javac.util.Version in com.sun.tools.javac.util match
+|        AttributeReader(Name name, Version version, Set<AttributeKind> kinds) {
+|                                   ^
+|.../langtools/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java:909: reference to Version is ambiguous,
+|    both class com.sun.tools.javac.jvm.ClassFile.Version in com.sun.tools.javac.jvm.ClassFile
+|    and class com.sun.tools.javac.util.Version in com.sun.tools.javac.util match
+|        final Version version;
+|              ^
+|2 errors
+|----------
+This patch may be a useful workaround.
+
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java b/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
+@@ -54,6 +54,7 @@
+ import static com.sun.tools.javac.code.TypeTags.*;
+ import static com.sun.tools.javac.jvm.ClassFile.*;
+ import static com.sun.tools.javac.jvm.ClassFile.Version.*;
++import static com.sun.tools.javac.jvm.ClassFile.Version; // TEMPORARY
+ 
+ /** This class provides operations to read a classfile into an internal
+  *  representation. The internal representation is anchored in a

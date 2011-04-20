@@ -1,0 +1,310 @@
+diff --git a/src/cpu/sparc/vm/c1_LIRAssembler_sparc.cpp b/src/cpu/sparc/vm/c1_LIRAssembler_sparc.cpp
+--- a/src/cpu/sparc/vm/c1_LIRAssembler_sparc.cpp
++++ b/src/cpu/sparc/vm/c1_LIRAssembler_sparc.cpp
+@@ -682,7 +682,8 @@
+ 
+ void LIR_Assembler::call(LIR_OpJavaCall* op, relocInfo::relocType rtype) {
+   __ call(op->addr(), rtype);
+-  // the peephole pass fills the delay slot
++  // The peephole pass fills the delay slot, add_call_info is done in
++  // LIR_Assembler::emit_delay.
+ }
+ 
+ 
+@@ -691,7 +692,8 @@
+   __ set_oop((jobject)Universe::non_oop_word(), G5_inline_cache_reg);
+   __ relocate(rspec);
+   __ call(op->addr(), relocInfo::none);
+-  // the peephole pass fills the delay slot
++  // The peephole pass fills the delay slot, add_call_info is done in
++  // LIR_Assembler::emit_delay.
+ }
+ 
+ 
+@@ -708,17 +710,20 @@
+   }
+   __ ld_ptr(G5_method, methodOopDesc::from_compiled_offset(), G3_scratch);
+   __ callr(G3_scratch, G0);
+-  // the peephole pass fills the delay slot
++  // The peephole pass fills the delay slot, add_call_info is done in
++  // LIR_Assembler::emit_delay.
+ }
+ 
+ 
+ void LIR_Assembler::preserve_SP(LIR_OpJavaCall* op) {
+-  Unimplemented();
++  __ mov(SP, FrameMap::method_handle_invoke_SP_save_opr()->as_register());
+ }
+ 
+ 
+ void LIR_Assembler::restore_SP(LIR_OpJavaCall* op) {
+-  Unimplemented();
++  __ delayed()->nop();
++  add_call_info(code_offset(), op->info(), /* is_method_handle_invoke */ true);
++  __ mov(FrameMap::method_handle_invoke_SP_save_opr()->as_register(), SP);
+ }
+ 
+ 
+@@ -2873,7 +2878,7 @@
+ 
+   // we may also be emitting the call info for the instruction
+   // which we are the delay slot of.
+-  CodeEmitInfo * call_info = op->call_info();
++  CodeEmitInfo* call_info = op->call_info();
+   if (call_info) {
+     add_call_info(code_offset(), call_info);
+   }
+@@ -3092,12 +3097,13 @@
+           if (prev && LIR_Assembler::is_single_instruction(prev) && prev->info() == NULL) {
+             // swap previous instruction into delay slot
+             inst->at_put(i - 1, op);
+-            inst->at_put(i, new LIR_OpDelay(prev, op->info()));
++            inst->at_put(i, new LIR_OpDelay(prev, op));
+ #ifndef PRODUCT
+             if (LIRTracePeephole) {
+               tty->print_cr("delayed");
+               inst->at(i - 1)->print();
+               inst->at(i)->print();
++              tty->cr();
+             }
+ #endif
+             continue;
+@@ -3113,9 +3119,15 @@
+       case lir_static_call:
+       case lir_virtual_call:
+       case lir_icvirtual_call:
+-      case lir_optvirtual_call: {
+-        LIR_Op* delay_op = NULL;
++      case lir_optvirtual_call:
++      case lir_dynamic_call: {
++        //LIR_Op* delay_op = NULL;
+         LIR_Op* prev = inst->at(i - 1);
++        LIR_OpJavaCall* call = op->as_OpJavaCall();
++        if (call->is_method_handle_invoke()) {
++          // MethodHandle call sites already have filled delay-slots.
++          break;
++        }
+         if (LIRFillDelaySlots && prev && prev->code() == lir_move && prev->info() == NULL &&
+             (op->code() != lir_virtual_call ||
+              !prev->result_opr()->is_single_cpu() ||
+@@ -3125,21 +3137,20 @@
+           // Also don't allow the setup of the receiver in the delay
+           // slot for vtable calls.
+           inst->at_put(i - 1, op);
+-          inst->at_put(i, new LIR_OpDelay(prev, op->info()));
++          inst->at_put(i, new LIR_OpDelay(prev, op));
+ #ifndef PRODUCT
+           if (LIRTracePeephole) {
+             tty->print_cr("delayed");
+             inst->at(i - 1)->print();
+             inst->at(i)->print();
++            tty->cr();
+           }
+ #endif
+           continue;
+         }
+ 
+-        if (!delay_op) {
+-          delay_op = new LIR_OpDelay(new LIR_Op0(lir_nop), op->as_OpJavaCall()->info());
+-          inst->insert_before(i + 1, delay_op);
+-        }
++        LIR_Op* delay_op = new LIR_OpDelay(new LIR_Op0(lir_nop), call);
++        inst->insert_before(i + 1, delay_op);
+         break;
+       }
+     }
+diff --git a/src/cpu/sparc/vm/c1_Runtime1_sparc.cpp b/src/cpu/sparc/vm/c1_Runtime1_sparc.cpp
+--- a/src/cpu/sparc/vm/c1_Runtime1_sparc.cpp
++++ b/src/cpu/sparc/vm/c1_Runtime1_sparc.cpp
+@@ -679,8 +679,15 @@
+         __ call_VM_leaf(L7_thread_cache, CAST_FROM_FN_PTR(address, SharedRuntime::exception_handler_for_return_address),
+                         G2_thread, Oissuing_pc->after_save());
+         __ verify_not_null_oop(Oexception->after_save());
+-        __ jmp(O0, 0);
+-        __ delayed()->restore();
++
++        // Restore SP from L7 if the exception PC is a MethodHandle call site.
++        __ mov(O0, G5);  // Save the target address.
++        __ lduw(Address(G2_thread, JavaThread::is_method_handle_return_offset()), L0);
++        __ tst(L0);  // Condition codes are preserved over the restore.
++        __ restore();
++
++        __ jmp(G5, 0);
++        __ delayed()->movcc(Assembler::notZero, false, Assembler::icc, L7, SP);  // Restore SP if required.
+       }
+       break;
+ 
+diff --git a/src/cpu/sparc/vm/frame_sparc.cpp b/src/cpu/sparc/vm/frame_sparc.cpp
+--- a/src/cpu/sparc/vm/frame_sparc.cpp
++++ b/src/cpu/sparc/vm/frame_sparc.cpp
+@@ -336,9 +336,11 @@
+ #endif // ASSERT
+ }
+ 
+-frame::frame(intptr_t* sp, intptr_t* younger_sp, bool younger_frame_adjusted_stack) {
+-  _sp = sp;
+-  _younger_sp = younger_sp;
++frame::frame(intptr_t* sp, intptr_t* younger_sp, bool younger_frame_is_interpreted) :
++  _sp(sp),
++  _younger_sp(younger_sp),
++  _deopt_state(unknown),
++  _sp_adjustment_by_callee(0) {
+   if (younger_sp == NULL) {
+     // make a deficient frame which doesn't know where its PC is
+     _pc = NULL;
+@@ -352,20 +354,32 @@
+     // wrong.  (the _last_native_pc will have the right value)
+     // So do not put add any asserts on the _pc here.
+   }
+-  if (younger_frame_adjusted_stack) {
+-    // compute adjustment to this frame's SP made by its interpreted callee
+-    _sp_adjustment_by_callee = (intptr_t*)((intptr_t)younger_sp[I5_savedSP->sp_offset_in_saved_window()] +
+-                                             STACK_BIAS) - sp;
+-  } else {
+-    _sp_adjustment_by_callee = 0;
++
++  if (_pc != NULL)
++    _cb = CodeCache::find_blob(_pc);
++
++  // Check for MethodHandle call sites.
++  if (_cb != NULL) {
++    nmethod* nm = _cb->as_nmethod_or_null();
++    if (nm != NULL) {
++      if (nm->is_deopt_mh_entry(_pc) || nm->is_method_handle_return(_pc)) {
++        _sp_adjustment_by_callee = (intptr_t*) ((intptr_t) sp[L7->sp_offset_in_saved_window()] + STACK_BIAS) - sp;
++        // The SP is already adjusted by this MH call site, don't
++        // overwrite this value with the wrong interpreter value.
++        younger_frame_is_interpreted = false;
++      }
++    }
+   }
+ 
+-  _deopt_state = unknown;
++  if (younger_frame_is_interpreted) {
++    // compute adjustment to this frame's SP made by its interpreted callee
++    _sp_adjustment_by_callee = (intptr_t*) ((intptr_t) younger_sp[I5_savedSP->sp_offset_in_saved_window()] + STACK_BIAS) - sp;
++  }
+ 
+-  // It is important that frame be fully construct when we do this lookup
+-  // as get_original_pc() needs correct value for unextended_sp()
++  // It is important that the frame is fully constructed when we do
++  // this lookup as get_deopt_original_pc() needs a correct value for
++  // unextended_sp() which uses _sp_adjustment_by_callee.
+   if (_pc != NULL) {
+-    _cb = CodeCache::find_blob(_pc);
+     address original_pc = nmethod::get_deopt_original_pc(this);
+     if (original_pc != NULL) {
+       _pc = original_pc;
+@@ -462,9 +476,8 @@
+ 
+   if (is_entry_frame()) return sender_for_entry_frame(map);
+ 
+-  intptr_t* younger_sp     = sp();
+-  intptr_t* sp             = sender_sp();
+-  bool      adjusted_stack = false;
++  intptr_t* younger_sp = sp();
++  intptr_t* sp         = sender_sp();
+ 
+   // Note:  The version of this operation on any platform with callee-save
+   //        registers must update the register map (if not null).
+@@ -483,8 +496,8 @@
+   // interpreted but its pc is in the code cache (for c1 -> osr_frame_return_id stub), so it must be
+   // explicitly recognized.
+ 
+-  adjusted_stack = is_interpreted_frame();
+-  if (adjusted_stack) {
++  bool frame_is_interpreted = is_interpreted_frame();
++  if (frame_is_interpreted) {
+     map->make_integer_regs_unsaved();
+     map->shift_window(sp, younger_sp);
+   } else if (_cb != NULL) {
+@@ -503,7 +516,7 @@
+       }
+     }
+   }
+-  return frame(sp, younger_sp, adjusted_stack);
++  return frame(sp, younger_sp, frame_is_interpreted);
+ }
+ 
+ 
+diff --git a/src/cpu/sparc/vm/sharedRuntime_sparc.cpp b/src/cpu/sparc/vm/sharedRuntime_sparc.cpp
+--- a/src/cpu/sparc/vm/sharedRuntime_sparc.cpp
++++ b/src/cpu/sparc/vm/sharedRuntime_sparc.cpp
+@@ -950,26 +950,13 @@
+   // O0-O5          - Outgoing args in compiled layout
+   // O6             - Adjusted or restored SP
+   // O7             - Valid return address
+-  // L0-L7, I0-I7    - Caller's temps (no frame pushed yet)
++  // L0-L7, I0-I7   - Caller's temps (no frame pushed yet)
+   // F0-F7          - more outgoing args
+ 
+ 
+   // Gargs is the incoming argument base, and also an outgoing argument.
+   __ sub(Gargs, BytesPerWord, Gargs);
+ 
+-#ifdef ASSERT
+-  {
+-    // on entry OsavedSP and SP should be equal
+-    Label ok;
+-    __ cmp(O5_savedSP, SP);
+-    __ br(Assembler::equal, false, Assembler::pt, ok);
+-    __ delayed()->nop();
+-    __ stop("I5_savedSP not set");
+-    __ should_not_reach_here();
+-    __ bind(ok);
+-  }
+-#endif
+-
+   // ON ENTRY TO THE CODE WE ARE MAKING, WE HAVE AN INTERPRETED FRAME
+   // WITH O7 HOLDING A VALID RETURN PC
+   //
+diff --git a/src/share/vm/c1/c1_LIR.hpp b/src/share/vm/c1/c1_LIR.hpp
+--- a/src/share/vm/c1/c1_LIR.hpp
++++ b/src/share/vm/c1/c1_LIR.hpp
+@@ -1610,19 +1610,22 @@
+  friend class LIR_OpVisitState;
+ 
+  private:
+-  LIR_Op* _op;
++  LIR_Op* _op;          // delayed op
++  LIR_Op* _delayer_op;  // op that has the delay-slot (the delayer)
+ 
+  public:
+-  LIR_OpDelay(LIR_Op* op, CodeEmitInfo* info):
+-    LIR_Op(lir_delay_slot, LIR_OprFact::illegalOpr, info),
+-    _op(op) {
++  LIR_OpDelay(LIR_Op* op, LIR_Op* delayer_op):
++    LIR_Op(lir_delay_slot, LIR_OprFact::illegalOpr, delayer_op ? delayer_op->info() : NULL),
++    _op(op),
++    _delayer_op(delayer_op) {
+     assert(op->code() == lir_nop || LIRFillDelaySlots, "should be filling with nops");
+   }
+   virtual void emit_code(LIR_Assembler* masm);
+   virtual LIR_OpDelay* as_OpDelay() { return this; }
+   void print_instr(outputStream* out) const PRODUCT_RETURN;
+-  LIR_Op* delay_op() const { return _op; }
+-  CodeEmitInfo* call_info() const { return info(); }
++  LIR_Op* delay_op()   const { return _op; }
++  LIR_Op* delayer_op() const { return _delayer_op; }
++  CodeEmitInfo* call_info() const { return delayer_op() ? delayer_op()->info() : NULL; }
+ };
+ 
+ 
+diff --git a/src/share/vm/prims/methodHandles.hpp b/src/share/vm/prims/methodHandles.hpp
+--- a/src/share/vm/prims/methodHandles.hpp
++++ b/src/share/vm/prims/methodHandles.hpp
+@@ -430,12 +430,12 @@
+                                RegisterOrConstant arg_slots,
+                                int arg_mask,
+                                Register argslot_reg,
+-                               Register temp_reg, Register temp2_reg);
++                               Register temp_reg, Register temp2_reg, Register temp3_reg = noreg);
+ 
+   static void remove_arg_slots(MacroAssembler* _masm,
+                                RegisterOrConstant arg_slots,
+                                Register argslot_reg,
+-                               Register temp_reg, Register temp2_reg);
++                               Register temp_reg, Register temp2_reg, Register temp3_reg = noreg);
+ };
+ 
+ 

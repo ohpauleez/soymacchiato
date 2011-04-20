@@ -1,0 +1,147 @@
+diff --git a/src/share/classes/java/dyn/InterfaceImplementor.java b/src/share/classes/java/dyn/InterfaceImplementor.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/java/dyn/InterfaceImplementor.java
+@@ -0,0 +1,38 @@
++package java.dyn;
++
++import java.util.Map;
++import java.util.HashMap;
++
++/**
++ * An interface implementor is used to provide the {@link MethodHandle}s that
++ * are required to implement an interface upon injection.
++ *
++ * @author Tobias Ivarsson (tobias@thobe.org)
++ */
++public interface InterfaceImplementor {
++    public class DefaultImplementation implements InterfaceImplementor {
++	private final Map<String, MethodHandle> implementations =
++	    new HashMap<String, MethodHandle>();
++
++	public DefaultImplementation(String[] names, MethodHandle[] impls) {
++	    if (names.length != impls.length) {
++		throw new IllegalArgumentException(
++                    "Arrays not of matching lengths.");
++	    }
++	    for (int i = 0; i < names.length; i++) {
++		implementations.put(signature(names[i], impls[i].type()),
++				    impls[i]);
++	    }
++	}
++
++	public MethodHandle getImplementation(String name, MethodType type) {
++	    return implementations.get(signature(name, type));
++	}
++	
++	private String signature(String name, MethodType type) {
++	    return name + type.toBytecodeString();
++	}
++    }
++
++    MethodHandle getImplementation(String name, MethodType type);
++}
+diff --git a/src/share/classes/java/dyn/InterfaceInjector.java b/src/share/classes/java/dyn/InterfaceInjector.java
+new file mode 100644
+--- /dev/null
++++ b/src/share/classes/java/dyn/InterfaceInjector.java
+@@ -0,0 +1,99 @@
++package java.dyn;
++
++/**
++ * An interface injector is the object used for injecting an interface into a
++ * {@link java.lang.Class}.
++ *
++ * @author Tobias Ivarsson (tobias@thobe.org)
++ */
++public abstract class InterfaceInjector {
++    public abstract InterfaceImplementor inject(Class<?> iface, Class<?> target);
++
++    public static void setInjector(InterfaceInjector injector) {
++        InjectorSetup current = setup.get();
++        if (current == null)
++            throw new IllegalStateException("Not called from interface class initializer.");
++        Class cc = sun.reflect.Reflection.getCallerClass(2);
++        if (cc != current.iface)
++            throw new IllegalStateException("Not called from interface class initializer.");
++        current.set(injector);
++    }
++
++    // Implementation internals
++    private static class InjectorSetup {
++        private InterfaceInjector injector = null;
++        final Class<?> iface;
++        private final InjectorSetup last;
++        InjectorSetup(Class<?> iface) {
++            this.iface = iface;
++            this.last = setup.get();
++        }
++        void set(InterfaceInjector injector) {
++            if (this.injector != null)
++                throw new IllegalStateException("Injector already specified for " + iface);
++	    this.injector = injector;
++        }
++        void pop(Class<?> iface) {
++            if (iface != this.iface) {
++                return last.pop(iface);
++            } else {
++                setup.set(last);
++		return injector;
++            }
++        }
++    }
++
++    private static final ThreadLocal<InjectorSetup> setup =
++        new ThreadLocal<InjectorSetup>() {
++        @Override
++        protected InjectorSetup initialValue() {
++            return new InjectorSetup(null) {
++                @Override
++                void pop(Class<?> iface) {
++                    setup.set(this)
++                }
++            };
++        }
++    };
++
++    private MethodHandle getHandle(Class<?> target,
++				   InterfaceImplementor implementor,
++				   String name, MethodType type) {
++	MethodHandle result = MethodHandles.findVirtual(target, name, type);
++	if (result == null) {
++	    result = implementor.getImplementation(name, type);
++	}
++	return result;
++    }
++
++    // interface for the VM
++    
++    /* Called by the JVM to get the implementation for an injected interface. */
++    private MethodHandle[] performInjection(Class<?> target, Class<?> iface,
++					    String[] names,MethodType[] types) {
++        System.out.println("Trying to inject " + iface " into " + taget);
++	// Pull based interface - only ask for the required methods
++	InterfaceImplementor implementor = inject(iface, target);
++	if (implementor == null) {
++	    return null;
++	}
++	try {
++	    MethodHandle[] result = new MethodHandle[types.length];
++	    for (int i = 0; i < types.length; i++) {
++		MethodHandle handle = getHandle(target, implementor,
++						names[i], types[i]);
++	    }
++	} catch(Throwable t) {
++	    return null;
++	}
++        return null; // TODO
++    }
++    /* Called by the JVM before invoking <clinit> on an injectable interface. */
++    private static void beforeClassInit(Class<?> iface) {
++        setup.set(new InjectorSetup(iface));
++    }
++    /* Called by the JVM after invoking <clinit> on an injectable interface.  */
++    private static InterfaceInjector afterClassInit(Class<?> iface) {
++        return setup.get().pop(iface);
++    }
++}

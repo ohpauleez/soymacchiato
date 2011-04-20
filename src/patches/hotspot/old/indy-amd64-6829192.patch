@@ -1,0 +1,545 @@
+pushed to jdk7
+6829192: JSR 292 needs to support 64-bit x86
+Summary: changes for method handles and invokedynamic
+Reviewed-by: kvn
+
+diff --git a/src/cpu/x86/vm/assembler_x86.cpp b/src/cpu/x86/vm/assembler_x86.cpp
+--- a/src/cpu/x86/vm/assembler_x86.cpp
++++ b/src/cpu/x86/vm/assembler_x86.cpp
+@@ -7647,7 +7647,7 @@
+ 
+ #ifdef ASSERT
+   Label L;
+-  testl(tmp, tmp);
++  testptr(tmp, tmp);
+   jccb(Assembler::notZero, L);
+   hlt();
+   bind(L);
+diff --git a/src/cpu/x86/vm/interp_masm_x86_32.cpp b/src/cpu/x86/vm/interp_masm_x86_32.cpp
+--- a/src/cpu/x86/vm/interp_masm_x86_32.cpp
++++ b/src/cpu/x86/vm/interp_masm_x86_32.cpp
+@@ -196,6 +196,9 @@
+   } else {
+     assert(EnableInvokeDynamic, "giant index used only for EnableInvokeDynamic");
+     movl(reg, Address(rsi, bcp_offset));
++    // Check if the secondary index definition is still ~x, otherwise
++    // we have to change the following assembler code to calculate the
++    // plain index.
+     assert(constantPoolCacheOopDesc::decode_secondary_index(~123) == 123, "else change next line");
+     notl(reg);  // convert to plain index
+   }
+diff --git a/src/cpu/x86/vm/interp_masm_x86_64.cpp b/src/cpu/x86/vm/interp_masm_x86_64.cpp
+--- a/src/cpu/x86/vm/interp_masm_x86_64.cpp
++++ b/src/cpu/x86/vm/interp_masm_x86_64.cpp
+@@ -185,12 +185,30 @@
+ }
+ 
+ 
++void InterpreterMacroAssembler::get_cache_index_at_bcp(Register index,
++                                                       int bcp_offset,
++                                                       bool giant_index) {
++  assert(bcp_offset > 0, "bcp is still pointing to start of bytecode");
++  if (!giant_index) {
++    load_unsigned_short(index, Address(r13, bcp_offset));
++  } else {
++    assert(EnableInvokeDynamic, "giant index used only for EnableInvokeDynamic");
++    movl(index, Address(r13, bcp_offset));
++    // Check if the secondary index definition is still ~x, otherwise
++    // we have to change the following assembler code to calculate the
++    // plain index.
++    assert(constantPoolCacheOopDesc::decode_secondary_index(~123) == 123, "else change next line");
++    notl(index);  // convert to plain index
++  }
++}
++
++
+ void InterpreterMacroAssembler::get_cache_and_index_at_bcp(Register cache,
+                                                            Register index,
+-                                                           int bcp_offset) {
+-  assert(bcp_offset > 0, "bcp is still pointing to start of bytecode");
++                                                           int bcp_offset,
++                                                           bool giant_index) {
+   assert(cache != index, "must use different registers");
+-  load_unsigned_short(index, Address(r13, bcp_offset));
++  get_cache_index_at_bcp(index, bcp_offset, giant_index);
+   movptr(cache, Address(rbp, frame::interpreter_frame_cache_offset * wordSize));
+   assert(sizeof(ConstantPoolCacheEntry) == 4 * wordSize, "adjust code below");
+   // convert from field index to ConstantPoolCacheEntry index
+@@ -200,10 +218,10 @@
+ 
+ void InterpreterMacroAssembler::get_cache_entry_pointer_at_bcp(Register cache,
+                                                                Register tmp,
+-                                                               int bcp_offset) {
+-  assert(bcp_offset > 0, "bcp is still pointing to start of bytecode");
++                                                               int bcp_offset,
++                                                               bool giant_index) {
+   assert(cache != tmp, "must use different register");
+-  load_unsigned_short(tmp, Address(r13, bcp_offset));
++  get_cache_index_at_bcp(tmp, bcp_offset, giant_index);
+   assert(sizeof(ConstantPoolCacheEntry) == 4 * wordSize, "adjust code below");
+   // convert from field index to ConstantPoolCacheEntry index
+   // and from word offset to byte offset
+@@ -1236,7 +1254,8 @@
+ 
+ void InterpreterMacroAssembler::profile_virtual_call(Register receiver,
+                                                      Register mdp,
+-                                                     Register reg2) {
++                                                     Register reg2,
++                                                     bool receiver_can_be_null) {
+   if (ProfileInterpreter) {
+     Label profile_continue;
+ 
+@@ -1246,8 +1265,15 @@
+     // We are making a call.  Increment the count.
+     increment_mdp_data_at(mdp, in_bytes(CounterData::count_offset()));
+ 
++    Label skip_receiver_profile;
++    if (receiver_can_be_null) {
++      testptr(receiver, receiver);
++      jcc(Assembler::zero, skip_receiver_profile);
++    }
++
+     // Record the receiver type.
+     record_klass_in_profile(receiver, mdp, reg2);
++    bind(skip_receiver_profile);
+ 
+     // The method data pointer needs to be updated to reflect the new target.
+     update_mdp_by_constant(mdp,
+diff --git a/src/cpu/x86/vm/interp_masm_x86_64.hpp b/src/cpu/x86/vm/interp_masm_x86_64.hpp
+--- a/src/cpu/x86/vm/interp_masm_x86_64.hpp
++++ b/src/cpu/x86/vm/interp_masm_x86_64.hpp
+@@ -95,9 +95,10 @@
+ 
+   void get_unsigned_2_byte_index_at_bcp(Register reg, int bcp_offset);
+   void get_cache_and_index_at_bcp(Register cache, Register index,
+-                                  int bcp_offset);
++                                  int bcp_offset, bool giant_index = false);
+   void get_cache_entry_pointer_at_bcp(Register cache, Register tmp,
+-                                      int bcp_offset);
++                                      int bcp_offset, bool giant_index = false);
++  void get_cache_index_at_bcp(Register index, int bcp_offset, bool giant_index = false);
+ 
+ 
+   void pop_ptr(Register r = rax);
+@@ -236,7 +237,8 @@
+   void profile_call(Register mdp);
+   void profile_final_call(Register mdp);
+   void profile_virtual_call(Register receiver, Register mdp,
+-                            Register scratch2);
++                            Register scratch2,
++                            bool receiver_can_be_null = false);
+   void profile_ret(Register return_bci, Register mdp);
+   void profile_null_seen(Register mdp);
+   void profile_typecheck(Register mdp, Register klass, Register scratch);
+diff --git a/src/cpu/x86/vm/interpreter_x86_64.cpp b/src/cpu/x86/vm/interpreter_x86_64.cpp
+--- a/src/cpu/x86/vm/interpreter_x86_64.cpp
++++ b/src/cpu/x86/vm/interpreter_x86_64.cpp
+@@ -277,12 +277,11 @@
+   address entry_point = __ pc();
+ 
+   // abstract method entry
+-  // remove return address. Not really needed, since exception
+-  // handling throws away expression stack
+-  __ pop(rbx);
+ 
+-  // adjust stack to what a normal return would do
+-  __ mov(rsp, r13);
++  //  pop return address, reset last_sp to NULL
++  __ empty_expression_stack();
++  __ restore_bcp();      // rsi must be correct for exception handler   (was destroyed)
++  __ restore_locals();   // make sure locals pointer is correct as well (was destroyed)
+ 
+   // throw exception
+   __ call_VM(noreg, CAST_FROM_FN_PTR(address,
+@@ -300,7 +299,10 @@
+   if (!EnableMethodHandles) {
+     return generate_abstract_entry();
+   }
+-  return generate_abstract_entry(); //6815692//
++
++  address entry_point = MethodHandles::generate_method_handle_interpreter_entry(_masm);
++
++  return entry_point;
+ }
+ 
+ 
+diff --git a/src/cpu/x86/vm/methodHandles_x86.cpp b/src/cpu/x86/vm/methodHandles_x86.cpp
+--- a/src/cpu/x86/vm/methodHandles_x86.cpp
++++ b/src/cpu/x86/vm/methodHandles_x86.cpp
+@@ -448,7 +448,7 @@
+                                 rbx_index, Address::times_ptr,
+                                 base + vtableEntry::method_offset_in_bytes());
+       Register rbx_method = rbx_temp;
+-      __ movl(rbx_method, vtable_entry_addr);
++      __ movptr(rbx_method, vtable_entry_addr);
+ 
+       __ verify_oop(rbx_method);
+       __ jmp(rbx_method_fie);
+diff --git a/src/cpu/x86/vm/stubGenerator_x86_64.cpp b/src/cpu/x86/vm/stubGenerator_x86_64.cpp
+--- a/src/cpu/x86/vm/stubGenerator_x86_64.cpp
++++ b/src/cpu/x86/vm/stubGenerator_x86_64.cpp
+@@ -2935,6 +2935,16 @@
+ 
+     // arraycopy stubs used by compilers
+     generate_arraycopy_stubs();
++
++    // generic method handle stubs
++    if (EnableMethodHandles && SystemDictionary::MethodHandle_klass() != NULL) {
++      for (MethodHandles::EntryKind ek = MethodHandles::_EK_FIRST;
++           ek < MethodHandles::_EK_LIMIT;
++           ek = MethodHandles::EntryKind(1 + (int)ek)) {
++        StubCodeMark mark(this, "MethodHandle", MethodHandles::entry_name(ek));
++        MethodHandles::generate_method_handle_stub(_masm, ek);
++      }
++    }
+   }
+ 
+  public:
+diff --git a/src/cpu/x86/vm/templateInterpreter_x86_64.cpp b/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
+--- a/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
++++ b/src/cpu/x86/vm/templateInterpreter_x86_64.cpp
+@@ -100,21 +100,26 @@
+   return entry;
+ }
+ 
+-// Arguments are: required type in rarg1, failing object (or NULL) in rarg2
++// Arguments are: required type at TOS+8, failing object (or NULL) at TOS+4.
+ address TemplateInterpreterGenerator::generate_WrongMethodType_handler() {
+   address entry = __ pc();
+ 
+   __ pop(c_rarg2);              // failing object is at TOS
+   __ pop(c_rarg1);              // required type is at TOS+8
+ 
+-  // expression stack must be empty before entering the VM if an
+-  // exception happened
++  __ verify_oop(c_rarg1);
++  __ verify_oop(c_rarg2);
++
++  // Various method handle types use interpreter registers as temps.
++  __ restore_bcp();
++  __ restore_locals();
++
++  // Expression stack must be empty before entering the VM for an exception.
+   __ empty_expression_stack();
+ 
+   __ call_VM(noreg,
+              CAST_FROM_FN_PTR(address,
+-                              InterpreterRuntime::
+-                              throw_WrongMethodTypeException),
++                              InterpreterRuntime::throw_WrongMethodTypeException),
+              // pass required type, failing object (or NULL)
+              c_rarg1, c_rarg2);
+   return entry;
+@@ -182,15 +187,29 @@
+   __ restore_bcp();
+   __ restore_locals();
+ 
+-  __ get_cache_and_index_at_bcp(rbx, rcx, 1);
++  Label L_got_cache, L_giant_index;
++  if (EnableInvokeDynamic) {
++    __ cmpb(Address(r13, 0), Bytecodes::_invokedynamic);
++    __ jcc(Assembler::equal, L_giant_index);
++  }
++  __ get_cache_and_index_at_bcp(rbx, rcx, 1, false);
++  __ bind(L_got_cache);
+   __ movl(rbx, Address(rbx, rcx,
+-                       Address::times_8,
++                       Address::times_ptr,
+                        in_bytes(constantPoolCacheOopDesc::base_offset()) +
+                        3 * wordSize));
+   __ andl(rbx, 0xFF);
+   if (TaggedStackInterpreter) __ shll(rbx, 1); // 2 slots per parameter.
+   __ lea(rsp, Address(rsp, rbx, Address::times_8));
+   __ dispatch_next(state, step);
++
++  // out of the main line of code...
++  if (EnableInvokeDynamic) {
++    __ bind(L_giant_index);
++    __ get_cache_and_index_at_bcp(rbx, rcx, 1, true);
++    __ jmp(L_got_cache);
++  }
++
+   return entry;
+ }
+ 
+diff --git a/src/cpu/x86/vm/templateTable_x86_32.cpp b/src/cpu/x86/vm/templateTable_x86_32.cpp
+--- a/src/cpu/x86/vm/templateTable_x86_32.cpp
++++ b/src/cpu/x86/vm/templateTable_x86_32.cpp
+@@ -3146,7 +3146,6 @@
+     __ profile_call(rsi);
+   }
+ 
+-  Label handle_unlinked_site;
+   __ movptr(rcx, Address(rax, __ delayed_value(java_dyn_CallSite::target_offset_in_bytes, rcx)));
+   __ null_check(rcx);
+   __ prepare_to_jump_from_interpreted();
+diff --git a/src/cpu/x86/vm/templateTable_x86_64.cpp b/src/cpu/x86/vm/templateTable_x86_64.cpp
+--- a/src/cpu/x86/vm/templateTable_x86_64.cpp
++++ b/src/cpu/x86/vm/templateTable_x86_64.cpp
+@@ -203,18 +203,15 @@
+     __ jcc(Assembler::notEqual, fast_patch);
+     __ get_method(scratch);
+     // Let breakpoint table handling rewrite to quicker bytecode
+-    __ call_VM(noreg,
+-               CAST_FROM_FN_PTR(address,
+-                                InterpreterRuntime::set_original_bytecode_at),
+-               scratch, r13, bc);
++    __ call_VM(noreg, CAST_FROM_FN_PTR(address, InterpreterRuntime::set_original_bytecode_at), scratch, r13, bc);
+ #ifndef ASSERT
+     __ jmpb(patch_done);
++#else
++    __ jmp(patch_done);
++#endif
+     __ bind(fast_patch);
+   }
+-#else
+-    __ jmp(patch_done);
+-    __ bind(fast_patch);
+-  }
++#ifdef ASSERT
+   Label okay;
+   __ load_unsigned_byte(scratch, at_bcp(0));
+   __ cmpl(scratch, (int) Bytecodes::java_code(bytecode));
+@@ -2054,26 +2051,28 @@
+   }
+ }
+ 
+-void TemplateTable::resolve_cache_and_index(int byte_no,
+-                                            Register Rcache,
+-                                            Register index) {
++void TemplateTable::resolve_cache_and_index(int byte_no, Register Rcache, Register index) {
+   assert(byte_no == 1 || byte_no == 2, "byte_no out of range");
++  bool is_invokedynamic = (bytecode() == Bytecodes::_invokedynamic);
+ 
+   const Register temp = rbx;
+   assert_different_registers(Rcache, index, temp);
+ 
+   const int shift_count = (1 + byte_no) * BitsPerByte;
+   Label resolved;
+-  __ get_cache_and_index_at_bcp(Rcache, index, 1);
+-  __ movl(temp, Address(Rcache,
+-                        index, Address::times_8,
+-                        constantPoolCacheOopDesc::base_offset() +
+-                        ConstantPoolCacheEntry::indices_offset()));
+-  __ shrl(temp, shift_count);
+-  // have we resolved this bytecode?
+-  __ andl(temp, 0xFF);
+-  __ cmpl(temp, (int) bytecode());
+-  __ jcc(Assembler::equal, resolved);
++  __ get_cache_and_index_at_bcp(Rcache, index, 1, is_invokedynamic);
++  if (is_invokedynamic) {
++    // we are resolved if the f1 field contains a non-null CallSite object
++    __ cmpptr(Address(Rcache, index, Address::times_ptr, constantPoolCacheOopDesc::base_offset() + ConstantPoolCacheEntry::f1_offset()), (int32_t) NULL_WORD);
++    __ jcc(Assembler::notEqual, resolved);
++  } else {
++    __ movl(temp, Address(Rcache, index, Address::times_ptr, constantPoolCacheOopDesc::base_offset() + ConstantPoolCacheEntry::indices_offset()));
++    __ shrl(temp, shift_count);
++    // have we resolved this bytecode?
++    __ andl(temp, 0xFF);
++    __ cmpl(temp, (int) bytecode());
++    __ jcc(Assembler::equal, resolved);
++  }
+ 
+   // resolve first time through
+   address entry;
+@@ -2090,6 +2089,9 @@
+   case Bytecodes::_invokeinterface:
+     entry = CAST_FROM_FN_PTR(address, InterpreterRuntime::resolve_invoke);
+     break;
++  case Bytecodes::_invokedynamic:
++    entry = CAST_FROM_FN_PTR(address, InterpreterRuntime::resolve_invokedynamic);
++    break;
+   default:
+     ShouldNotReachHere();
+     break;
+@@ -2098,7 +2100,7 @@
+   __ call_VM(noreg, entry, temp);
+ 
+   // Update registers with resolved info
+-  __ get_cache_and_index_at_bcp(Rcache, index, 1);
++  __ get_cache_and_index_at_bcp(Rcache, index, 1, is_invokedynamic);
+   __ bind(resolved);
+ }
+ 
+@@ -2832,15 +2834,14 @@
+   ShouldNotReachHere();
+ }
+ 
+-void TemplateTable::prepare_invoke(Register method,
+-                                   Register index,
+-                                   int byte_no,
+-                                   Bytecodes::Code code) {
++void TemplateTable::prepare_invoke(Register method, Register index, int byte_no) {
+   // determine flags
++  Bytecodes::Code code = bytecode();
+   const bool is_invokeinterface  = code == Bytecodes::_invokeinterface;
++  const bool is_invokedynamic    = code == Bytecodes::_invokedynamic;
+   const bool is_invokevirtual    = code == Bytecodes::_invokevirtual;
+   const bool is_invokespecial    = code == Bytecodes::_invokespecial;
+-  const bool load_receiver       = code != Bytecodes::_invokestatic;
++  const bool load_receiver      = (code != Bytecodes::_invokestatic && code != Bytecodes::_invokedynamic);
+   const bool receiver_null_check = is_invokespecial;
+   const bool save_flags = is_invokeinterface || is_invokevirtual;
+   // setup registers & access constant pool cache
+@@ -2858,9 +2859,13 @@
+     __ movl(recv, flags);
+     __ andl(recv, 0xFF);
+     if (TaggedStackInterpreter) __ shll(recv, 1);  // index*2
+-    __ movptr(recv, Address(rsp, recv, Address::times_8,
+-                                 -Interpreter::expr_offset_in_bytes(1)));
+-    __ verify_oop(recv);
++    Address recv_addr(rsp, recv, Address::times_8, -Interpreter::expr_offset_in_bytes(1));
++    if (is_invokedynamic) {
++      __ lea(recv, recv_addr);
++    } else {
++      __ movptr(recv, recv_addr);
++      __ verify_oop(recv);
++    }
+   }
+ 
+   // do null check if needed
+@@ -2878,10 +2883,14 @@
+   ConstantPoolCacheEntry::verify_tosBits();
+   // load return address
+   {
+-    ExternalAddress return_5((address)Interpreter::return_5_addrs_by_index_table());
+-    ExternalAddress return_3((address)Interpreter::return_3_addrs_by_index_table());
+-    __ lea(rscratch1, (is_invokeinterface ? return_5 : return_3));
+-    __ movptr(flags, Address(rscratch1, flags, Address::times_8));
++    address table_addr;
++    if (is_invokeinterface || is_invokedynamic)
++      table_addr = (address)Interpreter::return_5_addrs_by_index_table();
++    else
++      table_addr = (address)Interpreter::return_3_addrs_by_index_table();
++    ExternalAddress table(table_addr);
++    __ lea(rscratch1, table);
++    __ movptr(flags, Address(rscratch1, flags, Address::times_ptr));
+   }
+ 
+   // push return address
+@@ -2947,7 +2956,7 @@
+ 
+ void TemplateTable::invokevirtual(int byte_no) {
+   transition(vtos, vtos);
+-  prepare_invoke(rbx, noreg, byte_no, bytecode());
++  prepare_invoke(rbx, noreg, byte_no);
+ 
+   // rbx: index
+   // rcx: receiver
+@@ -2959,7 +2968,7 @@
+ 
+ void TemplateTable::invokespecial(int byte_no) {
+   transition(vtos, vtos);
+-  prepare_invoke(rbx, noreg, byte_no, bytecode());
++  prepare_invoke(rbx, noreg, byte_no);
+   // do the call
+   __ verify_oop(rbx);
+   __ profile_call(rax);
+@@ -2969,7 +2978,7 @@
+ 
+ void TemplateTable::invokestatic(int byte_no) {
+   transition(vtos, vtos);
+-  prepare_invoke(rbx, noreg, byte_no, bytecode());
++  prepare_invoke(rbx, noreg, byte_no);
+   // do the call
+   __ verify_oop(rbx);
+   __ profile_call(rax);
+@@ -2983,7 +2992,7 @@
+ 
+ void TemplateTable::invokeinterface(int byte_no) {
+   transition(vtos, vtos);
+-  prepare_invoke(rax, rbx, byte_no, bytecode());
++  prepare_invoke(rax, rbx, byte_no);
+ 
+   // rax: Interface
+   // rbx: index
+@@ -3072,7 +3081,24 @@
+     return;
+   }
+ 
+-  __ stop("invokedynamic NYI");//6815692//
++  prepare_invoke(rax, rbx, byte_no);
++
++  // rax: CallSite object (f1)
++  // rbx: unused (f2)
++  // rcx: receiver address
++  // rdx: flags (unused)
++
++  if (ProfileInterpreter) {
++    Label L;
++    // %%% should make a type profile for any invokedynamic that takes a ref argument
++    // profile this call
++    __ profile_call(r13);
++  }
++
++  __ movptr(rcx, Address(rax, __ delayed_value(java_dyn_CallSite::target_offset_in_bytes, rcx)));
++  __ null_check(rcx);
++  __ prepare_to_jump_from_interpreted();
++  __ jump_to_method_handle_entry(rcx, rdx);
+ }
+ 
+ 
+diff --git a/src/cpu/x86/vm/templateTable_x86_64.hpp b/src/cpu/x86/vm/templateTable_x86_64.hpp
+--- a/src/cpu/x86/vm/templateTable_x86_64.hpp
++++ b/src/cpu/x86/vm/templateTable_x86_64.hpp
+@@ -22,8 +22,7 @@
+  *
+  */
+ 
+-  static void prepare_invoke(Register method, Register index, int byte_no,
+-                             Bytecodes::Code code);
++  static void prepare_invoke(Register method, Register index, int byte_no);
+   static void invokevirtual_helper(Register index, Register recv,
+                                    Register flags);
+   static void volatile_barrier(Assembler::Membar_mask_bits order_constraint);
+diff --git a/src/share/vm/classfile/classFileParser.cpp b/src/share/vm/classfile/classFileParser.cpp
+--- a/src/share/vm/classfile/classFileParser.cpp
++++ b/src/share/vm/classfile/classFileParser.cpp
+@@ -2511,23 +2511,12 @@
+       fac_ptr->nonstatic_byte_count -= 1;
+       (*fields_ptr)->ushort_at_put(i + instanceKlass::signature_index_offset,
+                                    word_sig_index);
+-      if (wordSize == jintSize) {
+-        fac_ptr->nonstatic_word_count += 1;
+-      } else {
+-        fac_ptr->nonstatic_double_count += 1;
+-      }
+-
+-      FieldAllocationType atype = (FieldAllocationType) (*fields_ptr)->ushort_at(i+4);
++      fac_ptr->nonstatic_word_count += 1;
++
++      FieldAllocationType atype = (FieldAllocationType) (*fields_ptr)->ushort_at(i + instanceKlass::low_offset);
+       assert(atype == NONSTATIC_BYTE, "");
+       FieldAllocationType new_atype = NONSTATIC_WORD;
+-      if (wordSize > jintSize) {
+-        if (Universe::field_type_should_be_aligned(T_LONG)) {
+-          atype = NONSTATIC_ALIGNED_DOUBLE;
+-        } else {
+-          atype = NONSTATIC_DOUBLE;
+-        }
+-      }
+-      (*fields_ptr)->ushort_at_put(i+4, new_atype);
++      (*fields_ptr)->ushort_at_put(i + instanceKlass::low_offset, new_atype);
+ 
+       found_vmentry = true;
+       break;
+@@ -3085,7 +3074,7 @@
+     int len = fields->length();
+     for (int i = 0; i < len; i += instanceKlass::next_offset) {
+       int real_offset;
+-      FieldAllocationType atype = (FieldAllocationType) fields->ushort_at(i+4);
++      FieldAllocationType atype = (FieldAllocationType) fields->ushort_at(i + instanceKlass::low_offset);
+       switch (atype) {
+         case STATIC_OOP:
+           real_offset = next_static_oop_offset;
+@@ -3173,8 +3162,8 @@
+         default:
+           ShouldNotReachHere();
+       }
+-      fields->short_at_put(i+4, extract_low_short_from_int(real_offset) );
+-      fields->short_at_put(i+5, extract_high_short_from_int(real_offset) );
++      fields->short_at_put(i + instanceKlass::low_offset,  extract_low_short_from_int(real_offset));
++      fields->short_at_put(i + instanceKlass::high_offset, extract_high_short_from_int(real_offset));
+     }
+ 
+     // Size of instances

@@ -1,0 +1,115 @@
+6981791: remove experimental code for JSR 292
+Reviewed-by: ?
+
+diff --git a/src/share/classes/com/sun/tools/javac/code/Symtab.java b/src/share/classes/com/sun/tools/javac/code/Symtab.java
+--- a/src/share/classes/com/sun/tools/javac/code/Symtab.java
++++ b/src/share/classes/com/sun/tools/javac/code/Symtab.java
+@@ -123,9 +123,7 @@
+     public final Type stringBuilderType;
+     public final Type cloneableType;
+     public final Type serializableType;
+-    public final Type transientMethodHandleType; // transient - 292
+     public final Type methodHandleType;
+-    public final Type transientPolymorphicSignatureType; // transient - 292
+     public final Type polymorphicSignatureType;
+     public final Type throwableType;
+     public final Type errorType;
+@@ -419,9 +417,7 @@
+         cloneableType = enterClass("java.lang.Cloneable");
+         throwableType = enterClass("java.lang.Throwable");
+         serializableType = enterClass("java.io.Serializable");
+-        transientMethodHandleType = enterClass("java.dyn.MethodHandle"); // transient - 292
+         methodHandleType = enterClass("java.lang.invoke.MethodHandle");
+-        transientPolymorphicSignatureType = enterClass("java.dyn.MethodHandle$PolymorphicSignature"); // transient - 292
+         polymorphicSignatureType = enterClass("java.lang.invoke.MethodHandle$PolymorphicSignature");
+         errorType = enterClass("java.lang.Error");
+         illegalArgumentExceptionType = enterClass("java.lang.IllegalArgumentException");
+@@ -466,7 +462,6 @@
+ 
+         synthesizeEmptyInterfaceIfMissing(cloneableType);
+         synthesizeEmptyInterfaceIfMissing(serializableType);
+-        synthesizeEmptyInterfaceIfMissing(transientPolymorphicSignatureType); // transient - 292
+         synthesizeEmptyInterfaceIfMissing(polymorphicSignatureType);
+         synthesizeBoxTypeIfMissing(doubleType);
+         synthesizeBoxTypeIfMissing(floatType);
+diff --git a/src/share/classes/com/sun/tools/javac/comp/MemberEnter.java b/src/share/classes/com/sun/tools/javac/comp/MemberEnter.java
+--- a/src/share/classes/com/sun/tools/javac/comp/MemberEnter.java
++++ b/src/share/classes/com/sun/tools/javac/comp/MemberEnter.java
+@@ -788,8 +788,7 @@
+             // Internally to java.lang.invoke, a @PolymorphicSignature annotation
+             // acts like a classfile attribute.
+             if (!c.type.isErroneous() &&
+-                    (types.isSameType(c.type, syms.polymorphicSignatureType) ||
+-                     types.isSameType(c.type, syms.transientPolymorphicSignatureType))) {
++                types.isSameType(c.type, syms.polymorphicSignatureType)) {
+                 if (!target.hasMethodHandles()) {
+                     // Somebody is compiling JDK7 source code to a JDK6 target.
+                     // Make it an error, since it is unlikely but important.
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java b/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/ClassReader.java
+@@ -1318,8 +1318,7 @@
+                 else
+                     proxies.append(proxy);
+                 if (majorVersion >= V51.major &&
+-                        (proxy.type.tsym == syms.polymorphicSignatureType.tsym ||
+-                         proxy.type.tsym == syms.transientPolymorphicSignatureType.tsym)) {
++                    proxy.type.tsym == syms.polymorphicSignatureType.tsym) {
+                     sym.flags_field |= POLYMORPHIC_SIGNATURE;
+                 }
+             }
+diff --git a/src/share/classes/com/sun/tools/javac/util/Names.java b/src/share/classes/com/sun/tools/javac/util/Names.java
+--- a/src/share/classes/com/sun/tools/javac/util/Names.java
++++ b/src/share/classes/com/sun/tools/javac/util/Names.java
+@@ -73,7 +73,6 @@
+     public final Name java_io_Serializable;
+     public final Name serialVersionUID;
+     public final Name java_lang_Enum;
+-    public final Name transient_java_dyn_MethodHandle; // transient - 292
+     public final Name java_lang_invoke_MethodHandle;
+     public final Name package_info;
+     public final Name ConstantValue;
+@@ -184,7 +183,6 @@
+         java_lang_Cloneable = fromString("java.lang.Cloneable");
+         java_io_Serializable = fromString("java.io.Serializable");
+         java_lang_Enum = fromString("java.lang.Enum");
+-        transient_java_dyn_MethodHandle = fromString("java.dyn.MethodHandle"); //transient - 292
+         java_lang_invoke_MethodHandle = fromString("java.lang.invoke.MethodHandle");
+         package_info = fromString("package-info");
+         serialVersionUID = fromString("serialVersionUID");
+diff --git a/test/tools/javac/meth/InvokeMH.java b/test/tools/javac/meth/InvokeMH.java
+--- a/test/tools/javac/meth/InvokeMH.java
++++ b/test/tools/javac/meth/InvokeMH.java
+@@ -42,7 +42,7 @@
+ 
+ package meth;
+ 
+-import java.dyn.MethodHandle;
++import java.lang.invoke.MethodHandle;
+ 
+ public class InvokeMH {
+     void test(MethodHandle mh_SiO,
+diff --git a/test/tools/javac/meth/TestCP.java b/test/tools/javac/meth/TestCP.java
+--- a/test/tools/javac/meth/TestCP.java
++++ b/test/tools/javac/meth/TestCP.java
+@@ -35,7 +35,7 @@
+ import com.sun.tools.classfile.ConstantPool.*;
+ import com.sun.tools.classfile.Method;
+ 
+-import java.dyn.*;
++import java.lang.invoke.*;
+ import java.io.*;
+ 
+ public class TestCP {
+diff --git a/test/tools/javac/meth/XlintWarn.java b/test/tools/javac/meth/XlintWarn.java
+--- a/test/tools/javac/meth/XlintWarn.java
++++ b/test/tools/javac/meth/XlintWarn.java
+@@ -30,7 +30,7 @@
+  * @compile -Werror -Xlint:cast XlintWarn.java
+  */
+ 
+-import java.dyn.*;
++import java.lang.invoke.*;
+ 
+ class XlintWarn {
+     void test(MethodHandle mh) throws Throwable {

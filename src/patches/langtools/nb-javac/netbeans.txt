@@ -1,0 +1,37 @@
+Instructions:
+
+Make a workspace for the NetBeans javac parser.
+
+$ hg clone http://hg.netbeans.org/main/nb-javac
+
+Install these patches.
+
+$ hg qinit -R nb-javac
+$ cp davinci/patches/langtools/nb-javac/* nb-javac/.hg/patches
+
+Verify the revision guard and apply the patches.
+
+$ cd nb-javac
+$ hg co release65_base
+$ hg qselect 4d206181439a
+$ hg qpush --all
+
+Build:
+
+$ (cd make/netbeans/nb-javac; ant clean jar)
+
+Deploy the updated javac into a scratch copy of NetBeans 6.5:
+
+$ nborig="/Applications/NetBeans/NetBeans 6.5.app"
+$ nbcopy="/Applications/NetBeans/NetBeans 6.5 Experimental.app"
+$ cp -pr "$nborig" "$nbcopy"
+
+$ nbdist="$nbcopy/Contents/Resources/NetBeans/java2/modules/ext"
+$ cp make/netbeans/nb-javac/dist/javac-impl.jar  "$nbdist"/javac-impl-nb-7.0-b07.jar
+$ cp make/netbeans/nb-javac/dist/javac-api.jar   "$nbdist"/javac-api-nb-7.0-b07.jar
+
+(There is probably a better way to plug this in; ask any NetBeans expert and let me know.)
+
+Enjoy:
+
+$ open "$nbcopy"

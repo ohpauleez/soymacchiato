@@ -1,0 +1,3262 @@
+diff --git a/src/cpu/x86/vm/sharedRuntime_x86_32.cpp b/src/cpu/x86/vm/sharedRuntime_x86_32.cpp
+--- a/src/cpu/x86/vm/sharedRuntime_x86_32.cpp
++++ b/src/cpu/x86/vm/sharedRuntime_x86_32.cpp
+@@ -31,6 +31,8 @@
+ #endif // COMPILER2
+ 
+ DeoptimizationBlob *SharedRuntime::_deopt_blob;
++RuntimeStub*       SharedRuntime::_continuation_save_blob;
++RuntimeStub*       SharedRuntime::_continuation_resume_blob;
+ SafepointBlob      *SharedRuntime::_polling_page_safepoint_handler_blob;
+ SafepointBlob      *SharedRuntime::_polling_page_return_handler_blob;
+ RuntimeStub*       SharedRuntime::_wrong_method_blob;
+@@ -2642,6 +2644,270 @@
+   _deopt_blob->set_unpack_with_exception_in_tls_offset(exception_in_tls_offset);
+ }
+ 
++RuntimeStub* SharedRuntime::generate_continuation_save_blob() {
++  const char* name = "continuation_save_stub";
++  ResourceMark rm;
++  CodeBuffer   buffer(name, 2048, 2048);
++  MacroAssembler* masm = new MacroAssembler(&buffer);
++  int frame_size = 0;
++
++  // This code is called like a void func(thread, sp, fp, pc, &rv_oop) from Unsafe_CutStack
++
++  // trash the (unneeded) return pc
++  __ pop(rdi);
++
++  // pop the thread
++  __ pop(rcx);
++  __ reset_last_Java_frame(rcx, false, true);
++
++  // pop arguments
++  __ pop(rdi); // sp
++  __ pop(rsi); // fp
++  __ pop(rbx); // pc
++  __ pop(rax); // &rv
++
++  // Set last Java frame
++  __ set_last_Java_frame(rcx, rdi, rsi, NULL);
++
++  // Cut to the frame
++  __ movl(rsp, rdi);
++  __ movl(rbp, rsi);
++
++  __ push(rbx); // push the cut pc as the return pc
++  __ push(rbp); // construct a dummy frame
++  __ movl(rbp, rsp);
++  __ push(rcx); // save thread ptr
++  __ push(rax); // push the address of the return value
++  __ push(rcx); // push thread ptr for the call
++
++  // Call a C function that deallocates the
++  // ThreadInVMfromNativeForContinuation object. This could block for
++  // GC.
++  __ call(RuntimeAddress(CAST_FROM_FN_PTR(address, ThreadInVMfromNativeForContinuation::dealloc)));
++  __ addl(rsp, 4); // discard the param
++
++  __ pop(rax); // address of return value
++  __ pop(rcx); // pop the thread ptr
++  __ push(rax); // address of return value
++
++  __ movl(Address(rcx, JavaThread::thread_state_offset()), _thread_in_native_trans);
++
++  if(os::is_MP()) {
++    if (UseMembar) {
++      // Force this write out before the read below
++      __ membar(Assembler::Membar_mask_bits(
++           Assembler::LoadLoad | Assembler::LoadStore |
++           Assembler::StoreLoad | Assembler::StoreStore));
++    } else {
++      // Write serialization page so VM thread can do a pseudo remote membar.
++      // We use the current thread pointer to calculate a thread specific
++      // offset to write to within the page. This minimizes bus traffic
++      // due to cache line collision.
++      __ serialize_memory(rcx, rdx);
++    }
++  }
++
++  if (AlwaysRestoreFPU) {
++    // Make sure the control word is correct.
++    __ fldcw(ExternalAddress(StubRoutines::addr_fpu_cntrl_wrd_std()));
++  }
++
++  // check for safepoint operation in progress and/or pending suspend requests
++  { Label Continue;
++
++    __ cmp32(ExternalAddress((address)SafepointSynchronize::address_of_state()),
++             SafepointSynchronize::_not_synchronized);
++
++    Label L;
++    __ jcc(Assembler::notEqual, L);
++    __ cmpl(Address(rcx, JavaThread::suspend_flags_offset()), 0);
++    __ jcc(Assembler::equal, Continue);
++    __ bind(L);
++
++    // Don't use call_VM as it will see a possible pending exception and forward it
++    // and never return here preventing us from clearing _last_native_pc down below.
++    // Also can't use call_VM_leaf either as it will check to see if rsi & rdi are
++    // preserved and correspond to the bcp/locals pointers. So we do a runtime call
++    // by hand.
++    //
++    __ push(rcx);
++    __ push(rcx);
++    __ call(RuntimeAddress(CAST_FROM_FN_PTR(address,
++                                            JavaThread::check_special_condition_for_native_trans)));
++    __ increment(rsp, wordSize);
++    __ pop(rcx);
++
++    __ bind(Continue);
++  }
++
++  // reguard the stack ?
++
++  __ pop(rax); // address of return value
++  __ movl(rax, Address(rax, 0)); // unhandle rv
++
++  // reset handle block
++  __ movl(rdi, Address(rcx, JavaThread::active_handles_offset()));
++  __ movl(Address(rdi, JNIHandleBlock::top_offset_in_bytes()), 0);
++
++  // Compiled code leaves the floating point stack dirty, empty it.
++  __ empty_FPU_stack();
++
++  // Change the thread state to _thread_in_Java
++  __ movl(Address(rcx, JavaThread::thread_state_offset()), _thread_in_Java);
++
++  // This field must remain non-null so that GC won't check the
++  // outgoing arguments of the enter0 frame (they could be invalid oops
++  // if the frame above is a compiled frame). But now it should be
++  // nullified because GC won't happen in this blob at this point.
++  __ movl(Address(rcx, JavaThread::cont_thread_transition_offset()), NULL_WORD);
++
++  __ reset_last_Java_frame(rcx, true, true);
++
++  __ leave();  // deconstruct the frame
++  __ ret(0);   // return to the cut pc (the top frame of the resumed stack)
++
++  // -------------
++  // make sure all code is generated
++  masm->flush();
++
++  return RuntimeStub::new_runtime_stub(name, &buffer, CodeOffsets::frame_never_safe, 0, NULL, true);
++}
++
++RuntimeStub* SharedRuntime::generate_continuation_resume_blob() {
++  const char* name = "continuation_resume_stub";
++  ResourceMark rm;
++  CodeBuffer   buffer(name, 2048, 2048);
++  MacroAssembler* masm = new MacroAssembler(&buffer);
++
++  // This code is called like a void func(JavaThread* thread, ResumeBlock* rb) from Unsafe_ResumeStack0
++
++  // Pop the unneeded return pc
++  __ pop(rsi);
++
++  // Pop the thread
++  __ pop(rcx);
++  __ reset_last_Java_frame(rcx, false, true);
++
++  // Compiled code leaves the floating point stack dirty, empty it.
++  __ empty_FPU_stack();
++
++  // Pop the ResumeBlock*
++  __ pop(rdi);
++
++  // Get the image
++  __ movl(rsi, Address(rdi, ResumeBlock::top_sp_offset_in_bytes()));
++  __ movl(rax, Address(rdi, ResumeBlock::image_offset_in_bytes()));
++  __ movl(rbx, Address(rdi, ResumeBlock::image_size_offset_in_bytes()));
++  // rsi sp, rai - image, rbx - image_size
++
++  // Copy the image into the stack
++  Label resume_frames_loop;
++  __ bind(resume_frames_loop);
++  __ movl(rdx, Address(rax, 0)); // read from the image
++  __ movl(Address(rsi, 0), rdx); // write into the stack
++  __ addl(rsi, 4); // increment the pointer
++  __ addl(rax, 4); //
++  __ subl(rbx, 1); // decerement the length
++  __ jcc(Assembler::notZero, resume_frames_loop);
++
++  // Move (shift) the locals of the bottom frame
++  // rsi points to one word past the bottom here
++  Label move_bottom_frame_locals_loop;
++  Label move_bottom_frame_locals_loop_cont;
++  __ movl(rax, Address(rdi, ResumeBlock::alignment_padding_offset_in_bytes()));
++  __ movl(rbx, Address(rdi, ResumeBlock::bottom_frame_max_locals_offset_in_bytes()));
++  // Check if the padding == 0 or max_locals == 0
++  __ testl(rax, rax);
++  __ jcc(Assembler::zero, move_bottom_frame_locals_loop_cont);
++  __ testl(rbx, rbx);
++  __ jcc(Assembler::zero, move_bottom_frame_locals_loop_cont);
++
++  __ movl(rdx, rsi);
++  __ shll(rax, 2); // words -> bytes
++  __ addl(rdx, rax);
++
++  // rsi: copy dest, rdx: copy src, rbx: counter
++  // loop
++  __ bind(move_bottom_frame_locals_loop);
++  __ movl(rax, Address(rdx, 0));
++  __ movl(Address(rsi, 0), rax);
++  __ movl(Address(rdx, 0), 0xbaadbaad); // for error detection
++  __ addl(rsi, 4);
++  __ addl(rdx, 4);
++  __ subl(rbx, 1);
++  __ jcc(Assembler::notZero, move_bottom_frame_locals_loop);
++  __ bind(move_bottom_frame_locals_loop_cont);
++
++  // Set sp, fp, rv
++  __ movl(rsi, Address(rdi, ResumeBlock::top_sp_offset_in_bytes()));
++  __ movl(rbx, Address(rdi, ResumeBlock::top_fp_offset_in_bytes()));
++  __ movl(rdx, Address(rdi, ResumeBlock::top_pc_offset_in_bytes()));
++  // rax = handle of the return value
++  __ movl(rax, Address(rdi, ResumeBlock::return_value_offset_in_bytes()));
++
++  // Restore the top frame sp and fp
++  __ movl(rsp, rsi);
++  __ movl(rbp, rbx);
++
++  // Set last Java frame
++  __ set_last_Java_frame(rcx, rsi, rbx, NULL);
++  // After jumping back to the native wrapper at the end of this
++  // rountine, we could hit a safepoint. But the only pc that has an oop
++  // map in the native wrapper is the rough pc set by the native
++  // wrapper. So, we must set the last Java pc to it.
++  __ movl(rsi, Address(rdi, ResumeBlock::rough_top_pc_offset_in_bytes()));
++  __ movl(Address(rcx, JavaThread::last_Java_pc_offset()), rsi);
++
++  // The native wrapper expects to see the thread ptr preserved in rdi.
++  // Note rdi is a callee saved register in the C convention.
++  __ movl(rdi, rcx);
++
++  // push resume pc (rdx) and rv (rax) on stack to preserve across the C call.
++  __ push(rdx);
++  __ push(rax);
++  __ push(rcx); // one for each of the two calls
++  __ push(rcx);
++  // call a C function that deallocates deopt_mark
++  __ call(RuntimeAddress(CAST_FROM_FN_PTR(address, Deoptimization::dealloc_deopt_mark)));
++  __ addl(rsp, 4); // discard the param
++
++  __ pop(rcx); // thread ptr
++  __ pop(rax); // the handle of the return value
++  __ pop(rdx); // resume pc
++
++  __ push(rdx); // push the resume pc as the return pc
++  __ push(rbp); // construct a dummy frame
++  __ movl(rbp, rsp);
++  __ push(rax); // push the handle of the return value
++  __ push(rcx); // save the thread ptr across the call
++  __ push(rcx); // push the thread ptr for the call
++
++  // call a C function that deallocates the
++  // ThreadInVMfromNativeForContinuation object.  This could block for
++  // GC.
++  __ call(RuntimeAddress(CAST_FROM_FN_PTR(address, ThreadInVMfromNativeForContinuation::dealloc)));
++  __ addl(rsp, 4); // discard the param
++
++  // This field must remain non-null so that GC won't check the
++  // outgoing arguments of the top frame which could be invalid
++  // oops. But now it should be nullified because GC won't happen in
++  // this blob at this point.
++  __ pop(rcx); // the thread ptr
++  __ movl(Address(rcx, JavaThread::cont_thread_transition_offset()), NULL_WORD);
++
++  // Since we're returning to native wrapper/entry, the return value
++  // should be handlized here.
++  __ pop(rax); // pop the handle of the return value
++
++  __ leave();  // deconstruct the frame
++  __ ret(0);   // return to the resume pc (the top frame of the resumed stack)
++
++  // -------------
++  // make sure all code is generated
++  masm->flush();
++
++  return RuntimeStub::new_runtime_stub(name, &buffer, CodeOffsets::frame_never_safe, 0, NULL, true);
++}
+ 
+ #ifdef COMPILER2
+ //------------------------------generate_uncommon_trap_blob--------------------
+@@ -3031,7 +3297,11 @@
+     generate_handler_blob(CAST_FROM_FN_PTR(address,
+                    SafepointSynchronize::handle_polling_page_exception), true);
+ 
++  _continuation_save_blob = generate_continuation_save_blob();
++  _continuation_resume_blob = generate_continuation_resume_blob();
++
+   generate_deopt_blob();
++
+ #ifdef COMPILER2
+   generate_uncommon_trap_blob();
+ #endif // COMPILER2
+diff --git a/src/cpu/x86/vm/sharedRuntime_x86_64.cpp b/src/cpu/x86/vm/sharedRuntime_x86_64.cpp
+--- a/src/cpu/x86/vm/sharedRuntime_x86_64.cpp
++++ b/src/cpu/x86/vm/sharedRuntime_x86_64.cpp
+@@ -33,6 +33,8 @@
+ 
+ SafepointBlob      *SharedRuntime::_polling_page_safepoint_handler_blob;
+ SafepointBlob      *SharedRuntime::_polling_page_return_handler_blob;
++RuntimeStub*       SharedRuntime::_continuation_save_blob;
++RuntimeStub*       SharedRuntime::_continuation_resume_blob;
+ RuntimeStub*       SharedRuntime::_wrong_method_blob;
+ RuntimeStub*       SharedRuntime::_ic_miss_blob;
+ RuntimeStub*       SharedRuntime::_resolve_opt_virtual_call_blob;
+@@ -2831,6 +2833,249 @@
+   _deopt_blob->set_unpack_with_exception_in_tls_offset(exception_in_tls_offset);
+ }
+ 
++RuntimeStub* SharedRuntime::generate_continuation_save_blob() {
++  const char* name = "continuation_save_stub";
++  ResourceMark rm;
++  CodeBuffer   buffer(name, 2048, 2048);
++  MacroAssembler* masm = new MacroAssembler(&buffer);
++  int frame_size = 0;
++
++  // This code is called like a void func(thread, sp, fp, pc, &rv_oop) from Unsafe_CutStack
++  // thread on rdi
++  // sp     on rsi
++  // fp     on rdx
++  // pc     on rcx
++  // &rv_oop on r8
++
++  // pop thread
++  __ mov(r15_thread, rdi);
++  __ reset_last_Java_frame(false, true);
++
++  // trash the (unneeded) return pc
++  __ pop(rdi);
++
++  // Set last Java frame
++  __ set_last_Java_frame(rsi, rdx, NULL);
++
++  // Cut to the frame
++  __ mov(rsp, rsi);
++  __ mov(rbp, rdx);
++
++  __ push(rcx); // push the cut pc as the return pc
++  __ push(rbp); // construct a dummy frame
++  __ mov(rbp, rsp);
++  __ push(r8);         // save the address of the return value across the call
++  __ mov(rdi, r15_thread); // pass thread ptr to the call
++
++  // Call a C function that deallocates the
++  // ThreadInVMfromNativeForContinuation object. This could block for
++  // GC.
++  __ call(RuntimeAddress(CAST_FROM_FN_PTR(address, ThreadInVMfromNativeForContinuation::dealloc)));
++  // r15_thread is callee-saved
++
++  __ movl(Address(r15_thread, JavaThread::thread_state_offset()), _thread_in_native_trans);
++
++  if(os::is_MP()) {
++    if (UseMembar) {
++      // Force this write out before the read below
++      __ membar(Assembler::Membar_mask_bits(
++           Assembler::LoadLoad | Assembler::LoadStore |
++           Assembler::StoreLoad | Assembler::StoreStore));
++    } else {
++      // Write serialization page so VM thread can do a pseudo remote membar.
++      // We use the current thread pointer to calculate a thread specific
++      // offset to write to within the page. This minimizes bus traffic
++      // due to cache line collision.
++      __ serialize_memory(r15_thread, rcx);
++    }
++  }
++
++  // check for safepoint operation in progress and/or pending suspend requests
++  {
++    Label Continue;
++
++    __ cmp32(ExternalAddress((address)SafepointSynchronize::address_of_state()),
++             SafepointSynchronize::_not_synchronized);
++
++    Label L;
++    __ jcc(Assembler::notEqual, L);
++    __ cmpl(Address(r15_thread, JavaThread::suspend_flags_offset()), 0);
++    __ jcc(Assembler::equal, Continue);
++    __ bind(L);
++
++    // Don't use call_VM as it will see a possible pending exception and forward it
++    // and never return here preventing us from clearing _last_native_pc down below.
++    // Also can't use call_VM_leaf either as it will check to see if rsi & rdi are
++    // preserved and correspond to the bcp/locals pointers. So we do a runtime call
++    // by hand.
++    //
++    __ mov(c_rarg0, r15_thread);
++    __ mov(r12, rsp); // remember sp
++    __ subptr(rsp, frame::arg_reg_save_area_bytes); // windows
++    __ andptr(rsp, -16); // align stack as required by ABI
++    __ call(RuntimeAddress(CAST_FROM_FN_PTR(address, JavaThread::check_special_condition_for_native_trans)));
++    __ mov(rsp, r12); // restore sp
++    __ reinit_heapbase();
++    __ bind(Continue);
++
++  }
++
++  // regard the stack ?
++
++  __ pop(r8); // restore rv
++  __ movq(rax, Address(r8, 0)); // unhandle rv
++
++  // reset handle block
++  __ movptr(rdi, Address(r15_thread, JavaThread::active_handles_offset()));
++  __ movptr(Address(rdi, JNIHandleBlock::top_offset_in_bytes()), (int32_t)NULL_WORD);
++
++  __ movl(Address(r15_thread, JavaThread::thread_state_offset()), _thread_in_Java);
++
++  // This field must remain non-null so that GC won't check the
++  // outgoing arguments of the enter0 frame (they could be invalid oops
++  // if the frame above is a compiled frame). But now it should be
++  // nullified because GC won't happen in this blob at this point.
++  __ movptr(Address(r15_thread, JavaThread::cont_thread_transition_offset()), (intptr_t) NULL_WORD);
++
++  __ reset_last_Java_frame(true, true);
++
++  __ leave();  // deconstruct the frame
++  __ ret(0);   // return to the cut pc (the top frame of the resumed stack)
++
++  // -------------
++  // make sure all code is generated
++  masm->flush();
++
++  return RuntimeStub::new_runtime_stub(name, &buffer, CodeOffsets::frame_never_safe, 0, NULL, true);
++}
++
++RuntimeStub* SharedRuntime::generate_continuation_resume_blob() {
++  const char* name = "continuation_resume_stub";
++  ResourceMark rm;
++  CodeBuffer   buffer(name, 2048, 2048);
++  MacroAssembler* masm = new MacroAssembler(&buffer);
++
++  // This code is called like a void func(JavaThread* thread, ResumeBlock* rb) from Unsafe_ResumeStack0
++  // thread on rdi
++  // rb     on rsi
++
++  // Set r15_thread
++  __ mov(r15_thread, rdi);
++  __ reset_last_Java_frame(false, true);
++
++  // Pop the unneeded return pc
++  __ pop(rdx);
++
++  // Set the ResumeBlock* in rdi
++  __ mov(rdi, rsi);
++
++  // Get the image
++  __ movq(rsi, Address(rdi, ResumeBlock::top_sp_offset_in_bytes()));
++  __ movq(rax, Address(rdi, ResumeBlock::image_offset_in_bytes()));
++  __ movq(rbx, Address(rdi, ResumeBlock::image_size_offset_in_bytes()));
++  // rsi sp, rai - image, rbx - image_size
++
++  // Copy the image into the stack
++  Label resume_frames_loop;
++  __ bind(resume_frames_loop);
++  __ movq(rdx, Address(rax, 0)); // read from the image
++  __ movq(Address(rsi, 0), rdx); // write into the stack
++  __ addq(rsi, 8); // increment the pointer
++  __ addq(rax, 8); //
++  __ subq(rbx, 1); // decerement the length
++  __ jcc(Assembler::notZero, resume_frames_loop);
++
++  // Move (shift) the locals of the bottom frame
++  // rsi points to one word past the bottom here
++  Label move_bottom_frame_locals_loop;
++  Label move_bottom_frame_locals_loop_cont;
++  __ movq(rax, Address(rdi, ResumeBlock::alignment_padding_offset_in_bytes()));
++  __ movq(rbx, Address(rdi, ResumeBlock::bottom_frame_max_locals_offset_in_bytes()));
++  // Check if the padding == 0 or max_locals == 0
++  __ testq(rax, rax);
++  __ jcc(Assembler::zero, move_bottom_frame_locals_loop_cont);
++  __ testq(rbx, rbx);
++  __ jcc(Assembler::zero, move_bottom_frame_locals_loop_cont);
++  __ mov(rdx, rsi);
++  __ shlq(rax, 3); // words -> bytes
++  __ addq(rdx, rax);
++  // rsi: copy dest, rdx: copy src, rbx: counter
++  // loop
++  __ bind(move_bottom_frame_locals_loop);
++  __ movq(rax, Address(rdx, 0));
++  __ movq(Address(rsi, 0), rax);
++  __ mov64(rax, 0xbaadbaadbaadbaad);
++  __ movq(Address(rdx, 0), rax); // for error detection
++  __ addq(rsi, 8);
++  __ addq(rdx, 8);
++  __ subq(rbx, 1);
++  __ jcc(Assembler::notZero, move_bottom_frame_locals_loop);
++  __ bind(move_bottom_frame_locals_loop_cont);
++
++  // Set sp, fp, rv
++  __ movq(rsi, Address(rdi, ResumeBlock::top_sp_offset_in_bytes()));
++  __ movq(rbx, Address(rdi, ResumeBlock::top_fp_offset_in_bytes()));
++  __ movq(rdx, Address(rdi, ResumeBlock::top_pc_offset_in_bytes()));
++  // rax = handle of the return value
++  __ movq(rax, Address(rdi, ResumeBlock::return_value_offset_in_bytes()));
++
++  // Restore the top frame sp and fp
++  __ mov(rsp, rsi);
++  __ mov(rbp, rbx);
++
++  // Set last Java frame
++  __ set_last_Java_frame(rsi, rbx, NULL);
++  // After jumping back to the native wrapper at the end of this
++  // rountine, we could hit a safepoint. But the only pc that has an oop
++  // map in the native wrapper is the rough pc set by the native
++  // wrapper. So, we must set the last Java pc to it.
++  __ movq(rsi, Address(rdi, ResumeBlock::rough_top_pc_offset_in_bytes()));
++  __ movq(Address(r15_thread, JavaThread::last_Java_pc_offset()), rsi);
++
++  // The native wrapper expects to see the thread ptr preserved in r15_thread.
++
++  // push resume pc (rdx) and rv (rax) on stack to preserve across the C call.
++  __ push(rdx);
++  __ push(rax);
++
++  __ mov(rdi, r15_thread);
++  // call a C function that deallocates deopt_mark
++  __ call(RuntimeAddress(CAST_FROM_FN_PTR(address, Deoptimization::dealloc_deopt_mark)));
++
++  __ pop(rax); // the handle of the return value
++  __ pop(rdx); // resume pc
++
++  __ push(rdx); // push the resume pc as the return pc
++  __ push(rbp); // construct a dummy frame
++  __ mov(rbp, rsp);
++  __ push(rax); // save the handle of the return value
++
++  // call a C function that deallocates the
++  // ThreadInVMfromNativeForContinuation object.  This could block for
++  // GC.
++  __ mov(rdi, r15_thread);
++  __ call(RuntimeAddress(CAST_FROM_FN_PTR(address, ThreadInVMfromNativeForContinuation::dealloc)));
++
++  // This field must remain non-null so that GC won't check the
++  // outgoing arguments of the top frame which could be invalid
++  // oops. But now it should be nullified because GC won't happen in
++  // this blob at this point.
++  __ movptr(Address(r15_thread, JavaThread::cont_thread_transition_offset()), (intptr_t) NULL_WORD);
++
++  // Since we're returning to native wrapper/entry, the return value
++  // should be handlized here.
++  __ pop(rax); // restore the handle of the return value
++
++  __ leave();  // deconstruct the frame
++  __ ret(0);   // return to the resume pc (the top frame of the resumed stack)
++
++  // -------------
++  // make sure all code is generated
++  masm->flush();
++
++  return RuntimeStub::new_runtime_stub(name, &buffer, CodeOffsets::frame_never_safe, 0, NULL, true);
++}
++
+ #ifdef COMPILER2
+ //------------------------------generate_uncommon_trap_blob--------------------
+ void SharedRuntime::generate_uncommon_trap_blob() {
+@@ -3194,6 +3439,9 @@
+     generate_handler_blob(CAST_FROM_FN_PTR(address,
+                    SafepointSynchronize::handle_polling_page_exception), true);
+ 
++  _continuation_save_blob = generate_continuation_save_blob();
++  _continuation_resume_blob = generate_continuation_resume_blob();
++
+   generate_deopt_blob();
+ 
+ #ifdef COMPILER2
+diff --git a/src/share/vm/adlc/output_h.cpp b/src/share/vm/adlc/output_h.cpp
+--- a/src/share/vm/adlc/output_h.cpp
++++ b/src/share/vm/adlc/output_h.cpp
+@@ -1909,6 +1909,7 @@
+     else if (instr->is_tls_instruction()) {
+       // Special hack for tlsLoadP
+       fprintf(fp,"  const Type            *bottom_type() const { return TypeRawPtr::BOTTOM; } // tlsLoadP\n");
++      fprintf(fp,"  bool is_tlsLoadP() const { return true; } // tlsLoadP\n");
+     }
+     else if ( instr->is_ideal_if() ) {
+       fprintf(fp,"  const Type            *bottom_type() const { return TypeTuple::IFBOTH; } // matched IfNode\n");
+diff --git a/src/share/vm/classfile/vmSymbols.hpp b/src/share/vm/classfile/vmSymbols.hpp
+--- a/src/share/vm/classfile/vmSymbols.hpp
++++ b/src/share/vm/classfile/vmSymbols.hpp
+@@ -385,6 +385,7 @@
+   template(void_signature,                            "V")                                        \
+   template(byte_array_signature,                      "[B")                                       \
+   template(char_array_signature,                      "[C")                                       \
++  template(long_array_signature,                      "[J")                                       \
+   template(object_void_signature,                     "(Ljava/lang/Object;)V")                    \
+   template(object_int_signature,                      "(Ljava/lang/Object;)I")                    \
+   template(object_boolean_signature,                  "(Ljava/lang/Object;)Z")                    \
+@@ -842,6 +843,15 @@
+     /*== LAST_COMPILER_INLINE*/                                                                                         \
+     /*the compiler does have special inlining code for these; bytecode inline is just fine */                           \
+                                                                                                                         \
++                                                                                                                        \
++  /* continuation intrinsic (excluded from compilation) */                                                              \
++  do_class(sun_misc_Continuation,          "sun/misc/Continuation")                                                     \
++  do_intrinsic(_enter,                    sun_misc_Continuation,   enter_name, enter_signature,  F_S)                   \
++   do_name(     enter_name,                                       "enter")                                              \
++   do_signature(enter_signature,           "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/lang/Object;")                \
++  do_intrinsic(_enter0,                   sun_misc_Continuation,   enter0_name, enter_signature,  F_S)                  \
++   do_name(     enter0_name,                                      "enter0")                                             \
++                                                                                                                        \
+   do_intrinsic(_fillInStackTrace,         java_lang_Throwable, fillInStackTrace_name, void_throwable_signature,  F_RNY) \
+                                                                                                                           \
+   do_intrinsic(_StringBuilder_void,   java_lang_StringBuilder, object_initializer_name, void_method_signature,     F_R)   \
+diff --git a/src/share/vm/code/nmethod.cpp b/src/share/vm/code/nmethod.cpp
+--- a/src/share/vm/code/nmethod.cpp
++++ b/src/share/vm/code/nmethod.cpp
+@@ -608,6 +608,7 @@
+     _nul_chk_table_offset    = _handler_table_offset;
+     _nmethod_end_offset      = _nul_chk_table_offset;
+     _compile_id              = 0;  // default
++    _cont_ref_count          = 0;
+     _comp_level              = CompLevel_none;
+     _entry_point             = instructions_begin();
+     _verified_entry_point    = instructions_begin() + offsets->value(CodeOffsets::Verified_Entry);
+@@ -785,6 +786,7 @@
+     _oops_do_mark_link       = NULL;
+     _method                  = method;
+     _compile_id              = compile_id;
++    _cont_ref_count          = 0;
+     _comp_level              = comp_level;
+     _entry_bci               = entry_bci;
+     _osr_link                = NULL;
+@@ -1146,6 +1148,11 @@
+ bool nmethod::can_not_entrant_be_converted() {
+   assert(is_not_entrant(), "must be a non-entrant method");
+ 
++  // If some continuation includes a stack frame of this nmethod, say no.
++  if (cont_ref_count() > 0) {
++    return false;
++  }
++
+   // Since the nmethod sweeper only does partial sweep the sweeper's traversal
+   // count can be greater than the stack traversal count before it hits the
+   // nmethod for the second time.
+diff --git a/src/share/vm/code/nmethod.hpp b/src/share/vm/code/nmethod.hpp
+--- a/src/share/vm/code/nmethod.hpp
++++ b/src/share/vm/code/nmethod.hpp
+@@ -146,6 +146,9 @@
+ 
+   AbstractCompiler* _compiler; // The compiler which compiled this nmethod
+ 
++  // Continuation support
++  int _cont_ref_count;                 // how many live continuations include this nmethod
++
+   // Offsets for different nmethod parts
+   int _exception_offset;
+   // All deoptee's will resume execution at this location described by
+@@ -516,6 +519,8 @@
+     return (addr >= instructions_begin() && addr < verified_entry_point());
+   }
+ 
++  int orig_pc_offset() { return _orig_pc_offset; }
++
+   // unlink and deallocate this nmethod
+   // Only NMethodSweeper class is expected to use this. NMethodSweeper is not
+   // expected to use any other private methods/data in this class.
+@@ -643,6 +648,26 @@
+   int  compile_id() const                         { return _compile_id; }
+   const char* compile_kind() const;
+ 
++  // Continuation support
++  int cont_ref_count() const {
++    assert(_cont_ref_count >= 0, "negative cont ref count");
++    return _cont_ref_count;
++  }
++  int inc_cont_ref_count() {
++    Atomic::inc(&_lock_count);
++    guarantee(!is_zombie(), "cannot lock a zombie method");
++
++    assert(_cont_ref_count >= 0, "negative cont ref count");
++    return ++_cont_ref_count;
++  }
++  int dec_cont_ref_count() {
++    Atomic::dec(&_lock_count);
++    guarantee(_lock_count >= 0, "unmatched nmethod lock/unlock");
++
++    assert(_cont_ref_count > 0, "negative cont ref count");
++    return --_cont_ref_count;
++  }
++
+   // For debugging
+   // CompiledIC*    IC_at(char* p) const;
+   // PrimitiveIC*   primitiveIC_at(char* p) const;
+diff --git a/src/share/vm/compiler/compilerOracle.cpp b/src/share/vm/compiler/compilerOracle.cpp
+--- a/src/share/vm/compiler/compilerOracle.cpp
++++ b/src/share/vm/compiler/compilerOracle.cpp
+@@ -277,6 +277,12 @@
+ 
+ bool CompilerOracle::should_exclude(methodHandle method, bool& quietly) {
+   quietly = true;
++
++  // Continuation: the enter method can never be compiled
++  if (method->intrinsic_id() == vmIntrinsics::_enter
++      || method->intrinsic_id() == vmIntrinsics::_enter0)
++    return true;
++
+   if (lists[ExcludeCommand] != NULL) {
+     if (lists[ExcludeCommand]->match(method)) {
+       quietly = _quiet;
+diff --git a/src/share/vm/compiler/oopMap.cpp b/src/share/vm/compiler/oopMap.cpp
+--- a/src/share/vm/compiler/oopMap.cpp
++++ b/src/share/vm/compiler/oopMap.cpp
+@@ -188,6 +188,13 @@
+   }
+ }
+ 
++
++void OopMap::set_thread_ptr(VMReg reg) {
++  set_xxx(reg, OopMapValue::thread_ptr_value, VMRegImpl::Bad());
++}
++
++
++
+ // OopMapSet
+ 
+ OopMapSet::OopMapSet() {
+@@ -543,6 +550,9 @@
+     st->print("Derived_oop_" );
+     optional->print_on(st);
+     break;
++  case OopMapValue::thread_ptr_value:
++    st->print("ThreadPtr");
++    break;
+   default:
+     ShouldNotReachHere();
+   }
+diff --git a/src/share/vm/compiler/oopMap.hpp b/src/share/vm/compiler/oopMap.hpp
+--- a/src/share/vm/compiler/oopMap.hpp
++++ b/src/share/vm/compiler/oopMap.hpp
+@@ -29,6 +29,7 @@
+ //   Dead        - Dead; can be Zapped for debugging
+ //   CalleeXX    - Callee saved; also describes which caller register is saved
+ //   DerivedXX   - A derived oop; original oop is described.
++//   ThreadPtr   - A current thread pointer
+ //
+ // OopMapValue describes a single OopMap entry
+ 
+@@ -46,7 +47,7 @@
+ 
+ public:
+   // Constants
+-  enum { type_bits                = 5,
++  enum { type_bits                = 6,
+          register_bits            = BitsPerShort - type_bits };
+ 
+   enum { type_shift               = 0,
+@@ -63,7 +64,8 @@
+          value_value = 2,
+          narrowoop_value = 4,
+          callee_saved_value = 8,
+-         derived_oop_value= 16 };
++         derived_oop_value= 16,
++         thread_ptr_value = 32};
+ 
+   // Constructors
+   OopMapValue () { set_value(0); set_content_reg(VMRegImpl::Bad()); }
+@@ -92,12 +94,14 @@
+   bool is_narrowoop()           { return mask_bits(value(), type_mask_in_place) == narrowoop_value; }
+   bool is_callee_saved()      { return mask_bits(value(), type_mask_in_place) == callee_saved_value; }
+   bool is_derived_oop()       { return mask_bits(value(), type_mask_in_place) == derived_oop_value; }
++  bool is_thread_ptr()        { return mask_bits(value(), type_mask_in_place) == thread_ptr_value; }
+ 
+   void set_oop()              { set_value((value() & register_mask_in_place) | oop_value); }
+   void set_value()            { set_value((value() & register_mask_in_place) | value_value); }
+   void set_narrowoop()          { set_value((value() & register_mask_in_place) | narrowoop_value); }
+   void set_callee_saved()     { set_value((value() & register_mask_in_place) | callee_saved_value); }
+   void set_derived_oop()      { set_value((value() & register_mask_in_place) | derived_oop_value); }
++  void set_thread_ptr()       { set_value((value() & register_mask_in_place) | thread_ptr_value); }
+ 
+   VMReg reg() const { return VMRegImpl::as_VMReg(mask_bits(value(), register_mask_in_place) >> register_shift); }
+   oop_types type() const      { return (oop_types)mask_bits(value(), type_mask_in_place); }
+@@ -177,6 +181,7 @@
+   void set_dead ( VMReg local);
+   void set_callee_saved( VMReg local, VMReg caller_machine_register );
+   void set_derived_oop ( VMReg local, VMReg derived_from_local_register );
++  void set_thread_ptr  ( VMReg local);
+   void set_xxx(VMReg reg, OopMapValue::oop_types x, VMReg optional);
+ 
+   int heap_size() const;
+diff --git a/src/share/vm/includeDB_core b/src/share/vm/includeDB_core
+--- a/src/share/vm/includeDB_core
++++ b/src/share/vm/includeDB_core
+@@ -4464,7 +4464,9 @@
+ universe.inline.hpp                     universe.hpp
+ 
+ unsafe.cpp                              allocation.inline.hpp
++unsafe.cpp                              biasedLocking.hpp
+ unsafe.cpp                              copy.hpp
++unsafe.cpp                              deoptimization.hpp
+ unsafe.cpp                              dtrace.hpp
+ unsafe.cpp                              globals.hpp
+ unsafe.cpp                              interfaceSupport.hpp
+@@ -4475,6 +4477,10 @@
+ unsafe.cpp                              synchronizer.hpp
+ unsafe.cpp                              threadService.hpp
+ unsafe.cpp                              vmSymbols.hpp
++unsafe.cpp                              oopMapCache.hpp
++unsafe.cpp                              oopFactory.hpp
++unsafe.cpp                              vframe.hpp
++unsafe.cpp                              vframeArray.hpp
+ 
+ utf8.cpp                                utf8.hpp
+ 
+@@ -4555,6 +4561,7 @@
+ vframe.hpp                              stackValueCollection.hpp
+ 
+ vframeArray.cpp                         allocation.inline.hpp
++vframeArray.cpp                         bytecode.hpp
+ vframeArray.cpp                         events.hpp
+ vframeArray.cpp                         handles.inline.hpp
+ vframeArray.cpp                         interpreter.hpp
+diff --git a/src/share/vm/oops/instanceKlass.cpp b/src/share/vm/oops/instanceKlass.cpp
+--- a/src/share/vm/oops/instanceKlass.cpp
++++ b/src/share/vm/oops/instanceKlass.cpp
+@@ -706,19 +706,20 @@
+ }
+ 
+ 
+-void instanceKlass::mask_for(methodHandle method, int bci,
+-  InterpreterOopMap* entry_for) {
++void instanceKlass::mask_for(methodHandle method, int bci, InterpreterOopMap* entry_for,
++                             OopMapCacheId oop_map_cache_id) {
++  OopMapCache* volatile* cache = &_oop_map_caches[oop_map_cache_id];
+   // Dirty read, then double-check under a lock.
+-  if (_oop_map_cache == NULL) {
++  if (*cache == NULL) {
+     // Otherwise, allocate a new one.
+     MutexLocker x(OopMapCacheAlloc_lock);
+     // First time use. Allocate a cache in C heap
+-    if (_oop_map_cache == NULL) {
+-      _oop_map_cache = new OopMapCache();
++    if (*cache == NULL) {
++      *cache = new OopMapCache();
+     }
+   }
+   // _oop_map_cache is constant after init; lookup below does is own locking.
+-  _oop_map_cache->lookup(method, bci, entry_for);
++  (*cache)->lookup(method, bci, entry_for);
+ }
+ 
+ 
+@@ -1911,10 +1912,13 @@
+ }
+ 
+ void instanceKlass::release_C_heap_structures() {
+-  // Deallocate oop map cache
+-  if (_oop_map_cache != NULL) {
+-    delete _oop_map_cache;
+-    _oop_map_cache = NULL;
++  // Deallocate oop map caches
++  for (int i = default_oop_map_cache_id; i < limit_oop_map_cache_id; i++) {
++    OopMapCache* volatile* cache = &_oop_map_caches[i];
++    if (*cache != NULL) {
++      delete *cache;
++      *cache = NULL;
++    }
+   }
+ 
+   // Deallocate JNI identifiers for jfieldIDs
+diff --git a/src/share/vm/oops/instanceKlass.hpp b/src/share/vm/oops/instanceKlass.hpp
+--- a/src/share/vm/oops/instanceKlass.hpp
++++ b/src/share/vm/oops/instanceKlass.hpp
+@@ -225,7 +225,7 @@
+   int             _vtable_len;           // length of Java vtable (in words)
+   int             _itable_len;           // length of Java itable (in words)
+   ReferenceType   _reference_type;       // reference type
+-  OopMapCache*    volatile _oop_map_cache;   // OopMapCache for all methods in the klass (allocated lazily)
++  OopMapCache*    volatile _oop_map_caches[limit_oop_map_cache_id]; // OopMapCache for all methods in the klass (allocated lazily).
+   JNIid*          _jni_ids;              // First JNI identifier for static fields in this class
+   jmethodID*      _methods_jmethod_ids;  // jmethodIDs corresponding to method_idnum, or NULL if none
+   int*            _methods_cached_itable_indices;  // itable_index cache for JNI invoke corresponding to methods idnum, or NULL
+@@ -569,9 +569,14 @@
+   void set_initialization_state_and_notify(ClassState state, TRAPS);
+ 
+   // OopMapCache support
+-  OopMapCache* oop_map_cache()               { return _oop_map_cache; }
+-  void set_oop_map_cache(OopMapCache *cache) { _oop_map_cache = cache; }
+-  void mask_for(methodHandle method, int bci, InterpreterOopMap* entry);
++  OopMapCache* oop_map_cache(OopMapCacheId oop_map_cache_id = default_oop_map_cache_id) {
++    return _oop_map_caches[oop_map_cache_id];
++  }
++  void set_oop_map_cache(OopMapCache *cache, OopMapCacheId oop_map_cache_id = default_oop_map_cache_id) {
++    _oop_map_caches[oop_map_cache_id] = cache;
++  }
++  void mask_for(methodHandle method, int bci, InterpreterOopMap* entry,
++                OopMapCacheId oop_map_cache_id = default_oop_map_cache_id);
+ 
+   // JNI identifier support (for static fields - for jni performance)
+   JNIid* jni_ids()                               { return _jni_ids; }
+diff --git a/src/share/vm/oops/methodOop.cpp b/src/share/vm/oops/methodOop.cpp
+--- a/src/share/vm/oops/methodOop.cpp
++++ b/src/share/vm/oops/methodOop.cpp
+@@ -135,7 +135,8 @@
+ }
+ 
+ 
+-void methodOopDesc::mask_for(int bci, InterpreterOopMap* mask) {
++void methodOopDesc::mask_for(int bci, InterpreterOopMap* mask,
++                             OopMapCacheId oop_map_cache_id) {
+ 
+   Thread* myThread    = Thread::current();
+   methodHandle h_this(myThread, this);
+@@ -144,7 +145,7 @@
+                         myThread->is_ConcurrentGC_thread() ||
+                         myThread->is_GC_task_thread();
+ 
+-  if (!has_capability) {
++  if (oop_map_cache_id == default_oop_map_cache_id && !has_capability) {
+     if (!VerifyStack && !VerifyLastFrame) {
+       // verify stack calls this outside VM thread
+       warning("oopmap should only be accessed by the "
+@@ -155,7 +156,7 @@
+     }
+   }
+ #endif
+-  instanceKlass::cast(method_holder())->mask_for(h_this, bci, mask);
++  instanceKlass::cast(method_holder())->mask_for(h_this, bci, mask, oop_map_cache_id);
+   return;
+ }
+ 
+diff --git a/src/share/vm/oops/methodOop.hpp b/src/share/vm/oops/methodOop.hpp
+--- a/src/share/vm/oops/methodOop.hpp
++++ b/src/share/vm/oops/methodOop.hpp
+@@ -357,7 +357,8 @@
+   void set_signature_handler(address handler);
+ 
+   // Interpreter oopmap support
+-  void mask_for(int bci, InterpreterOopMap* mask);
++  void mask_for(int bci, InterpreterOopMap* mask,
++                OopMapCacheId oop_map_cache_id = default_oop_map_cache_id);
+ 
+ #ifndef PRODUCT
+   // operations on invocation counter
+diff --git a/src/share/vm/opto/buildOopMap.cpp b/src/share/vm/opto/buildOopMap.cpp
+--- a/src/share/vm/opto/buildOopMap.cpp
++++ b/src/share/vm/opto/buildOopMap.cpp
+@@ -347,15 +347,100 @@
+       }
+ 
+     } else {
+-      // Other - some reaching non-oop value
+-      omap->set_value( r);
++      bool is_thread_ptr = false;
++      if (def->bottom_type() == TypeRawPtr::BOTTOM) {
++        // Peek through copies
++        if (DebugContinuation) {
++          tty->print_cr("build_oop_map: Traversing for tlsLoadP...");
++        }
+ #ifdef ASSERT
+-      if( t->isa_rawptr() && C->cfg()->_raw_oops.member(def) ) {
+-        def->dump();
+-        n->dump();
+-        assert(false, "there should be a oop in OopMap instead of a live raw oop at safepoint");
++        bool is_not_thread_ptr = false;
++#endif
++        Unique_Node_List worklist;
++        Unique_Node_List visited;
++        worklist.push(def);
++        while (worklist.size() > 0) {
++          Node* n = worklist.pop();
++          if (visited.member(n)) {
++            continue;
++          }
++          visited.push(n);
++
++          if (DebugContinuation) {
++            tty->print_cr("build_oop_map: Looking at %d", n->_idx);
++#ifdef ASSERT
++            n->dump();
++#endif // ASSERT
++          }
++
++          if (n->is_Mach() && n->as_Mach()->is_tlsLoadP()) {
++            is_thread_ptr = true;
++            if (DebugContinuation) {
++              tty->print_cr("build_oop_map: Found tlsLoadP ");
++            }
++#ifdef ASSERT
++            continue;
++#else
++            break;
++#endif
++          }
++
++          uint copy_in_idx = n->is_Copy();
++          if (copy_in_idx != 0) {
++            Node* copy_in = n->in(copy_in_idx);
++            worklist.push(copy_in);
++            continue;
++          }
++
++          if (n->is_Phi()) {
++            PhiNode* phi = n->as_Phi();
++            for (uint i = 1; i < phi->req(); ++i) {
++              worklist.push(phi->in(i));
++            }
++            continue;
++          }
++#ifdef ASSERT
++          is_not_thread_ptr = true;
++#else
++          break;
++#endif
++        }
++#ifdef ASSERT
++        // To conservatively check for an accidental mixup of a
++        // thread pointer and a non-thread-pointer in the compiler.
++        assert(is_thread_ptr ^ is_not_thread_ptr, "thread pointer and non-thread-pointer mixed up");
++#endif
++        if (is_thread_ptr) {
++          if (DebugContinuation) {
++            if (r->is_reg()) {
++              tty->print_cr("build_oop_map: Found a thread pointer in reg %s", r->name());
++            } else if (r->is_stack()) {
++              int stack_offset_in_bytes = r->reg2stack() * 4; // from the stack pointer
++              tty->print_cr("build_oop_map: Found a thread pointer in stack [%d]", stack_offset_in_bytes);
++              if (jvms->has_method()) {
++                tty->print_cr(" in ");
++                jvms->method()->name()->print_symbol();
++                tty->print_cr(" at bci: %d", jvms->bci());
++              }
++            } else {
++              tty->print_cr("build_oop_map: Found a thread pointer in bad VMReg");
++            }
++          }
++          assert(r->is_reg() || r->is_stack(), "thread pointer not in a reg or stack");
++          omap->set_thread_ptr(r);
++        }
+       }
++      if (!is_thread_ptr) {
++        // Other - some reaching non-oop value
++        omap->set_value( r);
++#ifdef ASSERT
++        if( t->isa_rawptr() && C->cfg()->_raw_oops.member(def) ) {
++          def->dump();
++          n->dump();
++          assert(false, "there should be a oop in OopMap instead of a live raw oop at safepoint");
++        }
+ #endif
++      }
+     }
+ 
+   }
+diff --git a/src/share/vm/opto/machnode.hpp b/src/share/vm/opto/machnode.hpp
+--- a/src/share/vm/opto/machnode.hpp
++++ b/src/share/vm/opto/machnode.hpp
+@@ -238,6 +238,12 @@
+   virtual const class Type *bottom_type() const { return _opnds[0]->type(); }
+   virtual uint ideal_reg() const { const Type *t = _opnds[0]->type(); return t == TypeInt::CC ? Op_RegFlags : Matcher::base2reg[t->base()]; }
+ 
++  // tlsLoadP is the mach node that represents the (current) thread
++  // pointer. Returns true iff this node is a tlsLoadP node. Used to
++  // compute the locations of the thread pointer in the compiled code
++  // as part of the oopmap.
++  virtual bool is_tlsLoadP() const { return false; }
++
+   // If this is a memory op, return the base pointer and fixed offset.
+   // If there are no such, return NULL.  If there are multiple addresses
+   // or the address is indeterminate (rare cases) then return (Node*)-1,
+diff --git a/src/share/vm/prims/nativeLookup.cpp b/src/share/vm/prims/nativeLookup.cpp
+--- a/src/share/vm/prims/nativeLookup.cpp
++++ b/src/share/vm/prims/nativeLookup.cpp
+@@ -78,6 +78,7 @@
+ 
+ extern "C" {
+   void JNICALL JVM_RegisterUnsafeMethods(JNIEnv *env, jclass unsafecls);
++  void JNICALL JVM_RegisterContinuationMethods(JNIEnv *env, jclass contcls);
+   void JNICALL JVM_RegisterMethodHandleMethods(JNIEnv *env, jclass unsafecls);
+   void JNICALL JVM_RegisterPerfMethods(JNIEnv *env, jclass perfclass);
+ }
+@@ -98,6 +99,9 @@
+   if (strstr(jni_name, "Java_sun_misc_Unsafe_registerNatives") != NULL) {
+     return CAST_FROM_FN_PTR(address, JVM_RegisterUnsafeMethods);
+   }
++  if (strstr(jni_name, "Java_sun_misc_Continuation_registerNatives") != NULL) {
++    return CAST_FROM_FN_PTR(address, JVM_RegisterContinuationMethods);
++  }
+   if (strstr(jni_name, "Java_sun_dyn_MethodHandleNatives_registerNatives") != NULL) {
+     return CAST_FROM_FN_PTR(address, JVM_RegisterMethodHandleMethods);
+   }
+diff --git a/src/share/vm/prims/unsafe.cpp b/src/share/vm/prims/unsafe.cpp
+--- a/src/share/vm/prims/unsafe.cpp
++++ b/src/share/vm/prims/unsafe.cpp
+@@ -1169,6 +1169,1640 @@
+   Prefetch::write(addr, (intx)offset);
+ UNSAFE_END
+ 
++// Experimental Continuation Support -----------------------------------
++
++#define THROW_IE_(msg, rv) THROW_MSG_(vmSymbols::java_lang_InternalError(), msg, rv)
++#define THROW_IE(msg)      THROW_MSG( vmSymbols::java_lang_InternalError(), msg)
++
++// Writes a single stack frame
++class StackFrameWriter : public ResourceObj {
++ private:
++  Thread* _thread;
++  frame _fr;
++  GrowableArray<intptr_t>* _relocates;          // In-stack offsets of pointers within the stack
++  // Some slots hold a value at a certain offset of an oop (eg
++  // bytecode index off of a const method oop). We call those slots
++  // 'relatives'.
++  GrowableArray<intptr_t>* _relatives;          // In-stack offsets of relatives
++  GrowableArray<intptr_t>* _relatives_diff;     // Offsets of relatives off the base oop
++  GrowableArray<intptr_t>* _relatives_base_oop; // Base oops of relatives
++  GrowableArray<intptr_t>* _oop_offsets;        // In-stack offsets of oops
++  GrowableArray<oop*>*     _oop_ptrs;           // Pointers to oops, shared with StackWriter
++  GrowableArray<Handle>*   _oop_handles;        // Handles to oops, shared with StackWriter
++  GrowableArray<intptr_t>* _thread_ptrs;        // In-stack offsets of thread pointers
++  intptr_t*                _frame_image;        // The image of the stack frame
++  CompressedWriteStream*   _stream;             // Stream used to marshal the stack frame
++  intptr_t                 _alignment_padding;  // The stack alignment (0, 4, 8, or 12) for this frame
++
++  void inc_nmethod_cont_ref_count() {
++    CodeBlob* cb = CodeCache::find_blob(_fr.pc());
++    assert(cb != NULL, "Unrecognizable pc");
++    if (cb->is_nmethod()) {
++      nmethod* nm = (nmethod*) cb;
++      nm->inc_cont_ref_count();
++    }
++  }
++
++ public:
++  StackFrameWriter(Thread* thread, frame fr, CompressedWriteStream* stream,
++                   GrowableArray<oop*>* oop_ptrs,
++                   GrowableArray<Handle>* oop_handles) :
++      _thread(thread),
++      _fr(fr),
++      _stream(stream),
++      _relocates(new GrowableArray<intptr_t>()),
++      _relatives(new GrowableArray<intptr_t>()),
++      _relatives_base_oop(new GrowableArray<intptr_t>()),
++      _relatives_diff(new GrowableArray<intptr_t>()),
++      _oop_offsets(new GrowableArray<intptr_t>()),
++      _oop_ptrs(oop_ptrs),
++      _oop_handles(oop_handles),
++      _thread_ptrs(new GrowableArray<intptr_t>()),
++      _alignment_padding(0) {
++    if (fr.is_compiled_frame() || fr.is_native_frame()) {
++      inc_nmethod_cont_ref_count();
++    }
++  }
++
++  frame original_frame() { return _fr; }
++
++  bool is_in_stack(address a) {
++    return _thread->stack_base() - _thread->stack_size() <= a
++        && a < _thread->stack_base();
++  }
++
++  void add_relocate(intptr_t reloc) {
++    address loc = (address) reloc;
++    address ptr = (address) * (intptr_t*) reloc;
++    if (is_in_stack(loc) && is_in_stack(ptr)) {
++      _relocates->append(reloc);
++    }
++  }
++
++  void add_thread_pointer(intptr_t* thread_ptr_addr) {
++    _thread_ptrs->append((intptr_t) thread_ptr_addr);
++  }
++
++  // If the stack being saved is one that's been resumed before,
++  // the stack alignment padding may be inserted below the bottom frame
++  // Adjust the sender_sp and the old_fp (link) offsets of the bottom frame
++  // so that the saved stack image does not account for any padding
++  void count_past_alignment_padding() {
++    intptr_t* fp = _fr.fp();
++    intptr_t* prev_fp = _fr.link();
++    intptr_t* ptr = fp;
++    // traverse fp to prev_fp and count the number of 0xbaadbaad words
++    intptr_t padding = 0;
++    // TODO: actually up to 3 iterations are enough
++    while (ptr != prev_fp) {
++#ifndef _LP64
++      if (*ptr == (intptr_t) 0xbaadbaad) { // the magic word must match with the resume blob in sharedRuntime_x86_32
++#else
++      if (*ptr == (intptr_t) 0xbaadbaadbaadbaad) { // the magic word must match with the resume blob in sharedRuntime_x86_32
++#endif // _LP64
++        padding++;
++      }
++      ptr++;
++    }
++    if (padding > 0) {
++      _alignment_padding = padding;
++      if (DebugContinuation) {
++        tty->print_cr("count_past_alignment_padding: " INTPTR_FORMAT, padding);
++      }
++    }
++  }
++
++  void add_bcx_mdx(intptr_t* bcx, intptr_t* mdx, oop const_method, oop mdo) {
++    bool is_bci = frame::is_bci(*bcx);
++    if (!is_bci) {
++      intptr_t bcp = *bcx;
++      intptr_t diff = bcp - (intptr_t) const_method;
++      intptr_t cmo_index = _oop_handles->append(Handle(const_method));
++      _relatives->append((intptr_t) bcx);
++      _relatives_base_oop->append(cmo_index);
++      _relatives_diff->append(diff);
++      if (*mdx != 0 && mdo != NULL) {
++        // mdx is an mdp when is_bci = false and is an pointer into the middle of a methodDataOop
++        intptr_t mdp = *mdx;
++        intptr_t diff = mdp - (intptr_t) mdo;
++        assert(mdo->is_oop(), "mdo isn't an oop?");
++        intptr_t mdo_index = _oop_handles->append(Handle(mdo));
++        _relatives->append((intptr_t) mdx);
++        _relatives_base_oop->append(mdo_index);
++        _relatives_diff->append(diff);
++        if (DebugContinuation) {
++          tty->print_cr("found mdp=" INTPTR_FORMAT ", mdo=" INTPTR_FORMAT,
++                        (intptr_t)mdp, (intptr_t)mdo);
++        }
++      }
++    }
++  }
++
++  void finish() {
++    // Copy the frame memory
++    RegisterMap rmap(JavaThread::current(), false);
++    intptr_t size = _fr.frame_size(&rmap);
++    intptr_t* base = _fr.sp();
++
++    _frame_image = NEW_RESOURCE_ARRAY(intptr_t, size);
++    memcpy(_frame_image, base, size * sizeof(intptr_t));
++
++    // Update the prev fp of the bottom frame (the link in the enter0
++    // frame or the fp of the enter frame) in the copied image (not in
++    // the actual stack)
++    if (_alignment_padding != 0) {
++      intptr_t prev_fp_off = ((intptr_t) _fr.fp() - (intptr_t) _fr.sp()) / sizeof(intptr_t);
++      intptr_t sender_sp_off = (((intptr_t) _fr.fp() + frame::interpreter_frame_sender_sp_offset) - (intptr_t) _fr.sp()) / sizeof(intptr_t);
++      intptr_t* prev_fp = (intptr_t*) _frame_image[prev_fp_off];
++      intptr_t* sender_sp = (intptr_t*) _frame_image[sender_sp_off];
++      intptr_t* paddingless_prev_fp = prev_fp - _alignment_padding;
++      intptr_t* paddingless_sender_sp = sender_sp - _alignment_padding;
++      _frame_image[prev_fp_off] = (intptr_t) paddingless_prev_fp;
++      _frame_image[sender_sp_off] = (intptr_t) paddingless_sender_sp;
++      if (DebugContinuation) {
++        tty->print_cr("adjusting _alignment_padding: prev_fp " INTPTR_FORMAT " -> " INTPTR_FORMAT,
++                      (intptr_t) prev_fp, (intptr_t) paddingless_prev_fp);
++        tty->print_cr("adjusting _alignment_padding: sender_sp " INTPTR_FORMAT " -> " INTPTR_FORMAT,
++                      (intptr_t) sender_sp, (intptr_t) paddingless_sender_sp);
++      }
++    }
++
++    // Replace within-stack pointers with relative offsets and updates
++    // the relocate array with relative offsets
++    for (int i = 0; i < _relocates->length(); ++i) {
++      intptr_t off = _relocates->at(i) - (intptr_t) base;
++      intptr_t* ptr_loc = (intptr_t*)((intptr_t) _frame_image + off);
++      intptr_t* ptr = (intptr_t*)*ptr_loc;
++      *ptr_loc = ((intptr_t) ptr - (intptr_t) base) / sizeof(intptr_t);
++      _relocates->at_put(i, off/sizeof(intptr_t));
++    }
++
++    // Relatives
++    for (int i = 0; i < _relatives->length(); ++i) {
++      intptr_t off = _relatives->at(i) - (intptr_t) base;
++      _relatives->at_put(i, off / sizeof(intptr_t));
++    }
++
++    // Thread pointers
++    for (int i = 0; i < _thread_ptrs->length(); ++i) {
++      intptr_t off = _thread_ptrs->at(i) - (intptr_t) base;
++      _thread_ptrs->at_put(i, off / sizeof(intptr_t));
++    }
++
++    // Populate the oop offsets array & the oop handles array
++    // Replace oops in the frame memory with indices into the oop handles array
++    for (int k = 0; k < _oop_ptrs->length(); ++k) {
++      oop* p = _oop_ptrs->at(k);
++      intptr_t off = ((intptr_t) p - (intptr_t) base) / sizeof(intptr_t);  // offsets are in words
++      // Only if the oop is within this frame
++      if (0 <= off && off < (intptr_t) size) {
++        _oop_offsets->append(off);
++        int index = _oop_handles->find(Handle(*p));
++        assert(index >= 0, "should be found");
++        _frame_image[off] = (intptr_t) index;
++      }
++    }
++  }
++
++  void print() {
++    RegisterMap rmap(JavaThread::current(), false);
++    int frame_size = _fr.frame_size(&rmap);
++    tty->print_cr("StackFrameWriter:");
++    tty->print_cr("    type=%s",
++                  _fr.is_compiled_frame() ? "Compiled" : (_fr.is_native_frame() ? "Native" : "Interpreted"));
++    tty->print_cr("    sp=" INTPTR_FORMAT, 0);
++    tty->print_cr("    unextended_sp=" INTPTR_FORMAT, (intptr_t)_fr.unextended_sp() - (intptr_t) _fr.sp());
++    tty->print_cr("    fp=" INTPTR_FORMAT, (intptr_t) _fr.fp() - (intptr_t) _fr.sp());
++    tty->print_cr("    size_of_parameters=" INTPTR_FORMAT,
++                  _fr.is_interpreted_frame() ? (intptr_t) _fr.interpreter_frame_method()->size_of_parameters() : 0);
++    tty->print_cr("    frame_size=" INTPTR_FORMAT, frame_size);
++    tty->print_cr("    pc=" INTPTR_FORMAT, _fr.pc());
++    tty->print_cr("    relocates:");
++    for (int i = 0; i < _relocates->length(); ++i) {
++      tty->print_cr("        [%x]=" INTPTR_FORMAT, i, _relocates->at(i));
++    }
++    tty->print_cr("    relatives:");
++    for (int i = 0; i < _relatives->length(); ++i) {
++      tty->print_cr("        [%x]=" INTPTR_FORMAT, i, _relatives->at(i));
++    }
++    tty->print_cr("    relatives_base_oop:");
++    for (int i = 0; i < _relatives_base_oop->length(); ++i) {
++      tty->print_cr("        [%x]=" INTPTR_FORMAT, i, _relatives_base_oop->at(i));
++    }
++    tty->print_cr("    relatives_diff:");
++    for (int i = 0; i < _relatives_diff->length(); ++i) {
++      tty->print_cr("        [%x]=" INTPTR_FORMAT, i, _relatives_diff->at(i));
++    }
++    tty->print_cr("    oop offsets:");
++    for (int i = 0; i < _oop_offsets->length(); ++i) {
++      tty->print_cr("        [%x]=" INTPTR_FORMAT, i, _oop_offsets->at(i));
++    }
++    tty->print_cr("    thread ptrs:");
++    for (int i = 0; i < _thread_ptrs->length(); ++i) {
++      tty->print_cr("        [%x]=" INTPTR_FORMAT, i, _thread_ptrs->at(i));
++    }
++    tty->print_cr("    image:");
++    for (int i = 0; i < frame_size; ++i) {
++      if (_relocates->contains(i)) {
++        tty->print_cr("R       %x: " INTPTR_FORMAT, i, _frame_image[i]);
++      } else if (_oop_offsets->contains(i)) {
++        tty->print_cr("O       %x: " INTPTR_FORMAT, i, _frame_image[i]);
++      } else {
++        tty->print_cr("        %x: " INTPTR_FORMAT, i, _frame_image[i]);
++      }
++    }
++  }
++
++  void write() {
++    CompressedWriteStream* s = _stream;
++    // Encode the frame into a byte stream
++    // frame {
++    //   frame_type
++    //   sp
++    //   unextended_sp
++    //   fp
++    //   size_of_parameters (meaningful for interpreter_frame only)
++    //   frame_size
++    //   pc
++    //   nreloc
++    //   reloc[nreloc]
++    //   noops
++    //   oops[noops]
++    //   nimage
++    //   image[nimage]
++    // }
++    // Every field is a intptr_t type
++    RegisterMap rmap(JavaThread::current(), false);
++    int frame_size = _fr.frame_size(&rmap);
++#ifndef _LP64
++    s->write_int(_fr.is_compiled_frame() ? 1 : (_fr.is_native_frame() ? 2 : (_fr.is_interpreted_frame() ? 0 : -1)));
++    // Relative to sp
++    s->write_int((jint) 0);
++    s->write_int((jint) ((intptr_t) _fr.unextended_sp() - (intptr_t) _fr.sp()));
++    s->write_int((jint) ((intptr_t) _fr.fp() - (intptr_t) _fr.sp()));
++    s->write_int(_fr.is_interpreted_frame() ? (jint) _fr.interpreter_frame_method()->size_of_parameters() : 0);
++    s->write_int((jint) frame_size);
++    s->write_int((jint) _fr.pc());
++    s->write_int(_relocates->length());
++    for (int i = 0; i < _relocates->length(); ++i) {
++      s->write_int(_relocates->at(i));
++    }
++    s->write_int(_relatives->length());
++    for (int i = 0; i < _relatives->length(); ++i) {
++      s->write_int(_relatives->at(i));
++    }
++    s->write_int(_relatives_base_oop->length());
++    for (int i = 0; i < _relatives_base_oop->length(); ++i) {
++      s->write_int(_relatives_base_oop->at(i));
++    }
++    s->write_int(_relatives_diff->length());
++    for (int i = 0; i < _relatives_diff->length(); ++i) {
++      s->write_int(_relatives_diff->at(i));
++    }
++    s->write_int(_oop_offsets->length());
++    for (int i = 0; i < _oop_offsets->length(); ++i) {
++      s->write_int(_oop_offsets->at(i));
++    }
++    s->write_int(_thread_ptrs->length());
++    for (int i = 0; i < _thread_ptrs->length(); ++i) {
++      s->write_int(_thread_ptrs->at(i));
++    }
++    s->write_int(frame_size);
++    for (int i = 0; i < frame_size; ++i) {
++      s->write_int(_frame_image[i]);
++    }
++#else
++    s->write_long(_fr.is_compiled_frame() ? 1 : (_fr.is_native_frame() ? 2 : (_fr.is_interpreted_frame() ? 0 : -1)));
++    // Relative to sp
++    s->write_long((jlong) 0);
++    s->write_long((jlong) ((intptr_t) _fr.unextended_sp() - (intptr_t) _fr.sp()));
++    s->write_long((jlong) ((intptr_t) _fr.fp() - (intptr_t) _fr.sp()));
++    s->write_long(_fr.is_interpreted_frame() ? (jlong) _fr.interpreter_frame_method()->size_of_parameters() : 0);
++    s->write_long((jlong) frame_size);
++    s->write_long((jlong) _fr.pc());
++    s->write_long(_relocates->length());
++    for (int i = 0; i < _relocates->length(); ++i) {
++      s->write_long(_relocates->at(i));
++    }
++    s->write_long(_relatives->length());
++    for (int i = 0; i < _relatives->length(); ++i) {
++      s->write_long(_relatives->at(i));
++    }
++    s->write_long(_relatives_base_oop->length());
++    for (int i = 0; i < _relatives_base_oop->length(); ++i) {
++      s->write_long(_relatives_base_oop->at(i));
++    }
++    s->write_long(_relatives_diff->length());
++    for (int i = 0; i < _relatives_diff->length(); ++i) {
++      s->write_long(_relatives_diff->at(i));
++    }
++    s->write_long(_oop_offsets->length());
++    for (int i = 0; i < _oop_offsets->length(); ++i) {
++      s->write_long(_oop_offsets->at(i));
++    }
++    s->write_long(_thread_ptrs->length());
++    for (int i = 0; i < _thread_ptrs->length(); ++i) {
++      s->write_long(_thread_ptrs->at(i));
++    }
++    s->write_long(frame_size);
++    for (int i = 0; i < frame_size; ++i) {
++      s->write_long(_frame_image[i]);
++    }
++#endif
++  }
++};
++
++// Writes stack frames into the Continuation.stack object
++class StackWriter : public StackObj {
++ private:
++  GrowableArray<StackFrameWriter*>* _frameWriters;        // List of StackFrameWriters
++  StackFrameWriter*                 _currentFrameWriter;  // The current frame writer
++  Thread*                           _thread;              // The thread
++  GrowableArray<oop*>*              _oop_ptrs;            // Pointers to oops
++  GrowableArray<Handle>*            _oop_handles;         // Handles to oops
++  CompressedWriteStream             _stream;              // Stream used to marshal the stack
++
++  address                           _rough_last_frame_pc; // GC-map-bearing pc set by native wrapper
++  address                           _stack_bottom;        // End of the stack to be marshaled
++
++  // OopClosure is a StackObj
++  class OopCatcher : public OopClosure {
++   private:
++    GrowableArray<oop*>* _oop_ptrs;
++   public:
++    void set_oop_ptrs_array(GrowableArray<oop*>* oop_ptrs) {
++      _oop_ptrs = oop_ptrs;
++    }
++    void do_oop(oop* p) {
++      if (_oop_ptrs != NULL) {
++        if (DebugContinuation) {
++          tty->print_cr("OopCatcher::do_oop: " INTPTR_FORMAT ", " INTPTR_FORMAT,
++                        (intptr_t)p, (intptr_t)*p);
++        }
++        _oop_ptrs->append(p);
++      }
++    }
++    void do_oop(narrowOop* p) { ShouldNotReachHere(); }
++  };
++
++  OopCatcher _oop_catcher;
++
++  // Create the object set to Continuation.stack. It's an Object[2].
++  // The first element is the array of oops referenced by the stack.
++  // The second element is the byte array that contains the marshaled stack image.
++  objArrayHandle create_blob() {
++    objArrayHandle oopArray = write_oop_array();
++    Handle byteArray = write_byte_array();
++
++    Thread* THREAD = _thread;
++    objArrayHandle topArray;
++    {
++      objArrayOop tem = oopFactory::new_objArray(SystemDictionary::Object_klass(),
++                                                 2, CHECK_NULL);
++      topArray = objArrayHandle(_thread, tem);
++    }
++    topArray->obj_at_put(0, oopArray());
++    topArray->obj_at_put(1, byteArray());
++    return topArray;
++  }
++
++  objArrayHandle write_oop_array() {
++    Thread* THREAD = _thread;
++    // Create the object array that contains the oops
++    objArrayHandle oopArray;
++    {
++      objArrayOop tem = oopFactory::new_objArray(SystemDictionary::Object_klass(),
++                                                 _oop_handles->length(), CHECK_NULL);
++      oopArray = objArrayHandle(_thread, tem);
++    }
++    for (int i = 0; i < _oop_handles->length(); i++) {
++      oop o = _oop_handles->at(i)();
++      oopArray->obj_at_put(i, o);
++    }
++    return oopArray;
++  }
++
++  Handle write_byte_array() {
++    Thread* THREAD = _thread;
++    int size = _stream.position();
++    // Create a byte[] array to hold the compressed stream.
++    typeArrayOop ba = oopFactory::new_byteArray(size, CHECK_NH);
++    Copy::conjoint_bytes(_stream.buffer(), ba->byte_at_addr(0), size);
++    return Handle(_thread, ba);
++  }
++
++ public:
++  StackWriter(Thread* thread) :
++      _thread(thread),
++      _frameWriters(new GrowableArray<StackFrameWriter*>()),
++      _oop_ptrs(new GrowableArray<oop*>()),
++      _oop_handles(new GrowableArray<Handle>()),
++      _currentFrameWriter(NULL),
++      _stream(CompressedWriteStream(4096)) {
++    _oop_catcher.set_oop_ptrs_array(_oop_ptrs);
++  }
++
++  OopClosure* get_oop_catcher() {
++    return &_oop_catcher;
++  }
++
++  GrowableArray<oop*>* oop_ptrs() { return _oop_ptrs; }
++
++  void set_rough_last_frame_pc(address pc) { _rough_last_frame_pc = pc; }
++
++  // The end of the stack frames to be captured.
++  void set_stack_bottom(address stack_bottom) { _stack_bottom = stack_bottom; }
++
++  StackFrameWriter* writer() { return _currentFrameWriter; }
++
++  StackFrameWriter* add(frame fr) {
++    StackFrameWriter* writer = new StackFrameWriter(_thread, fr, &_stream, _oop_ptrs, _oop_handles);
++    _currentFrameWriter = writer;
++    _frameWriters->append(writer);
++    return _currentFrameWriter;
++  }
++
++  int nframes() { return _frameWriters->length(); }
++  StackFrameWriter* frame_at(int i) { return _frameWriters->at(i); }
++
++  // Creates the object set to Continuation.pcs
++  Handle getCodeCachePCs() {
++    GrowableArray<address>* pcs = new GrowableArray<address>();
++    for (int i = 0; i < _frameWriters->length(); ++i) {
++      StackFrameWriter* fw = _frameWriters->at(i);
++      frame fr = fw->original_frame();
++      if (fr.is_compiled_frame() || fr.is_native_frame()) {
++        pcs->append(fr.pc());
++      }
++    }
++    int size = pcs->length();
++    Thread* THREAD = _thread;
++    // Create a long[] array to hold the pc list.
++    typeArrayOop la = oopFactory::new_longArray(size, CHECK_NH);
++    for (int i = 0; i < size; ++i) {
++      la->long_at_put(0, (jlong) pcs->at(i));
++    }
++    return Handle(_thread, la);
++  }
++
++  objArrayHandle write() {
++    // Populate the oop handles array
++    for (int k = 0; k < _oop_ptrs->length(); ++k) {
++      oop* p = _oop_ptrs->at(k);
++      if (DebugContinuation) {
++        tty->print_cr("StackFrameWriter::write: " INTPTR_FORMAT ", " INTPTR_FORMAT,
++                      (intptr_t) p, (intptr_t) *p);
++      }
++      _oop_handles->append_if_missing(Handle(*p));
++    }
++#ifndef _LP64
++    _stream.write_int((int)_rough_last_frame_pc);
++    _stream.write_int((int)_stack_bottom);
++    _stream.write_int((int)_thread);
++    // Write the number of frames
++    _stream.write_int((int)_frameWriters->length());
++#else
++    _stream.write_long((jlong)_rough_last_frame_pc);
++    _stream.write_long((jlong)_stack_bottom);
++    _stream.write_long((jlong)_thread);
++    // Write the number of frames
++    _stream.write_long((jlong)_frameWriters->length());
++#endif // _LP64
++    // Write each frame
++    for (int i = 0; i < _frameWriters->length(); ++i) {
++      StackFrameWriter* fw = _frameWriters->at(i);
++      if (i == _frameWriters->length() - 1) {
++        // for bottom frame
++        fw->count_past_alignment_padding();
++      }
++      fw->finish();
++      fw->write();
++    }
++    objArrayHandle blob = create_blob();
++    return blob;
++  }
++
++  void print() {
++    tty->print_cr("StackWriter:");
++    tty->print_cr("    rough_last_frame_pc=" INTPTR_FORMAT, (intptr_t)_rough_last_frame_pc);
++    tty->print_cr("    oops:");
++    for (int i = 0; i < _oop_handles->length(); ++i) {
++      Handle h = _oop_handles->at(i);
++      tty->print_cr("        [%x]=" INTPTR_FORMAT, i, (intptr_t) h());
++    }
++    for (int i = 0; i < _frameWriters->length(); ++i) {
++      StackFrameWriter* fw = _frameWriters->at(i);
++      fw->print();
++    }
++  }
++};
++
++// Reads a single stack frame from the Continuation.stack object
++class StackFrameReader : public ResourceObj {
++ private:
++  Thread*                  _thread;             // Thread to resume the stack onto
++  CompressedReadStream*    _stream;             // Stream used to read marshaled stack image
++  intptr_t                 _stream_limit;       // The limit of the stream
++  GrowableArray<Handle>*   _oop_arr;            // Handles to oops
++  GrowableArray<intptr_t>* _relocates;          // Relocates. See StackFrameWriter.
++  GrowableArray<intptr_t>* _relatives;          // Relatives.
++  GrowableArray<intptr_t>* _relatives_base_oop; // Base oops of relatives.
++  GrowableArray<intptr_t>* _relatives_diff;     // Offsets of relatives.
++  GrowableArray<intptr_t>* _oop_offsets;        // In-stack offsets of oops
++  GrowableArray<intptr_t>* _thread_ptrs;        // In-stack offsets of thread pointers
++  intptr_t*                _image_size;         // The size of the frame image
++  intptr_t*                _frame_image;        // The frame image
++  address                  _original_thread;    // The original thread that the stack was saved from 
++
++  intptr_t*                _sp;
++  intptr_t*                _unextended_sp;
++  intptr_t*                _fp;
++  address                  _pc;
++  intptr_t                 _size_of_parameters;
++  intptr_t                 _frame_size;
++  enum FrameType { interpreter = 0,
++                   compiled    = 1,
++                   native      = 2, }; // native wrappers
++  FrameType                _frame_type;
++
++ public:
++  StackFrameReader(Thread* thread, CompressedReadStream* stream,
++                   intptr_t stream_limit, GrowableArray<Handle>* oop_arr,
++                   intptr_t* image_size, address original_thread) :
++      _thread(thread), _stream(stream),
++      _stream_limit(stream_limit), _oop_arr(oop_arr),
++      _relocates(new GrowableArray<intptr_t>()),
++      _relatives(new GrowableArray<intptr_t>()),
++      _relatives_base_oop(new GrowableArray<intptr_t>()),
++      _relatives_diff(new GrowableArray<intptr_t>()),
++      _oop_offsets(new GrowableArray<intptr_t>()),
++      _thread_ptrs(new GrowableArray<intptr_t>()),
++      _image_size(image_size),
++      _original_thread(original_thread) {
++  }
++
++  intptr_t* frame_image() { return _frame_image; }
++  intptr_t frame_size() { return _frame_size; }
++  intptr_t* sp() { return _sp; }
++  intptr_t* unextended_sp() { return _unextended_sp; }
++  intptr_t* fp() { return _fp; }
++  address pc() { return _pc; }
++  void set_pc(address pc) { _pc = pc; }
++  intptr_t size_of_parameters() { return _size_of_parameters; }
++  bool may_deopt() { return _frame_type == compiled || _frame_type == native; }
++
++  void read() {
++    CompressedReadStream* s = _stream;
++    // See the layout in StackFrameWriter
++#ifndef _LP64
++    // 32 bit version
++    _frame_type = (FrameType) s->read_int();
++    _sp = (intptr_t*) s->read_int();
++    _unextended_sp = (intptr_t*) s->read_int();
++    _fp = (intptr_t*) s->read_int(); // if this is a compiled frame, _fp could be an oop in which case, it may not be GC-unsafe oop
++    _size_of_parameters = s->read_int();
++    _frame_size = s->read_int();
++    *_image_size = *_image_size + _frame_size;
++    _pc = (address) s->read_int();
++
++    int nrelocates = s->read_int();
++    for (int i = 0; i < nrelocates; ++i) {
++      _relocates->append((intptr_t) s->read_int());
++    }
++    int nrelatives = s->read_int();
++    for (int i = 0; i < nrelatives; ++i) {
++      _relatives->append((intptr_t) s->read_int());
++    }
++    int nrelatives_base_oop = s->read_int();
++    for (int i = 0; i < nrelatives_base_oop; ++i) {
++      _relatives_base_oop->append((intptr_t) s->read_int());
++    }
++    int nrelatives_diff = s->read_int();
++    for (int i = 0; i < nrelatives_diff; ++i) {
++      _relatives_diff->append((intptr_t) s->read_int());
++    }
++    int noop_offsets = s->read_int();
++    for (int i = 0; i < noop_offsets; ++i) {
++      _oop_offsets->append((intptr_t) s->read_int());
++    }
++    int nthread_ptrs = s->read_int();
++    for (int i = 0; i < nthread_ptrs; ++i) {
++      _thread_ptrs->append((intptr_t) s->read_int());
++    }
++    int frame_size = s->read_int();
++    assert(frame_size == _frame_size, "inconsistent frame size");
++    _frame_image = NEW_RESOURCE_ARRAY(intptr_t, frame_size);
++    for (int i = 0; i < frame_size; ++i) {
++      _frame_image[i] = s->read_int();
++    }
++#else
++    // 64 bit version.
++    _frame_type = (FrameType) s->read_long();
++    _sp = (intptr_t*) s->read_long();
++    _unextended_sp = (intptr_t*) s->read_long();
++    _fp = (intptr_t*) s->read_long(); // if this is a compiled frame, _fp could be an oop in which case, it may not be GC-unsafe oop
++    _size_of_parameters = s->read_long();
++    _frame_size = s->read_long();
++    *_image_size = *_image_size + _frame_size;
++    _pc = (address) s->read_long();
++
++    intptr_t nrelocates = s->read_long();
++    for (int i = 0; i < nrelocates; ++i) {
++      _relocates->append((intptr_t) s->read_long());
++    }
++    intptr_t nrelatives = s->read_long();
++    for (int i = 0; i < nrelatives; ++i) {
++      _relatives->append((intptr_t) s->read_long());
++    }
++    intptr_t nrelatives_base_oop = s->read_long();
++    for (int i = 0; i < nrelatives_base_oop; ++i) {
++      _relatives_base_oop->append((intptr_t) s->read_long());
++    }
++    intptr_t nrelatives_diff = s->read_long();
++    for (int i = 0; i < nrelatives_diff; ++i) {
++      _relatives_diff->append((intptr_t) s->read_long());
++    }
++    intptr_t noop_offsets = s->read_long();
++    for (int i = 0; i < noop_offsets; ++i) {
++      _oop_offsets->append((intptr_t) s->read_long());
++    }
++    intptr_t nthread_ptrs = s->read_long();
++    for (int i = 0; i < nthread_ptrs; ++i) {
++      _thread_ptrs->append((intptr_t) s->read_long());
++    }
++    intptr_t frame_size = s->read_long();
++    assert(frame_size == _frame_size, "inconsistent frame size");
++    _frame_image = NEW_RESOURCE_ARRAY(intptr_t, frame_size);
++    for (int i = 0; i < frame_size; ++i) {
++      _frame_image[i] = (intptr_t) s->read_long();
++    }
++#endif // _LP64
++  }
++
++  void print() {
++#ifndef _LP64
++    // 32 bit version
++    tty->print_cr("StackFrameReader:");
++    tty->print(   "    type=");
++    switch (_frame_type) {
++      case interpreter:
++        tty->print_cr("Interpreted");
++        break;
++      case compiled:
++        tty->print_cr("Compiled");
++        break;
++      case native:
++        tty->print_cr("Native");
++        break;
++      default:
++        ShouldNotReachHere();
++    }
++    tty->print_cr("    sp=%x", _sp);
++    tty->print_cr("    unextended_sp=%x", _unextended_sp);
++    tty->print_cr("    fp=%x", _fp);
++    tty->print_cr("    size_of_parameters=%x", _size_of_parameters);
++    tty->print_cr("    frame_size=%x", _frame_size);
++    tty->print_cr("    pc=%x", _pc);
++    tty->print_cr("    relocates:");
++    for (int i = 0; i < _relocates->length(); ++i) {
++      tty->print_cr("        [%x]=%x", i, _relocates->at(i));
++    }
++    tty->print_cr("    relatives:");
++    for (int i = 0; i < _relatives->length(); ++i) {
++      tty->print_cr("        [%x]=%x", i, _relatives->at(i));
++    }
++    tty->print_cr("    relatives_base_oop:");
++    for (int i = 0; i < _relatives_base_oop->length(); ++i) {
++      tty->print_cr("        [%x]=%x", i, _relatives_base_oop->at(i));
++    }
++    tty->print_cr("    relatives_diff:");
++    for (int i = 0; i < _relatives_diff->length(); ++i) {
++      tty->print_cr("        [%x]=%x", i, _relatives_diff->at(i));
++    }
++    tty->print_cr("    oop offsets:");
++    for (int i = 0; i < _oop_offsets->length(); ++i) {
++      tty->print_cr("        [%x]=%x", i, _oop_offsets->at(i));
++    }
++    tty->print_cr("    thread ptrs:");
++    for (int i = 0; i < _thread_ptrs->length(); ++i) {
++      tty->print_cr("        [%x]=%x", i, _thread_ptrs->at(i));
++    }
++    tty->print_cr("    image:");
++    for (int i = 0; i < _frame_size; ++i) {
++      if (_relocates->contains(i)) {
++        tty->print_cr("R       %x: %x", i, _frame_image[i]);
++      } else if (_oop_offsets->contains(i)) {
++        tty->print_cr("O       %x: %x", i, _frame_image[i]);
++      } else {
++        tty->print_cr("        %x: %x", i, _frame_image[i]);
++      }
++    }
++#else
++    // 64 bit version.
++    tty->print_cr("StackFrameReader:");
++    tty->print(   "    type=");
++    switch (_frame_type) {
++      case interpreter:
++        tty->print_cr("Interpreted");
++        break;
++      case compiled:
++        tty->print_cr("Compiled");
++        break;
++      case native:
++        tty->print_cr("Native");
++        break;
++      default:
++        ShouldNotReachHere();
++    }
++    tty->print_cr("    sp=" INTPTR_FORMAT, _sp);
++    tty->print_cr("    unextended_sp=" INTPTR_FORMAT, _unextended_sp);
++    tty->print_cr("    fp=" INTPTR_FORMAT, _fp);
++    tty->print_cr("    size_of_parameters=" INTPTR_FORMAT, _size_of_parameters);
++    tty->print_cr("    frame_size=" INTPTR_FORMAT, _frame_size);
++    tty->print_cr("    pc=" INTPTR_FORMAT, _pc);
++    tty->print_cr("    relocates:");
++    for (int i = 0; i < _relocates->length(); ++i) {
++      tty->print_cr("        [%x]=" INTPTR_FORMAT, i, _relocates->at(i));
++    }
++    tty->print_cr("    relatives:");
++    for (int i = 0; i < _relatives->length(); ++i) {
++      tty->print_cr("        [%x]=" INTPTR_FORMAT, i, _relatives->at(i));
++    }
++    tty->print_cr("    relatives_base_oop:");
++    for (int i = 0; i < _relatives_base_oop->length(); ++i) {
++      tty->print_cr("        [%x]=" INTPTR_FORMAT, i, _relatives_base_oop->at(i));
++    }
++    tty->print_cr("    relatives_diff:");
++    for (int i = 0; i < _relatives_diff->length(); ++i) {
++      tty->print_cr("        [%x]=" INTPTR_FORMAT, i, _relatives_diff->at(i));
++    }
++    tty->print_cr("    oop offsets:");
++    for (int i = 0; i < _oop_offsets->length(); ++i) {
++      tty->print_cr("        [%x]=" INTPTR_FORMAT, i, _oop_offsets->at(i));
++    }
++    tty->print_cr("    thread ptrs:");
++    for (int i = 0; i < _thread_ptrs->length(); ++i) {
++      tty->print_cr("        [%x]=" INTPTR_FORMAT, i, _thread_ptrs->at(i));
++    }
++    tty->print_cr("    image:");
++    for (int i = 0; i < _frame_size; ++i) {
++      if (_relocates->contains(i)) {
++        tty->print_cr("R       %x: " INTPTR_FORMAT, i, _frame_image[i]);
++      } else if (_oop_offsets->contains(i)) {
++        tty->print_cr("O       %x: " INTPTR_FORMAT, i, _frame_image[i]);
++      } else {
++        tty->print_cr("        %x: " INTPTR_FORMAT, i, _frame_image[i]);
++      }
++    }
++#endif // _LP64
++  }
++
++  // base - the base address (sp) at the destination
++  void relocate(intptr_t* base) {
++    No_Safepoint_Verifier no_safepoint;
++    // update sp, fp
++    _sp = base;
++    _unextended_sp = (intptr_t*) ((intptr_t) _unextended_sp + (intptr_t) _sp);
++    _fp = (intptr_t*) ((intptr_t) _fp + (intptr_t) _sp); // if this is a compiled frame, _fp could be an oop in which case, it may not be GC-unsafe oop
++    // update relocates
++    int reloc_len = _relocates->length();
++    for (int i = 0; i < reloc_len; ++i) {
++      intptr_t* addr = _frame_image + _relocates->at(i);
++      *addr = (intptr_t)base + *addr * sizeof(intptr_t);
++    }
++    // write oops - note safe points
++    int oop_off_len = _oop_offsets->length();
++    for (int i = 0; i < oop_off_len; ++i) {
++      intptr_t* addr = _frame_image + _oop_offsets->at(i);
++      *addr = (intptr_t) _oop_arr->at(*addr)();
++    }
++    // update relatives
++    int relative_len = _relatives->length();
++    for (int i = 0; i < relative_len; ++i) {
++      intptr_t* addr = _frame_image + _relatives->at(i);
++      intptr_t base_oop = (intptr_t)_oop_arr->at(_relatives_base_oop->at(i))();
++      *addr =  base_oop + _relatives_diff->at(i);
++    }
++
++    // Thread pointers
++    int thread_ptrs_len = _thread_ptrs->length();
++    for (int i = 0; i < thread_ptrs_len; ++i) {
++      intptr_t* addr = _frame_image + _thread_ptrs->at(i);
++      if (DebugContinuation) {
++        tty->print_cr("Writing thread pointer offset=" INTPTR_FORMAT, _thread_ptrs->at(i));
++        tty->print_cr("frame_size " INTPTR_FORMAT, _frame_size);
++        tty->print_cr("Thread pointer. Overwrote " INTPTR_FORMAT " with " INTPTR_FORMAT,
++                      (intptr_t) *addr, (intptr_t) _thread);
++      }
++      *addr = (intptr_t) _thread;
++    }
++  }
++};
++
++class StackReader : public StackObj {
++ private:
++  Thread* _thread;
++  CompressedReadStream _stream;
++  intptr_t _stream_limit;
++  GrowableArray<Handle>* _oop_arr;
++  GrowableArray<StackFrameReader*>* _frame_readers;
++  intptr_t _nframes;
++  intptr_t _image_size;
++  address _rough_last_frame_pc;
++  address _original_stack_bottom;
++  address _original_thread;
++
++ public:
++  StackReader(Thread* thread) :
++    _thread(thread),
++    _frame_readers(new GrowableArray<StackFrameReader*>()),
++    _nframes(0),
++    _stream(CompressedReadStream(NULL, 0)),
++    _stream_limit(0),
++    _image_size(0) {
++  }
++
++  address rough_last_frame_pc() { return _rough_last_frame_pc; }
++  address original_stack_bottom() { return _original_stack_bottom; }
++
++  void read(objArrayHandle arr) {
++    assert(arr->obj_at(0) != NULL, "oop array null");
++    assert(arr->obj_at(1) != NULL, "byte array null");
++    _oop_arr = new GrowableArray<Handle>();
++    objArrayHandle oops(_thread, (objArrayOop) arr->obj_at(0));
++    for (int i = 0; i < oops->length(); ++i) {
++      _oop_arr->append(Handle(_thread, oops->obj_at(i)));
++    }
++    prepare_byte_stream(Handle(_thread, arr->obj_at(1)));
++#ifndef _LP64
++    _rough_last_frame_pc = (address) _stream.read_int();
++    _original_stack_bottom = (address) _stream.read_int();
++    _original_thread = (address) _stream.read_int();
++    _nframes = _stream.read_int();
++#else
++    _rough_last_frame_pc = (address) _stream.read_long();
++    _original_stack_bottom = (address) _stream.read_long();
++    _original_thread = (address) _stream.read_long();
++    _nframes = (intptr_t) _stream.read_long();
++#endif // _LP64
++    read_frames();
++  }
++
++  void read_frames() {
++    for (int i = 0; i < _nframes; ++i) {
++      StackFrameReader* fr = new StackFrameReader(
++          _thread, &_stream, _stream_limit, _oop_arr, &_image_size, _original_thread);
++      fr->read();
++      _frame_readers->append(fr);
++    }
++  }
++
++  intptr_t nframes() { return _nframes; }
++
++  StackFrameReader* frame_at(int i) { return _frame_readers->at(i); }
++
++  void prepare_byte_stream(Handle byte_arr) {
++    typeArrayOop ba = (typeArrayOop) byte_arr();
++    _stream_limit = ba->length();
++    const int SLOP = 10;
++    u_char* buf = NEW_RESOURCE_ARRAY(u_char, _stream_limit + SLOP);
++    Copy::conjoint_bytes(ba->byte_at_addr(0), buf, _stream_limit);
++    Copy::zero_to_bytes(buf + _stream_limit, SLOP);
++    _stream = CompressedReadStream(buf, 0);
++  }
++
++  void print() {
++    tty->print_cr("StackReader:");
++    tty->print_cr("    oops:");
++    for (int i = 0; i < _oop_arr->length(); ++i) {
++      tty->print_cr("        [%x]=" INTPTR_FORMAT, i, (intptr_t) _oop_arr->at(i)());
++    }
++    for (int i = 0; i < _frame_readers->length(); ++i) {
++      StackFrameReader* fr = _frame_readers->at(i);
++      fr->print();
++    }
++  }
++
++  // Relocate the stack image.
++  //
++  // top_frame is the frame to resume frames on top of.
++  // It's the interpreted frame for enter.
++  // Note allocations in this function are under DeoptResourceMark
++  // top_frame -> enter's frame (the frame on which to resume stack)
++  // bottom_frame_max_locals (the max_locals of the bottom frame in the saved stack)
++  ResumeBlock* relocate(frame top_frame, Handle return_value, int bottom_frame_max_locals) {
++    intptr_t* limit = top_frame.sp();
++    intptr_t* base = limit - _image_size;
++
++    intptr_t alignment_padding = 0; // the number of the alignment padding in words
++
++    {
++      if (DebugContinuation) {
++        tty->print_cr("bottom_frame_max_locals %d", bottom_frame_max_locals);
++        tty->print_cr("old limit " INTPTR_FORMAT, (intptr_t) limit);
++        tty->print_cr("old base " INTPTR_FORMAT, (intptr_t) base);
++      }
++
++      // if the stack alignment does not match the original stack,
++      // add padding at the bottom and adjust the old fp/sender_sp in the bottom frame
++      // Note: enter* are always interpreted.
++      intptr_t new_bottom = (intptr_t) limit;
++      intptr_t old_bottom = (intptr_t) _original_stack_bottom;
++      intptr_t new_alignment = new_bottom & (StackAlignmentInBytes - 1);
++      intptr_t old_alignment = old_bottom & (StackAlignmentInBytes - 1);
++
++      if (DebugContinuation) {
++        tty->print_cr("old_bottom " INTPTR_FORMAT, old_bottom);
++        tty->print_cr("new_bottom " INTPTR_FORMAT, limit);
++        tty->print_cr("old_alignment " INTPTR_FORMAT, old_alignment);
++        tty->print_cr("new_alignment " INTPTR_FORMAT, new_alignment);
++      }
++
++      if (old_alignment != new_alignment) {
++        intptr_t padding = 0;
++        padding = (new_alignment + (intptr_t)(StackAlignmentInBytes) - old_alignment) & 0xf;
++        assert(padding > 0 && padding < StackAlignmentInBytes &&
++               (padding % sizeof(intptr_t) == 0), "bad padding");
++        if (DebugContinuation) {
++          tty->print_cr("padding = " INTPTR_FORMAT " (bytes)", padding);
++        }
++        intptr_t paddingInWords = padding / sizeof(intptr_t);
++        alignment_padding = paddingInWords;
++        if (DebugContinuation) {
++          tty->print_cr("old base = " INTPTR_FORMAT, (intptr_t)base);
++        }
++        // note stack grows down
++        base  -= paddingInWords;
++        limit -= paddingInWords; // though limit is dead
++        if (DebugContinuation) {
++          tty->print_cr("new base = " INTPTR_FORMAT, (intptr_t)base);
++        }
++        // adjust the old fp/sender_sp in the bottom frame
++        StackFrameReader* bottom_fr = frame_at(nframes() - 1);
++        intptr_t* btm_frame_image = bottom_fr->frame_image();
++        intptr_t btm_frame_size = bottom_fr->frame_size(); // in words
++
++#ifdef X86
++        intptr_t old_fp_index = btm_frame_size - 2 + frame::link_offset;
++        intptr_t sender_sp_index = btm_frame_size - 2 + frame::interpreter_frame_sender_sp_offset;
++        // old fp
++        if (DebugContinuation) {
++          tty->print_cr("old old_fp = " INTPTR_FORMAT, (intptr_t)btm_frame_image[old_fp_index]);
++        }
++        btm_frame_image[old_fp_index] += paddingInWords;
++        if (DebugContinuation) {
++          tty->print_cr("new old_fp = " INTPTR_FORMAT, (intptr_t)btm_frame_image[old_fp_index]);
++        }
++        // sender sp
++        if (DebugContinuation) {
++          tty->print_cr("old sender_sp = " INTPTR_FORMAT, (intptr_t)btm_frame_image[sender_sp_index]);
++        }
++        btm_frame_image[sender_sp_index] += paddingInWords;
++        if (DebugContinuation) {
++          tty->print_cr("new sender_sp = " INTPTR_FORMAT, (intptr_t)btm_frame_image[sender_sp_index]);
++        }
++#else
++        ShouldNotReachHere();
++#endif // X86
++      }
++    }
++
++    if (DebugContinuation) {
++      tty->print_cr("StackReader::relocate() limit " INTPTR_FORMAT, (intptr_t)limit);
++      tty->print_cr("StackReader::relocate() base " INTPTR_FORMAT, (intptr_t)base);
++    }
++
++    intptr_t* image = NEW_RESOURCE_ARRAY(intptr_t, _image_size);
++    intptr_t image_off = 0;
++    for (int i = 0; i < nframes(); ++i) {
++      StackFrameReader* fr = NULL;
++      int frame_size = -1;
++      fr = frame_at(i);
++      frame_size = fr->frame_size();
++      if (DebugContinuation) {
++        tty->print_cr("StackReader::relocate() relocating frame to " INTPTR_FORMAT, (intptr_t)(base + image_off));
++      }
++      fr->relocate(base + image_off);
++      memcpy(image + image_off, fr->frame_image(), frame_size * sizeof(intptr_t));
++      image_off += frame_size;
++    }
++    StackFrameReader* top_fr = frame_at(0);
++
++    // patch pc for deopt
++    // Top frame: update the pc in SFR
++    {
++      if (top_fr->may_deopt()) {
++        CodeBlob* cb = CodeCache::find_blob(top_fr->pc());
++        assert(cb != NULL, "Unrecognizable pc");
++        if (cb->is_nmethod()) {
++          nmethod* nm = (nmethod*) cb;
++          if (!nm->is_in_use() ||
++              (nm->is_osr_method() && nm->osr_entry_bci() == InvalidOSREntryBci)) // see nmethod::make_not_entrant_or_zombie for the handling of osr methods
++          {
++            address deopt_handler_pc = nm->deopt_handler_begin();
++            int orig_pc_offset = nm->orig_pc_offset();
++            if (DebugContinuation) {
++              tty->print_cr("orig_pc_offset=%d", orig_pc_offset);
++            }
++            // set original pc
++            address orig_pc_address = (address) top_fr->unextended_sp() + orig_pc_offset;
++            assert(orig_pc_address >= (address) top_fr->sp() &&
++                   orig_pc_address <= (address) (top_fr->sp() + top_fr->frame_size()), "bad orig pc address");
++            address in_image_orig_pc_address = orig_pc_address - (address)base + (address)image;
++            assert(in_image_orig_pc_address >= (address) image &&
++                   in_image_orig_pc_address < (address)(image + _image_size), "out of range of image");
++            *(address*)(in_image_orig_pc_address) = top_fr->pc();
++            if (DebugContinuation) {
++              tty->print_cr("deopt top_frame orig_pc = " INTPTR_FORMAT, (intptr_t)top_fr->pc());
++            }
++            // patch pc
++            top_fr->set_pc(deopt_handler_pc);
++            if (DebugContinuation) {
++              tty->print_cr("deopt top_frame deopt_pc = " INTPTR_FORMAT, (intptr_t)deopt_handler_pc);
++            }
++          }
++        }
++      }
++    }
++
++    // The rest: update the pc in the image
++    for (int i = 1; i < nframes(); ++i) {
++      StackFrameReader* fr = frame_at(i);
++      if (fr->may_deopt()) {
++        CodeBlob* cb = CodeCache::find_blob(fr->pc());
++        assert(cb != NULL, "Unrecognizable pc");
++        if (cb->is_nmethod()) {
++          nmethod* nm = (nmethod*) cb;
++          if (DebugContinuation) {
++            tty->print_cr("frame %d's nm=" INTPTR_FORMAT, i, (intptr_t)nm);
++          }
++          if (!nm->is_in_use() ||
++              (nm->is_osr_method() && nm->osr_entry_bci() == InvalidOSREntryBci)) // see nmethod::make_not_entrant_or_zombie for the handling of osr methods
++          {
++            address deopt_handler_pc = nm->deopt_handler_begin();
++            int orig_pc_offset = nm->orig_pc_offset();
++            if (DebugContinuation) {
++              tty->print_cr("orig_pc_offset=%d", orig_pc_offset);
++            }
++            // set original pc in the image
++            address orig_pc_address = (address) fr->unextended_sp() + orig_pc_offset;
++            assert(orig_pc_address >= (address) fr->sp() &&
++                   orig_pc_address <= (address) (fr->sp() + fr->frame_size()), "bad orig pc address");
++            address in_image_orig_pc_address = orig_pc_address - (address)base + (address)image;
++            assert(in_image_orig_pc_address >= (address) image &&
++                   in_image_orig_pc_address < (address)(image + _image_size), "out of range of image");
++            *((address*) in_image_orig_pc_address) = fr->pc();
++            if (DebugContinuation) {
++              tty->print_cr("deopt frame %d orig_pc = " INTPTR_FORMAT, i, (intptr_t)fr->pc());
++            }
++            // patch pc in the image
++            fr->set_pc(deopt_handler_pc); // this is probably useless
++#ifdef X86
++            address pc_addr = (address)(fr->sp() - 1) - (address) base + (address) image;
++            assert(pc_addr >= (address) image &&
++                   pc_addr < (address)(image + _image_size), "out of image range");
++#else
++            ShouldNotReachHere();
++#endif // X86
++            *((address*) pc_addr) = deopt_handler_pc;
++            if (DebugContinuation) {
++              tty->print_cr("deopt frame %d deopt_pc = " INTPTR_FORMAT, i, (intptr_t)deopt_handler_pc);
++            }
++          }
++        }
++      }
++    }
++
++    assert(top_fr->sp() == base, "wrong base address");
++    ResumeBlock* rb = new ResumeBlock(top_fr->sp(), top_fr->fp(), top_fr->pc(),
++                                      _rough_last_frame_pc, return_value.raw_value(),
++                                      image, _image_size, bottom_frame_max_locals,
++                                      alignment_padding);
++    return rb;
++  }
++
++};
++
++void Continuation_DecCodeCacheRefCount(JNIEnv* env, jclass contcls, jlong pc) {
++  JavaThread* thread = JavaThread::thread_from_jni_environment(env);
++  JavaThread* THREAD = thread;
++
++  if (!UseContinuation) {
++    THROW_IE("Continuation disabled");
++  }
++
++  if (DebugContinuation) {
++    tty->print_cr("DecCodeCacheRefCount called");
++  }
++
++  CodeBlob* cb = CodeCache::find_blob((address) pc);
++  if (cb != NULL && cb->is_nmethod()) {
++    nmethod* nm = (nmethod*) cb;
++    if (nm->cont_ref_count() > 0) {
++      nm->dec_cont_ref_count();
++    }
++  }
++}
++
++typedef void (*ResumeFunction)(JavaThread*, ResumeBlock*);
++
++void Continuation_ResumeContinuation(JNIEnv *env, jclass contcls, jobject stack, jobject rv)
++{
++  JavaThread* thread = JavaThread::thread_from_jni_environment(env);
++  JavaThread* THREAD = thread;
++  ResumeBlock* rb;
++  frame top_frame;
++  int bottom_frame_max_locals = 0;
++
++  if (!UseContinuation) {
++    THROW_IE("Continuation disabled");
++  }
++
++  if (DebugContinuation) {
++    tty->print_cr("ResumeContinuation thread = " INTPTR_FORMAT, (intptr_t) thread);
++  }
++  {
++    ThreadInVMfromNative threadInVM(thread);
++    if (stack == NULL)
++      THROW_MSG(vmSymbols::java_lang_IllegalArgumentException(), "stack cannot be null");
++  }
++
++  ThreadInVMfromNativeForContinuation* thread_transition = new ThreadInVMfromNativeForContinuation(thread);
++  thread->set_cont_thread_transition(thread_transition);
++
++  {
++    HandleMark hm(thread);
++
++    frame caller;
++    RegisterMap     reg_map(thread, true);
++    {
++      ResourceMark rm(thread);
++      vframe* vf = thread->last_java_vframe(&reg_map);
++      vframe* prev_vf = NULL;
++      do {
++        if (vf == NULL || !vf->is_java_frame()) {
++          ThreadInVMfromNative thread_in_vm(thread);
++          THROW_MSG(vmSymbols::java_lang_IllegalArgumentException(), "no enter call on stack or a native call above it");
++        }
++
++        javaVFrame* jvf = javaVFrame::cast(vf);
++
++        if (jvf->method() && jvf->method()->intrinsic_id() == vmIntrinsics::_enter) {
++          caller = *vf->frame_pointer();
++          bottom_frame_max_locals = prev_vf->frame_pointer()->interpreter_frame_method()->max_locals();
++          break;
++        }
++
++        prev_vf = vf;
++        vf = vf->sender();
++      } while (true);
++    } // end of ResourceMark
++
++    top_frame = caller;
++    assert(bottom_frame_max_locals >= 3, "not enough locals in enter0");
++  }
++
++  {
++    // Allocate our special deoptimization ResourceMark. We need a
++    // DeoptResourceMark here, as opposed to a normal ResourceMark, to
++    // allocate arena-based data structures in the C heap, to be able
++    // to deallocate them in a non-stack disciplined way (by an
++    // explicit call rather than implicitly at an the end of a source
++    // code-level scope), and to avoid the safepoint check (and
++    // possible GC) that happens at the decontruction of a normal
++    // ResourceMark.
++    DeoptResourceMark* dmark = new DeoptResourceMark(thread);
++    assert(thread->deopt_mark() == NULL, "Pending deopt!");
++    thread->set_deopt_mark(dmark);
++
++    GrowableArray<FrameInfo*>* frame_infos;
++    {
++      StackReader sr(thread);
++      // Deserialize the saved frames
++      sr.read(objArrayHandle(thread, (objArrayOop) JNIHandles::resolve(stack)));
++      if (DebugContinuation) {
++        sr.print();
++      }
++      Handle rvh(JNIHandles::resolve(rv));
++      rb = sr.relocate(top_frame, rvh, bottom_frame_max_locals);
++      if (DebugContinuation) {
++        sr.print();
++        rb->print();
++      }
++    }
++  }
++
++  ResumeFunction resume_func = (ResumeFunction) SharedRuntime::continuation_resume_blob()->entry_point();
++  resume_func(thread, rb);
++  return; // unreached.
++}
++
++class OopPrinter: public OopClosure {
++ private:
++  GrowableArray<oop*>* _oops;
++ public:
++  OopPrinter(GrowableArray<oop*>* oops) : _oops(oops) {
++  }
++  void do_oop(oop* p) {
++    _oops->append(p);
++    if (DebugContinuation) {
++      tty->print_cr("    oop: " INTPTR_FORMAT ": " INTPTR_FORMAT, p, *p);
++    }
++  }
++};
++
++static int lookup_field_offset(const char* klass_name,
++                               const char* field_name,
++                               symbolHandle field_signature,
++                               bool is_static,
++                               JavaThread* THREAD) {
++  symbolHandle        klass_sym   = oopFactory::new_symbol_handle(klass_name, CHECK_0);
++  instanceKlassHandle klass = SystemDictionary::resolve_or_fail(klass_sym, true, CHECK_0);
++  symbolHandle        field_sym  = oopFactory::new_symbol_handle(field_name, CHECK_0);
++  fieldDescriptor     fd;
++  if (!klass->find_local_field(field_sym(), field_signature(), &fd)
++      || (!is_static && fd.is_static())) {
++    return 0;
++  }
++  return fd.offset();
++}
++
++typedef void (*SaveFunction)(JavaThread* thread, intptr_t sp, intptr_t fp, intptr_t pc, oop* rv);
++
++jobject Continuation_SaveContinuation(JNIEnv *env, jclass contcls, jobject continuation)
++{
++  JavaThread* thread = JavaThread::thread_from_jni_environment(env);
++  JavaThread* THREAD = thread;
++
++  if (!UseContinuation) {
++    THROW_IE_("Continuation disabled", NULL);
++  }
++
++  // Bail out if any monitor is locked in the stack
++  {
++    ThreadInVMfromNative threadInVM(thread);
++    ResourceMark rm;
++    RegisterMap     reg_map(thread, true);
++    vframe* vf = thread->last_java_vframe(&reg_map);
++    int callee_params = javaVFrame::cast(vf)->method()->size_of_parameters();
++    for (; vf; vf = vf->sender()) {
++      if (vf->is_java_frame()) {
++        javaVFrame* jvf = javaVFrame::cast(vf);
++        if (jvf->method() && jvf->method()->intrinsic_id() == vmIntrinsics::_enter) {
++          break;
++        }
++        GrowableArray<MonitorInfo*>* ms = jvf->locked_monitors();
++        if (ms->length() > 0) {
++          THROW_MSG_(vmSymbols::java_lang_IllegalThreadStateException(), "a monitor is held in the continuation scope", NULL);
++          break;
++        }
++        callee_params = jvf->method()->size_of_parameters();
++      } else {
++        THROW_MSG_(vmSymbols::java_lang_IllegalThreadStateException(), "no continuation scope found", NULL);
++        break;
++      }
++    }
++  }
++
++  ThreadInVMfromNativeForContinuation* thread_transition = new ThreadInVMfromNativeForContinuation(thread);
++  thread->set_cont_thread_transition(thread_transition);
++
++  // frame to cut stack to. The frame for enter0
++  frame cut_to_frame;
++
++  // These handles need to live until the end of this function
++  Handle blob;
++  Handle pcs;
++  Handle cont;
++  Handle data1;
++  {
++    ResourceMark rm;
++    StackWriter sw(thread);
++    RegisterMap     reg_map(thread, true);
++    RegisterMap reg_map_callee(&reg_map);
++    frame caller = thread->last_frame().sender(&reg_map);
++    frame callee = thread->last_frame();
++    // This is the inaccurate pc set by native_entry/native_wrapper
++    address rough_last_frame_pc = callee.pc();
++    sw.set_rough_last_frame_pc(rough_last_frame_pc);
++    intptr_t* last_frame_sp = callee.sp();
++#ifdef X86
++    // Reread pc from the stack because the last frame may have an inaccurate pc
++    // see templateInterpreter_x86_32.cpp:914 (generate_native_entry()) and
++    // sharedRuntime_x86_32.cpp:1470 (generate_native_wrapper())
++    callee = frame(callee.sp(), callee.fp());
++    // native wrapper could leave an invalid fp. So, if it's out of range,
++    // try to set fp to sp+frame_size-2
++    RegisterMap rmap(JavaThread::current(), false);
++    int callee_frame_size = callee.frame_size(&rmap);
++    address last_frame_fp = (address) callee.fp();
++    if (last_frame_fp != (address)(callee.sp() + callee_frame_size - frame::sender_sp_offset)
++        || !(last_frame_fp <= thread->stack_base() &&
++             last_frame_fp > (address) callee.sp())) {
++      // out of range
++      intptr_t* real_fp = callee.sp() + callee_frame_size - frame::sender_sp_offset;
++      if (real_fp <= (intptr_t*)thread->stack_base() &&
++          real_fp > callee.sp()) {
++        // in range
++        callee = frame(callee.sp(), real_fp);
++      } else {
++        guarantee(false, "no valid fp found for the top frame");
++      }
++    }
++#else
++    ShouldNotReachHere();
++#endif // X86
++
++    StackFrameWriter* prev_writer = NULL;
++    StackFrameWriter* writer = sw.add(callee);
++    do {
++      if (!caller.is_java_frame()) {
++        THROW_MSG_(vmSymbols::java_lang_IllegalThreadStateException(),
++                   "no continuation scope found or there is a native frame inside the scope", 0);
++      }
++
++      if (DebugContinuation) {
++        RegisterMap rmap(JavaThread::current(), false);
++        int callee_frame_size = callee.frame_size(&rmap);
++        tty->print_cr("%s sp=" INTPTR_FORMAT ":     " INTPTR_FORMAT " (pc=" INTPTR_FORMAT ", frame_size=%d, sp+frame_size=" INTPTR_FORMAT ", unextended_sp=" INTPTR_FORMAT ", fp=" INTPTR_FORMAT ")",
++                      callee.is_interpreted_frame() ? "I" : callee.is_compiled_frame() ? "C" : "N",
++                      callee.sp(),
++                      *callee.sp(),
++                      callee.pc(),
++                      (intptr_t)callee_frame_size * sizeof(intptr_t),
++                      (intptr_t)callee.sp() + callee_frame_size * sizeof(intptr_t),
++                      callee.unextended_sp(),
++                      callee.fp());
++        for (intptr_t* p = callee.sp() + 1; p < caller.sp(); ++p) {
++          if (p == callee.fp()) {
++            tty->print_cr("  fp=" INTPTR_FORMAT ":     " INTPTR_FORMAT, p, (int)*p);
++          } else {
++            tty->print_cr("     " INTPTR_FORMAT ":     " INTPTR_FORMAT, p, (int)*p);
++          }
++        }
++      }
++
++      // Need to temporarily change the pc to the rough pc set by
++      // native_wrapper in the last frame so that the OopMap is found
++      // during the oops_do call.
++      address org_pc = NULL;
++      if (last_frame_sp == callee.sp()) {
++        org_pc = callee.pc();
++        callee.set_pc(rough_last_frame_pc);
++      }
++
++      if (callee.is_interpreted_frame()) {
++        // Both GC and this code walk down the stacks and need
++        // interpreter oop maps.  Because oop maps has a mutex lock,
++        // only one of the two use them at the same time and can cause
++        // deadlocks. Use the 2nd oop map cache to avoid the
++        // deadlock with GC.
++        callee.oops_interpreted_do(sw.get_oop_catcher(), &reg_map_callee, true, continuation_oop_map_cache_id);
++      } else {
++        callee.oops_do(sw.get_oop_catcher(), NULL, &reg_map_callee);
++      }
++
++      // Thread pointer map in c2 compiled frames
++      if (callee.is_compiled_frame()) {
++        CodeBlob* cb = callee.cb();
++        assert(cb != NULL, "no codeblob found");
++        OopMapSet* maps = cb->oop_maps();
++        OopMap* map = cb->oop_map_for_return_address(callee.pc());
++        assert(map != NULL, "no oop map found");
++        if (DebugContinuation) {
++          tty->print_cr("Current thread pointer " INTPTR_FORMAT, (intptr_t) thread);
++        }
++        OopMapValue omv;
++        {
++          for (OopMapStream oms(map, OopMapValue::thread_ptr_value); !oms.is_done(); oms.next()) {
++            omv = oms.current();
++            assert(omv.is_thread_ptr(), "not a OopMapValue::thread_ptr_value");
++            VMReg reg = omv.reg();
++            assert(reg->is_reg() || reg->is_stack(), "A VMReg is neither a reg or stack");
++            if (reg->is_reg()) {
++#ifndef X86
++              ShouldNotReachHere();
++#endif // X86
++              if (DebugContinuation) {
++                tty->print("Found a reg VMReg containing a thread pointer. ");
++                reg->print_on(tty);
++                tty->cr();
++              }
++              if (strcmp("ebp", reg->name()) == 0 || strcmp("rbp", reg->name()) == 0) {
++                assert(prev_writer != NULL, "prev_writer cannot be NULL");
++                frame prev_frame = prev_writer->original_frame();
++                intptr_t* thread_ptr_addr = NULL;
++                if (prev_frame.is_compiled_frame()) {
++                  thread_ptr_addr = callee.sp() - frame::sender_sp_offset;
++                } else {
++                  thread_ptr_addr = prev_frame.fp();
++                }
++                prev_writer->add_thread_pointer(thread_ptr_addr);
++              } else {
++                guarantee(false, "Found a reg VMReg containing a thread pointer.");
++              }
++            } else if (reg->is_stack()) {
++              int stack_offset_in_bytes = reg->reg2stack() * 4; // based off of the unextended sp. 4 bytes even on 64 bit.
++              int stack_offset_in_words = stack_offset_in_bytes / sizeof(intptr_t);
++              intptr_t* thread_ptr_addr = &callee.unextended_sp()[stack_offset_in_words];
++              intptr_t thread_ptr = *thread_ptr_addr;
++              if (DebugContinuation) {
++                tty->print_cr("Found thread pointer " INTPTR_FORMAT " in a compiled frame.",
++                              thread_ptr);
++              }
++              writer->add_thread_pointer(thread_ptr_addr);
++            }
++          }
++        }
++      }
++
++      if (last_frame_sp == callee.sp()) {
++        callee.set_pc(org_pc); // set it back to the original
++      }
++
++      // Find pointers within the stack (eg sp, fp)
++      if (callee.is_interpreted_frame()) {
++#ifndef X86
++        ShouldNotReachHere();
++#endif // X86
++        writer->add_relocate((intptr_t) &callee.fp()[frame::interpreter_frame_sender_sp_offset]);
++        writer->add_relocate((intptr_t) &callee.fp()[frame::interpreter_frame_last_sp_offset]);
++        writer->add_relocate((intptr_t) &callee.fp()[frame::interpreter_frame_monitor_block_top_offset]);
++        writer->add_relocate((intptr_t) &callee.fp()[frame::interpreter_frame_locals_offset]);
++
++        intptr_t* bcx = &callee.fp()[frame::interpreter_frame_bcx_offset];
++        intptr_t* mdx = &callee.fp()[frame::interpreter_frame_mdx_offset];
++        // Note unsafe oop here
++        constMethodOop const_method = callee.interpreter_frame_method()->constMethod();
++        methodDataOop mdo = callee.interpreter_frame_method()->method_data();
++        writer->add_bcx_mdx(bcx, mdx, const_method, mdo);
++
++        if (caller.is_interpreted_frame()) {
++          writer->add_relocate((intptr_t) callee.fp());
++          if (DebugContinuation) {
++            tty->print_cr("    relocates: " INTPTR_FORMAT, (intptr_t) callee.fp());
++          }
++        } else if (caller.is_compiled_frame()) {
++#ifdef COMPILER2
++          // nothing because fp is a plain callee saved reg
++#elif COMPILER1
++          intptr_t* fp = caller.sp() - frame::sender_sp_offset;
++          writer->add_relocate((intptr_t) fp);
++          if (DebugContinuation) {
++            tty->print_cr("    relocates: %x", (intptr_t) fp);
++          }
++#else
++          ShouldNotReachHere();
++#endif // COMPILER1/2
++        } else {
++          ShouldNotReachHere();
++        }
++      } else if (callee.is_compiled_frame()) {
++        if (caller.is_interpreted_frame()) {
++          intptr_t* fp = caller.sp() - frame::sender_sp_offset;
++          writer->add_relocate((intptr_t) fp);
++          if (DebugContinuation) {
++            tty->print_cr("    relocates: " INTPTR_FORMAT, (intptr_t) fp);
++          }
++        } else if (caller.is_compiled_frame()) {
++#ifdef COMPILER2
++          // nothing because fp is a plain callee saved reg
++#elif COMPILER1
++          intptr_t* fp = caller.sp() - frame::sender_sp_offset;
++          writer->add_relocate((intptr_t) fp);
++          if (DebugContinuation) {
++            tty->print_cr("    relocates: " INTPTR_FORMAT, (intptr_t) fp);
++          }
++#else
++          ShouldNotReachHere();
++#endif // COMPILER1/2
++        } else {
++          ShouldNotReachHere();
++        }
++      } else if (callee.is_native_frame()) {
++        // this is for the second frame to the top native_wrapper frame call.
++        if (caller.is_interpreted_frame()) {
++          intptr_t* fp = caller.sp() - frame::sender_sp_offset;
++          writer->add_relocate((intptr_t) fp);
++          if (DebugContinuation) {
++            tty->print_cr("    relocates: " INTPTR_FORMAT, (intptr_t) fp);
++          }
++        } else if (caller.is_compiled_frame()) {
++#ifdef COMPILER2
++          // nothing because fp is a plain callee saved reg
++#elif COMPILER1
++          intptr_t* fp = caller.sp() - frame::sender_sp_offset;
++          writer->add_relocate((intptr_t) fp);
++          if (DebugContinuation) {
++            tty->print_cr("    relocates: " INTPTR_FORMAT, (intptr_t) fp);
++          }
++#else
++          ShouldNotReachHere();
++#endif // COMPILER1/2
++        } else {
++          ShouldNotReachHere();
++        }
++      } else {
++        if (DebugContinuation) {
++          tty->print_cr("callee.is_native = %d", callee.is_native_frame());
++          tty->print_cr("caller.is_interpreted = %d", caller.is_interpreted_frame());
++          tty->print_cr("caller.is_compiled = %d", caller.is_compiled_frame());
++          tty->print_cr("caller.is_native = %d", caller.is_native_frame());
++        }
++        ShouldNotReachHere();
++      }
++
++      if (caller.is_interpreted_frame()) {
++        // Note unsafe oop here
++        assert(thread->thread_state() == _thread_in_vm, "thread not in vm?");
++        methodHandle method = methodHandle(caller.interpreter_frame_method());
++        if (method.not_null() && method()->intrinsic_id() == vmIntrinsics::_enter) {
++          data1 = Handle((oop)(*caller.interpreter_frame_local_at(1)));
++          break;
++        }
++      }
++      reg_map_callee = reg_map;
++      prev_writer = writer;
++      writer = sw.add(caller);
++      callee = caller;
++      caller = caller.sender(&reg_map);
++    } while (true);
++
++    // At this point,
++    // caller is the enter frame
++    // callee is the enter0 frame
++    cut_to_frame = callee;
++
++    sw.set_stack_bottom((address)caller.sp());
++
++    pcs = sw.getCodeCachePCs(); // this could cause a safepoint.
++    blob = sw.write();          // this could cause a safepoint.
++    // For debugging
++    if (DebugContinuation) {
++      sw.print();
++    }
++
++    static int cont_stack_offset = 0;
++    if (cont_stack_offset == 0) {
++      cont_stack_offset = lookup_field_offset("sun/misc/Continuation",
++                                              "stack",
++                                              vmSymbolHandles::object_signature(),
++                                              false,
++                                              THREAD);
++      if (cont_stack_offset == 0) {
++        THROW_IE_("Field not found: Continuation.stack", NULL);
++      }
++    }
++    static int cont_data1_offset = 0;
++    if (cont_data1_offset == 0) {
++      cont_data1_offset = lookup_field_offset("sun/misc/Continuation",
++                                              "data1",
++                                              vmSymbolHandles::object_signature(),
++                                              false,
++                                              THREAD);
++      if (cont_data1_offset == 0) {
++        THROW_IE_("Field not found: Continuation.data1", NULL);
++      }
++    }
++    static int cont_pcs_offset = 0;
++    if (cont_pcs_offset == 0) {
++      cont_pcs_offset = lookup_field_offset("sun/misc/Continuation",
++                                            "pcs",
++                                            vmSymbolHandles::long_array_signature(),
++                                            false,
++                                            THREAD);
++      if (cont_data1_offset == 0) {
++        THROW_IE_("Field not found: Continuation.pcs", NULL);
++      }
++    }
++
++    // Signature of save_cont guarantees continuation is a Continuation
++    Handle cont_h(THREAD, JNIHandles::resolve(continuation));
++    if (cont_h->obj_field(cont_stack_offset) != NULL)
++      // Refuse to fill in a Continuation twice.  It would allow various spoofs.
++      THROW_IE_("Continuation has already been filled in", NULL);
++
++    cont_h->release_obj_field_put(cont_stack_offset, blob());
++    cont_h->release_obj_field_put(cont_data1_offset, data1());
++    cont_h->release_obj_field_put(cont_pcs_offset, pcs());
++    cont = cont_h;
++  } // end of ResouceMark
++
++  if (DebugContinuation) {
++    tty->print_cr("save_cont thread=%x", (intptr_t)thread);
++    tty->print_cr("save_cont thread tlab=%x", (intptr_t)&thread->tlab());
++    tty->print_cr("save_cont thread_state=%x", (intptr_t)thread->thread_state());
++  }
++
++  // The sp/fp/pc/rv_oop to cut the stack to
++  intptr_t cut_sp = (intptr_t) cut_to_frame.sp();
++  intptr_t cut_fp = (intptr_t) cut_to_frame.fp();
++  intptr_t cut_pc = (intptr_t) cut_to_frame.pc();
++
++  SaveFunction save_func = (SaveFunction) SharedRuntime::continuation_save_blob()->entry_point();
++  save_func(thread, cut_sp, cut_fp, cut_pc, cont.raw_value());
++  return NULL;
++}
+ 
+ /// JVM_RegisterUnsafeMethods
+ 
+@@ -1464,6 +3098,14 @@
+     {CC"defineAnonymousClass", CC"("DAC_Args")"CLS,      FN_PTR(Unsafe_DefineAnonymousClass)},
+ };
+ 
++#define CONT "Lsun/misc/Continuation;"
++JNINativeMethod continuation_methods[] = {
++    {CC"save_cont",                CC"("CONT")"OBJ,      FN_PTR(Continuation_SaveContinuation)},
++    {CC"resume_cont",              CC"("OBJ OBJ")V",     FN_PTR(Continuation_ResumeContinuation)},
++    {CC"dec_code_cache_ref_count", CC"(J)V",             FN_PTR(Continuation_DecCodeCacheRefCount)}
++};
++#undef CONT
++
+ #undef CC
+ #undef FN_PTR
+ 
+@@ -1562,3 +3204,19 @@
+     guarantee(status == 0, "register unsafe natives");
+   }
+ JVM_END
++
++JVM_ENTRY(void, JVM_RegisterContinuationMethods(JNIEnv *env, jclass contcls))
++  UnsafeWrapper("JVM_RegisterContinuationMethods");
++  {
++    ThreadToNativeFromVM ttnfv(thread);
++    {
++      env->RegisterNatives(contcls, continuation_methods, sizeof(continuation_methods)/sizeof(JNINativeMethod));
++      if (env->ExceptionOccurred()) {
++        if (PrintMiscellaneous && (Verbose || WizardMode)) {
++          tty->print_cr("Warning:  Continuation not found.");
++        }
++        env->ExceptionClear();
++      }
++    }
++  }
++JVM_END
+diff --git a/src/share/vm/runtime/arguments.cpp b/src/share/vm/runtime/arguments.cpp
+--- a/src/share/vm/runtime/arguments.cpp
++++ b/src/share/vm/runtime/arguments.cpp
+@@ -2906,6 +2906,10 @@
+       UseCompressedOops = false;
+     }
+   }
++  // Continuation currently does not support compressed oops.
++  if (UseCompressedOops && UseContinuation) {
++    UseCompressedOops = false;
++  }
+ #endif // _LP64
+ 
+   // Check the GC selections again.
+diff --git a/src/share/vm/runtime/deoptimization.cpp b/src/share/vm/runtime/deoptimization.cpp
+--- a/src/share/vm/runtime/deoptimization.cpp
++++ b/src/share/vm/runtime/deoptimization.cpp
+@@ -461,6 +461,11 @@
+   thread->dec_in_deopt_handler();
+ }
+ 
++void Deoptimization::dealloc_deopt_mark(JavaThread* thread) {
++  delete thread->deopt_mark();
++  thread->set_deopt_mark(NULL);
++}
++
+ 
+ // Return BasicType of value being returned
+ JRT_LEAF(BasicType, Deoptimization::unpack_frames(JavaThread* thread, int exec_mode))
+diff --git a/src/share/vm/runtime/deoptimization.hpp b/src/share/vm/runtime/deoptimization.hpp
+--- a/src/share/vm/runtime/deoptimization.hpp
++++ b/src/share/vm/runtime/deoptimization.hpp
+@@ -27,6 +27,70 @@
+ class MonitorValue;
+ class ObjectValue;
+ 
++class FrameInfo;
++
++// Data structure used for resuming from a continuation
++class ResumeBlock : public ResourceObj {
++ private:
++  intptr_t* _top_sp;
++  intptr_t* _top_fp;
++  address _top_pc;
++  address _rough_top_pc; // inaccurate pc that has a valid oop map, set by the native wrapper
++  oop* _return_value;
++  intptr_t* _image;
++  intptr_t _image_size;
++  intptr_t _bottom_frame_max_locals;
++  intptr_t _alignment_padding; // in words, >= 0
++
++ public:
++  ResumeBlock(intptr_t* top_sp, intptr_t* top_fp, address top_pc,
++              address rough_top_pc, oop* return_value,
++              intptr_t* image, intptr_t image_size, intptr_t bottom_frame_max_locals,
++              intptr_t alignment_padding) :
++      _top_sp(top_sp),
++      _top_fp(top_fp),
++      _top_pc(top_pc),
++      _rough_top_pc(rough_top_pc),
++      _return_value(return_value),
++      _image(image),
++      _image_size(image_size),
++      _bottom_frame_max_locals(bottom_frame_max_locals),
++      _alignment_padding(alignment_padding) {
++  }
++
++  static int top_sp_offset_in_bytes() { return offset_of(ResumeBlock, _top_sp); }
++  static int top_fp_offset_in_bytes() { return offset_of(ResumeBlock, _top_fp); }
++  static int top_pc_offset_in_bytes() { return offset_of(ResumeBlock, _top_pc); }
++  static int rough_top_pc_offset_in_bytes() { return offset_of(ResumeBlock, _rough_top_pc); }
++  static int return_value_offset_in_bytes() { return offset_of(ResumeBlock, _return_value); }
++  static int image_offset_in_bytes() { return offset_of(ResumeBlock, _image); }
++  static int image_size_offset_in_bytes() { return offset_of(ResumeBlock, _image_size); }
++  static int bottom_frame_max_locals_offset_in_bytes() { return offset_of(ResumeBlock, _bottom_frame_max_locals); }
++  static int alignment_padding_offset_in_bytes() { return offset_of(ResumeBlock, _alignment_padding); }
++
++  intptr_t* top_sp() { return _top_sp; }
++  intptr_t* top_fp() { return _top_fp; }
++  address top_pc() { return _top_pc; }
++  address rough_top_pc() { return _rough_top_pc; }
++  oop* return_value() { return _return_value; }
++  intptr_t* image() { return _image; }
++  intptr_t image_size() { return _image_size; }
++
++  void print() {
++    tty->print_cr("ResumeBlock: " INTPTR_FORMAT, (intptr_t) this);
++    tty->print_cr("top_sp=" INTPTR_FORMAT ", top_fp=" INTPTR_FORMAT ", top_pc=" INTPTR_FORMAT ", return_value=" INTPTR_FORMAT,
++                  _top_sp, _top_fp, _top_pc, _return_value != NULL ? (intptr_t)*_return_value : 0);
++    tty->print_cr("image=" INTPTR_FORMAT, (intptr_t) _image);
++    tty->print_cr("image_size=" INTPTR_FORMAT, _image_size);
++    tty->print_cr("bottom_frame_max_locals=" INTPTR_FORMAT, _bottom_frame_max_locals);
++    tty->print_cr("alignment_padding=" INTPTR_FORMAT, _alignment_padding);
++    for (int i = 0; i < _image_size; ++i) {
++      intptr_t* p = &_image[i];
++      tty->print_cr("     " INTPTR_FORMAT ": " INTPTR_FORMAT ":   " INTPTR_FORMAT, p, _top_sp + i, *p);
++    }
++  }
++};
++
+ class Deoptimization : AllStatic {
+  public:
+   // What condition caused the deoptimization?
+@@ -197,6 +261,9 @@
+   // Return BasicType of call return type, if any
+   static BasicType unpack_frames(JavaThread* thread, int exec_mode);
+ 
++  // Called by the continuation resume blob
++  static void dealloc_deopt_mark(JavaThread* thread);
++
+   // Cleans up deoptimization bits on thread after unpacking or in the
+   // case of an exception.
+   static void cleanup_deopt_info(JavaThread  *thread,
+diff --git a/src/share/vm/runtime/frame.cpp b/src/share/vm/runtime/frame.cpp
+--- a/src/share/vm/runtime/frame.cpp
++++ b/src/share/vm/runtime/frame.cpp
+@@ -838,7 +838,8 @@
+ }
+ 
+ 
+-void frame::oops_interpreted_do(OopClosure* f, const RegisterMap* map, bool query_oop_map_cache) {
++void frame::oops_interpreted_do(OopClosure* f, const RegisterMap* map, bool query_oop_map_cache,
++                                OopMapCacheId oop_map_cache_id) {
+   assert(is_interpreted_frame(), "Not an interpreted frame");
+   assert(map != NULL, "map must be set");
+   Thread *thread = Thread::current();
+@@ -921,7 +922,7 @@
+   // process locals & expression stack
+   InterpreterOopMap mask;
+   if (query_oop_map_cache) {
+-    m->mask_for(bci, &mask);
++    m->mask_for(bci, &mask, oop_map_cache_id);
+   } else {
+     OopMapCache::compute_one_oop_map(m, bci, &mask);
+   }
+@@ -1281,4 +1282,14 @@
+   assert(thread->has_last_Java_frame(), "sanity check");
+   _fr = thread->last_frame();
+   _is_done = false;
++  // In the call to ThreadInVMfromNativeForContinuation::dealloc in
++  // the continuation save blob, GC can occur and will walk down the
++  // stack of this thread from the enter0 frame (which is the
++  // designated last Java frame.) But here in the GC code we shouldn't
++  // examine oops in the outgoing arguments of the enter0 frame
++  // because they can be garbage if the frame above (the enter1 frame)
++  // is a compiled frame.
++  if (thread->cont_thread_transition() != NULL) {
++    _reg_map.set_include_argument_oops(false);
++  }
+ }
+diff --git a/src/share/vm/runtime/frame.hpp b/src/share/vm/runtime/frame.hpp
+--- a/src/share/vm/runtime/frame.hpp
++++ b/src/share/vm/runtime/frame.hpp
+@@ -354,7 +354,7 @@
+ 
+   // Oops-do's
+   void oops_compiled_arguments_do(symbolHandle signature, bool has_receiver, const RegisterMap* reg_map, OopClosure* f);
+-  void oops_interpreted_do(OopClosure* f, const RegisterMap* map, bool query_oop_map_cache = true);
++  void oops_interpreted_do(OopClosure* f, const RegisterMap* map, bool query_oop_map_cache = true, OopMapCacheId oop_map_cache_id = default_oop_map_cache_id);
+ 
+  private:
+   void oops_interpreted_arguments_do(symbolHandle signature, bool has_receiver, OopClosure* f);
+diff --git a/src/share/vm/runtime/globals.hpp b/src/share/vm/runtime/globals.hpp
+--- a/src/share/vm/runtime/globals.hpp
++++ b/src/share/vm/runtime/globals.hpp
+@@ -3523,6 +3523,12 @@
+   develop(bool, TraceInvokeDynamic, false,                                  \
+           "trace internal invoke dynamic operations")                       \
+                                                                             \
++  product(bool, UseContinuation, true,                                      \
++          "Enable the Continuation feature")                                \
++                                                                            \
++  diagnostic(bool, DebugContinuation, false,                                \
++             "Print the Continuation debug messages")                       \
++                                                                            \
+   diagnostic(bool, PauseAtStartup,      false,                              \
+           "Causes the VM to pause at startup time and wait for the pause "  \
+           "file to be removed (default: ./vm.paused.<pid>)")                \
+diff --git a/src/share/vm/runtime/interfaceSupport.hpp b/src/share/vm/runtime/interfaceSupport.hpp
+--- a/src/share/vm/runtime/interfaceSupport.hpp
++++ b/src/share/vm/runtime/interfaceSupport.hpp
+@@ -251,6 +251,33 @@
+   }
+ };
+ 
++// Special version of ThreadInVMfromNative for continuation operations
++class ThreadInVMfromNativeForContinuation : public CHeapObj {
++ private:
++  JavaThread* _thread;
++ public:
++  ThreadInVMfromNativeForContinuation(JavaThread* thread) {
++    _thread = thread;
++    ThreadStateTransition::transition_from_native(_thread, _thread_in_vm);
++  }
++  ~ThreadInVMfromNativeForContinuation() {
++    if (DebugContinuation) {
++      tty->print_cr("~ThreadInVMfromNativeForContinuation... " INTPTR_FORMAT,
++                    (intptr_t) _thread);
++    }
++    ThreadStateTransition::transition_and_fence(_thread, _thread_in_vm, _thread_in_native);
++  }
++  static void dealloc(JavaThread* thread) {
++    ThreadInVMfromNativeForContinuation* tt = thread->cont_thread_transition();
++    assert(tt != NULL, "Null cont thread transition");
++    delete tt; // this calls the destructor and could block for GC
++    // The field thread::_cont_thread_transition must be non-null
++    // (i.e., pointing the deallocated) until the end of the
++    // continuation_{save,resume}_blob so that GCs that happen while
++    // the thread is in the blob won't look at the arguments of the
++    // top enter0 frame.
++  }
++};
+ 
+ class ThreadToNativeFromVM : public ThreadStateTransition {
+  public:
+diff --git a/src/share/vm/runtime/sharedRuntime.hpp b/src/share/vm/runtime/sharedRuntime.hpp
+--- a/src/share/vm/runtime/sharedRuntime.hpp
++++ b/src/share/vm/runtime/sharedRuntime.hpp
+@@ -262,9 +262,16 @@
+   // deopt blob
+   static void generate_deopt_blob(void);
+   static DeoptimizationBlob* _deopt_blob;
++  // continuation blob
++  static RuntimeStub* generate_continuation_save_blob(void);
++  static RuntimeStub* generate_continuation_resume_blob(void);
++  static RuntimeStub* _continuation_save_blob;
++  static RuntimeStub* _continuation_resume_blob;
+ 
+   public:
+   static DeoptimizationBlob* deopt_blob(void)      { return _deopt_blob; }
++  static RuntimeStub* continuation_save_blob(void)   { return _continuation_save_blob; }
++  static RuntimeStub* continuation_resume_blob(void) { return _continuation_resume_blob; }
+ 
+   // Resets a call-site in compiled code so it will get resolved again.
+   static methodHandle reresolve_call_site(JavaThread *thread, TRAPS);
+diff --git a/src/share/vm/runtime/thread.cpp b/src/share/vm/runtime/thread.cpp
+--- a/src/share/vm/runtime/thread.cpp
++++ b/src/share/vm/runtime/thread.cpp
+@@ -1158,6 +1158,7 @@
+   set_vframe_array_head(NULL);
+   set_vframe_array_last(NULL);
+   set_deferred_locals(NULL);
++  set_cont_thread_transition(NULL);
+   set_deopt_mark(NULL);
+   clear_must_deopt_id();
+   set_monitor_chunks(NULL);
+diff --git a/src/share/vm/runtime/thread.hpp b/src/share/vm/runtime/thread.hpp
+--- a/src/share/vm/runtime/thread.hpp
++++ b/src/share/vm/runtime/thread.hpp
+@@ -39,6 +39,7 @@
+ class CompilerCounters;
+ class vframeArray;
+ 
++class ThreadInVMfromNativeForContinuation;
+ class DeoptResourceMark;
+ class jvmtiDeferredLocalVariableSet;
+ 
+@@ -672,6 +673,9 @@
+ 
+   JNIEnv        _jni_environment;
+ 
++  // Used by continuation operations
++  ThreadInVMfromNativeForContinuation* _cont_thread_transition;
++
+   // Deopt support
+   DeoptResourceMark*  _deopt_mark;               // Holds special ResourceMark for deoptimization
+ 
+@@ -1082,6 +1086,10 @@
+   void set_vframe_array_last(vframeArray* value) { _vframe_array_last = value; }
+   vframeArray* vframe_array_last() const         { return _vframe_array_last;  }
+ 
++  // Continuation support
++  void set_cont_thread_transition(ThreadInVMfromNativeForContinuation* value)  { _cont_thread_transition = value; }
++  ThreadInVMfromNativeForContinuation* cont_thread_transition(void)            { return _cont_thread_transition; }
++
+   // The special resourceMark used during deoptimization
+ 
+   void set_deopt_mark(DeoptResourceMark* value)  { _deopt_mark = value; }
+@@ -1182,6 +1190,7 @@
+   static ByteSize callee_target_offset()         { return byte_offset_of(JavaThread, _callee_target       ); }
+   static ByteSize vm_result_offset()             { return byte_offset_of(JavaThread, _vm_result           ); }
+   static ByteSize vm_result_2_offset()           { return byte_offset_of(JavaThread, _vm_result_2         ); }
++  static ByteSize cont_thread_transition_offset(){ return byte_offset_of(JavaThread, _cont_thread_transition); }
+   static ByteSize thread_state_offset()          { return byte_offset_of(JavaThread, _thread_state        ); }
+   static ByteSize saved_exception_pc_offset()    { return byte_offset_of(JavaThread, _saved_exception_pc  ); }
+   static ByteSize osthread_offset()              { return byte_offset_of(JavaThread, _osthread            ); }
+diff --git a/src/share/vm/runtime/vframeArray.cpp b/src/share/vm/runtime/vframeArray.cpp
+--- a/src/share/vm/runtime/vframeArray.cpp
++++ b/src/share/vm/runtime/vframeArray.cpp
+@@ -26,6 +26,117 @@
+ # include "incls/_vframeArray.cpp.incl"
+ 
+ 
++#ifndef PRODUCT
++void FrameInfo::print(outputStream* st) {
++  st->print("FrameInfo method: ");
++  _method->name()->print_symbol_on(st);
++  st->print(" (bci: %i, ", _bci);
++  st->print("locals: %i, expressions: %i, monitors: %i\n", _locals->size(), _expressions->size(), _monitors->length());
++
++  st->print("  locals: ");
++  for (int i=0; i<_locals->size(); i++) {
++    StackValue* v = _locals->at(i);
++    switch (v->type()) {
++    case T_INT:
++      st->print(INTPTR_FORMAT " ", v->get_int());
++      break;
++    case T_OBJECT:
++      st->print("OBJ(" INTPTR_FORMAT ") ", v->get_int(T_OBJECT));
++      break;
++    default:
++      ShouldNotReachHere();
++    }
++  }
++
++  st->print("\n  expressions: ");
++  for (int i=0; i<_expressions->size(); i++) {
++    StackValue* v = _expressions->at(i);
++    switch (v->type()) {
++    case T_INT:
++      st->print("%08x ", v->get_int());
++      break;
++    case T_OBJECT:
++      st->print("OBJ(%08x) ", v->get_int(T_OBJECT));
++      break;
++    default:
++      ShouldNotReachHere();
++    }
++  }
++  st->print("\n  monitors: ");
++  for (int i=0; i<_monitors->length(); i++) {
++    MonitorInfo* v = _monitors->at(i);
++    st->print("%08x ", v->owner());
++  }
++  st->print("\n");
++}
++#endif /* PRODUCT */
++
++#ifdef ASSERT
++void FrameInfo::verify() {
++  // TODO add useful assertions
++}
++#endif /* ASSERT */
++
++
++void vframeArrayElement::fill_in(FrameInfo* frame_info) {
++
++  // copy the info from the FrameInfo object - it has to be in the correct format (object locals and expressions as ints)
++  _method = frame_info->method();
++  _bci    = frame_info->bci();
++  _locals = frame_info->locals();
++  _expressions = frame_info->expressions();
++
++  // reacquire the monitors of the stack frame
++  GrowableArray<MonitorInfo*>* list = frame_info->monitors();
++  if (list->is_empty()) {
++    _monitors = NULL;
++  } else {
++    int index;
++    JavaThread* thread = JavaThread::current();
++
++    // monitor handling is not finished...
++    //ShouldNotReachHere();
++
++    // Allocate monitor chunk
++    _monitors = new MonitorChunk(list->length());
++    thread->add_monitor_chunk(_monitors);
++
++    // Simply restore monitor entries with lockee obj + displaced
++    // header saved by write_monitors.  Populate monitor chuncks (that
++    // unpack_to_stack copies to real interpreter frames later) from
++    // the MonitorInfos.
++    for (index = 0; index < list->length(); index++) {
++      MonitorInfo* monitor = list->at(index);
++      oop obj = monitor->owner();
++      BasicObjectLock* dest = _monitors->at(index);
++      dest->set_obj(obj);
++      dest->lock()->set_displaced_header(monitor->lock()->displaced_header());
++    }
++  }
++}
++
++vframeArray* vframeArray::allocate(JavaThread* thread, int frame_size, GrowableArray<FrameInfo*>* frame_infos,
++                                   frame sender, frame caller) {
++
++  // Allocate the vframeArray
++  vframeArray * result = (vframeArray*) AllocateHeap(sizeof(vframeArray) + // fixed part
++                                                     sizeof(vframeArrayElement) * (frame_infos->length() - 1), // variable part
++                                                     "vframeArray::allocate");
++  result->_frames = frame_infos->length();
++  result->_owner_thread = thread;
++  result->_sender = sender;
++  result->_caller = caller;
++  // result->_original = self;
++  result->set_unroll_block(NULL); // initialize it
++
++  result->_frame_size = frame_size;
++  for(int i = 0; i < frame_infos->length(); i++) {
++    result->element(i)->fill_in(frame_infos->at(i));
++  }
++
++  return result;
++}
++
+ int vframeArrayElement:: bci(void) const { return (_bci == SynchronizationEntryBCI ? 0 : _bci); }
+ 
+ void vframeArrayElement::free_monitors(JavaThread* jt) {
+diff --git a/src/share/vm/runtime/vframeArray.hpp b/src/share/vm/runtime/vframeArray.hpp
+--- a/src/share/vm/runtime/vframeArray.hpp
++++ b/src/share/vm/runtime/vframeArray.hpp
+@@ -34,6 +34,46 @@
+ class MonitorArrayElement;
+ class StackValueCollection;
+ 
++// Represents the current state of one stack frame. Used mainly for creating vframeArrays from scratch.
++
++class FrameInfo : public ResourceObj {
++private:
++  methodOop _method;
++  int _bci;
++  StackValueCollection* _locals;
++  StackValueCollection* _expressions;
++  GrowableArray<MonitorInfo*>* _monitors;
++
++public:
++
++  FrameInfo(methodOop method, int bci, StackValueCollection* locals, StackValueCollection* expressions, GrowableArray<MonitorInfo*>* monitors) {
++    _method = method;
++    _bci = bci;
++    _locals = locals;
++    _expressions = expressions;
++    _monitors = monitors;
++  }
++
++  methodOop method() const                      { return _method; }
++
++  int bci() const                               { return _bci; }
++
++  StackValueCollection* locals() const          { return _locals; }
++
++  StackValueCollection* expressions() const     { return _expressions; }
++
++  GrowableArray<MonitorInfo*>* monitors() const { return _monitors; }
++
++#ifndef PRODUCT
++  void print(outputStream* st);
++#endif /* PRODUCT */
++
++#ifdef ASSERT
++  void verify();
++#endif /* ASSERT */
++};
++
++
+ // A vframeArrayElement is an element of a vframeArray. Each element
+ // represent an interpreter frame which will eventually be created.
+ 
+@@ -68,6 +108,7 @@
+   StackValueCollection* expressions(void) const        { return _expressions; }
+ 
+   void fill_in(compiledVFrame* vf);
++  void fill_in(FrameInfo* frame_info);
+ 
+   // Formerly part of deoptimizedVFrame
+ 
+@@ -147,6 +188,10 @@
+   static vframeArray* allocate(JavaThread* thread, int frame_size, GrowableArray<compiledVFrame*>* chunk,
+                                RegisterMap* reg_map, frame sender, frame caller, frame self);
+ 
++  // special case for creating a vframeArray from scratch
++  static vframeArray* allocate(JavaThread* thread, int frame_size, GrowableArray<FrameInfo*>* frame_infos,
++                               frame sender, frame caller);
++
+ 
+   vframeArrayElement* element(int index)        { assert(is_within_bounds(index), "Bad index"); return &_elements[index]; }
+ 
+diff --git a/src/share/vm/runtime/vmStructs.cpp b/src/share/vm/runtime/vmStructs.cpp
+--- a/src/share/vm/runtime/vmStructs.cpp
++++ b/src/share/vm/runtime/vmStructs.cpp
+@@ -116,7 +116,7 @@
+   nonstatic_field(instanceKlass,               _vtable_len,                                   int)                                   \
+   nonstatic_field(instanceKlass,               _itable_len,                                   int)                                   \
+   nonstatic_field(instanceKlass,               _reference_type,                               ReferenceType)                         \
+-  volatile_nonstatic_field(instanceKlass,      _oop_map_cache,                                OopMapCache*)                          \
++  volatile_nonstatic_field(instanceKlass,      _oop_map_caches[0],                            OopMapCache*)                          \
+   nonstatic_field(instanceKlass,               _jni_ids,                                      JNIid*)                                \
+   nonstatic_field(instanceKlass,               _osr_nmethods_head,                            nmethod*)                              \
+   nonstatic_field(instanceKlass,               _breakpoints,                                  BreakpointInfo*)                       \
+diff --git a/src/share/vm/utilities/globalDefinitions.hpp b/src/share/vm/utilities/globalDefinitions.hpp
+--- a/src/share/vm/utilities/globalDefinitions.hpp
++++ b/src/share/vm/utilities/globalDefinitions.hpp
+@@ -1171,3 +1171,9 @@
+ # endif /* ASSERT */
+ 
+ #define ARRAY_SIZE(array) (sizeof(array)/sizeof((array)[0]))
++
++enum OopMapCacheId {
++  default_oop_map_cache_id      = 0,
++  continuation_oop_map_cache_id = 1,
++  limit_oop_map_cache_id        = 2 // Not a real entry. Always the last.
++};

@@ -1,0 +1,35 @@
+diff --git a/src/share/vm/oops/generateOopMap.cpp b/src/share/vm/oops/generateOopMap.cpp
+--- a/src/share/vm/oops/generateOopMap.cpp
++++ b/src/share/vm/oops/generateOopMap.cpp
+@@ -1254,7 +1254,7 @@
+       case Bytecodes::_invokestatic:
+       case Bytecodes::_invokedynamic:
+       case Bytecodes::_invokeinterface:
+-        int idx = currentBC->has_index_u4() ? currentBC->get_index_u4() : currentBC->get_index_u2();
++        int idx = currentBC->has_index_u4() ? currentBC->get_index_u4() : currentBC->get_index_u2_cpcache();
+         constantPoolOop cp    = method()->constants();
+         int nameAndTypeIdx    = cp->name_and_type_ref_index_at(idx);
+         int signatureIdx      = cp->signature_ref_index_at(nameAndTypeIdx);
+@@ -1286,7 +1286,7 @@
+       case Bytecodes::_invokestatic:
+       case Bytecodes::_invokedynamic:
+       case Bytecodes::_invokeinterface:
+-        int idx = currentBC->has_index_u4() ? currentBC->get_index_u4() : currentBC->get_index_u2();
++        int idx = currentBC->has_index_u4() ? currentBC->get_index_u4() : currentBC->get_index_u2_cpcache();
+         constantPoolOop cp    = method()->constants();
+         int nameAndTypeIdx    = cp->name_and_type_ref_index_at(idx);
+         int signatureIdx      = cp->signature_ref_index_at(nameAndTypeIdx);
+@@ -1356,8 +1356,11 @@
+ 
+     case Bytecodes::_ldc2_w:            ppush(vvCTS);               break;
+ 
+-    case Bytecodes::_ldc:               do_ldc(itr->get_index(),    itr->bci()); break;
+-    case Bytecodes::_ldc_w:             do_ldc(itr->get_index_u2(), itr->bci()); break;
++    case Bytecodes::_ldc:               // fall through:
++    case Bytecodes::_ldc_w:           { Bytecode_loadconstant* ldc = Bytecode_loadconstant_at(itr->method(), itr->bci());
++                                        do_ldc(ldc->pool_index(), itr->bci());
++                                        break;
++                                      }
+ 
+     case Bytecodes::_iload:
+     case Bytecodes::_fload:             ppload(vCTS, itr->get_index()); break;

@@ -1,0 +1,14 @@
+diff --git a/src/cpu/x86/vm/c1_LIRAssembler_x86.cpp b/src/cpu/x86/vm/c1_LIRAssembler_x86.cpp
+--- a/src/cpu/x86/vm/c1_LIRAssembler_x86.cpp
++++ b/src/cpu/x86/vm/c1_LIRAssembler_x86.cpp
+@@ -469,8 +469,8 @@
+   // Fetch the exception from TLS and clear out exception related thread state
+   __ get_thread(rsi);
+   __ movptr(rax, Address(rsi, JavaThread::exception_oop_offset()));
+-  __ movptr(Address(rsi, JavaThread::exception_oop_offset()), (int32_t)NULL_WORD);
+-  __ movptr(Address(rsi, JavaThread::exception_pc_offset()), (int32_t)NULL_WORD);
++  __ movptr(Address(rsi, JavaThread::exception_oop_offset()), LP64_ONLY((int32_t))NULL_WORD);
++  __ movptr(Address(rsi, JavaThread::exception_pc_offset()),  LP64_ONLY((int32_t))NULL_WORD);
+ 
+   __ bind(_unwind_handler_entry);
+   __ verify_not_null_oop(rax);

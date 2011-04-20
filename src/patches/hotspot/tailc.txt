@@ -1,0 +1,40 @@
+6804517: some languages need to be able to perform tail calls
+Summary: new tail-call prefix to the invokeX bytecode instructions
+
+Features:
+- the 'wide' bytecode prefix is overloaded for all the invokeX opcodes
+- the verifier requires that such calls be tail calls
+- the JVM ensures that tail-caller stack frames will not pile up
+- there are cross-domain tail-call checks which preserve security
+
+References:
+- http://wikis.sun.com/display/mlvm/TailCalls (design notes)
+- http://blogs.sun.com/jrose/entry/tail_calls_in_the_vm
+
+Intended uses:
+- Scheme, Clojure, Haskell language support
+- PyPy (threaded code JITs
+- dynamic language runtimes
+
+Tests:
+- (not uploaded yet)
+
+Author:
+- Arnold Schwaighofer (JKU, Linz)
+
+Incremental testing:
+(TBW)
+
+March 2009 update:  Tail call update, as of jdk7 b50.
+
+Contains 2 versions of tailcall patch.
+* tailcall-eager.patch: Apply to jdk7/hotspot directory. Support tailcalls in
+ hotspot vm. In compiled code a tail-call moves its arguments at the call
+ site. Now supports stackcompression.
+* tailcall[-lazy].patch:   Apply to jdk7/hotspot directory. Support tailcalls in
+ hotspot vm. In compiled code tail-calls move their arguments twice. Once
+ at the call site to the outgoing area. And a second time on entry
+ to a method to the caller's caller.
+Corrected protection domain comparisons (use the method_holder.pd instead
+of the receiver.pd). Both patches contain jttreg tests. To run those tests javac
+has to be patched. See langtools repository.

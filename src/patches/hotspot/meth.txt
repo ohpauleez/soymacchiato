@@ -1,0 +1,37 @@
+6655638: dynamic languages need method handles
+Summary: MethodHandle and related types, precursor to invokedynamic
+
+http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=6655638
+
+Features:
+- JVM support for method handles
+- enabled via -XX:+MethodHandleSupport
+- method handle types implemented:
+- * direct method handles (all cases of invoke{static,special,virtual,interface})
+- * bound method handles for any argument (any position, of type ref/int/long)
+- * non-blocking argument conversion adapters: null retype, checkcast, prim-to-prim, ref-to-prim
+- * argument motion adapters: duplicate, delete, swap, rotate argument(s)
+- * non-blocking unbox and varargs adapters: unbox from wrapper, spread from reference array
+- method handle types not implemented (must be created via Java code):
+- * prim-to-prim when float and non-float types are mixed (matrix is incomplete)
+- * blocking adapters: prim-to-ref argument (boxing), varargs collection
+- * flyby, ricochet (complex blocking combinators, require arglist abstraction)
+- JIT support: NYI (uses compiled-to-interpreted calling sequences currently)
+
+Authors:
+- John Rose (Sun)
+- JSR 292 EG
+
+Tests:
+- unit tests in hotspot/src/share/projects/meth/test
+
+Incremental testing:
+This does not require a full JDK build.
+
+$ cp -pr hotspot/src/share/projects/meth /tmp/meth
+$ cp -pr hotspot/src/share/projects/anonk /tmp/anonk
+$ cd /tmp/anonk
+$ ant compile
+$ cd /tmp/meth
+$ ant compile
+$ cat README.txt | sed '/--------/q'

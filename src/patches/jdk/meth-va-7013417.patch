@@ -1,0 +1,1729 @@
+7013417: JSR 292 needs to support variadic method handle calls
+Summary: Implement MH.asVarargsCollector, etc., and remove withTypeHandler.
+Reviewed-by: twisti
+
+diff --git a/src/share/classes/java/dyn/MethodHandle.java b/src/share/classes/java/dyn/MethodHandle.java
+--- a/src/share/classes/java/dyn/MethodHandle.java
++++ b/src/share/classes/java/dyn/MethodHandle.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -134,6 +134,11 @@
+  * constant pool entry.
+  * For more details, see the <a href="package-summary.html#mhcon">package summary</a>.)
+  * <p>
++ * Method handles produced by lookups or constant loads from methods or
++ * constructors with the variable arity modifier bit ({@code 0x0080})
++ * have a corresponding variable arity, as if they were defined with
++ * the help of {@link #asVarargsCollector asVarargsCollector}.
++ * <p>
+  * Java code can also use a reflective API called
+  * {@link java.dyn.MethodHandles.Lookup MethodHandles.Lookup}
+  * for creating and calling method handles.
+@@ -175,6 +180,9 @@
+ // mt is {Object[] =&gt; List}
+ mt = MethodType.methodType(java.util.List.class, Object[].class);
+ mh = lookup.findStatic(java.util.Arrays.class, "asList", mt);
++assert(mh.isVarargsCollector());
++x = mh.invokeGeneric("one", "two");
++assert(x.equals(java.util.Arrays.asList("one","two")));
+ // mt is {(Object,Object,Object) =&gt; Object}
+ mt = MethodType.genericMethodType(3);
+ mh = MethodHandles.collectArguments(mh, mt);
+@@ -307,26 +315,6 @@
+     }
+ 
+     /**
+-     * Returns a string representation of the method handle,
+-     * starting with the string {@code "MethodHandle"} and
+-     * ending with the string representation of the method handle's type.
+-     * In other words, this method returns a string equal to the value of:
+-     * <blockquote><pre>
+-     * "MethodHandle" + type().toString()
+-     * </pre></blockquote>
+-     * <p>
+-     * Note:  Future releases of this API may add further information
+-     * to the string representation.
+-     * Therefore, the present syntax should not be parsed by applications.
+-     *
+-     * @return a string representation of the method handle
+-     */
+-    @Override
+-    public String toString() {
+-        return MethodHandleImpl.getNameString(IMPL_TOKEN, this);
+-    }
+-
+-    /**
+      * Invoke the method handle, allowing any caller signature, but requiring an exact signature match.
+      * The signature at the call site of {@code invokeExact} must
+      * exactly match this method handle's {@link #type type}.
+@@ -338,7 +326,7 @@
+ 
+     /**
+      * Invoke the method handle, allowing any caller signature,
+-     * and optionally performing conversions for arguments and return types.
++     * and optionally performing conversions on arguments and return values.
+      * <p>
+      * If the call site signature exactly matches this method handle's {@link #type type},
+      * the call proceeds as if by {@link #invokeExact invokeExact}.
+@@ -353,14 +341,13 @@
+      * adaptations directly on the caller's arguments,
+      * and call the target method handle according to its own exact type.
+      * <p>
+-     * If the method handle is equipped with a
+-     * {@linkplain #withTypeHandler type handler}, the handler must produce
+-     * an entry point of the call site's exact type.
+-     * Otherwise, the signature at the call site of {@code invokeGeneric} must
+-     * be a valid argument to the standard {@code asType} method.
++     * The signature at the call site of {@code invokeGeneric} must
++     * be a valid argument to the receivers {@code asType} method.
+      * In particular, the caller must specify the same argument arity
+-     * as the callee's type.
++     * as the callee's type,
++     * if the callee is not a {@linkplain #asVarargsCollector variable arity collector}.
+      * @throws WrongMethodTypeException if the target's type cannot be adjusted to the caller's type signature
++     * @throws ClassCastException if the target's type can be adjusted to the caller, but a reference cast fails
+      * @throws Throwable anything thrown by the underlying method propagates unchanged through the method handle call
+      */
+     public final native @PolymorphicSignature Object invokeGeneric(Object... args) throws Throwable;
+@@ -400,14 +387,14 @@
+      * <p>
+      * This call is equivalent to the following code:
+      * <p><blockquote><pre>
+-     * MethodHandle invoker = MethodHandles.varargsInvoker(this.type(), 0);
++     * MethodHandle invoker = MethodHandles.spreadInvoker(this.type(), 0);
+      * Object result = invoker.invokeExact(this, arguments);
+      * </pre></blockquote>
+      * @param arguments the arguments to pass to the target
+      * @return the result returned by the target
+      * @throws WrongMethodTypeException if the target's type cannot be adjusted to take the arguments
+      * @throws Throwable anything thrown by the target method invocation
+-     * @see MethodHandles#varargsInvoker
++     * @see MethodHandles#spreadInvoker
+      */
+     public final Object invokeWithArguments(Object... arguments) throws Throwable {
+         int argc = arguments == null ? 0 : arguments.length;
+@@ -456,7 +443,7 @@
+         }
+ 
+         // more than ten arguments get boxed in a varargs list:
+-        MethodHandle invoker = MethodHandles.invokers(type).varargsInvoker(0);
++        MethodHandle invoker = invokers(type).spreadInvoker(0);
+         return invoker.invokeExact(this, arguments);
+     }
+     /** Equivalent to {@code invokeWithArguments(arguments.toArray())}. */
+@@ -488,13 +475,7 @@
+      * to match up the caller's and callee's types.
+      * <p>
+      * This method is equivalent to {@link MethodHandles#convertArguments convertArguments},
+-     * except for method handles produced by {@link #withTypeHandler withTypeHandler},
+-     * in which case the specified type handler is used for calls to {@code asType}.
+-     * <p>
+-     * Note that the default behavior of {@code asType} only performs
+-     * pairwise argument conversion and return value conversion.
+-     * Because of this, unless the method handle has a type handler,
+-     * the original type and new type must have the same number of arguments.
++     * except for variable arity method handles produced by {@link #asVarargsCollector asVarargsCollector}.
+      *
+      * @param newType the expected type of the new method handle
+      * @return a method handle which delegates to {@code this} after performing
+@@ -508,14 +489,16 @@
+     }
+ 
+     /**
+-     * Produce a method handle which adapts, as its <i>target</i>,
++     * Make an adapter which accepts a trailing array argument
++     * and spreads its elements as positional arguments.
++     * The new method handle adapts, as its <i>target</i>,
+      * the current method handle.  The type of the adapter will be
+      * the same as the type of the target, except that the final
+      * {@code arrayLength} parameters of the target's type are replaced
+      * by a single array parameter of type {@code arrayType}.
+      * <p>
+      * If the array element type differs from any of the corresponding
+-     * argument types on original target,
++     * argument types on the original target,
+      * the original target is adapted to take the array elements directly,
+      * as if by a call to {@link #asType asType}.
+      * <p>
+@@ -539,6 +522,7 @@
+      * @throws IllegalArgumentException if target does not have at least
+      *         {@code arrayLength} parameter types
+      * @throws WrongMethodTypeException if the implied {@code asType} call fails
++     * @see #asCollector
+      */
+     public final MethodHandle asSpreader(Class<?> arrayType, int arrayLength) {
+         Class<?> arrayElement = arrayType.getComponentType();
+@@ -553,13 +537,15 @@
+     }
+ 
+     /**
+-     * Produce a method handle which adapts, as its <i>target</i>,
++     * Make an adapter which accepts a given number of trailing
++     * positional arguments and collects them into an array argument.
++     * The new method handle adapts, as its <i>target</i>,
+      * the current method handle.  The type of the adapter will be
+      * the same as the type of the target, except that a single trailing
+      * parameter (usually of type {@code arrayType}) is replaced by
+      * {@code arrayLength} parameters whose type is element type of {@code arrayType}.
+      * <p>
+-     * If the array type differs from the final argument type on original target,
++     * If the array type differs from the final argument type on the original target,
+      * the original target is adapted to take the array type directly,
+      * as if by a call to {@link #asType asType}.
+      * <p>
+@@ -570,21 +556,31 @@
+      * What the target eventually returns is returned unchanged by the adapter.
+      * <p>
+      * (The array may also be a shared constant when {@code arrayLength} is zero.)
+-     * @param arrayType usually {@code Object[]}, the type of the array argument which will collect the arguments
++     * <p>
++     * (<em>Note:</em> The {@code arrayType} is often identical to the last
++     * parameter type of the original target.
++     * It is an explicit argument for symmetry with {@code asSpreader}, and also
++     * to allow the target to use a simple {@code Object} as its last parameter type.)
++     * <p>
++     * In order to create a collecting adapter which is not restricted to a particular
++     * number of collected arguments, use {@link #asVarargsCollector asVarargsCollector} instead.
++     * @param arrayType often {@code Object[]}, the type of the array argument which will collect the arguments
+      * @param arrayLength the number of arguments to collect into a new array argument
+      * @return a new method handle which collects some trailing argument
+      *         into an array, before calling the original method handle
+      * @throws IllegalArgumentException if {@code arrayType} is not an array type
+-               or {@code arrayType} is not assignable to this method handle's trailing parameter type
+-     * @throws IllegalArgumentException if {@code arrayLength} is not
+-     *         a legal array size
++     *         or {@code arrayType} is not assignable to this method handle's trailing parameter type,
++     *         or {@code arrayLength} is not a legal array size
+      * @throws WrongMethodTypeException if the implied {@code asType} call fails
++     * @see #asSpreader
++     * @see #asVarargsCollector
+      */
+     public final MethodHandle asCollector(Class<?> arrayType, int arrayLength) {
+         Class<?> arrayElement = arrayType.getComponentType();
+         if (arrayElement == null)  throw newIllegalArgumentException("not an array type");
+         MethodType oldType = type();
+         int nargs = oldType.parameterCount();
++        if (nargs == 0)  throw newIllegalArgumentException("no trailing argument");
+         MethodType newType = oldType.dropParameterTypes(nargs-1, nargs);
+         newType = newType.insertParameterTypes(nargs-1,
+                     java.util.Collections.<Class<?>>nCopies(arrayLength, arrayElement));
+@@ -592,8 +588,183 @@
+     }
+ 
+     /**
+-     * Produce a method handle which binds the given argument
+-     * to the current method handle as <i>target</i>.
++     * Make a <em>variable arity</em> adapter which is able to accept
++     * any number of trailing positional arguments and collect them
++     * into an array argument.
++     * <p>
++     * The type and behavior of the adapter will be the same as
++     * the type and behavior of the target, except that certain
++     * {@code invokeGeneric} and {@code asType} requests can lead to
++     * trailing positional arguments being collected into target's
++     * trailing parameter.
++     * Also, the last parameter type of the adapter will be
++     * {@code arrayType}, even if the target has a different
++     * last parameter type.
++     * <p>
++     * When called with {@link #invokeExact invokeExact}, the adapter invokes
++     * the target with no argument changes.
++     * (<em>Note:</em> This behavior is different from a
++     * {@linkplain #asCollector fixed arity collector},
++     * since it accepts a whole array of indeterminate length,
++     * rather than a fixed number of arguments.)
++     * <p>
++     * When called with {@link #invokeGeneric invokeGeneric}, if the caller
++     * type is the same as the adapter, the adapter invokes the target as with
++     * {@code invokeExact}.
++     * (This is the normal behavior for {@code invokeGeneric} when types match.)
++     * <p>
++     * Otherwise, if the caller and adapter arity are the same, and the
++     * trailing parameter type of the caller is a reference type identical to
++     * or assignable to the trailing parameter type of the adapter,
++     * the arguments and return values are converted pairwise,
++     * as if by {@link MethodHandles#convertArguments convertArguments}.
++     * (This is also normal behavior for {@code invokeGeneric} in such a case.)
++     * <p>
++     * Otherwise, the arities differ, or the adapter's trailing parameter
++     * type is not assignable from the corresponding caller type.
++     * In this case, the adapter replaces all trailing arguments from
++     * the original trailing argument position onward, by
++     * a new array of type {@code arrayType}, whose elements
++     * comprise (in order) the replaced arguments.
++     * <p>
++     * The caller type must provides as least enough arguments,
++     * and of the correct type, to satisfy the target's requirement for
++     * positional arguments before the trailing array argument.
++     * Thus, the caller must supply, at a minimum, {@code N-1} arguments,
++     * where {@code N} is the arity of the target.
++     * Also, there must exist conversions from the incoming arguments
++     * to the target's arguments.
++     * As with other uses of {@code invokeGeneric}, if these basic
++     * requirements are not fulfilled, a {@code WrongMethodTypeException}
++     * may be thrown.
++     * <p>
++     * In all cases, what the target eventually returns is returned unchanged by the adapter.
++     * <p>
++     * In the final case, it is exactly as if the target method handle were
++     * temporarily adapted with a {@linkplain #asCollector fixed arity collector}
++     * to the arity required by the caller type.
++     * (As with {@code asCollector}, if the array length is zero,
++     * a shared constant may be used instead of a new array.
++     * If the implied call to {@code asCollector} would throw
++     * an {@code IllegalArgumentException} or {@code WrongMethodTypeException},
++     * the call to the variable arity adapter must throw
++     * {@code WrongMethodTypeException}.)
++     * <p>
++     * The behavior of {@link #asType asType} is also specialized for
++     * variable arity adapters, to maintain the invariant that
++     * {@code invokeGeneric} is always equivalent to an {@code asType}
++     * call to adjust the target type, followed by {@code invokeExact}.
++     * Therefore, a variable arity adapter responds
++     * to an {@code asType} request by building a fixed arity collector,
++     * if and only if the adapter and requested type differ either
++     * in arity or trailing argument type.
++     * The resulting fixed arity collector has its type further adjusted
++     * (if necessary) to the requested type by pairwise conversion,
++     * as if by another application of {@code asType}.
++     * <p>
++     * When a method handle is obtained by executing an {@code ldc} instruction
++     * of a {@code CONSTANT_MethodHandle} constant, and the target method is marked
++     * as a variable arity method (with the modifier bit {@code 0x0080}),
++     * the method handle will accept multiple arities, as if the method handle
++     * constant were created by means of a call to {@code asVarargsCollector}.
++     * <p>
++     * In order to create a collecting adapter which collects a predetermined
++     * number of arguments, and whose type reflects this predetermined number,
++     * use {@link #asCollector asCollector} instead.
++     * <p>
++     * No method handle transformations produce new method handles with
++     * variable arity, unless they are documented as doing so.
++     * Therefore, besides {@code asVarargsCollector},
++     * all methods in {@code MethodHandle} and {@code MethodHandles}
++     * will return a method handle with fixed arity,
++     * except in the cases where they are specified to return their original
++     * operand (e.g., {@code asType} of the method handle's own type).
++     * <p>
++     * Calling {@code asVarargsCollector} on a method handle which is already
++     * of variable arity will produce a method handle with the same type and behavior.
++     * It may (or may not) return the original variable arity method handle.
++     * <p>
++     * Here is an example, of a list-making variable arity method handle:
++     * <blockquote><pre>
++MethodHandle asList = publicLookup()
++  .findStatic(Arrays.class, "asList", methodType(List.class, Object[].class))
++  .asVarargsCollector(Object[].class);
++assertEquals("[]", asList.invokeGeneric().toString());
++assertEquals("[1]", asList.invokeGeneric(1).toString());
++assertEquals("[two, too]", asList.invokeGeneric("two", "too").toString());
++Object[] argv = { "three", "thee", "tee" };
++assertEquals("[three, thee, tee]", asList.invokeGeneric(argv).toString());
++List ls = (List) asList.invokeGeneric((Object)argv);
++assertEquals(1, ls.size());
++assertEquals("[three, thee, tee]", Arrays.toString((Object[])ls.get(0)));
++     * </pre></blockquote>
++     * <p style="font-size:smaller;">
++     * These rules are designed as a dynamically-typed variation
++     * of the Java rules for variable arity methods.
++     * In both cases, callers to a variable arity method or method handle
++     * can either pass zero or more positional arguments, or else pass
++     * pre-collected arrays of any length.  Users should be aware of the
++     * special role of the final argument, and of the effect of a
++     * type match on that final argument, which determines whether
++     * or not a single trailing argument is interpreted as a whole
++     * array or a single element of an array to be collected.
++     * Note that the dynamic type of the trailing argument has no
++     * effect on this decision, only a comparison between the static
++     * type signature of the call site and the type of the method handle.)
++     * <p style="font-size:smaller;">
++     * As a result of the previously stated rules, the variable arity behavior
++     * of a method handle may be suppressed, by binding it to the exact invoker
++     * of its own type, as follows:
++     * <blockquote><pre>
++MethodHandle vamh = publicLookup()
++  .findStatic(Arrays.class, "asList", methodType(List.class, Object[].class))
++  .asVarargsCollector(Object[].class);
++MethodHandle invokeExact = publicLookup()
++  .findVirtual(MethodHandle.class, "invokeExact", vamh.type());
++MethodHandle mh = invokeExact.bindTo(vamh);
++assert(vamh.type().equals(mh.type()));
++assertEquals("[1, 2, 3]", vamh.invokeGeneric(1,2,3).toString());
++boolean failed = false;
++try { mh.invokeGeneric(1,2,3); }
++catch (WrongMethodTypeException ex) { failed = true; }
++assert(failed);
++     * </pre></blockquote>
++     * This transformation has no behavioral effect if the method handle is
++     * not of variable arity.
++     * @param arrayType often {@code Object[]}, the type of the array argument which will collect the arguments
++     * @return a new method handle which can collect any number of trailing arguments
++     *         into an array, before calling the original method handle
++     * @throws IllegalArgumentException if {@code arrayType} is not an array type
++     *         or {@code arrayType} is not assignable to this method handle's trailing parameter type
++     * @see #asCollector
++     */
++    public MethodHandle asVarargsCollector(Class<?> arrayType) {
++        Class<?> arrayElement = arrayType.getComponentType();
++        if (arrayElement == null)  throw newIllegalArgumentException("not an array type");
++        return MethodHandles.asVarargsCollector(this, arrayType);
++    }
++
++    /**
++     * Determine if this method handle
++     * supports {@linkplain #asVarargsCollector variable arity} calls.
++     * Such method handles arise from the following sources:
++     * <ul>
++     * <li>a call to {@linkplain #asVarargsCollector asVarargsCollector}
++     * <li>a call to a {@linkplain java.dyn.MethodHandles.Lookup lookup method}
++     *     which resolves to a variable arity Java method or constructor
++     * <li>an {@code ldc} instruction of a {@code CONSTANT_MethodHandle}
++     *     which resolves to a variable arity Java method or constructor
++     * </ul>
++     * @return true if this method handle accepts more than one arity of {@code invokeGeneric} calls
++     */
++    public boolean isVarargsCollector() {
++        return false;
++    }
++
++    /**
++     * Bind a value {@code x} to the first argument of a method handle, without invoking it.
++     * The new method handle adapts, as its <i>target</i>,
++     * to the current method handle.
+      * The type of the bound handle will be
+      * the same as the type of the target, except that a single leading
+      * reference parameter will be omitted.
+@@ -619,74 +790,22 @@
+     }
+ 
+     /**
+-     * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+-     * Create a new method handle with the same type as this one,
+-     * but whose {@code asType} method invokes the given
+-     * {@code typeHandler} on this method handle,
+-     * instead of the standard {@code MethodHandles.convertArguments}.
+-     * <p>
+-     * The new method handle will have the same behavior as the
+-     * old one when invoked by {@code invokeExact}.
+-     * For {@code invokeGeneric} calls which exactly match
+-     * the method type, the two method handles will also
+-     * have the same behavior.
+-     * For other {@code invokeGeneric} calls, the {@code typeHandler}
+-     * will control the behavior of the new method handle.
+-     * <p>
+-     * Thus, a method handle with an {@code asType} handler can
+-     * be configured to accept more than one arity of {@code invokeGeneric}
+-     * call, and potentially every possible arity.
+-     * It can also be configured to supply default values for
+-     * optional arguments, when the caller does not specify them.
+-     * <p>
+-     * The given method handle must take two arguments and return
+-     * one result.  The result it returns must be a method handle
+-     * of exactly the requested type.  If the result returned by
+-     * the target is null, a {@link NullPointerException} is thrown,
+-     * else if the type of the target does not exactly match
+-     * the requested type, a {@link WrongMethodTypeException} is thrown.
+-     * <p>
+-     * A method handle's type handler is not guaranteed to be called every
+-     * time its {@code asType} or {@code invokeGeneric} method is called.
+-     * If the implementation is faced is able to prove that an equivalent
+-     * type handler call has already occurred (on the same two arguments),
+-     * it may substitute the result of that previous invocation, without
+-     * making a new invocation.  Thus, type handlers should not (in general)
+-     * perform significant side effects.
+-     * <p>
+-     * Therefore, the type handler is invoked as if by this code:
++     * Returns a string representation of the method handle,
++     * starting with the string {@code "MethodHandle"} and
++     * ending with the string representation of the method handle's type.
++     * In other words, this method returns a string equal to the value of:
+      * <blockquote><pre>
+-     * MethodHandle target = this;      // original method handle
+-     * MethodHandle adapter = ...;      // adapted method handle
+-     * MethodType requestedType = ...;  // argument to asType()
+-     * if (type().equals(requestedType))
+-     *    return adapter;
+-     * MethodHandle result = (MethodHandle)
+-     *    typeHandler.invokeGeneric(target, requestedType);
+-     * if (!result.type().equals(requestedType))
+-     *    throw new WrongMethodTypeException();
+-     * return result;
++     * "MethodHandle" + type().toString()
+      * </pre></blockquote>
+      * <p>
+-     * For example, here is a list-making variable-arity method handle:
+-     * <blockquote><pre>
+-MethodHandle makeEmptyList = MethodHandles.constant(List.class, Arrays.asList());
+-MethodHandle asList = lookup()
+-  .findStatic(Arrays.class, "asList", methodType(List.class, Object[].class));
+-static MethodHandle collectingTypeHandler(MethodHandle base, MethodType newType) {
+-  return asList.asCollector(Object[].class, newType.parameterCount()).asType(newType);
+-}
+-MethodHandle collectingTypeHandler = lookup()
+-  .findStatic(lookup().lookupClass(), "collectingTypeHandler",
+-     methodType(MethodHandle.class, MethodHandle.class, MethodType.class));
+-MethodHandle makeAnyList = makeEmptyList.withTypeHandler(collectingTypeHandler);
+-
+-assertEquals("[]", makeAnyList.invokeGeneric().toString());
+-assertEquals("[1]", makeAnyList.invokeGeneric(1).toString());
+-assertEquals("[two, too]", makeAnyList.invokeGeneric("two", "too").toString());
+-     * <pre><blockquote>
++     * Note:  Future releases of this API may add further information
++     * to the string representation.
++     * Therefore, the present syntax should not be parsed by applications.
++     *
++     * @return a string representation of the method handle
+      */
+-    public MethodHandle withTypeHandler(MethodHandle typeHandler) {
+-        return MethodHandles.withTypeHandler(this, typeHandler);
++    @Override
++    public String toString() {
++        return MethodHandleImpl.getNameString(IMPL_TOKEN, this);
+     }
+ }
+diff --git a/src/share/classes/java/dyn/MethodHandles.java b/src/share/classes/java/dyn/MethodHandles.java
+--- a/src/share/classes/java/dyn/MethodHandles.java
++++ b/src/share/classes/java/dyn/MethodHandles.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -135,7 +135,10 @@
+      * <p>
+      * In general, the conditions under which a method handle may be
+      * created for a method {@code M} are exactly as restrictive as the conditions
+-     * under which the lookup class could have compiled a call to {@code M}.
++     * under which the lookup class could have compiled a call to {@code M},
++     * or could have compiled an {@code ldc} instruction loading a
++     * {@code CONSTANT_MethodHandle} of M.
++     * The same point is true of fields and constructors.
+      * <p>
+      * In some cases, this access is obtained by the Java compiler by creating
+      * an wrapper method to access a private method of another class
+@@ -391,6 +394,10 @@
+          * The method and all its argument types must be accessible to the lookup class.
+          * If the method's class has not yet been initialized, that is done
+          * immediately, before the method handle is returned.
++         * <p>
++         * The returned method handle will have
++         * {@linkplain MethodHandle#asVarargsCollector variable arity} if and only if
++         * the method's variable arity modifier bit ({@code 0x0080}) is set.
+          * @param refc the class from which the method is accessed
+          * @param name the name of the method
+          * @param type the type of the method
+@@ -415,6 +422,10 @@
+          * implementation to enter.
+          * (The dispatching action is identical with that performed by an
+          * {@code invokevirtual} or {@code invokeinterface} instruction.)
++         * <p>
++         * The returned method handle will have
++         * {@linkplain MethodHandle#asVarargsCollector variable arity} if and only if
++         * the method's variable arity modifier bit ({@code 0x0080}) is set.
+          * @param refc the class or interface from which the method is accessed
+          * @param name the name of the method
+          * @param type the type of the method, with the receiver argument omitted
+@@ -439,6 +450,10 @@
+          * <p>
+          * Note:  The requested type must have a return type of {@code void}.
+          * This is consistent with the JVM's treatment of constructor signatures.
++         * <p>
++         * The returned method handle will have
++         * {@linkplain MethodHandle#asVarargsCollector variable arity} if and only if
++         * the constructor's variable arity modifier bit ({@code 0x0080}) is set.
+          * @param refc the class or interface from which the method is accessed
+          * @param type the type of the method, with the receiver argument omitted, and a void return type
+          * @return the desired method handle
+@@ -450,7 +465,23 @@
+             assert(ctor.isConstructor());
+             checkAccess(refc, ctor);
+             MethodHandle rawMH = MethodHandleImpl.findMethod(IMPL_TOKEN, ctor, false, lookupClassOrNull());
+-            return MethodHandleImpl.makeAllocator(IMPL_TOKEN, rawMH);
++            MethodHandle allocMH = MethodHandleImpl.makeAllocator(IMPL_TOKEN, rawMH);
++            return fixVarargs(allocMH, rawMH);
++        }
++
++        /** Return a version of MH which matches matchMH w.r.t. isVarargsCollector. */
++        private static MethodHandle fixVarargs(MethodHandle mh, MethodHandle matchMH) {
++            boolean va1 = mh.isVarargsCollector();
++            boolean va2 = matchMH.isVarargsCollector();
++            if (va1 == va2) {
++                return mh;
++            } else if (va2) {
++                MethodType type = mh.type();
++                int arity = type.parameterCount();
++                return mh.asVarargsCollector(type.parameterType(arity-1));
++            } else {
++                throw new InternalError("already varargs, but template is not: "+mh);
++            }
+         }
+ 
+         /**
+@@ -470,6 +501,10 @@
+          * If the explicitly specified caller class is not identical with the
+          * lookup class, or if this lookup object does not have private access
+          * privileges, the access fails.
++         * <p>
++         * The returned method handle will have
++         * {@linkplain MethodHandle#asVarargsCollector variable arity} if and only if
++         * the method's variable arity modifier bit ({@code 0x0080}) is set.
+          * @param refc the class or interface from which the method is accessed
+          * @param name the name of the method (which must not be "&lt;init&gt;")
+          * @param type the type of the method, with the receiver argument omitted
+@@ -559,13 +594,26 @@
+          * so that every call to the method handle will invoke the
+          * requested method on the given receiver.
+          * <p>
+-         * This is equivalent to the following expression:
+-         * <code>
+-         * {@link #insertArguments insertArguments}({@link #findVirtual findVirtual}(defc, name, type), receiver)
+-         * </code>
++         * The returned method handle will have
++         * {@linkplain MethodHandle#asVarargsCollector variable arity} if and only if
++         * the method's variable arity modifier bit ({@code 0x0080}) is set
++         * <em>and</em> the trailing array argument is not the only argument.
++         * (If the trailing array argument is the only argument,
++         * the given receiver value will be bound to it.)
++         * <p>
++         * This is equivalent to the following code:
++         * <blockquote><pre>
++MethodHandle mh0 = {@link #findVirtual findVirtual}(defc, name, type);
++MethodHandle mh1 = mh0.{@link MethodHandle#bindTo bindTo}(receiver);
++MethodType mt1 = mh1.type();
++if (mh0.isVarargsCollector() && mt1.parameterCount() > 0) {
++  mh1 = mh1.asVarargsCollector(mt1.parameterType(mt1.parameterCount()-1));
++return mh1;
++         * </pre></blockquote>
+          * where {@code defc} is either {@code receiver.getClass()} or a super
+          * type of that class, in which the requested method is accessible
+          * to the lookup class.
++         * (Note that {@code bindTo} does not preserve variable arity.)
+          * @param receiver the object from which the method is accessed
+          * @param name the name of the method
+          * @param type the type of the method, with the receiver argument omitted
+@@ -580,7 +628,9 @@
+             MethodHandle bmh = MethodHandleImpl.bindReceiver(IMPL_TOKEN, dmh, receiver);
+             if (bmh == null)
+                 throw newNoAccessException(method, lookupClass());
+-            return bmh;
++            if (dmh.type().parameterCount() == 0)
++                return dmh;  // bound the trailing parameter; no varargs possible
++            return fixVarargs(bmh, dmh);
+         }
+ 
+         /**
+@@ -593,6 +643,10 @@
+          * If the method's {@code accessible} flag is not set,
+          * access checking is performed immediately on behalf of the lookup class.
+          * If <i>m</i> is not public, do not share the resulting handle with untrusted parties.
++         * <p>
++         * The returned method handle will have
++         * {@linkplain MethodHandle#asVarargsCollector variable arity} if and only if
++         * the method's variable arity modifier bit ({@code 0x0080}) is set.
+          * @param m the reflected method
+          * @return a method handle which can invoke the reflected method
+          * @exception NoAccessException if access checking fails
+@@ -615,6 +669,10 @@
+          * If the method's {@code accessible} flag is not set,
+          * access checking is performed immediately on behalf of the lookup class,
+          * as if {@code invokespecial} instruction were being linked.
++         * <p>
++         * The returned method handle will have
++         * {@linkplain MethodHandle#asVarargsCollector variable arity} if and only if
++         * the method's variable arity modifier bit ({@code 0x0080}) is set.
+          * @param m the reflected method
+          * @param specialCaller the class nominally calling the method
+          * @return a method handle which can invoke the reflected method
+@@ -640,6 +698,10 @@
+          * <p>
+          * If the constructor's {@code accessible} flag is not set,
+          * access checking is performed immediately on behalf of the lookup class.
++         * <p>
++         * The returned method handle will have
++         * {@linkplain MethodHandle#asVarargsCollector variable arity} if and only if
++         * the constructor's variable arity modifier bit ({@code 0x0080}) is set.
+          * @param c the reflected constructor
+          * @return a method handle which can invoke the reflected constructor
+          * @exception NoAccessException if access checking fails
+@@ -649,7 +711,8 @@
+             assert(ctor.isConstructor());
+             if (!c.isAccessible())  checkAccess(c.getDeclaringClass(), ctor);
+             MethodHandle rawCtor = MethodHandleImpl.findMethod(IMPL_TOKEN, ctor, false, lookupClassOrNull());
+-            return MethodHandleImpl.makeAllocator(IMPL_TOKEN, rawCtor);
++            MethodHandle allocator = MethodHandleImpl.makeAllocator(IMPL_TOKEN, rawCtor);
++            return fixVarargs(allocator, rawCtor);
+         }
+ 
+         /**
+@@ -797,7 +860,8 @@
+             MethodType rawType = mh.type();
+             if (rawType.parameterType(0) == caller)  return mh;
+             MethodType narrowType = rawType.changeParameterType(0, caller);
+-            return MethodHandleImpl.convertArguments(IMPL_TOKEN, mh, narrowType, rawType, null);
++            MethodHandle narrowMH = MethodHandleImpl.convertArguments(IMPL_TOKEN, mh, narrowType, rawType, null);
++            return fixVarargs(narrowMH, mh);
+         }
+ 
+         MethodHandle makeAccessor(Class<?> refc, String name, Class<?> type,
+@@ -921,22 +985,21 @@
+      * <p>
+      * This method is equivalent to the following code (though it may be more efficient):
+      * <p><blockquote><pre>
+-     * MethodHandle invoker = lookup().findVirtual(MethodHandle.class, "invokeGeneric", type);
+-     * MethodType vaType = MethodType.genericMethodType(objectArgCount, true);
+-     * vaType = vaType.insertParameterType(0, MethodHandle.class);
+-     * int spreadArgCount = type.parameterCount - objectArgCount;
+-     * invoker = invoker.asSpreader(Object.class, spreadArgCount);
+-     * return invoker.asType(vaType);
++MethodHandle invoker = publicLookup()
++  .findVirtual(MethodHandle.class, "invokeGeneric", type)
++int spreadArgCount = type.parameterCount - objectArgCount;
++invoker = invoker.asSpreader(Object[].class, spreadArgCount);
++return invoker;
+      * </pre></blockquote>
+      * @param type the desired target type
+      * @param objectArgCount number of fixed (non-varargs) {@code Object} arguments
+      * @return a method handle suitable for invoking any method handle of the given type
+      */
+     static public
+-    MethodHandle varargsInvoker(MethodType type, int objectArgCount) {
++    MethodHandle spreadInvoker(MethodType type, int objectArgCount) {
+         if (objectArgCount < 0 || objectArgCount > type.parameterCount())
+             throw new IllegalArgumentException("bad argument count "+objectArgCount);
+-        return invokers(type).varargsInvoker(objectArgCount);
++        return invokers(type).spreadInvoker(objectArgCount);
+     }
+ 
+     /**
+@@ -1838,7 +1901,10 @@
+      * the given {@code target} on the incoming arguments,
+      * and returning or throwing whatever the {@code target}
+      * returns or throws.  The invocation will be as if by
+-     * {@code target.invokeExact}.
++     * {@code target.invokeGeneric}.
++     * The target's type will be checked before the SAM
++     * instance is created, as if by a call to {@code asType},
++     * which may result in a {@code WrongMethodTypeException}.
+      * <p>
+      * The method handle may throw an <em>undeclared exception</em>,
+      * which means any checked exception (or other checked throwable)
+@@ -1886,15 +1952,17 @@
+      * {@link java.dyn.MethodHandles.AsInstanceObject AsInstanceObject}
+      * in the adapters, so that generic code can extract the underlying
+      * method handle without knowing where the SAM adapter came from.
++     * <p>
++     * Future versions of this API may accept additional types,
++     * such as abstract classes with single abstract methods.
+      * @param target the method handle to invoke from the wrapper
+      * @param samType the desired type of the wrapper, a SAM type
+      * @return a correctly-typed wrapper for the given {@code target}
+-     * @throws IllegalArgumentException if the {@code target} throws
+-     *         an undeclared exception
++     * @throws IllegalArgumentException if the {@code samType} is not a
++     *         valid argument to this method
++     * @throws WrongMethodTypeException if the {@code target} cannot
++     *         be converted to the type required by the SAM type
+      */
+-    // ISSUE: Should we delegate equals/hashCode to the targets?
+-    // Not useful unless there is a stable equals/hashCode behavior
+-    // for MethodHandle, but there isn't.
+     public static
+     <T> T asInstance(final MethodHandle target, final Class<T> samType) {
+         // POC implementation only; violates the above contract several ways
+@@ -1902,8 +1970,9 @@
+         if (sam == null)
+             throw new IllegalArgumentException("not a SAM type: "+samType.getName());
+         MethodType samMT = MethodType.methodType(sam.getReturnType(), sam.getParameterTypes());
+-        if (!samMT.equals(target.type()))
+-            throw new IllegalArgumentException("wrong method type: "+target+" should match "+sam);
++        MethodHandle checkTarget = target.asType(samMT);  // make throw WMT
++        checkTarget = checkTarget.asType(checkTarget.type().changeReturnType(Object.class));
++        final MethodHandle vaTarget = checkTarget.asSpreader(Object[].class, samMT.parameterCount());
+         return samType.cast(Proxy.newProxyInstance(
+                 samType.getClassLoader(),
+                 new Class[]{ samType, AsInstanceObject.class },
+@@ -1917,7 +1986,7 @@
+                         if (method.getDeclaringClass() == AsInstanceObject.class)
+                             return getArg(method.getName());
+                         if (method.equals(sam))
+-                            return target.invokeVarargs(args);
++                            return vaTarget.invokeExact(args);
+                         if (isObjectMethod(method))
+                             return callObjectMethod(this, method, args);
+                         throw new InternalError();
+@@ -2003,7 +2072,7 @@
+     }
+ 
+     /*non-public*/
+-    static MethodHandle withTypeHandler(MethodHandle target, MethodHandle typeHandler) {
+-        return MethodHandleImpl.withTypeHandler(IMPL_TOKEN, target, typeHandler);
++    static MethodHandle asVarargsCollector(MethodHandle target, Class<?> arrayType) {
++        return MethodHandleImpl.asVarargsCollector(IMPL_TOKEN, target, arrayType);
+     }
+ }
+diff --git a/src/share/classes/java/dyn/package-info.java b/src/share/classes/java/dyn/package-info.java
+--- a/src/share/classes/java/dyn/package-info.java
++++ b/src/share/classes/java/dyn/package-info.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -166,13 +166,13 @@
+  * normal accesses are legal.
+  * <p>
+  * A constant may refer to a method or constructor with the {@code varargs}
+- * bit (hexadecimal {@code 80}) set in its modifier bitmask.
+- * The method handle constant produced for such a method behaves the same
++ * bit (hexadecimal {@code 0x0080}) set in its modifier bitmask.
++ * The method handle constant produced for such a method behaves as if
++ * it were created by {@link java.dyn.MethodHandle#asVarargsCollector asVarargsCollector}.
++ * In other words, the constant method handle will exhibit variable arity,
++ * when invoked via {@code invokeGeneric}.
++ * On the other hand, its behavior with respect to {@code invokeExact} will be the same
+  * as if the {@code varargs} bit were not set.
+- * The argument-collecting behavior of {@code varargs} can be emulated by
+- * adapting the method handle constant with
+- * {@link java.dyn.MethodHandle#asCollector asCollector}.
+- * There is no provision for doing this automatically.
+  * <p>
+  * Although the {@code CONSTANT_MethodHandle} and {@code CONSTANT_MethodType} constant types
+  * resolve class names, they do not force class initialization.
+@@ -369,21 +369,40 @@
+  * the instruction's bootstrap method will be invoked on three arguments,
+  * conveying the instruction's caller class, name, and method type.
+  * If the {@code invokedynamic} instruction specifies one or more static arguments,
+- * a fourth argument will be passed to the bootstrap argument,
+- * either an {@code Object} reference to the sole extra argument (if there is one)
+- * or an {@code Object} array of references to all the arguments (if there are two or more),
+- * as if the bootstrap method is a variable-arity method.
++ * those values will be passed as additional arguments to the method handle.
++ * (Note that because there is a limit of 255 arguments to any method,
++ * at most 252 extra arguments can be supplied.)
++ * The bootstrap method will be invoked as if by either {@code invokeGeneric}
++ * or {@code invokeWithArguments}.  (There is no way to tell the difference.)
++ * If the bootstrap method is a variable arity method (its modifier bit {@code 0x0080} is set),
++ * then some or all of the arguments specified here may be collected into a trailing array parameter.
++ * (This is not a special rule, but rather a useful consequence of the interaction
++ * between {@code CONSTANT_MethodHandle} constants, the modifier bit for variable arity methods,
++ * and the {@code java.dyn.MethodHandle#asVarargsCollector asVarargsCollector} transformation.)
++ * <p>
++ * Given these rules, here are examples of legal bootstrap method declarations,
++ * given various numbers {@code N} of extra arguments.
++ * The first rows (marked {@code *}) will work for any number of extra arguments.
+  * <code>
+  * <table border=1 cellpadding=5 summary="Static argument types">
+  * <tr><th>N</th><th>sample bootstrap method</th></tr>
++ * <tr><td>*</td><td><code>CallSite bootstrap(Lookup caller, String name, MethodType type, Object... args)</code></td></tr>
++ * <tr><td>*</td><td><code>CallSite bootstrap(Object... args)</code></td></tr>
++ * <tr><td>*</td><td><code>CallSite bootstrap(Object caller, Object... nameAndTypeWithArgs)</code></td></tr>
+  * <tr><td>0</td><td><code>CallSite bootstrap(Lookup caller, String name, MethodType type)</code></td></tr>
++ * <tr><td>0</td><td><code>CallSite bootstrap(Lookup caller, Object... nameAndType)</code></td></tr>
+  * <tr><td>1</td><td><code>CallSite bootstrap(Lookup caller, String name, MethodType type, Object arg)</code></td></tr>
+  * <tr><td>2</td><td><code>CallSite bootstrap(Lookup caller, String name, MethodType type, Object... args)</code></td></tr>
++ * <tr><td>2</td><td><code>CallSite bootstrap(Lookup caller, String name, MethodType type, String... args)</code></td></tr>
++ * <tr><td>2</td><td><code>CallSite bootstrap(Lookup caller, String name, MethodType type, String x, int y)</code></td></tr>
+  * </table>
+  * </code>
++ * The last example assumes that the extra arguments are of type
++ * {@code CONSTANT_String} and {@code CONSTANT_Integer}, respectively.
++ * The second-to-last example assumes that all extra arguments are of type
++ * {@code CONSTANT_String}.
++ * The other examples work with all types of extra arguments.
+  * <p>
+- * The argument and return types listed here are used by the {@code invokeGeneric}
+- * call to the bootstrap method.
+  * As noted above, the actual method type of the bootstrap method can vary.
+  * For example, the fourth argument could be {@code MethodHandle},
+  * if that is the type of the corresponding constant in
+@@ -391,14 +410,8 @@
+  * In that case, the {@code invokeGeneric} call will pass the extra method handle
+  * constant as an {@code Object}, but the type matching machinery of {@code invokeGeneric}
+  * will cast the reference back to {@code MethodHandle} before invoking the bootstrap method.
+- * (If a string constant were passed instead, by badly generated code, that cast would then fail.)
+- * <p>
+- * If the fourth argument is an array, the array element type must be {@code Object},
+- * since object arrays (as produced by the JVM at this point) cannot be converted
+- * to other array types.
+- * <p>
+- * If an array is provided, it will appear to be freshly allocated.
+- * That is, the same array will not appear to two bootstrap method calls.
++ * (If a string constant were passed instead, by badly generated code, that cast would then fail,
++ * resulting in an {@code InvokeDynamicBootstrapError}.)
+  * <p>
+  * Extra bootstrap method arguments are intended to allow language implementors
+  * to safely and compactly encode metadata.
+@@ -406,24 +419,6 @@
+  * since each call site could be given its own unique bootstrap method.
+  * Such a practice is likely to produce large class files and constant pools.
+  *
+- * <p style="font-size:smaller;">
+- * <em>PROVISIONAL API, WORK IN PROGRESS:</em>
+- * (Usage Note: There is no mechanism for specifying five or more positional arguments to the bootstrap method.
+- * If there are two or more arguments, the Java code of the bootstrap method is required to extract them from
+- * a varargs-style object array.
+- * This design uses varargs because it anticipates some use cases where bootstrap arguments
+- * contribute components of variable-length structures, such as virtual function tables
+- * or interpreter token streams.
+- * Such parameters would be awkward or impossible to manage if represented
+- * as normal positional method arguments,
+- * since there would need to be one Java method per length.
+- * On balance, leaving out the varargs feature would cause more trouble to users than keeping it.
+- * Also, this design allows bootstrap methods to be called in a limited JVM stack depth.
+- * At both the user and JVM level, the difference between varargs and non-varargs
+- * calling sequences can easily be bridged via the
+- * {@link java.dyn.MethodHandle#asSpreader asSpreader}
+- * and {@link java.dyn.MethodHandle#asSpreader asCollector} methods.)
+- *
+  * <h2><a name="structs"></a>Structure Summary</h2>
+  * <blockquote><pre>// summary of constant and attribute structures
+ struct CONSTANT_MethodHandle_info {
+diff --git a/src/share/classes/sun/dyn/AdapterMethodHandle.java b/src/share/classes/sun/dyn/AdapterMethodHandle.java
+--- a/src/share/classes/sun/dyn/AdapterMethodHandle.java
++++ b/src/share/classes/sun/dyn/AdapterMethodHandle.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -478,37 +478,60 @@
+         return new AdapterMethodHandle(target, newType, makeConv(raw ? OP_RETYPE_RAW : OP_RETYPE_ONLY));
+     }
+ 
+-    static MethodHandle makeTypeHandler(Access token,
+-                MethodHandle target, MethodHandle typeHandler) {
++    static MethodHandle makeVarargsCollector(Access token,
++                MethodHandle target, Class<?> arrayType) {
+         Access.check(token);
+-        return new WithTypeHandler(target, typeHandler);
++        return new AsVarargsCollector(target, arrayType);
+     }
+ 
+-    static class WithTypeHandler extends AdapterMethodHandle {
+-        final MethodHandle target, typeHandler;
+-        WithTypeHandler(MethodHandle target, MethodHandle typeHandler) {
++    static class AsVarargsCollector extends AdapterMethodHandle {
++        final MethodHandle target;
++        final Class<?> arrayType;
++        MethodHandle cache;
++
++        AsVarargsCollector(MethodHandle target, Class<?> arrayType) {
+             super(target, target.type(), makeConv(OP_RETYPE_ONLY));
+             this.target = target;
+-            this.typeHandler = typeHandler.asType(TYPE_HANDLER_TYPE);
++            this.arrayType = arrayType;
++            this.cache = target.asCollector(arrayType, 0);
+         }
+ 
++        @Override
++        public boolean isVarargsCollector() {
++            return true;
++        }
++
++        @Override
+         public MethodHandle asType(MethodType newType) {
+-            if (this.type() == newType)
++            MethodType type = this.type();
++            int collectArg = type.parameterCount() - 1;
++            int newArity = newType.parameterCount();
++            if (newArity == collectArg+1 &&
++                type.parameterType(collectArg).isAssignableFrom(newType.parameterType(collectArg))) {
++                // if arity and trailing parameter are compatible, do normal thing
++                return super.asType(newType);
++            }
++            // check cache
++            if (cache.type().parameterCount() == newArity)
++                return cache.asType(newType);
++            // build and cache a collector
++            int arrayLength = newArity - collectArg;
++            MethodHandle collector;
++            try {
++                collector = target.asCollector(arrayType, arrayLength);
++            } catch (IllegalArgumentException ex) {
++                throw new WrongMethodTypeException("cannot build collector");
++            }
++            cache = collector;
++            return collector.asType(newType);
++        }
++
++        public MethodHandle asVarargsCollector(Class<?> arrayType) {
++            MethodType type = this.type();
++            if (type.parameterType(type.parameterCount()-1) == arrayType)
+                 return this;
+-            try {
+-                MethodHandle retyped = (MethodHandle) typeHandler.invokeExact(target, newType);
+-                // Contract:  Must return the desired type, or throw WMT
+-                if (retyped.type() != newType)
+-                    throw new WrongMethodTypeException(retyped.toString());
+-                return retyped;
+-            } catch (Throwable ex) {
+-                if (ex instanceof Error)  throw (Error)ex;
+-                if (ex instanceof RuntimeException)  throw (RuntimeException)ex;
+-                throw new RuntimeException(ex);
+-            }
++            return super.asVarargsCollector(arrayType);
+         }
+-        private static final MethodType TYPE_HANDLER_TYPE
+-            = MethodType.methodType(MethodHandle.class, MethodHandle.class, MethodType.class);
+     }
+ 
+     /** Can a checkcast adapter validly convert the target to newType?
+diff --git a/src/share/classes/sun/dyn/CallSiteImpl.java b/src/share/classes/sun/dyn/CallSiteImpl.java
+--- a/src/share/classes/sun/dyn/CallSiteImpl.java
++++ b/src/share/classes/sun/dyn/CallSiteImpl.java
+@@ -37,17 +37,17 @@
+     static CallSite makeSite(MethodHandle bootstrapMethod,
+                              // Callee information:
+                              String name, MethodType type,
+-                             // Call-site attributes, if any:
++                             // Extra arguments for BSM, if any:
+                              Object info,
+                              // Caller information:
+                              MemberName callerMethod, int callerBCI) {
+         Class<?> callerClass = callerMethod.getDeclaringClass();
+         Object caller;
+-        if (bootstrapMethod.type().parameterType(0) == Class.class)
++        if (bootstrapMethod.type().parameterType(0) == Class.class && TRANSITIONAL_BEFORE_PFD)
+             caller = callerClass;  // remove for PFD
+         else
+             caller = MethodHandleImpl.IMPL_LOOKUP.in(callerClass);
+-        if (bootstrapMethod == null) {
++        if (bootstrapMethod == null && TRANSITIONAL_BEFORE_PFD) {
+             // If there is no bootstrap method, throw IncompatibleClassChangeError.
+             // This is a valid generic error type for resolution (JLS 12.3.3).
+             throw new IncompatibleClassChangeError
+@@ -56,30 +56,35 @@
+         CallSite site;
+         try {
+             Object binding;
++            info = maybeReBox(info);
+             if (info == null) {
+-                if (false)  // switch when invokeGeneric works
+-                    binding = bootstrapMethod.invokeGeneric(caller, name, type);
+-                else
+-                    binding = bootstrapMethod.invokeVarargs(new Object[]{ caller, name, type });
++                binding = bootstrapMethod.invokeGeneric(caller, name, type);
++            } else if (!info.getClass().isArray()) {
++                binding = bootstrapMethod.invokeGeneric(caller, name, type, info);
+             } else {
+-                info = maybeReBox(info);
+-                if (false)  // switch when invokeGeneric works
+-                    binding = bootstrapMethod.invokeGeneric(caller, name, type, info);
+-                else
+-                    binding = bootstrapMethod.invokeVarargs(new Object[]{ caller, name, type, info });
++                Object[] argv = (Object[]) info;
++                if (3 + argv.length > 255)
++                    new InvokeDynamicBootstrapError("too many bootstrap method arguments");
++                MethodType bsmType = bootstrapMethod.type();
++                if (bsmType.parameterCount() == 4 && bsmType.parameterType(3) == Object[].class)
++                    binding = bootstrapMethod.invokeGeneric(caller, name, type, argv);
++                else
++                    binding = MethodHandles.spreadInvoker(bsmType, 3)
++                        .invokeGeneric(bootstrapMethod, caller, name, type, argv);
+             }
+             //System.out.println("BSM for "+name+type+" => "+binding);
+             if (binding instanceof CallSite) {
+                 site = (CallSite) binding;
+-            } else if (binding instanceof MethodHandle) {
++            } else if (binding instanceof MethodHandle && TRANSITIONAL_BEFORE_PFD) {
+                 // Transitional!
+                 MethodHandle target = (MethodHandle) binding;
+                 site = new ConstantCallSite(target);
+             } else {
+-                throw new ClassCastException("bootstrap method failed to produce a MethodHandle or CallSite");
++                throw new ClassCastException("bootstrap method failed to produce a CallSite");
+             }
+-            PRIVATE_INITIALIZE_CALL_SITE.invokeExact(site, name, type,
+-                                                     callerMethod, callerBCI);
++            if (TRANSITIONAL_BEFORE_PFD)
++                PRIVATE_INITIALIZE_CALL_SITE.invokeExact(site, name, type,
++                                                         callerMethod, callerBCI);
+             assert(site.getTarget() != null);
+             assert(site.getTarget().type().equals(type));
+         } catch (Throwable ex) {
+@@ -93,6 +98,8 @@
+         return site;
+     }
+ 
++    private static boolean TRANSITIONAL_BEFORE_PFD = true;  // FIXME: remove for PFD
++
+     private static Object maybeReBox(Object x) {
+         if (x instanceof Integer) {
+             int xi = (int) x;
+@@ -117,6 +124,7 @@
+     static {
+         try {
+             PRIVATE_INITIALIZE_CALL_SITE =
++            !TRANSITIONAL_BEFORE_PFD ? null :
+             MethodHandleImpl.IMPL_LOOKUP.findVirtual(CallSite.class, "initializeFromJVM",
+                 MethodType.methodType(void.class,
+                                       String.class, MethodType.class,
+diff --git a/src/share/classes/sun/dyn/InvokeGeneric.java b/src/share/classes/sun/dyn/InvokeGeneric.java
+--- a/src/share/classes/sun/dyn/InvokeGeneric.java
++++ b/src/share/classes/sun/dyn/InvokeGeneric.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -108,7 +108,7 @@
+      */
+     private MethodHandle dispatch(MethodType callerType, MethodHandle target) {
+         MethodType targetType = target.type();
+-        if (USE_AS_TYPE_PATH || target instanceof AdapterMethodHandle.WithTypeHandler) {
++        if (USE_AS_TYPE_PATH || target.isVarargsCollector()) {
+             MethodHandle newTarget = target.asType(callerType);
+             targetType = callerType;
+             Invokers invokers = MethodTypeImpl.invokers(Access.TOKEN, targetType);
+diff --git a/src/share/classes/sun/dyn/Invokers.java b/src/share/classes/sun/dyn/Invokers.java
+--- a/src/share/classes/sun/dyn/Invokers.java
++++ b/src/share/classes/sun/dyn/Invokers.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -47,7 +47,7 @@
+     private /*lazy*/ MethodHandle genericInvoker;
+ 
+     // generic (untyped) invoker for the outgoing call; accepts a single Object[]
+-    private final /*lazy*/ MethodHandle[] varargsInvokers;
++    private final /*lazy*/ MethodHandle[] spreadInvokers;
+ 
+     // invoker for an unbound callsite
+     private /*lazy*/ MethodHandle uninitializedCallSite;
+@@ -55,10 +55,9 @@
+     /** Compute and cache information common to all collecting adapters
+      *  that implement members of the erasure-family of the given erased type.
+      */
+-    public Invokers(Access token, MethodType targetType) {
+-        Access.check(token);
++    /*non-public*/ Invokers(MethodType targetType) {
+         this.targetType = targetType;
+-        this.varargsInvokers = new MethodHandle[targetType.parameterCount()+1];
++        this.spreadInvokers = new MethodHandle[targetType.parameterCount()+1];
+     }
+ 
+     public static MethodType invokerType(MethodType targetType) {
+@@ -69,7 +68,7 @@
+         MethodHandle invoker = exactInvoker;
+         if (invoker != null)  return invoker;
+         try {
+-            invoker = MethodHandleImpl.IMPL_LOOKUP.findVirtual(MethodHandle.class, "invoke", targetType);
++            invoker = MethodHandleImpl.IMPL_LOOKUP.findVirtual(MethodHandle.class, "invokeExact", targetType);
+         } catch (NoAccessException ex) {
+             throw new InternalError("JVM cannot find invoker for "+targetType);
+         }
+@@ -101,13 +100,13 @@
+         return invoker;
+     }
+ 
+-    public MethodHandle varargsInvoker(int objectArgCount) {
+-        MethodHandle vaInvoker = varargsInvokers[objectArgCount];
++    public MethodHandle spreadInvoker(int objectArgCount) {
++        MethodHandle vaInvoker = spreadInvokers[objectArgCount];
+         if (vaInvoker != null)  return vaInvoker;
+         MethodHandle gInvoker = genericInvoker();
+         MethodType vaType = MethodType.genericMethodType(objectArgCount, true);
+         vaInvoker = MethodHandles.spreadArguments(gInvoker, invokerType(vaType));
+-        varargsInvokers[objectArgCount] = vaInvoker;
++        spreadInvokers[objectArgCount] = vaInvoker;
+         return vaInvoker;
+     }
+ 
+@@ -118,7 +117,7 @@
+         if (invoker != null)  return invoker;
+         if (targetType.parameterCount() > 0) {
+             MethodType type0 = targetType.dropParameterTypes(0, targetType.parameterCount());
+-            Invokers invokers0 = MethodTypeImpl.invokers(Access.TOKEN, type0);
++            Invokers invokers0 = MethodTypeImpl.invokers(type0);
+             invoker = MethodHandles.dropArguments(invokers0.uninitializedCallSite(),
+                                                   0, targetType.parameterList());
+             assert(invoker.type().equals(targetType));
+diff --git a/src/share/classes/sun/dyn/MethodHandleImpl.java b/src/share/classes/sun/dyn/MethodHandleImpl.java
+--- a/src/share/classes/sun/dyn/MethodHandleImpl.java
++++ b/src/share/classes/sun/dyn/MethodHandleImpl.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -184,7 +184,10 @@
+         if (!mh.isValid())
+             throw newNoAccessException(method, lookupClass);
+         assert(mh.type() == mtype);
+-        return mh;
++        if (!method.isVarargs())
++            return mh;
++        else
++            return mh.asVarargsCollector(mtype.parameterType(mtype.parameterCount()-1));
+     }
+ 
+     public static
+@@ -1263,8 +1266,8 @@
+         return MethodHandleNatives.getBootstrap(callerClass);
+     }
+ 
+-    public static MethodHandle withTypeHandler(Access token, MethodHandle target, MethodHandle typeHandler) {
++    public static MethodHandle asVarargsCollector(Access token, MethodHandle target, Class<?> arrayType) {
+         Access.check(token);
+-        return AdapterMethodHandle.makeTypeHandler(token, target, typeHandler);
++        return AdapterMethodHandle.makeVarargsCollector(token, target, arrayType);
+     }
+ }
+diff --git a/src/share/classes/sun/dyn/MethodTypeImpl.java b/src/share/classes/sun/dyn/MethodTypeImpl.java
+--- a/src/share/classes/sun/dyn/MethodTypeImpl.java
++++ b/src/share/classes/sun/dyn/MethodTypeImpl.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -498,9 +498,12 @@
+ 
+     public static Invokers invokers(Access token, MethodType type) {
+         Access.check(token);
++        return invokers(type);
++    }
++    /*non-public*/ static Invokers invokers(MethodType type) {
+         Invokers inv = METHOD_TYPE_FRIEND.getInvokers(type);
+         if (inv != null)  return inv;
+-        inv = new Invokers(token, type);
++        inv = new Invokers(type);
+         METHOD_TYPE_FRIEND.setInvokers(type, inv);
+         return inv;
+     }
+diff --git a/test/java/dyn/InvokeDynamicPrintArgs.java b/test/java/dyn/InvokeDynamicPrintArgs.java
+--- a/test/java/dyn/InvokeDynamicPrintArgs.java
++++ b/test/java/dyn/InvokeDynamicPrintArgs.java
+@@ -23,15 +23,19 @@
+ 
+ /* @test
+  * @summary smoke test for invokedynamic instructions
+- * @library indify
++ * @build indify.Indify
+  * @compile InvokeDynamicPrintArgs.java
+  * @run main/othervm -XX:+UnlockExperimentalVMOptions -XX:+EnableInvokeDynamic
+  *      indify.Indify
+  *      --verify-specifier-count=3 --transitionalJSR292=false
+  *      --expand-properties --classpath ${test.classes}
+- *      --java InvokeDynamicPrintArgs --check-output
++ *      --java test.java.dyn.InvokeDynamicPrintArgs --check-output
+  */
+ 
++package test.java.dyn;
++
++import org.junit.Test;
++
+ import java.util.*;
+ import java.io.*;
+ 
+@@ -52,6 +56,20 @@
+         System.out.println("Done printing argument lists.");
+         closeBuf();
+     }
++
++    @Test
++    public void testInvokeDynamicPrintArgs() throws IOException {
++        System.err.println(System.getProperties());
++        String testClassPath = System.getProperty("build.test.classes.dir");
++        if (testClassPath == null)  throw new RuntimeException();
++        String[] args = new String[]{
++            "--verify-specifier-count=3", "--transitionalJSR292=false",
++            "--expand-properties", "--classpath", testClassPath,
++            "--java", "test.java.dyn.InvokeDynamicPrintArgs", "--check-output"
++        };
++        System.err.println("Indify: "+Arrays.toString(args));
++        indify.Indify.main(args);
++    }
+ 
+     private static PrintStream oldOut;
+     private static ByteArrayOutputStream buf;
+@@ -79,11 +97,11 @@
+     }
+     private static final String[] EXPECT_OUTPUT = {
+         "Printing some argument lists, starting with a empty one:",
+-        "[InvokeDynamicPrintArgs, nothing, ()void][]",
+-        "[InvokeDynamicPrintArgs, bar, (java.lang.String,int)void, class java.lang.Void, void type!, 1, 234.5, 67.5, 89][bar arg, 1]",
+-        "[InvokeDynamicPrintArgs, bar2, (java.lang.String,int)void, class java.lang.Void, void type!, 1, 234.5, 67.5, 89][bar2 arg, 222]",
+-        "[InvokeDynamicPrintArgs, baz, (java.lang.String,int,double)void, 1234.5][baz arg, 2, 3.14]",
+-        "[InvokeDynamicPrintArgs, foo, (java.lang.String)void][foo arg]",
++        "[test.java.dyn.InvokeDynamicPrintArgs, nothing, ()void][]",
++        "[test.java.dyn.InvokeDynamicPrintArgs, bar, (String,int)void, class java.lang.Void, void type!, 1, 234.5, 67.5, 89][bar arg, 1]",
++        "[test.java.dyn.InvokeDynamicPrintArgs, bar2, (String,int)void, class java.lang.Void, void type!, 1, 234.5, 67.5, 89][bar2 arg, 222]",
++        "[test.java.dyn.InvokeDynamicPrintArgs, baz, (String,int,double)void, 1234.5][baz arg, 2, 3.14]",
++        "[test.java.dyn.InvokeDynamicPrintArgs, foo, (String)void][foo arg]",
+         "Done printing argument lists."
+     };
+ 
+@@ -110,18 +128,15 @@
+         return lookup().findStatic(lookup().lookupClass(), "bsm", MT_bsm());
+     }
+ 
+-    private static CallSite bsm2(Lookup caller, String name, MethodType type, Object arg) throws ReflectiveOperationException {
++    private static CallSite bsm2(Lookup caller, String name, MethodType type, Object... arg) throws ReflectiveOperationException {
+         // ignore caller and name, but match the type:
+         List<Object> bsmInfo = new ArrayList<>(Arrays.asList(caller, name, type));
+-        if (arg instanceof Object[])
+-            bsmInfo.addAll(Arrays.asList((Object[])arg));
+-        else
+-            bsmInfo.add(arg);
++        bsmInfo.addAll(Arrays.asList((Object[])arg));
+         return new ConstantCallSite(MH_printArgs().bindTo(bsmInfo).asCollector(Object[].class, type.parameterCount()).asType(type));
+     }
+     private static MethodType MT_bsm2() {
+         shouldNotCallThis();
+-        return methodType(CallSite.class, Lookup.class, String.class, MethodType.class, Object.class);
++        return methodType(CallSite.class, Lookup.class, String.class, MethodType.class, Object[].class);
+     }
+     private static MethodHandle MH_bsm2() throws ReflectiveOperationException {
+         shouldNotCallThis();
+diff --git a/test/java/dyn/JavaDocExamplesTest.java b/test/java/dyn/JavaDocExamplesTest.java
+--- a/test/java/dyn/JavaDocExamplesTest.java
++++ b/test/java/dyn/JavaDocExamplesTest.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -142,37 +142,80 @@
+         Assert.assertEquals(exp, act);
+     }
+ 
+-static MethodHandle asList;
+-    @Test public void testWithTypeHandler() throws Throwable {
++    @Test public void testMethodHandlesSummary() throws Throwable {
+         {{
+ {} /// JAVADOC
+-MethodHandle makeEmptyList = MethodHandles.constant(List.class, Arrays.asList());
+-MethodHandle asList = lookup()
+-  .findStatic(Arrays.class, "asList", methodType(List.class, Object[].class));
+-
+-JavaDocExamplesTest.asList = asList;
+-/*
+-static MethodHandle collectingTypeHandler(MethodHandle base, MethodType newType) {
+-  return asList.asCollector(Object[].class, newType.parameterCount()).asType(newType);
+-}
+-*/
+-
+-MethodHandle collectingTypeHandler = lookup()
+-  .findStatic(lookup().lookupClass(), "collectingTypeHandler",
+-     methodType(MethodHandle.class, MethodHandle.class, MethodType.class));
+-MethodHandle makeAnyList = makeEmptyList.withTypeHandler(collectingTypeHandler);
+-
+-assertEquals("[]", makeAnyList.invokeGeneric().toString());
+-assertEquals("[1]", makeAnyList.invokeGeneric(1).toString());
+-assertEquals("[two, too]", makeAnyList.invokeGeneric("two", "too").toString());
++Object x, y; String s; int i;
++MethodType mt; MethodHandle mh;
++MethodHandles.Lookup lookup = MethodHandles.lookup();
++// mt is (char,char)String
++mt = MethodType.methodType(String.class, char.class, char.class);
++mh = lookup.findVirtual(String.class, "replace", mt);
++// (Ljava/lang/String;CC)Ljava/lang/String;
++s = (String) mh.invokeExact("daddy",'d','n');
++assert(s.equals("nanny"));
++// weakly typed invocation (using MHs.invoke)
++s = (String) mh.invokeWithArguments("sappy", 'p', 'v');
++assert(s.equals("savvy"));
++// mt is (Object[])List
++mt = MethodType.methodType(java.util.List.class, Object[].class);
++mh = lookup.findStatic(java.util.Arrays.class, "asList", mt);
++assert(mh.isVarargsCollector());
++x = mh.invokeGeneric("one", "two");
++assert(x.equals(java.util.Arrays.asList("one","two")));
++// mt is (Object,Object,Object)Object
++mt = MethodType.genericMethodType(3);
++mh = MethodHandles.collectArguments(mh, mt);
++// mt is (Object,Object,Object)Object
++// (Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
++x = mh.invokeExact((Object)1, (Object)2, (Object)3);
++assert(x.equals(java.util.Arrays.asList(1,2,3)));
++// mt is { =&gt; int}
++mt = MethodType.methodType(int.class);
++mh = lookup.findVirtual(java.util.List.class, "size", mt);
++// (Ljava/util/List;)I
++i = (int) mh.invokeExact(java.util.Arrays.asList(1,2,3));
++assert(i == 3);
++mt = MethodType.methodType(void.class, String.class);
++mh = lookup.findVirtual(java.io.PrintStream.class, "println", mt);
++mh.invokeExact(System.out, "Hello, world.");
++{}
+             }}
+     }
+ 
+-static MethodHandle collectingTypeHandler(MethodHandle base, MethodType newType) {
+-    //System.out.println("Converting "+asList+" to "+newType);
+-    MethodHandle conv = asList.asCollector(Object[].class, newType.parameterCount()).asType(newType);
+-    //System.out.println(" =>"+conv);
+-    return conv;
++    @Test public void testAsVarargsCollector() throws Throwable {
++        {{
++{} /// JAVADOC
++MethodHandle asList = publicLookup()
++  .findStatic(Arrays.class, "asList", methodType(List.class, Object[].class))
++  .asVarargsCollector(Object[].class);
++assertEquals("[]", asList.invokeGeneric().toString());
++assertEquals("[1]", asList.invokeGeneric(1).toString());
++assertEquals("[two, too]", asList.invokeGeneric("two", "too").toString());
++Object[] argv = { "three", "thee", "tee" };
++assertEquals("[three, thee, tee]", asList.invokeGeneric(argv).toString());
++List ls = (List) asList.invokeGeneric((Object)argv);
++assertEquals(1, ls.size());
++assertEquals("[three, thee, tee]", Arrays.toString((Object[])ls.get(0)));
++            }}
++    }
++
++    @Test public void testVarargsCollectorSuppression() throws Throwable {
++        {{
++{} /// JAVADOC
++MethodHandle vamh = publicLookup()
++  .findStatic(Arrays.class, "asList", methodType(List.class, Object[].class))
++  .asVarargsCollector(Object[].class);
++MethodHandle invokeExact = publicLookup()
++  .findVirtual(MethodHandle.class, "invokeExact", vamh.type());
++MethodHandle mh = invokeExact.bindTo(vamh);
++assert(vamh.type().equals(mh.type()));
++assertEquals("[1, 2, 3]", vamh.invokeGeneric(1,2,3).toString());
++boolean failed = false;
++try { mh.invokeGeneric(1,2,3); }
++catch (WrongMethodTypeException ex) { failed = true; }
++assert(failed);
++{}
++            }}
++    }
+ }
+-
+-}
+diff --git a/test/java/dyn/MethodHandlesTest.java b/test/java/dyn/MethodHandlesTest.java
+--- a/test/java/dyn/MethodHandlesTest.java
++++ b/test/java/dyn/MethodHandlesTest.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -1108,18 +1108,6 @@
+         }
+     }
+ 
+-    static MethodHandle typeHandler2(MethodHandle target, MethodType newType) {
+-        MethodType oldType = target.type();
+-        int oldArity = oldType.parameterCount();
+-        int newArity = newType.parameterCount();
+-        if (newArity < oldArity)
+-            return MethodHandles.insertArguments(target, oldArity, "OPTIONAL");
+-        else if (newArity > oldArity)
+-            return MethodHandles.dropArguments(target, oldArity-1, newType.parameterType(oldArity-1));
+-        else
+-            return target;  // attempt no further conversions
+-    }
+-
+     @Test
+     public void testConvertArguments() throws Throwable {
+         if (CAN_SKIP_WORKING)  return;
+@@ -1137,23 +1125,6 @@
+         testConvert(true, true,  id, rtype, name, params);
+     }
+ 
+-    @Test
+-    public void testTypeHandler() throws Throwable {
+-        MethodHandle id = Callee.ofType(1);
+-        MethodHandle th2 = PRIVATE.findStatic(MethodHandlesTest.class, "typeHandler2",
+-                               MethodType.methodType(MethodHandle.class, MethodHandle.class, MethodType.class));
+-        MethodHandle id2 = id.withTypeHandler(th2);
+-        testConvert(true,  false, id2, null, "id", Object.class);
+-        testConvert(true,  true,  id2, null, "id", Object.class);
+-        if (true)  return;  //FIXME
+-        testConvert(true,  false, id2, null, "id", String.class);  // FIXME: throws WMT
+-        testConvert(false, true,  id2, null, "id", String.class);  // FIXME: should not succeed
+-        testConvert(false, false, id2, null, "id", Object.class, String.class); //FIXME: array[1] line 1164
+-        testConvert(true,  true,  id2, null, "id", Object.class, String.class);
+-        testConvert(false, false, id2, null, "id");
+-        testConvert(true,  true,  id2, null, "id");
+-    }
+-
+     void testConvert(boolean positive, boolean useAsType,
+                      MethodHandle id, Class<?> rtype, String name, Class<?>... params) throws Throwable {
+         countTest(positive);
+@@ -1183,9 +1154,9 @@
+         RuntimeException error = null;
+         try {
+             if (useAsType)
++                target = id.asType(newType);
++            else
+                 target = MethodHandles.convertArguments(id, newType);
+-            else
+-                target = id.asType(newType);
+         } catch (RuntimeException ex) {
+             error = ex;
+         }
+@@ -1205,6 +1176,20 @@
+     }
+ 
+     @Test
++    public void testVarargsCollector() throws Throwable {
++        MethodHandle vac0 = PRIVATE.findStatic(MethodHandlesTest.class, "called",
++                               MethodType.methodType(Object.class, String.class, Object[].class));
++        vac0 = vac0.bindTo("vac");
++        MethodHandle vac = vac0.asVarargsCollector(Object[].class);
++        testConvert(true,  true,  vac.asType(MethodType.genericMethodType(0)), null, "vac");
++        testConvert(true,  true,  vac.asType(MethodType.genericMethodType(0)), null, "vac");
++        for (Class<?> at : new Class[] { Object.class, String.class, Integer.class }) {
++            testConvert(true,  true,  vac.asType(MethodType.genericMethodType(1)), null, "vac", at);
++            testConvert(true,  true,  vac.asType(MethodType.genericMethodType(2)), null, "vac", at, at);
++        }
++    }
++
++    @Test
+     public void testPermuteArguments() throws Throwable {
+         if (CAN_SKIP_WORKING)  return;
+         startTest("permuteArguments");
+@@ -1644,14 +1629,14 @@
+         assertCalled("invokee", args);
+         // varargs invoker #0
+         calledLog.clear();
+-        inv = MethodHandles.varargsInvoker(type, 0);
++        inv = MethodHandles.spreadInvoker(type, 0);
+         result = inv.invokeExact(target, args);
+         if (testRetCode)  assertEquals(code, result);
+         assertCalled("invokee", args);
+         if (nargs >= 1) {
+             // varargs invoker #1
+             calledLog.clear();
+-            inv = MethodHandles.varargsInvoker(type, 1);
++            inv = MethodHandles.spreadInvoker(type, 1);
+             result = inv.invokeExact(target, args[0], Arrays.copyOfRange(args, 1, nargs));
+             if (testRetCode)  assertEquals(code, result);
+             assertCalled("invokee", args);
+@@ -1659,7 +1644,7 @@
+         if (nargs >= 2) {
+             // varargs invoker #2
+             calledLog.clear();
+-            inv = MethodHandles.varargsInvoker(type, 2);
++            inv = MethodHandles.spreadInvoker(type, 2);
+             result = inv.invokeExact(target, args[0], args[1], Arrays.copyOfRange(args, 2, nargs));
+             if (testRetCode)  assertEquals(code, result);
+             assertCalled("invokee", args);
+@@ -1667,7 +1652,7 @@
+         if (nargs >= 3) {
+             // varargs invoker #3
+             calledLog.clear();
+-            inv = MethodHandles.varargsInvoker(type, 3);
++            inv = MethodHandles.spreadInvoker(type, 3);
+             result = inv.invokeExact(target, args[0], args[1], args[2], Arrays.copyOfRange(args, 3, nargs));
+             if (testRetCode)  assertEquals(code, result);
+             assertCalled("invokee", args);
+@@ -1676,7 +1661,7 @@
+             // varargs invoker #0..N
+             countTest();
+             calledLog.clear();
+-            inv = MethodHandles.varargsInvoker(type, k);
++            inv = MethodHandles.spreadInvoker(type, k);
+             List<Object> targetPlusVarArgs = new ArrayList<Object>(targetPlusArgs);
+             List<Object> tailList = targetPlusVarArgs.subList(1+k, 1+nargs);
+             Object[] tail = tailList.toArray();
+@@ -2089,19 +2074,6 @@
+             }
+         }
+         // Test error checking:
+-        MethodHandle genericMH = ValueConversions.varargsArray(0);
+-        genericMH = MethodHandles.convertArguments(genericMH, genericMH.type().generic());
+-        for (Class<?> sam : new Class[] { Runnable.class,
+-                                          Fooable.class,
+-                                          Iterable.class }) {
+-            try {
+-                // Must throw, because none of these guys has generic type.
+-                MethodHandles.asInstance(genericMH, sam);
+-                System.out.println("Failed to throw");
+-                assertTrue(false);
+-            } catch (IllegalArgumentException ex) {
+-            }
+-        }
+         for (Class<?> nonSAM : new Class[] { Object.class,
+                                              String.class,
+                                              CharSequence.class,
+diff --git a/test/java/dyn/indify/Indify.java b/test/java/dyn/indify/Indify.java
+--- a/test/java/dyn/indify/Indify.java
++++ b/test/java/dyn/indify/Indify.java
+@@ -98,8 +98,9 @@
+ (same output as above)
+  * </pre></blockquote>
+  * <p>
+- * Until the format of {@code CONSTANT_InvokeDynamic} entries is finalized,
+- * the {@code --transitionalJSR292} switch is recommended (and turned on by default).
++ * Before OpenJDK build b123, the format of {@code CONSTANT_InvokeDynamic} is in transition,
++ * and the switch {@code --transitionalJSR292=yes} is recommended.
++ * It is turned <em>off</em> by default, but users of earlier builds may need to turn it on.
+  * <p>
+  * A version of this transformation built on top of <a href="http://asm.ow2.org/">http://asm.ow2.org/</a> would be welcome.
+  * @author John Rose
+@@ -116,7 +117,7 @@
+     public boolean overwrite = false;
+     public boolean quiet = false;
+     public boolean verbose = false;
+-    public boolean transitionalJSR292 = true;  // default to false later
++    public boolean transitionalJSR292 = false;  // final version is distributed
+     public boolean all = false;
+     public int verifySpecifierCount = -1;
+ 
+@@ -158,6 +159,7 @@
+         av = avl.toArray(new String[0]);
+         Class<?> mainClass = Class.forName(mainClassName, true, makeClassLoader());
+         java.lang.reflect.Method main = mainClass.getMethod("main", String[].class);
++        try { main.setAccessible(true); } catch (SecurityException ex) { }
+         main.invoke(null, (Object) av);
+     }
+ 
+@@ -223,8 +225,8 @@
+     private boolean booleanOption(String s) {
+         if (s == null)  return true;
+         switch (s) {
+-        case "true":  case "yes": case "1": return true;
+-        case "false": case "no":  case "0": return false;
++        case "true":  case "yes": case "on":  case "1": return true;
++        case "false": case "no":  case "off": case "0": return false;
+         }
+         throw new IllegalArgumentException("unrecognized boolean flag="+s);
+     }
+@@ -284,7 +286,7 @@
+     }
+ 
+     File classPathFile(File pathDir, String className) {
+-        String qualname = className+".class";
++        String qualname = className.replace('.','/')+".class";
+         qualname = qualname.replace('/', File.separatorChar);
+         return new File(pathDir, qualname);
+     }
+@@ -339,6 +341,7 @@
+         private File findClassInPath(String name) {
+             for (String s : classpath) {
+                 File f = classPathFile(new File(s), name);
++                //System.out.println("Checking for "+f);
+                 if (f.exists() && f.canRead()) {
+                     return f;
+                 }
+@@ -353,11 +356,11 @@
+             }
+         }
+         private Class<?> transformAndLoadClass(File f) throws ClassNotFoundException, IOException {
+-            if (verbose)  System.out.println("Loading class from "+f);
++            if (verbose)  System.err.println("Loading class from "+f);
+             ClassFile cf = new ClassFile(f);
+             Logic logic = new Logic(cf);
+             boolean changed = logic.transform();
+-            if (verbose && !changed)  System.out.println("(no change)");
++            if (verbose && !changed)  System.err.println("(no change)");
+             logic.reportPatternMethods(!verbose, keepgoing);
+             byte[] bytes = cf.toByteArray();
+             return defineClass(null, bytes, 0, bytes.length);
+@@ -525,6 +528,7 @@
+                     throw new IllegalArgumentException("BootstrapMethods length is "+specsLen+" but should be "+verifySpecifierCount);
+                 }
+             }
++            if (!quiet)  System.err.flush();
+         }
+ 
+         // mark constant pool entries according to participation in patterns
+@@ -696,6 +700,18 @@
+                     args.clear();
+                     break;
+ 
++                case opc_new:
++                {
++                    String type = pool.getString(CONSTANT_Class, (short)i.u2At(1));
++                    //System.out.println("new "+type);
++                    switch (type) {
++                    case "java/lang/StringBuilder":
++                        jvm.push("StringBuilder");
++                        continue decode;  // go to next instruction
++                    }
++                    break decode;  // bail out
++                }
++
+                 case opc_getstatic:
+                 {
+                     // int.class compiles to getstatic Integer.TYPE
+@@ -732,8 +748,9 @@
+ 
+                 case opc_invokestatic:
+                 case opc_invokevirtual:
++                case opc_invokespecial:
+                 {
+-                    boolean hasRecv = (bc == opc_invokevirtual);
++                    boolean hasRecv = (bc != opc_invokestatic);
+                     int methi = i.u2At(1);
+                     char mark = poolMarks[methi];
+                     Short[] ref = pool.getMemberRef((short)methi);
+@@ -770,6 +787,7 @@
+                     if (mark == 'T' || mark == 'H' || mark == 'I') {
+                         ownMethod = findMember(cf.methods, ref[1], ref[2]);
+                     }
++                    //if (intrinsic != null)  System.out.println("intrinsic = "+intrinsic);
+                     switch (intrinsic == null ? "" : intrinsic) {
+                     case "fromMethodDescriptorString":
+                         con = makeMethodTypeCon(args.get(0));
+@@ -860,6 +878,15 @@
+                             }
+                         }
+                         break decode;
++                    case "StringBuilder.append":
++                        // allow calls like ("value = "+x)
++                        removeEmptyJVMSlots(args);
++                        args.subList(1, args.size()).clear();
++                        continue;
++                    case "StringBuilder.toString":
++                        args.clear();
++                        args.add(intrinsic);
++                        continue;
+                     }
+                     if (!hasRecv && ownMethod != null && patternMark != 0) {
+                         con = constants.get(ownMethod);
+@@ -1506,6 +1533,7 @@
+                 out.write(bytes);
+             } else {
+                 trueSize = flatten(out);
++                //if (!(item instanceof Code))  System.err.println("wrote complex attr name="+(int)(char)name+" size="+trueSize+" data="+Arrays.toString(flatten()));
+             }
+             if (trueSize != size && size >= 0)
+                 System.err.println("warning: attribute size changed "+size+" to "+trueSize);
+@@ -1525,7 +1553,7 @@
+         }
+         public List<Attr> attrs() { return null; }  // Code overrides this
+         public byte[] flatten() {
+-            ByteArrayOutputStream buf = new ByteArrayOutputStream(size);
++            ByteArrayOutputStream buf = new ByteArrayOutputStream(Math.max(20, size));
+             flatten(buf);
+             return buf.toByteArray();
+         }
+@@ -1642,6 +1670,7 @@
+         opc_invokestatic           = 184,
+         opc_invokeinterface        = 185,
+         opc_invokedynamic          = 186,
++        opc_new                    = 187,
+         opc_anewarray              = 189,
+         opc_checkcast              = 192,
+         opc_ifnull                 = 198,

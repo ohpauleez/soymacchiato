@@ -1,0 +1,161 @@
+0000000: writing libraries in Java for non-Java languages requires permissive Dynamic type
+MQ base = 4d206181439a in http://hg.netbeans.org/main/nb-javac [release65_base] + meth.patch
+NOTE:  This needs to be refreshed after ../dyncast.patch is debugged.
+
+diff --git a/src/share/classes/com/sun/tools/javac/code/Symtab.java b/src/share/classes/com/sun/tools/javac/code/Symtab.java
+--- a/src/share/classes/com/sun/tools/javac/code/Symtab.java
++++ b/src/share/classes/com/sun/tools/javac/code/Symtab.java
+@@ -119,6 +119,7 @@
+     public final Type stringBuilderType;
+     public final Type cloneableType;
+     public final Type serializableType;
++    public final Type voidWrapperType;
+     public final Type methodHandleType;
+     public final Type dynamicType;
+     public final Type throwableType;
+@@ -353,8 +354,11 @@
+         cloneableType = enterClass("java.lang.Cloneable");
+         throwableType = enterClass("java.lang.Throwable");
+         serializableType = enterClass("java.io.Serializable");
++        voidWrapperType = enterClass("java.lang.Void");
+         methodHandleType = enterClass("java.dyn.MethodHandle");
+         dynamicType = enterClass("java.dyn.Dynamic");
++        // interface Dynamic does *not* inherit members from Object:
++        ((ClassType)dynamicType).supertype_field = Type.noType;
+         errorType = enterClass("java.lang.Error");
+         illegalArgumentExceptionType = enterClass("java.lang.IllegalArgumentException");
+         exceptionType = enterClass("java.lang.Exception");
+diff --git a/src/share/classes/com/sun/tools/javac/code/Types.java b/src/share/classes/com/sun/tools/javac/code/Types.java
+--- a/src/share/classes/com/sun/tools/javac/code/Types.java
++++ b/src/share/classes/com/sun/tools/javac/code/Types.java
+@@ -269,6 +269,8 @@
+      * convertions to s?
+      */
+     public boolean isConvertible(Type t, Type s, Warner warn) {
++        if (s.tsym == syms.dynamicType.tsym) return true;
++        if (t.tsym == syms.dynamicType.tsym && s.tsym == syms.objectType.tsym) return true;
+         boolean tPrimitive = t.isPrimitive();
+         boolean sPrimitive = s.isPrimitive();
+         if (tPrimitive == sPrimitive)
+@@ -879,6 +881,8 @@
+         if (t == s)
+             return true;
+ 
++        if (t.tsym == syms.dynamicType.tsym || s.tsym == syms.dynamicType.tsym) return true;
++
+         if (t.isPrimitive() != s.isPrimitive())
+             return allowBoxing && isConvertible(t, s, warn);
+ 
+@@ -1472,6 +1476,7 @@
+      * (not defined for Method and ForAll types)
+      */
+     public boolean isAssignable(Type t, Type s, Warner warn) {
++        if (s.tsym == syms.dynamicType.tsym) return true;
+         if (t.tag == ERROR)
+             return t.tsym != null && t.tsym.name == names.any;
+         if (t.tag <= INT && t.constValue() != null) {
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Lower.java b/src/share/classes/com/sun/tools/javac/comp/Lower.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Lower.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Lower.java
+@@ -2614,6 +2614,12 @@
+         Type unboxedType = types.unboxedType(tree.type);
+         // note: the "primitive" parameter is not used.  There muse be
+         // a conversion from unboxedType to primitive.
++        if (tree.type.tsym == syms.dynamicType.tsym) {
++            // use primitive target typing if the source is java.dyn.Dynamic
++            unboxedType = primitive;
++            ClassSymbol boxedClass = types.boxedClass(unboxedType);
++            tree = make.TypeCast(boxedClass.type, tree);
++        }
+         if (unboxedType.tsym == null)
+             return tree;
+         make_at(tree.pos());
+diff --git a/src/share/classes/com/sun/tools/javac/comp/Resolve.java b/src/share/classes/com/sun/tools/javac/comp/Resolve.java
+--- a/src/share/classes/com/sun/tools/javac/comp/Resolve.java
++++ b/src/share/classes/com/sun/tools/javac/comp/Resolve.java
+@@ -874,7 +874,7 @@
+         }
+         Type restype;
+         if (typeargtypes.isEmpty()) {
+-            restype = syms.objectType;
++            restype = syms.dynamicType;
+         } else {
+             restype = typeargtypes.head;
+             if (!typeargtypes.tail.isEmpty())
+@@ -914,9 +914,18 @@
+             };
+         Type implicitArgType(Type argType) {
+             argType = types.erasure(argType);
+-            if (argType.tag == BOT)
+-                // nulls type as Object
+-                argType = syms.objectType;
++            if (argType.tag == BOT) {
++                // Null arguments type as java.lang.Void, which is a
++                // reference that only takes a null value.
++                // The signature for this dynamic call will mention Void,
++                // and bootstrap methods will have to recognize this
++                // specially as a signal for ambiguous nulls (if they care).
++                // Even beyond the odd name, this is imperfect, since the
++                // conversion rules for real null (to any reference type T)
++                // do not match the reference conversion rules for Void
++                // (which of course only converts to Object).
++                argType = syms.voidWrapperType;
++            }
+             return argType;
+         }
+ 
+diff --git a/src/share/classes/com/sun/tools/javac/jvm/Gen.java b/src/share/classes/com/sun/tools/javac/jvm/Gen.java
+--- a/src/share/classes/com/sun/tools/javac/jvm/Gen.java
++++ b/src/share/classes/com/sun/tools/javac/jvm/Gen.java
+@@ -2070,6 +2070,7 @@
+         // For basic types, the coerce(...) in genExpr(...) will do
+         // the conversion.
+         if (tree.clazz.type.tag > lastBaseTag &&
++            !types.isSameType(tree.clazz.type, syms.dynamicType) &&
+             types.asSuper(tree.expr.type, tree.clazz.type.tsym) == null) {
+             code.emitop2(checkcast, makeRef(tree.pos(), tree.clazz.type));
+         }
+@@ -2153,9 +2154,21 @@
+             }
+             result = items.
+                 makeImmediateItem(sym.type, ((VarSymbol) sym).getConstValue());
+-        } else if (allowInvokedynamic && sym.kind == MTH && ssym == syms.dynamicType.tsym) {
+-            base.drop();
+-            result = items.makeDynamicItem(sym);
++        } else if (allowInvokedynamic && sym.kind == MTH && sym.owner == syms.dynamicType.tsym) {
++            if (ssym == syms.dynamicType.tsym) {
++                base.drop();
++                result = items.makeDynamicItem(sym);
++            } else {
++                // There is a receiver value here; let's mix it into the argument list.
++                Symbol sym1 = sym.clone(sym.owner);
++                MethodType type1 = (MethodType) sym1.type.clone();
++                type1.argtypes = type1.argtypes.prepend(tree.selected.type);
++                sym1.type = type1;
++                // TODO: find a way to memoize sym1 as derived from sym
++                base.load();
++                result = items.makeDynamicItem(sym1);
++                // Since invokedynamic allows null first argument, do not call genNullCheck.
++            }
+         } else {
+             if (!accessSuper)
+                 sym = binaryQualifier(sym, tree.selected.type);
+diff --git a/src/share/classes/com/sun/tools/javac/util/Name.java b/src/share/classes/com/sun/tools/javac/util/Name.java
+--- a/src/share/classes/com/sun/tools/javac/util/Name.java
++++ b/src/share/classes/com/sun/tools/javac/util/Name.java
+@@ -443,6 +443,7 @@
+             java_lang_Cloneable = fromString("java.lang.Cloneable");
+             java_io_Serializable = fromString("java.io.Serializable");
+             java_lang_Enum = fromString("java.lang.Enum");
++            java_lang_Void = fromString("java.lang.Void");
+             java_dyn_MethodHandle = fromString("java.dyn.MethodHandle");
+             java_dyn_Dynamic = fromString("java.dyn.Dynamic");
+             package_info = fromString("package-info");
+@@ -584,6 +585,7 @@
+         public final Name java_io_Serializable;
+         public final Name serialVersionUID;
+         public final Name java_lang_Enum;
++        public final Name java_lang_Void;
+         public final Name java_dyn_MethodHandle;
+         public final Name java_dyn_Dynamic;
+         public final Name package_info;

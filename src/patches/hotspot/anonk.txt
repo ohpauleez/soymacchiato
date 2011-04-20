@@ -1,0 +1,37 @@
+6653858: dynamic languages need to be able to load anonymous classes 
+Summary: low-level privileged sun.misc.Unsafe.defineAnonymousClass
+
+http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=6653858
+
+Features:
+- loads an arbitrary class from bytecodes
+- puts class in class hierarchy but *not* in any class loader
+- piggybacks on a "host class" as if it were an inner class
+- elements of the anonymous constant pool can be patched easily
+- string constants can be replaced by arbitrary objects in CP
+
+Tests:
+- jdk/test/java/dyn/AnonymousClassLoader/TestAnonK.java
+
+Why the patching stuff?  Mainly, it makes some use cases much easier.
+Second, the constant pool needed some internal patching anyway,
+to anonymize the loaded class itself.  Finally, if you are going
+to use this seriously, you'll want to build anonymous classes
+on top of pre-existing anonymous classes, and that requires patching.
+
+Incremental testing:
+This does not require a full JDK build.
+
+$ rm -rf build/bootcp
+$ mkdir -p build/bootcp
+
+$ files='
+sources/jdk/test/java/dyn/AnonymousClassLoader/*.java
+sources/jdk/src/share/classes/java/dyn/AnonymousClassLoader.java
+sources/jdk/src/share/classes/java/dyn/ConstantPool*.java
+sources/jdk/src/share/classes/java/dyn/InvalidConstantPoolFormatException.java
+sources/jdk/src/share/classes/sun/misc/Unsafe.java
+sources/jdk/src/share/classes/sun/reflect/Reflection.java
+'
+$ $JAVA_HOME/bin/javac -d build/bootcp $files
+$ $JAVA_HOME/bin/javac -XXaltjvm=?? -XX:+AnonymousClasses -Xbootclasspath/p:build/bootcp TestAnonK

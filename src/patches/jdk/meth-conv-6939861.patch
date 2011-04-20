@@ -1,0 +1,286 @@
+6939861: JVM should handle more conversion operations
+Reviewed-by: ?
+
+diff --git a/src/share/classes/java/lang/invoke/AdapterMethodHandle.java b/src/share/classes/java/lang/invoke/AdapterMethodHandle.java
+--- a/src/share/classes/java/lang/invoke/AdapterMethodHandle.java
++++ b/src/share/classes/java/lang/invoke/AdapterMethodHandle.java
+@@ -27,6 +27,7 @@
+ 
+ import sun.invoke.util.VerifyType;
+ import sun.invoke.util.Wrapper;
++import sun.invoke.util.ValueConversions;
+ import java.util.Arrays;
+ import static java.lang.invoke.MethodHandleNatives.Constants.*;
+ import static java.lang.invoke.MethodHandleStatics.*;
+@@ -55,6 +56,8 @@
+         this(target, newType, conv, null);
+     }
+ 
++    int getConversion() { return conversion; }
++
+     // TO DO:  When adapting another MH with a null conversion, clone
+     // the target and change its type, instead of adding another layer.
+ 
+@@ -164,7 +167,7 @@
+                 if (dst.isPrimitive()) {
+                     adapter = makePrimCast(midType, adapter, i, dst);
+                 } else {
+-                    adapter = makeBoxArgument(midType, adapter, i, dst);
++                    adapter = makeBoxArgument(midType, adapter, i, src);
+                 }
+             } else {
+                 if (dst.isPrimitive()) {
+@@ -310,6 +313,20 @@
+         return (spChange & CONV_STACK_MOVE_MASK) << CONV_STACK_MOVE_SHIFT;
+     }
+ 
++    static int extractStackMove(int convOp) {
++        int spChange = convOp >> CONV_STACK_MOVE_SHIFT;
++        return spChange / MethodHandleNatives.JVM_STACK_MOVE_UNIT;
++    }
++
++    static int extractStackMove(MethodHandle target) {
++        if (target instanceof AdapterMethodHandle) {
++            AdapterMethodHandle amh = (AdapterMethodHandle) target;
++            return extractStackMove(amh.getConversion());
++        } else {
++            return 0;
++        }
++    }
++
+     /** Construct an adapter conversion descriptor for a single-argument conversion. */
+     private static long makeConv(int convOp, int argnum, int src, int dest) {
+         assert(src  == (src  & 0xF));
+@@ -617,7 +634,7 @@
+     }
+     /** Can an primitive unboxing adapter validly convert src to dst? */
+     static boolean canUnboxArgument(Class<?> src, Class<?> dst) {
+-        return (!src.isPrimitive() && Wrapper.asPrimitiveType(dst).isPrimitive());
++        return (!src.isPrimitive() && dst.isPrimitive());
+     }
+ 
+     /** Factory method:  Unbox the given argument.
+@@ -642,19 +659,46 @@
+         return makeCheckCast(newType, adapter, arg, boxType);
+     }
+ 
++    /** Can a boxing conversion validly convert src to dst? */
++    static boolean canBoxArgument(MethodType newType, MethodType targetType,
++                int arg, Class<?> convType) {
++        if (!convOpSupported(OP_PRIM_TO_REF))  return false;
++        Class<?> src = newType.parameterType(arg);
++        Class<?> dst = targetType.parameterType(arg);
++        Class<?> boxType = Wrapper.asWrapperType(convType);
++        convType = Wrapper.asPrimitiveType(convType);
++        if (!canCheckCast(boxType, dst)
++                || boxType == convType
++                || !VerifyType.isNullConversion(src, convType))
++            return false;
++        int diff = diffTypes(newType, targetType, false);
++        return (diff == arg+1);  // arg is sole non-trivial diff
++    }
++
+     /** Can an primitive boxing adapter validly convert src to dst? */
+     static boolean canBoxArgument(Class<?> src, Class<?> dst) {
+         if (!convOpSupported(OP_PRIM_TO_REF))  return false;
+-        throw new UnsupportedOperationException("NYI");
++        return (src.isPrimitive() && !dst.isPrimitive());
+     }
+ 
+-    /** Factory method:  Unbox the given argument.
++    /** Factory method:  Box the given argument.
+      *  Return null if this cannot be done.
+      */
+     static MethodHandle makeBoxArgument(MethodType newType, MethodHandle target,
+                 int arg, Class<?> convType) {
+-        // this is difficult to do in the JVM because it must GC
+-        return null;
++        MethodType oldType = target.type();
++        Class<?> src = newType.parameterType(arg);
++        Class<?> dst = oldType.parameterType(arg);
++        Class<?> boxType = Wrapper.asWrapperType(convType);
++        Class<?> primType = Wrapper.asPrimitiveType(convType);
++        if (!canBoxArgument(newType, oldType, arg, convType)) {
++            return null;
++        }
++        if (!VerifyType.isNullConversion(boxType, dst))
++            target = makeCheckCast(oldType.changeParameterType(arg, boxType), target, arg, dst);
++        MethodHandle boxerMethod = ValueConversions.box(Wrapper.forPrimitiveType(primType), true);
++        long conv = makeConv(OP_PRIM_TO_REF, arg, basicType(primType), T_OBJECT);
++        return new AdapterMethodHandle(target, newType, conv, boxerMethod);
+     }
+ 
+     /** Can an adapter simply drop arguments to convert the target to newType? */
+@@ -874,12 +918,20 @@
+         return new AdapterMethodHandle(target, newType, conv);
+     }
+ 
++    /** Maximum number of arguments to spread before exceeding the push limit.
++     *  The "+1" is because the first spread argument simply replaces the original
++     *  array argument, from which all the arguments are extracted.
++     */
++    private static final int SPREAD_LIMIT = MethodHandleNatives.JVM_PUSH_LIMIT+1;
++
+     /** Can an adapter spread an argument to convert the target to newType? */
+     static boolean canSpreadArguments(MethodType newType, MethodType targetType,
+                 Class<?> spreadArgType, int spreadArgPos, int spreadArgCount) {
+         if (!convOpSupported(OP_SPREAD_ARGS))  return false;
+         if (diffReturnTypes(newType, targetType, false) != 0)
+             return false;
++        if (false && spreadArgCount > SPREAD_LIMIT)
++            return false;
+         int nptypes = newType.parameterCount();
+         // parameter types must be the same up to the spread point
+         if (spreadArgPos != 0 && diffParamTypes(newType, 0, targetType, 0, spreadArgPos, false) != 0)
+@@ -921,12 +973,77 @@
+         int slotCount    = keep1OutSlot - spreadSlot;
+         assert(spreadSlot == newType.parameterSlotDepth(spreadArgPos+1));
+         assert(slotCount >= spreadArgCount);
++        if (false && slotCount + extractStackMove(target) > SPREAD_LIMIT)
++            return null;  // perhaps spreading a long[] array is going to push too much
+         long conv = makeConv(OP_SPREAD_ARGS, spreadArgPos, slotCount-1);
+         MethodHandle res = new AdapterMethodHandle(target, newType, conv, spreadArgType);
+         assert(res.type().parameterType(spreadArgPos) == spreadArgType);
+         return res;
+     }
+ 
++    /** Can an adapter collect a series of arguments to convert the target to newType? */
++    static boolean canCollectArguments(MethodType newType, MethodType targetType,
++                Class<?> collectArgType, int collectArgPos, int collectArgCount) {
++        return false; //FIXME: NYI
++        /*
++        if (!convOpSupported(OP_COLLECT_ARGS))  return false;
++        if (diffReturnTypes(newType, targetType, false) != 0)
++            return false;
++        if (false && collectArgCount > COLLECT_LIMIT)
++            return false;
++        int nptypes = newType.parameterCount();
++        // parameter types must be the same up to the collect point
++        if (collectArgPos != 0 && diffParamTypes(newType, 0, targetType, 0, collectArgPos, false) != 0)
++            return false;
++        int afterPos = collectArgPos + collectArgCount;
++        int afterCount = nptypes - (collectArgPos + 1);
++        if (collectArgPos < 0 || collectArgPos >= nptypes ||
++            collectArgCount < 0 ||
++            targetType.parameterCount() != afterPos + afterCount)
++            return false;
++        // parameter types after the collect point must also be the same
++        if (afterCount != 0 && diffParamTypes(newType, collectArgPos+1, targetType, afterPos, afterCount, false) != 0)
++            return false;
++        // match the array element type to the collect arg types
++        Class<?> rawCollectArgType = newType.parameterType(collectArgPos);
++        if (rawCollectArgType != collectArgType && !canCheckCast(rawCollectArgType, collectArgType))
++            return false;
++        for (int i = 0; i < collectArgCount; i++) {
++            Class<?> src = VerifyType.collectArgElementType(collectArgType, i);
++            Class<?> dst = targetType.parameterType(collectArgPos + i);
++            if (src == null || !VerifyType.isNullConversion(src, dst))
++                return false;
++        }
++        return true;
++        */
++    }
++
++
++    /** Factory method:  Collect selected argument. */
++    static MethodHandle makeCollectArguments(MethodType newType, MethodHandle target,
++                Class<?> collectArgType, int collectArgPos, int collectArgCount) {
++        return null; //FIXME: NYI
++        /*
++        MethodType targetType = target.type();
++        if (!canCollectArguments(newType, targetType, collectArgType, collectArgPos, collectArgCount))
++            return null;
++        // in  arglist: [0: ...keep1 | spos: collectArg | spos+1:      keep2... ]
++        // out arglist: [0: ...keep1 | spos: collect... | spos+scount: keep2... ]
++        int keep2OutPos  = collectArgPos + collectArgCount;
++        int collectSlot   = targetType.parameterSlotDepth(keep2OutPos);
++        int keep1OutSlot = targetType.parameterSlotDepth(collectArgPos);
++        int slotCount    = keep1OutSlot - collectSlot;
++        assert(collectSlot == newType.parameterSlotDepth(collectArgPos+1));
++        assert(slotCount >= collectArgCount);
++        if (false && slotCount + extractStackMove(target) > COLLECT_LIMIT)
++            return null;  // perhaps collecting a long[] array is going to push too much
++        long conv = makeConv(OP_COLLECT_ARGS, collectArgPos, slotCount-1);
++        MethodHandle res = new AdapterMethodHandle(target, newType, conv, collectArgType);
++        assert(res.type().parameterType(collectArgPos) == collectArgType);
++        return res;
++        */
++    }
++
+     // TO DO: makeCollectArguments, makeFlyby, makeRicochet
+ 
+     @Override
+diff --git a/src/share/classes/java/lang/invoke/MethodHandleNatives.java b/src/share/classes/java/lang/invoke/MethodHandleNatives.java
+--- a/src/share/classes/java/lang/invoke/MethodHandleNatives.java
++++ b/src/share/classes/java/lang/invoke/MethodHandleNatives.java
+@@ -323,15 +323,39 @@
+      * The JVM wants to raise an exception.  Here's the path.
+      */
+     static void raiseException(int code, Object actual, Object required) {
+-        String message;
++        String message = null;
++        switch (code) {
++        case 190: // arraylength
++            try {
++                String reqLength = "";
++                if (required instanceof AdapterMethodHandle) {
++                    int conv = ((AdapterMethodHandle)required).getConversion();
++                    int spChange = AdapterMethodHandle.extractStackMove(conv);
++                    reqLength = " of length "+(spChange+1);
++                }
++                int actualLength = actual == null ? 0 : java.lang.reflect.Array.getLength(actual);
++                message = "required array"+reqLength+", but encountered wrong length "+actualLength;
++                break;
++            } catch (IllegalArgumentException ex) {
++            }
++            required = Object[].class;  // should have been an array
++            code = 192; // checkcast
++            break;
++        }
+         // disregard the identity of the actual object, if it is not a class:
+-        if (!(actual instanceof Class) && !(actual instanceof MethodType))
+-            actual = actual.getClass();
+-        if (actual != null)
+-            message = "required "+required+" but encountered "+actual;
+-        else
+-            message = "required "+required;
++        if (message == null) {
++            if (!(actual instanceof Class) && !(actual instanceof MethodType))
++                actual = actual.getClass();
++           if (actual != null)
++               message = "required "+required+" but encountered "+actual;
++           else
++               message = "required "+required;
++        }
+         switch (code) {
++        case 190: // arraylength
++            throw new ArrayIndexOutOfBoundsException(message);
++        case 50: //_aaload
++            throw new ClassCastException(message);
+         case 192: // checkcast
+             throw new ClassCastException(message);
+         default:
+diff --git a/test/java/lang/invoke/MethodHandlesTest.java b/test/java/lang/invoke/MethodHandlesTest.java
+--- a/test/java/lang/invoke/MethodHandlesTest.java
++++ b/test/java/lang/invoke/MethodHandlesTest.java
+@@ -1459,7 +1459,7 @@
+         MethodHandle target = varargsArray(nargs);
+         MethodHandle target2 = changeArgTypes(target, argType);
+         if (verbosity >= 3)
+-            System.out.println("spread into "+target2+" ["+pos+".."+nargs+"]");
++            System.out.println("spread into "+target2+target2.type()+" ["+pos+".."+nargs+"]");
+         Object[] args = randomArgs(target2.type().parameterArray());
+         // make sure the target does what we think it does:
+         if (pos == 0 && nargs < 5) {
+@@ -1499,6 +1499,11 @@
+             args1[pos] = Arrays.copyOfRange(args, pos, args.length);
+             returnValue = (Object[]) result.invokeWithArguments(args1);
+         }
++        if (!Arrays.equals(args, returnValue)) {
++            System.out.println("method:   "+result+result.type());
++            System.out.println("expected: "+Arrays.toString(args));
++            System.out.println("returned: "+Arrays.toString(returnValue));
++        }
+         assertArrayEquals(args, returnValue);
+     }
+ 

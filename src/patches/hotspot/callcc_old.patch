@@ -1,0 +1,4664 @@
+diff --git a/src/cpu/x86/vm/c1_CodeStubs_x86.cpp b/src/cpu/x86/vm/c1_CodeStubs_x86.cpp
+--- a/src/cpu/x86/vm/c1_CodeStubs_x86.cpp
++++ b/src/cpu/x86/vm/c1_CodeStubs_x86.cpp
+@@ -510,4 +510,44 @@
+ #endif // SERIALGC
+ /////////////////////////////////////////////////////////////////////////////
+ 
++
++ContinuationStub::ContinuationStub(LIR_OpJavaCall* op): _op(op) {
++  _info = op->info();
++}
++
++
++void ContinuationStub::emit_code(LIR_Assembler* ce) {
++  // TODO handle monitor count correctly
++  assert(ce->frame_map()->num_monitors() == 0, "monitor handling not implemented!");
++
++  // IMPORTANT this nop is required because ImplicitNullCheckStub sets debug info for the first instruction 
++  //  after its end (at least in product builds) and this collides with our debug info
++  __ nop();
++
++  __ bind(_entry); 
++  int stub_pc = ce->code_offset();
++  ce->add_call_info_here(_info);
++  ce->verify_oop_map(_info);
++
++  klassOop k = SystemDictionary::Continuation_klass();
++//  k->klass_part()->initialize();
++
++  nmethod* nm = javax_stack_Continuation::get_store_frames_nmethod(_op->method()->return_type()->basic_type());
++  assert(nm, "unsupported return type");
++
++  // this move is performed in create_storeFrameGeneric_contents
++  // __ movl(rcx, rax);
++
++  // this acts as a trampoline to the generic nmethod frame copying stub
++  __ call(RuntimeAddress(nm->verified_entry_point()));
++  
++  ce->add_call_info_here(_info);
++  ce->verify_oop_map(_info);
++
++  __ jmp(_continuation);
++
++  ce->compilation()->continuation_pc_table()->add_entry(_pc, stub_pc);
++
++}
++
+ #undef __
+diff --git a/src/cpu/x86/vm/c1_LIRAssembler_x86.cpp b/src/cpu/x86/vm/c1_LIRAssembler_x86.cpp
+--- a/src/cpu/x86/vm/c1_LIRAssembler_x86.cpp
++++ b/src/cpu/x86/vm/c1_LIRAssembler_x86.cpp
+@@ -436,6 +436,29 @@
+ 
+   int offset = code_offset();
+ 
++  if (compilation()->method()->create_continuation_stubs()) {
++//    tty->print("codepos: %08x\n", pc());
++
++    Label skip;
++    __ get_thread(rcx);
++    __ movptr(rcx, Address(rcx, JavaThread::current_continuation_frame_offset()));
++    __ testptr(rcx, rcx);
++    __ jcc(Assembler::zero, skip);
++    __ cmpptr(rbp, Address(rcx, activationFrameOopDesc::stack_pos_offset()));
++    __ jcc(Assembler::notEqual, skip);
++
++//    __ int3();
++//    __ warn("continuable exception handling");
++
++    __ push(rdx);
++    __ movptr(rcx, rax);
++    __ movptr(rbx, AddressLiteral(javax_stack_Continuation::get_unwind_nmethod_adr(), relocInfo::none));
++    __ movptr(rbx, Address(rbx, nmethod::verified_entry_point_offset()));
++    __ jmp(rbx);
++
++    __ bind(skip);
++  }
++
+   // the exception oop and pc are in rax, and rdx
+   // no other registers need to be preserved, so invalidate them
+   __ invalidate_registers(false, true, true, false, true, true);
+diff --git a/src/cpu/x86/vm/c1_MacroAssembler_x86.cpp b/src/cpu/x86/vm/c1_MacroAssembler_x86.cpp
+--- a/src/cpu/x86/vm/c1_MacroAssembler_x86.cpp
++++ b/src/cpu/x86/vm/c1_MacroAssembler_x86.cpp
+@@ -138,7 +138,7 @@
+ void C1_MacroAssembler::initialize_header(Register obj, Register klass, Register len, Register t1, Register t2) {
+   assert_different_registers(obj, klass, len);
+   if (UseBiasedLocking && !len->is_valid()) {
+-    assert_different_registers(obj, klass, len, t1, t2);
++    assert_different_registers(obj, klass, len, t1);
+     movptr(t1, Address(klass, Klass::prototype_header_offset_in_bytes() + klassOopDesc::klass_part_offset_in_bytes()));
+     movptr(Address(obj, oopDesc::mark_offset_in_bytes()), t1);
+   } else {
+diff --git a/src/cpu/x86/vm/interpreter_x86.hpp b/src/cpu/x86/vm/interpreter_x86.hpp
+--- a/src/cpu/x86/vm/interpreter_x86.hpp
++++ b/src/cpu/x86/vm/interpreter_x86.hpp
+@@ -30,6 +30,7 @@
+   // block of code to handle compiedl return values and cleaning
+   // the fpu stack.
+   static const int return_sentinel;
++  static const int return_sentinel2;
+ 
+ 
+   static Address::ScaleFactor stackElementScale() {
+diff --git a/src/cpu/x86/vm/interpreter_x86_32.cpp b/src/cpu/x86/vm/interpreter_x86_32.cpp
+--- a/src/cpu/x86/vm/interpreter_x86_32.cpp
++++ b/src/cpu/x86/vm/interpreter_x86_32.cpp
+@@ -29,6 +29,7 @@
+ 
+ // Initialize the sentinel used to distinguish an interpreter return address.
+ const int Interpreter::return_sentinel = 0xfeedbeed;
++const int Interpreter::return_sentinel2 = 0xfeedbffd;
+ 
+ //------------------------------------------------------------------------------------------------------------------------
+ 
+diff --git a/src/cpu/x86/vm/sharedRuntime_x86_32.cpp b/src/cpu/x86/vm/sharedRuntime_x86_32.cpp
+--- a/src/cpu/x86/vm/sharedRuntime_x86_32.cpp
++++ b/src/cpu/x86/vm/sharedRuntime_x86_32.cpp
+@@ -1181,6 +1181,16 @@
+   }
+ }
+ 
++void create_saveContinuation_contents(MacroAssembler *masm, int start, OopMapSet* oop_maps, int &stack_slots, int total_in_args, BasicType *in_sig_bt, VMRegPair *in_regs, BasicType ret_type);
++void create_resumeContinuation_contents(MacroAssembler *masm, int start, OopMapSet* oop_maps, int &stack_slots, int total_in_args, BasicType *in_sig_bt, VMRegPair *in_regs, BasicType ret_type);
++
++void create_storeFrameGeneric_contents(MacroAssembler *masm, int start, OopMapSet* oop_maps, int &stack_slots, int total_in_args, BasicType *in_sig_bt, VMRegPair *in_regs, BasicType ret_type);
++
++void create_startDelimited_contents(MacroAssembler *masm, int start, OopMapSet* oop_maps, int &stack_slots, int total_in_args, BasicType *in_sig_bt, VMRegPair *in_regs, BasicType ret_type);
++void create_continueDelimited_contents(MacroAssembler *masm, int start, OopMapSet* oop_maps, int &stack_slots, int total_in_args, BasicType *in_sig_bt, VMRegPair *in_regs, BasicType ret_type);
++
++void test_continuation_resume(MacroAssembler *masm, Register thread_reg, Register temp);
++
+ // ---------------------------------------------------------------------------
+ // Generate a native wrapper for a given method.  The method takes arguments
+ // in the Java compiled code convention, marshals them to the native
+@@ -1364,6 +1374,32 @@
+     __ ret(0);
+     __ bind (slowCase);
+   }
++
++  // all the continuation support methods have a hand-coded fast version that will handle the most common cases
++  if (method->intrinsic_id() == vmIntrinsics::_saveContinuation) {
++    create_saveContinuation_contents(masm, start, oop_maps, stack_slots, total_in_args, in_sig_bt, in_regs, ret_type);
++  }
++  if (method->intrinsic_id() == vmIntrinsics::_resumeContinuation) {
++    create_resumeContinuation_contents(masm, start, oop_maps, stack_slots, total_in_args, in_sig_bt, in_regs, ret_type);
++  }
++  if (method->intrinsic_id() == vmIntrinsics::_storeFrameObject ||
++      method->intrinsic_id() == vmIntrinsics::_storeFrameVoid ||
++      method->intrinsic_id() == vmIntrinsics::_storeFrameBoolean ||
++      method->intrinsic_id() == vmIntrinsics::_storeFrameByte ||
++      method->intrinsic_id() == vmIntrinsics::_storeFrameChar ||
++      method->intrinsic_id() == vmIntrinsics::_storeFrameShort ||
++      method->intrinsic_id() == vmIntrinsics::_storeFrameInt ||
++      method->intrinsic_id() == vmIntrinsics::_storeFrameLong ||
++      method->intrinsic_id() == vmIntrinsics::_storeFrameFloat ||
++      method->intrinsic_id() == vmIntrinsics::_storeFrameDouble) {
++    create_storeFrameGeneric_contents(masm, start, oop_maps, stack_slots, total_in_args, in_sig_bt, in_regs, ret_type);
++  }
++  if (method->intrinsic_id() == vmIntrinsics::_startDelimited) {
++    create_startDelimited_contents(masm, start, oop_maps, stack_slots, total_in_args, in_sig_bt, in_regs, ret_type);
++  }
++  if (method->intrinsic_id() == vmIntrinsics::_continueDelimited) {
++    create_continueDelimited_contents(masm, start, oop_maps, stack_slots, total_in_args, in_sig_bt, in_regs, ret_type);
++  }
+ #endif // COMPILER1
+ 
+   // The instruction at the verified entry point must be 5 bytes or longer
+@@ -1832,6 +1868,21 @@
+   // Return
+ 
+   __ leave();
++
++  if (method->intrinsic_id() == vmIntrinsics::_storeFrameObject ||
++      method->intrinsic_id() == vmIntrinsics::_storeFrameVoid ||
++      method->intrinsic_id() == vmIntrinsics::_storeFrameBoolean ||
++      method->intrinsic_id() == vmIntrinsics::_storeFrameByte ||
++      method->intrinsic_id() == vmIntrinsics::_storeFrameChar ||
++      method->intrinsic_id() == vmIntrinsics::_storeFrameShort ||
++      method->intrinsic_id() == vmIntrinsics::_storeFrameInt ||
++      method->intrinsic_id() == vmIntrinsics::_storeFrameLong ||
++      method->intrinsic_id() == vmIntrinsics::_storeFrameFloat ||
++      method->intrinsic_id() == vmIntrinsics::_storeFrameDouble) {
++    __ get_thread(rdi);
++    test_continuation_resume(masm, rdi, rsi);
++  }
++
+   __ ret(0);
+ 
+   // Unexpected paths are out of line and go here
+@@ -3077,3 +3128,862 @@
+   generate_uncommon_trap_blob();
+ #endif // COMPILER2
+ }
++
++// finds the code blob for a given pc, t1 needs to be rax ... rdx
++void find_code_blob(MacroAssembler* masm, Register pc, Register t1, Label& no_codeblob) {
++  __ cmpl(pc, (int)CodeCache::heap()->low_boundary());
++  __ jcc(Assembler::below, no_codeblob);
++  __ cmpl(pc, (int)CodeCache::heap()->high_boundary());
++  __ jcc(Assembler::aboveEqual, no_codeblob);
++
++  __ subl(pc, (int)CodeCache::heap()->begin());
++  __ shrl(pc, (int)CodeCache::heap()->log2_segment_size());
++
++  __ xorl(t1, t1);
++
++  Label loop;
++  __ bind(loop);
++  __ movb(t1, Address(pc, (int)CodeCache::heap()->segmap().low()));
++  __ cmpl(t1, 0xff);
++  __ jcc(Assembler::equal, no_codeblob);
++  __ subl(pc, t1);
++  __ testl(t1, t1);
++  __ jcc(Assembler::notZero, loop);
++
++  assert(sizeof(bool) == 1, "bool size");
++  __ shll(pc, CodeCache::heap()->log2_segment_size());
++  __ cmpb(Address(pc, in_bytes(HeapBlock::used_offset()) + (int)CodeCache::heap()->begin()), 0x00);
++  __ jcc(Assembler::zero, no_codeblob);
++
++  __ addl(pc, in_bytes(HeapBlock::allocated_offset()) + (int)CodeCache::heap()->begin());
++}
++
++
++void initialize_header(MacroAssembler* masm, Register obj, Register klass, Register t1) {
++  assert_different_registers(obj, klass);
++  if (UseBiasedLocking) {
++    assert_different_registers(obj, klass, t1);
++    __ movptr(t1, Address(klass, Klass::prototype_header_offset_in_bytes() + klassOopDesc::klass_part_offset_in_bytes()));
++    __ movptr(Address(obj, oopDesc::mark_offset_in_bytes()), t1);
++  } else {
++    // This assumes that all prototype bits fit in an int32_t
++    __ movptr(Address(obj, oopDesc::mark_offset_in_bytes ()), (int32_t)(intptr_t)markOopDesc::prototype());
++  }
++
++  __ movptr(Address(obj, oopDesc::klass_offset_in_bytes()), klass);
++}
++
++
++void test_continuation_resume(MacroAssembler *masm, Register thread_reg, Register temp) {
++  assert(temp != rdi, "cannot use rdi as temp");
++  // check if there is a pending resume operation
++  Label resume;
++  __ movptr(temp, Address(thread_reg, JavaThread::resume_common_frame_offset()));
++  __ testptr(temp, temp);
++  __ jcc(Assembler::notZero, resume);
++  __ ret(0);
++
++  __ bind(resume);
++
++  Label native_method;
++  __ movptr(temp, Address(rsp, 0));
++  __ cmpptr(temp, (int)Interpreter::code()->code_start());
++  __ jcc(Assembler::below, native_method);
++  __ cmpptr(temp, (int)Interpreter::code()->code_end());
++  __ jcc(Assembler::aboveEqual, native_method);
++
++  // we need to restore the sender_sp if the current frame is interpreted
++  __ movptr(rsp, Address(rbp, frame::interpreter_frame_sender_sp_offset * wordSize));
++  __ movptr(temp, Address(rbp, frame::return_addr_offset * wordSize));
++  __ push(temp);
++  __ movptr(temp, Address(rbp, frame::link_offset * wordSize));
++  __ push(temp);
++  __ movptr(rbp, rsp);
++
++  __ bind(native_method);
++
++  // check if we've reached the frame from where we'll resume yet, otherwise: return
++  Label resume_not_reached;
++  __ movptr(temp, Address(thread_reg, JavaThread::resume_common_frame_offset()));
++  __ cmpptr(temp, Address(thread_reg, JavaThread::current_continuation_frame_offset()));
++  __ jcc(Assembler::notEqual, resume_not_reached);
++
++  // jump to the resume method
++  __ movptr(temp, ExternalAddress(javax_stack_Continuation::get_resume_nmethod_adr()));
++  __ movptr(temp, Address(temp, nmethod::verified_entry_point_offset()));
++  __ movptr(rdi, thread_reg);
++  __ jmp(temp);
++
++  __ bind(resume_not_reached);
++
++  // destroy the last stack frame
++  __ movl(rax, 0);                          // clear the return value (might be an oop...)
++  __ leave();
++  __ ret(0);
++}
++
++
++void stop_if(MacroAssembler *masm, Assembler::Condition condition, const char* message) {
++  Label skip;
++  __ jcc(masm->negate_condition(condition), skip);
++
++  __ int3();
++  __ stop(message);
++  __ bind(skip);
++}
++
++void createAndPatchFrame(MacroAssembler* masm, Register& thread, Register& method, Register& frame, Register& temp1, 
++                         Register& temp2, Register return_address_reg, int return_address_offset, Label& slow_case) {
++  assert_different_registers(thread, method, frame, temp1, temp2);
++
++  // find the code blob that corresponds to the next frame's pc (a NULL codeblob is bad and will be handled by the C++ path)
++  __ movptr(method, Address(return_address_reg, return_address_offset));
++  find_code_blob(masm, method, temp1, slow_case);
++
++  // check if the returned blob is an nmethod, otherwise jump to the C++ path
++  __ cmpl(Address(method, CodeBlob::type_offset()), CodeBlob::_nmethod);
++  __ jcc(Assembler::notEqual, slow_case);
++
++  // get frame and parameter size, with activationFrameOop header size and object-aligned
++  __ movl(temp1, Address(method, nmethod::activation_frame_size_offset()));
++
++  // -1 is a marker for a native nmethod
++  __ cmpl(temp1, -1);
++  __ jcc(Assembler::equal, slow_case);
++
++  // allocate the next frame
++  __ tlab_allocate(frame, temp1, 0, temp2, temp1, slow_case);                             // new_frame = new activationFrame[temp1]
++  __ movoop(temp1, JNIHandles::make_local(Universe::activationFrameKlassObj()));          // temp1 = activationFrameKlass
++  initialize_header(masm, frame, temp1, temp2);
++
++  // prepare the new frame pt1: method, fp, state
++  __ movl(Address(frame, activationFrameOopDesc::method_offset()), method);               // frame->method = method
++  if (return_address_reg == rsp) {
++    __ movl(Address(frame, activationFrameOopDesc::stack_pos_offset()), rbp);             // frame->stack_pos = rbp
++  } else {
++    __ movl(temp1, Address(rbp, 0));
++    __ movl(Address(frame, activationFrameOopDesc::stack_pos_offset()), temp1);           // frame->stack_pos = *rbp
++  }
++  __ movl(Address(frame, activationFrameOopDesc::state_offset()), activationFrameOopDesc::_compiled_empty); // frame->state = _compiled_empty
++
++  __ movl(Address(frame, activationFrameOopDesc::thread_offset()), thread);               // frame->thread = thread
++  
++  {
++    // look for the patch address
++
++    // set rsi and rdi to the start and end of the continuation pc table
++    __ movl(temp2, Address(method, nmethod::nmethod_end_offset_offset()));
++    __ addl(temp2, method);
++    __ addl(method, Address(method, nmethod::continuation_pc_table_offset_offset()));
++
++    __ movl(temp1, Address(return_address_reg, return_address_offset));
++
++    // linear loop (should be binary search?) over all patch addresses
++    Label loop;
++    __ bind(loop);
++    __ cmpl(method, temp2);
++    __ jcc(Assembler::aboveEqual, slow_case);
++
++    __ addl(method, 2 * HeapWordSize);
++    __ cmpl(temp1, Address(method, -2 * HeapWordSize));
++    __ jcc(Assembler::notEqual, loop);
++
++    // patch the return address for the next frame
++    __ movl(temp1, Address(method, -HeapWordSize));
++    __ movl(Address(return_address_reg, return_address_offset), temp1);
++  }
++
++  // prepare the new frame pt2: pc
++  __ movl(Address(frame, activationFrameOopDesc::pc_offset()), temp1);
++
++  method = noreg;
++}
++
++//#define CONTINUATION_SLOW_CASE
++
++
++void create_saveContinuation_contents(MacroAssembler *masm, int start, OopMapSet* oop_maps, int &stack_slots, int total_in_args, BasicType *in_sig_bt, 
++                                      VMRegPair *in_regs, BasicType ret_type) {
++  assert(total_in_args == 1, "unexpected number of arguments");
++  assert(ret_type == T_OBJECT, "unexpected return type");
++  assert(in_sig_bt[0] == T_OBJECT, "unexpected argument type");
++  assert(in_regs[0].first() == rcx->as_VMReg(), "unexpected argument register");
++  Register cont = rcx;
++
++  Label slow_case;
++  Label no_continuation_object;
++
++#ifdef CONTINUATION_SLOW_CASE
++  __ jmp(slow_case);
++#endif
++
++  Register thread = rdx, method = rsi, frame = rbx, temp1 = rax, temp2 = rdi;
++
++  __ get_thread(thread);
++  createAndPatchFrame(masm, thread, method, frame, temp1, temp2, rsp, 0, slow_case);
++
++  // set the newly created activationFrameOop as the current one and set its next pointer
++  __ movptr(temp1, Address(thread, JavaThread::current_continuation_frame_offset()));
++  __ movptr(Address(frame, activationFrameOopDesc::next_offset()), temp1);               // frame->next = thread.current_continuation_frame
++  __ movptr(Address(thread, JavaThread::current_continuation_frame_offset()), frame);    // thread.current_continuation_frame = frame
++
++  // initialize the Continuation object (if it isn't null)
++  __ testptr(cont, cont);
++  __ jcc(Assembler::zero, no_continuation_object);
++
++  __ movptr(Address(cont, javax_stack_Continuation::get_data_offset()), frame);   // continuation->data = frame
++  __ movptr(temp1, Address(thread, JavaThread::threadObj_offset()));
++  __ movptr(Address(cont, javax_stack_Continuation::get_thread_offset()), temp1); // continuation->thread = thread->threadObj
++  __ store_check(cont);                                                                 // store check (destroys cont)
++
++  __ bind(no_continuation_object);
++
++  __ movoop(rax, JNIHandles::make_local(javax_stack_Continuation::static_captured()));
++  __ ret(0);
++
++  //////////////////////
++  // everything else is handled by the C++ part of this method
++  __ bind(slow_case);
++}
++
++#ifndef VM_LITTLE_ENDIAN
++x86 and big endian? This should never happen...
++#endif
++
++void create_resumeContinuation_contents(MacroAssembler *masm, int start, OopMapSet* oop_maps, int &stack_slots, int total_in_args, BasicType *in_sig_bt, 
++                                        VMRegPair *in_regs, BasicType ret_type) {
++  assert(total_in_args == 2, "unexpected number of arguments");
++  assert(in_sig_bt[0] == T_OBJECT && in_regs[0].first() == rcx->as_VMReg(), "unexpected argument type or register");
++  assert(in_sig_bt[1] == T_OBJECT && in_regs[1].first() == rdx->as_VMReg(), "unexpected argument type or register");
++  assert(ret_type == T_VOID, "unexpected return type");
++
++  /////////////////////////////////////////////////////////////////////////////////////
++  /////////////////////////////////////////////////////////////////////////////////////
++  // resume implementation
++
++  // rcx = Continuation object to be restored
++  // rdx = return value passed to resume (Object)
++
++  Label slow_case;
++  Label not_connected;
++  Label resume_from_intermediate;
++  Label step5_resume;
++
++  __ get_thread(rdi);
++
++  __ movptr(rax, Address(rdi, JavaThread::resume_common_frame_offset()));
++  __ testptr(rax, rax);
++  __ jcc(Assembler::notZero, resume_from_intermediate);
++
++
++  // check if Continuation.CAPTURED was passed as value
++  __ cmpoop(rdx, JNIHandles::make_local(javax_stack_Continuation::static_captured()));
++  __ jcc(Assembler::equal, slow_case);
++
++  // check if the Continuation belongs to our thread
++  __ movptr(rbx, Address(rcx, javax_stack_Continuation::get_thread_offset()));
++  __ cmpptr(rbx, Address(rdi, JavaThread::threadObj_offset()));
++  __ jcc(Assembler::notEqual, slow_case);
++
++  // check if the Continuation object is filled at all
++  __ movptr(rax, Address(rcx, javax_stack_Continuation::get_data_offset()));
++  __ testptr(rax, rax);
++  __ jcc(Assembler::zero, slow_case);
++
++  __ movptr(rcx, rax);
++
++#ifdef ASSERT
++  __ cmpptr(Address(rdi, JavaThread::current_continuation_frame_offset()), NULL);
++  stop_if(masm, Assembler::equal, "NULL current activation object");
++#endif
++
++  ////////////////////////////
++  // Step 1:
++  // * traverse the continuation until an empty activation object is encountered
++  {
++    Label loop;
++    Label nonfilled_frame;
++
++    __ bind(loop);
++    // check if the current frame is filled
++    __ cmpb(Address(rax, activationFrameOopDesc::state_offset()), activationFrameOopDesc::_filled);
++    __ jcc(Assembler::notEqual, nonfilled_frame);
++    __ movptr(rax, Address(rax, activationFrameOopDesc::next_offset()));                      // rax = rax->next
++
++#ifdef ASSERT
++    __ testptr(rax, rax);
++    stop_if(masm, Assembler::zero, "NULL frame reached during resume step1");
++#endif
++    __ jmp(loop);
++
++    __ bind(nonfilled_frame);
++
++    // the non-filled frame we found needs to be on the stack
++    __ cmpptr(Address(rax, activationFrameOopDesc::stack_pos_offset()), 0);
++    __ jcc(Assembler::equal, not_connected);
++
++    // check if rax->fp > fp
++    __ movptr(rbx, Address(rbp, 0));
++    __ cmpptr(rbx, Address(rax, activationFrameOopDesc::stack_pos_offset()));
++    __ jcc(Assembler::equal, step5_resume);
++  }
++
++  __ movptr(Address(rdi, JavaThread::resume_continuation_frame_offset()), rcx);
++  __ movptr(Address(rdi, JavaThread::resume_common_frame_offset()), rax);
++  __ movptr(Address(rdi, JavaThread::resume_return_value_offset()), rdx);
++
++  __ movptr(rcx, 0);
++  __ movptr(rbx, ExternalAddress(javax_stack_Continuation::get_save_nmethod_adr()));
++  __ movptr(rbx, Address(rbx, nmethod::verified_entry_point_offset()));
++  __ jmp(rbx);
++
++  __ bind(resume_from_intermediate);
++//  __ warn("resume from intermediate");
++
++  __ movptr(rcx, Address(rdi, JavaThread::resume_continuation_frame_offset()));
++  __ movptr(rax, Address(rdi, JavaThread::resume_common_frame_offset()));
++  __ movptr(rdx, Address(rdi, JavaThread::resume_return_value_offset()));
++
++  __ movptr(Address(rdi, JavaThread::resume_continuation_frame_offset()), 0);
++  __ movptr(Address(rdi, JavaThread::resume_common_frame_offset()), 0);
++  __ movptr(Address(rdi, JavaThread::resume_return_value_offset()), 0);
++
++  ////////////////////////////
++  // Step 5: store the reverse pointers in stack_pos and reinstate the actual frames
++  __ bind(step5_resume);
++
++  // we need to restore sender_sp if the current frame is an interpreted frame
++    Label native_method;
++  __ movptr(rsi, Address(rsp, 0));
++  __ cmpptr(rsi, (int)Interpreter::code()->code_start());
++  __ jcc(Assembler::below, native_method);
++  __ cmpptr(rsi, (int)Interpreter::code()->code_end());
++  __ jcc(Assembler::aboveEqual, native_method);
++
++//  __ int3();
++  // we need to restore the sender_sp if the current frame is interpreted
++  __ movptr(rsp, Address(rbp, frame::interpreter_frame_sender_sp_offset * wordSize));
++  __ movptr(rsi, Address(rbp, frame::return_addr_offset * wordSize));
++  __ push(rsi);
++  __ movptr(rsi, Address(rbp, frame::link_offset * wordSize));
++  __ push(rsi);
++  __ movptr(rbp, rsp);
++
++  __ bind(native_method);
++
++#ifdef ASSERT
++  __ cmpptr(rax, Address(rdi, JavaThread::current_continuation_frame_offset()));
++  stop_if(masm, Assembler::notEqual, "the current continuation frame is wrong during resume step 5");
++#endif
++  {
++    // rax: the activationFrameOop for the activation frame below the current one
++    // rcx: the top frame of the continuation that should be resumed
++    Label reverse_loop;
++    Label reverse_finished;
++
++    __ movptr(rsi, NULL);
++    __ bind(reverse_loop);
++    __ movptr(Address(rcx, activationFrameOopDesc::stack_pos_offset()), rsi);
++    __ movptr(rsi, rcx);
++    __ movptr(rcx, Address(rcx, activationFrameOopDesc::next_offset()));
++    __ cmpptr(rcx, rax);
++    __ jcc(Assembler::equal, reverse_finished);
++    __ jmp(reverse_loop);
++    __ bind(reverse_finished);
++
++    Label reinstate_loop;
++    Label reinstate_finished;
++    Label reinstate_interpreted;
++
++    __ movptr(rax, rsi);
++
++    __ bind(reinstate_loop);
++
++    __ cmpl(rbp, 0x1000);
++    stop_if(masm, Assembler::below, "yikes!");
++
++    // now restore the frame in rax into the stackframe starting at rbp
++
++#ifdef ASSERT
++    __ cmpb(Address(rax, activationFrameOopDesc::state_offset()), activationFrameOopDesc::_filled);
++    stop_if(masm, Assembler::notEqual, "reached frame that isn't filled during resume step 5");
++#endif
++
++    __ cmpb(Address(rax, activationFrameOopDesc::state_offset() + in_ByteSize(1)), activationFrameOopDesc::_compiled_type >> 8);
++    __ jcc(Assembler::notEqual, reinstate_interpreted);
++
++    /////////
++    // compiled frame
++
++    // rsp is not a valid stack pointer at this point!
++/*    __ movptr(rsp, rbp);
++    __ warn("restoring compiled frame");
++*/
++    __ movptr(rsp, Address(rax, activationFrameOopDesc::method_offset()));
++
++    // copy the arguments into the last stack frame
++    __ movl(rcx, Address(rsp, CodeBlob::frame_size_offset()));
++
++    __ lea(rdi, Address(rbp, 2 * BytesPerWord));
++    __ lea(rsi, Address(rax, rcx, Address::times_4, activationFrameOopDesc::header_size() * HeapWordSize));
++
++    __ movl(rcx, Address(rsp, nmethod::stack_parameter_words_offset()));
++    __ rep_mov();
++
++    // update frame pointer
++    __ movl(rcx, Address(rsp, CodeBlob::frame_size_offset()));
++    __ addl(rcx, rcx);
++    __ addl(rcx, rcx);
++    __ subl(rbp, rcx);
++
++    // copy the contents into the current stack frame
++    __ lea(rdi, Address(rbp, 2 * BytesPerWord));
++    __ lea(rsi, Address(rax, activationFrameOopDesc::header_size() * HeapWordSize));
++
++    __ movl(rcx, Address(rsp, CodeBlob::frame_size_offset()));
++    __ subl(rcx, 2);
++    __ rep_mov();
++
++    // update frame pointer and return address
++    __ movl(Address(rbp, 0), rdi);
++    __ movl(rdi, Address(rax, activationFrameOopDesc::pc_offset()));
++    __ movl(Address(rbp, HeapWordSize), rdi);
++
++
++    __ movptr(rbx, rax);
++    __ movptr(rax, Address(rax, activationFrameOopDesc::stack_pos_offset()));
++    __ movptr(rcx, Address(rbp, 0));    
++    __ movptr(Address(rbx, activationFrameOopDesc::stack_pos_offset()), rcx);
++    __ testptr(rax,rax);
++    __ jcc(Assembler::notZero, reinstate_loop);
++    __ jmp(reinstate_finished);
++
++    __ bind(reinstate_interpreted);
++
++
++    /////////
++    // interpreted frame
++//    __ int3();
++    // rsp is not a valid stack pointer at this point!
++/*    __ movptr(rsp, rbp);
++    __ warn("restoring interpreted frame");
++*/
++    __ movptr(rsp, Address(rax, activationFrameOopDesc::method_offset()));
++
++    
++    __ movzwl(rcx, Address(rsp, methodOopDesc::size_of_locals_offset()));                 // get max_locals (this includes parameters)
++    __ negl(rcx);   
++    __ lea(rbp, Address(rbp, rcx, Address::times_4));                                     // adjust rbp to the expanded stack frame
++    __ negl(rcx);
++
++    __ lea(rbx, Address(rbp, rcx, Address::times_4, 2 * wordSize));                       // compute the old stack pointer
++    __ movptr(Address(rbp, frame::interpreter_frame_sender_sp_offset * wordSize), rbx);   // store the old stack pointer (sender_sp)
++    
++    __ movptr(rbx, Address(rbp, rcx, Address::times_4));
++    __ movptr(Address(rbp, frame::link_offset * wordSize), rbx);                          // copy the link address to the new location
++    __ movptr(rbx, Address(rbp, rcx, Address::times_4, HeapWordSize));
++    __ movptr(Address(rbp, frame::return_addr_offset * wordSize), rbx);                   // copy the return address to the new location
++    __ lea(rbx, Address(rbp, rcx, Address::times_4, 1 * HeapWordSize));
++    __ movptr(Address(rbp, frame::interpreter_frame_locals_offset * wordSize), rbx);      // store the pointer to the locals
++
++    // copy the locals (and reverse the order)
++    __ lea(rdi, Address(rbp, 2 * HeapWordSize));
++    __ lea(rsi, Address(rax, activationFrameOopDesc::header_size() * HeapWordSize));
++    Label copy_loop;
++    __ bind(copy_loop);
++    __ movl(rbx, Address(rsi, 0));
++    __ movl(Address(rdi, rcx, Address::times_4, -1 * 4), rbx);
++    __ addptr(rsi, 4);
++    __ decrementl(rcx, 1);
++    __ jcc(Assembler::notZero, copy_loop);
++
++    __ movptr(Address(rbp, frame::interpreter_frame_method_offset * wordSize), rsp);      // store the methodOop
++    __ movptr(rbx, Address(rsp, methodOopDesc::method_data_offset()));
++    __ movptr(Address(rbp, frame::interpreter_frame_mdx_offset * wordSize), rbx);         // store the methodDataOop
++    __ movptr(rbx, Address(rsp, methodOopDesc::constants_offset()));
++    __ movptr(rbx, Address(rbx, constantPoolOopDesc::cache_offset_in_bytes()));
++    __ movptr(Address(rbp, frame::interpreter_frame_cache_offset * wordSize), rbx);       // store the constant pool cache
++    __ lea(rbx, Address(rbp, frame::interpreter_frame_monitor_block_top_offset * wordSize));
++    __ movptr(Address(rbp, frame::interpreter_frame_monitor_block_top_offset * wordSize), rbx); // store the monitor block size
++    __ movptr(rbx, Address(rsp, methodOopDesc::const_offset()));                          // address of constMethodOop
++    __ addptr(rbx, in_bytes(constMethodOopDesc::codes_offset()));                         // + code_offset()
++    __ addptr(rbx, Address(rax, activationFrameOopDesc::bci_offset()));                   // + bci = bcp
++    __ movptr(Address(rbp, frame::interpreter_frame_bcx_offset * wordSize), rbx);         // store the bcp
++
++    // copy the expression stack
++    __ movzwl(rcx, Address(rsp, methodOopDesc::size_of_locals_offset()));
++    __ lea(rsi, Address(rax, rcx, Address::times_4, activationFrameOopDesc::header_size() * HeapWordSize));
++    __ subl(rcx, Address(rax, activationFrameOopDesc::data_count_offset()));
++    __ lea(rdi, Address(rbp, rcx, Address::times_4, frame::interpreter_frame_initial_sp_offset * wordSize));
++    __ movptr(Address(rbp, frame::interpreter_frame_last_sp_offset * wordSize), rdi);     // store the last_sp
++    __ movptr(Address(rdi, -2 * HeapWordSize), rbp);          // store the link
++    __ lea(rbp, Address(rdi, -2 * HeapWordSize));
++    __ negl(rcx);
++
++
++    Label copy_loop2;
++    __ bind(copy_loop2);
++    __ movl(rbx, Address(rsi, 0));
++    __ movl(Address(rdi, rcx, Address::times_4, -1 * 4), rbx);
++    __ addptr(rsi, 4);
++    __ decrementl(rcx, 1);
++    __ jcc(Assembler::notZero, copy_loop2);
++
++    __ movptr(rbx, Address(rax, activationFrameOopDesc::pc_offset()));
++    __ movptr(Address(rbp, HeapWordSize), rbx);
++
++    __ movptr(rbx, rax);
++    __ movptr(rax, Address(rax, activationFrameOopDesc::stack_pos_offset()));
++    __ movptr(rcx, Address(rbp, 0));    
++    __ movptr(Address(rbx, activationFrameOopDesc::stack_pos_offset()), rcx);
++
++#ifdef ASSERT
++    __ cmpptr(Address(rbp, HeapWordSize), 0x01000000);
++    stop_if(masm, Assembler::greater, "suspicious pc");
++#endif
++
++    __ testptr(rax,rax);
++    __ jcc(Assembler::notZero, reinstate_loop);
++
++    __ bind(reinstate_finished);
++
++    __ movl(rax, rdx);
++    __ movl(rsp, rbp);
++
++    // get_thread needs a valid sp!
++    __ get_thread(rdi);
++    __ movptr(Address(rdi, JavaThread::current_continuation_frame_offset()), rbx);
++
++    __ pop(rbp);
++    __ ret(0);
++  }
++
++  __ bind(not_connected);
++  __ stop("unconnected continuation");
++
++  __ bind(slow_case);
++}
++
++void create_storeFrameGeneric_contents(MacroAssembler *masm, int start, OopMapSet* oop_maps, int &stack_slots, int total_in_args, BasicType *in_sig_bt,
++                                      VMRegPair *in_regs, BasicType ret_type) {
++  bool save_result = false;
++  if (ret_type == T_VOID) {
++    assert(total_in_args == 0, "unexpected number of arguments");
++  } else if (ret_type == T_LONG || ret_type == T_DOUBLE) {
++    assert(total_in_args == 2, "unexpected number of arguments");
++  } else if (ret_type == T_FLOAT) {
++    assert(total_in_args == 1, "unexpected number of arguments");
++  } else {
++    assert(total_in_args == 1, "unexpected number of arguments");
++    save_result = true;
++  }
++
++  /////////////////////////////////////////////////////////////////////////////////////
++  /////////////////////////////////////////////////////////////////////////////////////
++  // This is the shortcut implementation of the "storeFrameGeneric" method which
++  // fills the current activationFrameOop with data from the stack.
++  // The simple assembler implementation can only deal with compiled activation frames.
++
++  // rax = retValue (possibly, depends on the return value of the last method)
++  // IMPORTANT: retValue is an argument, so it should be in rcx, but it's left in rax for performance reasons
++
++  Label slow_case;
++  Label create_new_frame;
++  Label already_filled;
++  Label patch_not_found;
++  Label patching_end;
++
++#ifdef CONTINUATION_SLOW_CASE
++  __ jmp(slow_case);
++#endif
++
++  // get thread and current continuation frame
++  Register thread = rbx, frame = rdx, temp1 = rcx;
++  __ get_thread(thread);
++  __ movptr(frame, Address(thread, JavaThread::current_continuation_frame_offset()));
++
++#ifdef ASSERT
++  // let the slow implementation handle a NULL current activation frame
++  __ testl(frame, frame);
++  __ jcc(Assembler::zero, slow_case);
++#endif
++  
++  ////////////////////////////
++  // fill the current activationFrameOop with data from the stack
++
++  // skip already filled frames
++  __ cmpb(Address(frame, activationFrameOopDesc::state_offset()), activationFrameOopDesc::_filled);
++  __ jcc(Assembler::equal, already_filled);
++
++  // the slow implementation will take care of non-nmethod frames
++  __ cmpb(Address(frame, activationFrameOopDesc::state_offset() + in_ByteSize(1)), activationFrameOopDesc::_compiled_type >> 8);
++  __ jcc(Assembler::notEqual, slow_case);
++
++#ifdef ASSERT
++  // check that we're filling the correct frame
++  __ cmpptr(rbp, Address(frame, activationFrameOopDesc::stack_pos_offset()));
++  stop_if(masm, Assembler::notEqual, "trying to fill the wrong activationFrameOop");
++#endif
++
++  // set the state to "filled"
++  __ movl(Address(frame, activationFrameOopDesc::state_offset()), activationFrameOopDesc::_compiled_filled);
++  __ movl(Address(frame, activationFrameOopDesc::stack_pos_offset()), 0);
++
++  // fill current continuation frame with data
++  // load rcx with stack frame size + param size
++  __ movptr(rsi, Address(frame, activationFrameOopDesc::method_offset()));
++  __ movl(temp1, Address(rsi, nmethod::stack_parameter_words_offset()));
++  __ addl(temp1, Address(rsi, nmethod::frame_size_offset()));
++  __ lea(rdi, Address(frame, activationFrameOopDesc::header_size() * HeapWordSize));
++  // we need the stack pointer without the return address (so we add one word)
++  __ lea(rsi, Address(rsp, 1 * HeapWordSize));
++  assert(temp1 == rcx, "counter register needed");
++  __ rep_mov();
++
++  // we might have changed some pointers in the activationFrameOop
++  __ movptr(temp1, frame);
++  __ store_check(temp1);
++
++  ////////////////////////////
++  // decide if a new activationFrameOop should be created
++
++  Register next_frame = rsi;
++  // check if current_continuation_frame.next == NULL
++  __ movptr(next_frame, Address(frame, activationFrameOopDesc::next_offset()));
++  __ testptr(next_frame, next_frame);
++  __ jcc(Assembler::zero, create_new_frame);
++
++  // check if current_continuation_frame.next.fp > fp
++  __ movptr(temp1, Address(rbp, 0));
++  __ cmpptr(temp1, Address(next_frame, activationFrameOopDesc::stack_pos_offset()));
++  __ jcc(Assembler::below, create_new_frame);
++
++  // fastest case: use existing continuation frame
++  __ movptr(Address(thread, JavaThread::current_continuation_frame_offset()), next_frame);
++  __ jmp(patching_end);
++  next_frame = noreg;
++
++  ////////////////////////////
++  // create a new nmethod activationFrameOop
++
++  __ bind(create_new_frame);
++
++  Register method = rsi, temp2 = rdi;
++  createAndPatchFrame(masm, thread, method, frame, temp1, temp2, rbp, HeapWordSize, slow_case);
++
++  // prepare the new frame pt3: current activation object
++  __ movl(temp1, Address(thread, JavaThread::current_continuation_frame_offset()));       // temp1 = thread.current_continuation_frame
++  __ movl(Address(thread, JavaThread::current_continuation_frame_offset()), frame);       // thread.current_continuation_frame = frame
++
++  // prepare the new frame pt4: next
++  __ movl(temp2, Address(temp1, activationFrameOopDesc::next_offset()));
++  __ movl(Address(frame, activationFrameOopDesc::next_offset()), temp2);        // frame->next = thread.current_continuation_frame->next
++  __ movl(Address(temp1, activationFrameOopDesc::next_offset()), frame);        // thread.current_continuation_frame->next = frame
++
++  // general operations for all codeblob types...
++  __ bind(patching_end);
++
++
++  test_continuation_resume(masm, thread, temp1);
++
++  ////////////////////////////
++  // out-of-order case: frame already filled
++
++  __ bind(already_filled);
++  __ movptr(Address(frame, activationFrameOopDesc::stack_pos_offset()), NULL);
++  __ movptr(temp1, Address(frame, activationFrameOopDesc::next_offset()));
++  __ movptr(Address(thread, JavaThread::current_continuation_frame_offset()), temp1);
++  __ jmp(patching_end);
++
++  ////////////////////////////
++  // switch to the complete (C++) implementation
++  __ bind(slow_case);
++
++  // move the retValue argument where the native method stub expects it
++  if (save_result) {
++    __ movl(rcx, rax);
++  }
++}
++
++void create_startDelimited_contents(MacroAssembler *masm, int start, OopMapSet* oop_maps, int &stack_slots, int total_in_args, BasicType *in_sig_bt,
++                                      VMRegPair *in_regs, BasicType ret_type) {
++  assert(total_in_args == 2, "unexpected number of arguments");
++  assert(ret_type == T_OBJECT, "unexpected return type");
++  assert(in_sig_bt[0] == T_OBJECT, "unexpected argument type");
++  assert(in_regs[0].first() == rcx->as_VMReg(), "unexpected argument register");
++  assert(in_sig_bt[1] == T_OBJECT, "unexpected argument type");
++  assert(in_regs[1].first() == rdx->as_VMReg(), "unexpected argument register");
++
++  Label slow_case;
++
++#ifdef CONTINUATION_SLOW_CASE
++  __ jmp(slow_case);
++#endif
++
++  Register temp1 = rsi;
++  __ enter();
++  // -2 because return address is already present and so is the saved rbp
++  __ subptr(rsp, (stack_slots - 2) * wordSize);
++
++  klassOop k = SystemDictionary::Continuation_klass();
++  methodOop method = instanceKlass::cast(k)->find_method(vmSymbols::startDelimitedInternal_name(), vmSymbols::startDelimited_signature());
++  assert(method != NULL, "missing method startDelimitedInternal");
++
++  __ movoop(rbx, JNIHandles::make_local(method));
++  __ movptr(temp1, Address(rbx, methodOopDesc::from_compiled_offset()));
++
++#ifdef ASSERT
++    __ cmpptr(temp1, 0x01000000);
++    stop_if(masm, Assembler::greater, "suspicious method entry");
++#endif
++
++  __ call(temp1);
++
++  OopMap* map = new OopMap(stack_slots, 0);
++  oop_maps->add_gc_map(__ offset(), map);
++
++  AddressLiteral polling_page(os::get_polling_page() + (SafepointPollOffset % os::vm_page_size()), relocInfo::poll_return_type);
++  __ test32(rax, polling_page);
++
++  Register thread = rdi;
++  Register frame = rdx;
++
++  __ get_thread(thread);
++  __ movptr(frame, Address(thread, JavaThread::current_continuation_frame_offset()));
++
++#ifdef ASSERT
++  __ cmpl(Address(frame, activationFrameOopDesc::state_offset()), activationFrameOopDesc::_dummy_invalid);
++  stop_if(masm, Assembler::notEqual, "invalid frame after continueDelimited");
++#endif
++
++
++  __ movptr(temp1, Address(frame, activationFrameOopDesc::next_offset()));
++  __ movptr(Address(frame, activationFrameOopDesc::next_offset()), NULL);
++  __ movptr(Address(thread, JavaThread::current_continuation_frame_offset()), temp1);
++  __ movptr(temp1, frame);
++  __ store_check(temp1);
++  
++  __ movl(Address(frame, activationFrameOopDesc::state_offset()), activationFrameOopDesc::_dummy_delimited);
++  __ movb(Address(frame, activationFrameOopDesc::in_use_offset()), 0);
++  __ movptr(Address(frame, activationFrameOopDesc::stack_pos_offset()), 0);
++
++  __ leave();
++  __ ret(0);
++
++  __ bind(slow_case);
++}
++
++void create_continueDelimited_contents(MacroAssembler *masm, int start, OopMapSet* oop_maps, int &stack_slots, int total_in_args, BasicType *in_sig_bt,
++                                      VMRegPair *in_regs, BasicType ret_type) {
++  assert(total_in_args == 2, "unexpected number of arguments");
++  assert(ret_type == T_OBJECT, "unexpected return type");
++  assert(in_sig_bt[0] == T_OBJECT, "unexpected argument type");
++  assert(in_regs[0].first() == rcx->as_VMReg(), "unexpected argument register");
++  assert(in_sig_bt[1] == T_OBJECT, "unexpected argument type");
++  assert(in_regs[1].first() == rdx->as_VMReg(), "unexpected argument register");
++
++  Register continuation = rcx;
++  Register thread = rdi;
++  Register temp1 = rsi;
++
++  Label slow_case;
++
++#ifdef CONTINUATION_SLOW_CASE
++  __ jmp(slow_case);
++#endif
++
++  __ get_thread(thread);
++
++  // check if the Continuation belongs to our thread
++  __ movptr(temp1, Address(continuation, javax_stack_Continuation::get_thread_offset()));
++  __ cmpptr(temp1, Address(thread, JavaThread::threadObj_offset()));
++  __ jcc(Assembler::notEqual, slow_case);
++
++  Register frame = rbx;
++  // check if the Continuation object is filled at all
++  __ movptr(frame, Address(continuation, javax_stack_Continuation::get_data_offset()));
++  __ testptr(frame, frame);
++  __ jcc(Assembler::zero, slow_case);
++
++  Label loop, loop_exit;
++  __ bind(loop);
++  __ cmpptr(Address(frame, activationFrameOopDesc::next_offset()), NULL);
++  __ jcc(Assembler::equal, loop_exit);
++  __ movptr(frame, Address(frame, activationFrameOopDesc::next_offset()));
++  __ jmp(loop);
++
++  __ bind(loop_exit);
++  __ cmpl(Address(frame, activationFrameOopDesc::state_offset()), activationFrameOopDesc::_dummy_delimited);
++  __ jcc(Assembler::notEqual, slow_case);
++
++  __ cmpb(Address(frame, activationFrameOopDesc::in_use_offset()), 0);
++  __ jcc(Assembler::notEqual, slow_case);
++
++  __ movptr(temp1, Address(thread, JavaThread::current_continuation_frame_offset()));
++  __ movptr(Address(frame, activationFrameOopDesc::next_offset()), temp1);
++  __ movptr(temp1, frame);
++  __ store_check(temp1);
++  __ movptr(Address(thread, JavaThread::current_continuation_frame_offset()), frame);
++
++//  __ int3();
++  // Generate a new frame for the wrapper.
++  __ enter();
++  // -2 because return address is already present and so is the saved rbp
++  __ subptr(rsp, (stack_slots - 2) * wordSize);
++
++  __ movb(Address(frame, activationFrameOopDesc::in_use_offset()), 1);
++  __ movptr(Address(frame, activationFrameOopDesc::stack_pos_offset()), rbp);
++
++  klassOop k = SystemDictionary::Continuation_klass();
++  methodOop method = instanceKlass::cast(k)->find_method(vmSymbols::continueDelimitedInternal_name(), vmSymbols::continueDelimited_signature());
++  assert(method != NULL, "missing method continueDelimitedInternal");
++
++//  __ int3();
++  __ movoop(rbx, JNIHandles::make_local(method));
++  __ movptr(temp1, Address(rbx, methodOopDesc::from_compiled_offset()));
++
++#ifdef ASSERT
++    __ cmpptr(temp1, 0x01000000);
++    stop_if(masm, Assembler::greater, "suspicious method entry");
++#endif
++
++  __ call(temp1);
++
++  OopMap* map = new OopMap(stack_slots, 0);
++  oop_maps->add_gc_map(__ offset(), map);
++
++  // Note: we do not need to round double result; float result has the right precision
++  // the poll sets the condition code, but no data registers
++  AddressLiteral polling_page(os::get_polling_page() + (SafepointPollOffset % os::vm_page_size()), relocInfo::poll_return_type);
++
++  // NOTE: the requires that the polling page be reachable else the reloc
++  // goes to the movq that loads the address and not the faulting instruction
++  // which breaks the signal handler code
++  __ test32(rax, polling_page);
++
++
++  __ get_thread(thread);
++  __ movptr(frame, Address(thread, JavaThread::current_continuation_frame_offset()));
++
++#ifdef ASSERT
++  __ cmpl(Address(frame, activationFrameOopDesc::state_offset()), activationFrameOopDesc::_dummy_delimited);
++  stop_if(masm, Assembler::notEqual, "invalid frame after continueDelimited");
++  __ cmpb(Address(frame, activationFrameOopDesc::in_use_offset()), 0);
++  stop_if(masm, Assembler::equal, "in_use cannot be false after continueDelimited");
++#endif
++
++  __ movptr(temp1, Address(frame, activationFrameOopDesc::next_offset()));
++  __ movptr(Address(frame, activationFrameOopDesc::next_offset()), NULL);
++  __ movptr(Address(thread, JavaThread::current_continuation_frame_offset()), temp1);
++  __ movptr(temp1, frame);
++  __ store_check(temp1);
++  
++  __ movb(Address(frame, activationFrameOopDesc::in_use_offset()), 0);
++  __ movptr(Address(frame, activationFrameOopDesc::stack_pos_offset()), 0);
++
++  __ leave();
++  __ ret(0);
++
++  __ bind(slow_case);
++}
++
+diff --git a/src/cpu/x86/vm/templateInterpreter_x86_32.cpp b/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
+--- a/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
++++ b/src/cpu/x86/vm/templateInterpreter_x86_32.cpp
+@@ -159,6 +159,34 @@
+   TosState incoming_state = state;
+ 
+   Label interpreter_entry;
++  BasicType type;
++  switch(incoming_state) {
++    case btos: type = T_BYTE; break;
++    case ctos: type = T_CHAR; break;
++    case stos: type = T_SHORT; break;
++    case itos: type = T_INT; break;
++    case ltos: type = T_LONG; break;
++    case ftos: type = T_FLOAT; break;
++    case dtos: type = T_DOUBLE; break;
++    case atos: type = T_OBJECT; break;
++    case vtos: type = T_VOID; break;
++    default:
++      ShouldNotReachHere();
++  }
++  __ jmp(interpreter_entry, relocInfo::none);
++
++  address continuation_entry = __ pc();
++  // this acts as a trampoline to the generic nmethod frame copying stub
++  __ movl(rcx, rax);
++  __ movptr(rbx, AddressLiteral(javax_stack_Continuation::get_store_frames_nmethod_adr(type), relocInfo::none));
++  __ movptr(rbx, Address(rbx, nmethod::verified_entry_point_offset()));
++  __ call(rbx);
++  __ jmp(interpreter_entry, relocInfo::none);
++
++  __ a_long((int)continuation_entry);
++  __ a_long(Interpreter::return_sentinel2);
++  __ a_long((int)0);
++
+   address compiled_entry = __ pc();
+ 
+ #ifdef COMPILER2
+@@ -178,8 +206,18 @@
+   }
+ 
+   __ jmp(interpreter_entry, relocInfo::none);
++
++  address continuation_entry2 = __ pc();
++  // this acts as a trampoline to the generic nmethod frame copying stub
++  __ movl(rcx, rax);
++  __ movptr(rbx, AddressLiteral(javax_stack_Continuation::get_store_frames_nmethod_adr(type), relocInfo::none));
++  __ movptr(rbx, Address(rbx, nmethod::verified_entry_point_offset()));
++  __ call(rbx);
++  __ jmp(interpreter_entry, relocInfo::none);
++
+   // emit a sentinel we can test for when converting an interpreter
+   // entry point to a compiled entry point.
++  __ a_long((int)continuation_entry2);
+   __ a_long(Interpreter::return_sentinel);
+   __ a_long((int)compiled_entry);
+   address entry = __ pc();
+diff --git a/src/share/vm/c1/c1_CodeStubs.hpp b/src/share/vm/c1/c1_CodeStubs.hpp
+--- a/src/share/vm/c1/c1_CodeStubs.hpp
++++ b/src/share/vm/c1/c1_CodeStubs.hpp
+@@ -582,3 +582,25 @@
+ 
+ #endif // SERIALGC
+ //////////////////////////////////////////////////////////////////////////////////////////
++
++
++class ContinuationStub: public CodeStub {
++private:
++  LIR_OpJavaCall* _op;
++  CodeEmitInfo* _info;
++  int _pc;
++
++public:
++  ContinuationStub(LIR_OpJavaCall* op);
++
++  virtual void emit_code(LIR_Assembler *e);
++  virtual CodeEmitInfo* info() const          { return _op->info(); }
++  virtual void visit(LIR_OpVisitState* visitor) {
++    // don't pass in the code emit info since it's processed in the fast path
++    visitor->do_slow_case(_info);
++  }
++  void set_pc(int pc) { _pc = pc; }
++#ifndef PRODUCT
++  virtual void print_name(outputStream* out) const { out->print("ContinuationStub"); }
++#endif // PRODUCT
++};
+diff --git a/src/share/vm/c1/c1_Compilation.cpp b/src/share/vm/c1/c1_Compilation.cpp
+--- a/src/share/vm/c1/c1_Compilation.cpp
++++ b/src/share/vm/c1/c1_Compilation.cpp
+@@ -307,9 +307,11 @@
+     in_bytes(_frame_map->sp_offset_for_orig_pc()),
+     code(),
+     in_bytes(frame_map()->framesize_in_bytes()) / sizeof(intptr_t),
++    frame_map()->incoming_arguments()->reserved_stack_slots(),
+     debug_info_recorder()->_oopmaps,
+     exception_handler_table(),
+     implicit_exception_table(),
++    continuation_pc_table(),
+     compiler(),
+     _env->comp_level(),
+     needs_debug_information(),
+diff --git a/src/share/vm/c1/c1_Compilation.hpp b/src/share/vm/c1/c1_Compilation.hpp
+--- a/src/share/vm/c1/c1_Compilation.hpp
++++ b/src/share/vm/c1/c1_Compilation.hpp
+@@ -78,6 +78,7 @@
+   ExceptionInfoList* _exception_info_list;
+   ExceptionHandlerTable _exception_handler_table;
+   ImplicitExceptionTable _implicit_exception_table;
++  ContinuationPcTable _continuation_pc_table;
+   LinearScan*        _allocator;
+   CodeOffsets        _offsets;
+   CodeBuffer         _code;
+@@ -114,6 +115,8 @@
+ 
+   static Compilation* current_compilation()      { return _compilation; }
+ 
++  ContinuationPcTable* continuation_pc_table()   { return &_continuation_pc_table; }
++
+   // accessors
+   ciEnv* env() const                             { return _env; }
+   AbstractCompiler* compiler() const             { return _compiler; }
+diff --git a/src/share/vm/c1/c1_GraphBuilder.cpp b/src/share/vm/c1/c1_GraphBuilder.cpp
+--- a/src/share/vm/c1/c1_GraphBuilder.cpp
++++ b/src/share/vm/c1/c1_GraphBuilder.cpp
+@@ -2987,7 +2987,10 @@
+   // Clear out any existing inline bailout condition
+   clear_inline_bailout();
+ 
+-  if (callee->should_exclude()) {
++  if (scope()->method()->create_continuation_stubs() !=  callee->create_continuation_stubs()) {
++    // we need clean boundaries between continuable and non-continuable methods
++    INLINE_BAILOUT("mismatch in @Continuable")
++  } else if (callee->should_exclude()) {
+     // callee is excluded
+     INLINE_BAILOUT("excluded by CompilerOracle")
+   } else if (!callee->can_be_compiled()) {
+@@ -3046,6 +3049,11 @@
+       cantrap = false;
+       break;
+ 
++    case vmIntrinsics::_saveContinuation :
++    case vmIntrinsics::_resumeContinuation :
++      INLINE_BAILOUT("Continuation.save and Continuation.resume cannot be inlined");
++      break;
++
+     case vmIntrinsics::_dabs          : // fall through
+     case vmIntrinsics::_dsqrt         : // fall through
+     case vmIntrinsics::_dsin          : // fall through
+diff --git a/src/share/vm/c1/c1_IR.hpp b/src/share/vm/c1/c1_IR.hpp
+--- a/src/share/vm/c1/c1_IR.hpp
++++ b/src/share/vm/c1/c1_IR.hpp
+@@ -270,7 +270,6 @@
+   int               _id;
+ 
+   FrameMap*     frame_map() const                { return scope()->compilation()->frame_map(); }
+-  Compilation*  compilation() const              { return scope()->compilation(); }
+ 
+  public:
+ 
+@@ -293,6 +292,7 @@
+   CodeEmitInfo(CodeEmitInfo* info, bool lock_stack_only = false);
+ 
+   // accessors
++  Compilation*  compilation() const              { return scope()->compilation(); }
+   OopMap* oop_map()                              { return _oop_map; }
+   ciMethod* method() const                       { return _scope->method(); }
+   IRScope* scope() const                         { return _scope; }
+diff --git a/src/share/vm/c1/c1_LIRAssembler.cpp b/src/share/vm/c1/c1_LIRAssembler.cpp
+--- a/src/share/vm/c1/c1_LIRAssembler.cpp
++++ b/src/share/vm/c1/c1_LIRAssembler.cpp
+@@ -448,6 +448,13 @@
+     restore_SP();
+   }
+ 
++  if (compilation()->method()->create_continuation_stubs()) {
++    ContinuationStub* stub = new ContinuationStub(op);
++    _masm->bind(*stub->continuation());
++    stub->set_pc(code_offset());
++    emit_code_stub(stub);
++  }
++
+ #if defined(X86) && defined(TIERED)
+   // C2 leave fpu stack dirty clean it
+   if (UseSSE < 2) {
+diff --git a/src/share/vm/c1/c1_LIRAssembler.hpp b/src/share/vm/c1/c1_LIRAssembler.hpp
+--- a/src/share/vm/c1/c1_LIRAssembler.hpp
++++ b/src/share/vm/c1/c1_LIRAssembler.hpp
+@@ -44,8 +44,6 @@
+   void check_no_unbound_labels();
+ #endif
+ 
+-  FrameMap* frame_map() const { return _frame_map; }
+-
+   void set_current_block(BlockBegin* b) { _current_block = b; }
+   BlockBegin* current_block() const { return _current_block; }
+ 
+@@ -109,6 +107,7 @@
+  public:
+   LIR_Assembler(Compilation* c);
+   ~LIR_Assembler();
++  FrameMap* frame_map() const                    { return _frame_map; }
+   C1_MacroAssembler* masm() const                { return _masm; }
+   Compilation* compilation() const               { return _compilation; }
+   ciMethod* method() const                       { return compilation()->method(); }
+diff --git a/src/share/vm/ci/ciEnv.cpp b/src/share/vm/ci/ciEnv.cpp
+--- a/src/share/vm/ci/ciEnv.cpp
++++ b/src/share/vm/ci/ciEnv.cpp
+@@ -866,9 +866,11 @@
+                             int orig_pc_offset,
+                             CodeBuffer* code_buffer,
+                             int frame_words,
++                            int stack_param_words,
+                             OopMapSet* oop_map_set,
+                             ExceptionHandlerTable* handler_table,
+                             ImplicitExceptionTable* inc_table,
++                            ContinuationPcTable* continuation_pc_table,
+                             AbstractCompiler* compiler,
+                             int comp_level,
+                             bool has_debug_info,
+@@ -942,8 +944,8 @@
+                                offsets,
+                                orig_pc_offset,
+                                debug_info(), dependencies(), code_buffer,
+-                               frame_words, oop_map_set,
+-                               handler_table, inc_table,
++                               frame_words, stack_param_words, oop_map_set,
++                               handler_table, inc_table, continuation_pc_table,
+                                compiler, comp_level);
+ 
+     // Free codeBlobs
+diff --git a/src/share/vm/ci/ciEnv.hpp b/src/share/vm/ci/ciEnv.hpp
+--- a/src/share/vm/ci/ciEnv.hpp
++++ b/src/share/vm/ci/ciEnv.hpp
+@@ -282,9 +282,11 @@
+                        int                       orig_pc_offset,
+                        CodeBuffer*               code_buffer,
+                        int                       frame_words,
++                       int                       stack_param_words,
+                        OopMapSet*                oop_map_set,
+                        ExceptionHandlerTable*    handler_table,
+                        ImplicitExceptionTable*   inc_table,
++                       ContinuationPcTable*      continuation_pc_table,
+                        AbstractCompiler*         compiler,
+                        int                       comp_level,
+                        bool                      has_debug_info = true,
+diff --git a/src/share/vm/ci/ciMethod.cpp b/src/share/vm/ci/ciMethod.cpp
+--- a/src/share/vm/ci/ciMethod.cpp
++++ b/src/share/vm/ci/ciMethod.cpp
+@@ -56,6 +56,8 @@
+   _liveness           = NULL;
+   _bcea = NULL;
+   _method_blocks = NULL;
++
++  _create_continuation_stubs = h_m()->constMethod()->is_continuable();
+ #ifdef COMPILER2
+   _flow               = NULL;
+ #endif // COMPILER2
+diff --git a/src/share/vm/ci/ciMethod.hpp b/src/share/vm/ci/ciMethod.hpp
+--- a/src/share/vm/ci/ciMethod.hpp
++++ b/src/share/vm/ci/ciMethod.hpp
+@@ -65,6 +65,8 @@
+   bool _is_compilable;
+   bool _can_be_statically_bound;
+ 
++  bool _create_continuation_stubs;
++
+   // Lazy fields, filled in on demand
+   address              _code;
+   ciExceptionHandler** _exception_handlers;
+@@ -245,6 +247,7 @@
+   bool is_accessor    () const;
+   bool is_initializer () const;
+   bool can_be_statically_bound() const           { return _can_be_statically_bound; }
++  bool create_continuation_stubs() const         { return _create_continuation_stubs; }
+ 
+   // Print the bytecodes of this method.
+   void print_codes_on(outputStream* st);
+diff --git a/src/share/vm/classfile/classFileParser.cpp b/src/share/vm/classfile/classFileParser.cpp
+--- a/src/share/vm/classfile/classFileParser.cpp
++++ b/src/share/vm/classfile/classFileParser.cpp
+@@ -1707,6 +1707,7 @@
+   m->set_max_stack(max_stack);
+   m->set_max_locals(max_locals);
+   m->constMethod()->set_stackmap_data(stackmap_data());
++  m->constMethod()->set_continuable(constMethodOopDesc::_not_continuable);
+ 
+   /**
+    * The exception_table field is the flag used to indicate
+@@ -1842,6 +1843,42 @@
+                "Method handle invokers must be defined internally to the VM", nullHandle);
+   }
+ 
++  // parse the annotations to get the "Continuable" attribute
++  if ((*method_annotations)() != NULL) {
++    AnnotationParser parser(*method_annotations, cp);
++
++/*    if (!parser.verify(THREAD)) {
++     
++      ShouldNotReachHere();
++    } */
++
++    symbolOop klass_name = vmSymbols::javax_stack_Continuable_signature();
++    Annotation ann = parser.first_annotation();
++    for (int i=0; i<parser.annotation_count(); i++) {
++      if (ann.get_type_name() == klass_name) {
++        if (ann.value_count() == 0) {
++          // the ContinuableAccess defaults to HIDDEN
++          m->constMethod()->set_continuable(constMethodOopDesc::_continuable_hidden);
++        } else if (ann.value_count() > 1) {
++          ShouldNotReachHere();
++        } else {
++          ElementValuePair value = ann.first_value();
++          if (value.value().enum_const_name()->equals("HIDDEN", 6))
++            m->constMethod()->set_continuable(constMethodOopDesc::_continuable_hidden);
++          else if (value.value().enum_const_name()->equals("READONLY", 8))
++            m->constMethod()->set_continuable(constMethodOopDesc::_continuable_readonly);
++          else if (value.value().enum_const_name()->equals("READWRITE", 9))
++            m->constMethod()->set_continuable(constMethodOopDesc::_continuable_readwrite);
++          else {
++            ShouldNotReachHere();
++          }
++        }
++        break;
++      }
++      ann = parser.next_annotation(ann, THREAD);
++    }
++  }
++
+   return m;
+ }
+ 
+diff --git a/src/share/vm/classfile/javaClasses.cpp b/src/share/vm/classfile/javaClasses.cpp
+--- a/src/share/vm/classfile/javaClasses.cpp
++++ b/src/share/vm/classfile/javaClasses.cpp
+@@ -2713,6 +2713,56 @@
+   }
+ }
+ 
++/* stack manipulation */
++
++int javax_stack_Continuation::data_offset = 0;
++int javax_stack_Continuation::thread_offset = 0;
++int javax_stack_Continuation::static_captured_offset = 0;
++nmethod* javax_stack_Continuation::store_frames_nmethods[T_ILLEGAL+1];
++nmethod* javax_stack_Continuation::resume_nmethod;
++nmethod* javax_stack_Continuation::save_nmethod;
++nmethod* javax_stack_Continuation::unwind_nmethod;
++
++void javax_stack_Continuation::compute_offsets() {
++  klassOop k = SystemDictionary::Continuation_klass();
++  if (k != NULL) {
++      compute_offset(data_offset,             k, vmSymbols::data_name(),             vmSymbols::object_signature());
++      compute_offset(thread_offset,           k, vmSymbols::thread_name(),           vmSymbols::thread_signature());
++      compute_offset(static_captured_offset,  k, vmSymbols::captured_name(),         vmSymbols::object_signature());
++  }
++  memset(store_frames_nmethods, NULL, sizeof(store_frames_nmethods));
++  resume_nmethod = NULL;
++  save_nmethod = NULL;
++}
++
++activationFrameOop javax_stack_Continuation::data(oop obj) {
++  return (activationFrameOop)obj->obj_field(data_offset);
++}
++
++void javax_stack_Continuation::set_data(oop obj, activationFrameOop value) {
++  obj->obj_field_put(data_offset, (oop)value);
++}
++
++oop javax_stack_Continuation::thread(oop obj) {
++  return obj->obj_field(thread_offset);
++}
++
++void javax_stack_Continuation::set_thread(oop obj, oop value) {
++  obj->obj_field_put(thread_offset, (oop)value);
++}
++
++oop javax_stack_Continuation::static_captured() {
++  instanceKlass* ik = instanceKlass::cast(SystemDictionary::Continuation_klass());
++  char *addr = (((char *)ik->start_of_static_fields()) + static_captured_offset - ik->offset_of_static_fields());
++  if (UseCompressedOops) {
++    return oopDesc::load_decode_heap_oop((narrowOop *)addr);
++  } else {
++    return oopDesc::load_decode_heap_oop((oop*)addr);
++  }
++}
++
++
++
+ void java_util_concurrent_locks_AbstractOwnableSynchronizer::initialize(TRAPS) {
+   if (_owner_offset != 0) return;
+ 
+@@ -2836,6 +2886,8 @@
+ 
+   // generated interpreter code wants to know about the offsets we just computed:
+   AbstractAssembler::update_delayed_values();
++
++  javax_stack_Continuation::compute_offsets();
+ }
+ 
+ #ifndef PRODUCT
+diff --git a/src/share/vm/classfile/javaClasses.hpp b/src/share/vm/classfile/javaClasses.hpp
+--- a/src/share/vm/classfile/javaClasses.hpp
++++ b/src/share/vm/classfile/javaClasses.hpp
+@@ -1255,6 +1255,54 @@
+   static oop  get_owner_threadObj(oop obj);
+ };
+ 
++class javax_stack_Continuation: AllStatic {
++private:
++  // Note that to reduce dependencies on the JDK we compute these
++  // offsets at run-time.
++  static int data_offset;
++  static int thread_offset;
++  static int static_captured_offset;
++  static nmethod* store_frames_nmethods[T_ILLEGAL+1];
++  static nmethod* resume_nmethod;
++  static nmethod* save_nmethod;
++  static nmethod* unwind_nmethod;
++
++  static void compute_offsets();
++
++public:
++  // Accessors
++  static activationFrameOop data(oop obj);
++  static void set_data(oop obj, activationFrameOop value);
++
++  static oop thread(oop obj);
++  static void set_thread(oop obj, oop value);
++
++  static oop static_captured();
++
++  static int get_data_offset()    { return data_offset; }
++  static int get_thread_offset()  { return thread_offset; }
++
++  static void set_store_frames_nmethod(BasicType type, nmethod* m)  { store_frames_nmethods[type] = m; }
++  static nmethod* get_store_frames_nmethod(BasicType type)          { return store_frames_nmethods[type]; }
++  static address get_store_frames_nmethod_adr(BasicType type)       { return (address)(store_frames_nmethods + type); }
++  
++  static void set_resume_nmethod(nmethod* m)     { resume_nmethod = m; }
++  static nmethod* get_resume_nmethod()           { return resume_nmethod; }
++  static address get_resume_nmethod_adr()        { return (address)(&resume_nmethod); }
++  
++  static void set_save_nmethod(nmethod* m)     { save_nmethod = m; }
++  static nmethod* get_save_nmethod()           { return save_nmethod; }
++  static address get_save_nmethod_adr()        { return (address)(&save_nmethod); }
++
++  static void set_unwind_nmethod(nmethod* m)     { unwind_nmethod = m; }
++  static nmethod* get_unwind_nmethod()           { return unwind_nmethod; }
++  static address get_unwind_nmethod_adr()        { return (address)(&unwind_nmethod); }
++
++  // Debugging
++  friend class JavaClasses;
++};
++
++
+ // Interface to hard-coded offset checking
+ 
+ class JavaClasses : AllStatic {
+diff --git a/src/share/vm/classfile/systemDictionary.hpp b/src/share/vm/classfile/systemDictionary.hpp
+--- a/src/share/vm/classfile/systemDictionary.hpp
++++ b/src/share/vm/classfile/systemDictionary.hpp
+@@ -170,6 +170,9 @@
+   template(Short_klass,                  java_lang_Short,                Pre) \
+   template(Integer_klass,                java_lang_Integer,              Pre) \
+   template(Long_klass,                   java_lang_Long,                 Pre) \
++                                                                              \
++  /* Stack manipulation classes */                                            \
++  template(Continuation_klass,           javax_stack_Continuation,       Opt) \
+   /*end*/
+ 
+ 
+diff --git a/src/share/vm/classfile/vmSymbols.hpp b/src/share/vm/classfile/vmSymbols.hpp
+--- a/src/share/vm/classfile/vmSymbols.hpp
++++ b/src/share/vm/classfile/vmSymbols.hpp
+@@ -355,6 +355,10 @@
+   template(void_long_signature,                       "()J")                                      \
+   template(void_float_signature,                      "()F")                                      \
+   template(void_double_signature,                     "()D")                                      \
++  template(bool_bool_signature,                       "(Z)Z")                                     \
++  template(byte_byte_signature,                       "(B)B")                                     \
++  template(char_char_signature,                       "(C)C")                                     \
++  template(short_short_signature,                     "(S)S")                                     \
+   template(int_void_signature,                        "(I)V")                                     \
+   template(int_int_signature,                         "(I)I")                                     \
+   template(int_bool_signature,                        "(I)Z")                                     \
+@@ -364,6 +368,7 @@
+   template(int_float_signature,                       "(I)F")                                     \
+   template(long_int_signature,                        "(J)I")                                     \
+   template(long_long_signature,                       "(J)J")                                     \
++  template(float_float_signature,                     "(F)F")                                     \
+   template(long_double_signature,                     "(J)D")                                     \
+   template(byte_signature,                            "B")                                        \
+   template(char_signature,                            "C")                                        \
+@@ -375,10 +380,14 @@
+   template(bool_signature,                            "Z")                                        \
+   template(void_signature,                            "V")                                        \
+   template(byte_array_signature,                      "[B")                                       \
++  template(int_array_signature,                       "[I")                                       \
++  template(bool_array_signature,                      "[Z")                                       \
+   template(char_array_signature,                      "[C")                                       \
++  template(object_array_signature,                    "[Ljava/lang/Object;")                      \
+   template(object_void_signature,                     "(Ljava/lang/Object;)V")                    \
+   template(object_int_signature,                      "(Ljava/lang/Object;)I")                    \
+   template(object_boolean_signature,                  "(Ljava/lang/Object;)Z")                    \
++  template(object_object_signature,                   "(Ljava/lang/Object;)Ljava/lang/Object;")   \
+   template(string_void_signature,                     "(Ljava/lang/String;)V")                    \
+   template(string_int_signature,                      "(Ljava/lang/String;)I")                    \
+   template(throwable_void_signature,                  "(Ljava/lang/Throwable;)V")                 \
+@@ -489,6 +498,13 @@
+   template(serializePropertiesToByteArray_signature,   "()[B")                                                    \
+   template(serializeAgentPropertiesToByteArray_name,   "serializeAgentPropertiesToByteArray")                     \
+   template(classRedefinedCount_name,                   "classRedefinedCount")                                     \
++                                                                                                                  \
++  /* stack manipulation */                                                                                        \
++  template(javax_stack_Continuation,                   "javax/stack/Continuation")                                \
++  template(javax_stack_Continuable_signature,          "Ljavax/stack/Continuable;")                               \
++  template(data_name,                                  "data")                                                    \
++  template(thread_name,                                "thread")                                                  \
++  template(captured_name,                              "CAPTURED")                                                \
+   /*end*/
+ 
+ 
+@@ -597,9 +613,8 @@
+   do_intrinsic(_arraycopy,                java_lang_System,       arraycopy_name, arraycopy_signature,           F_S)   \
+    do_name(     arraycopy_name,                                  "arraycopy")                                           \
+    do_signature(arraycopy_signature,                             "(Ljava/lang/Object;ILjava/lang/Object;II)V")          \
+-  do_intrinsic(_isInterrupted,            java_lang_Thread,       isInterrupted_name, isInterrupted_signature,   F_R)   \
++  do_intrinsic(_isInterrupted,            java_lang_Thread,       isInterrupted_name, bool_bool_signature,   F_R)       \
+    do_name(     isInterrupted_name,                              "isInterrupted")                                       \
+-   do_signature(isInterrupted_signature,                         "(Z)Z")                                                \
+   do_intrinsic(_currentThread,            java_lang_Thread,       currentThread_name, currentThread_signature,   F_S)   \
+    do_name(     currentThread_name,                              "currentThread")                                       \
+    do_signature(currentThread_signature,                         "()Ljava/lang/Thread;")                                \
+@@ -825,6 +840,51 @@
+    do_name(     prefetchReadStatic_name,                         "prefetchReadStatic")                                  \
+   do_intrinsic(_prefetchWriteStatic,      sun_misc_Unsafe,        prefetchWriteStatic_name, prefetch_signature,  F_SN)  \
+    do_name(     prefetchWriteStatic_name,                        "prefetchWriteStatic")                                 \
++                                                                                                                        \
++   /* stack manipulation intrinsic (excluded from compilation) */														\
++  do_intrinsic(_doCopyStackContext,       sun_misc_Unsafe,        doCopyStackContext_name, doCSC_signature,  F_R)       \
++    do_name(    doCopyStackContext_name,    "doCopyStackContext")                                                       \
++    do_signature( doCSC_signature,           "(Ljava/lang/Runnable;Ljava/lang/Object;)V")                               \
++                                                                                                                        \
++   /* Continuation save and resume */                                                                                   \
++  do_intrinsic(_saveContinuation,         javax_stack_Continuation, saveContinuation_name, void_object_signature, F_RN) \
++    do_name(    saveContinuation_name,                           "save")                                                \
++  do_intrinsic(_resumeContinuation,       javax_stack_Continuation, resumeContinuation_name, object_void_signature, F_RN) \
++    do_name(    resumeContinuation_name,                         "resume")                                              \
++  do_intrinsic(_dumpContinuation,         javax_stack_Continuation, dumpContinuation_name, void_object_signature, F_RN) \
++    do_name(    dumpContinuation_name,                           "dump")                                                \
++  do_intrinsic(_storeFrameObject,         javax_stack_Continuation, storeFrameObject_name, object_object_signature, F_SN) \
++    do_name(    storeFrameObject_name,                           "storeFrameObject")                                    \
++  do_intrinsic(_storeFrameVoid,           javax_stack_Continuation, storeFrameVoid_name, void_method_signature, F_SN)   \
++    do_name(    storeFrameVoid_name,                             "storeFrameVoid")                                      \
++  do_intrinsic(_storeFrameBoolean,        javax_stack_Continuation, storeFrameBoolean_name, bool_bool_signature, F_SN)  \
++    do_name(    storeFrameBoolean_name,                          "storeFrameBoolean")                                   \
++  do_intrinsic(_storeFrameByte,           javax_stack_Continuation, storeFrameByte_name, byte_byte_signature, F_SN)     \
++    do_name(    storeFrameByte_name,                             "storeFrameByte")                                      \
++  do_intrinsic(_storeFrameChar,           javax_stack_Continuation, storeFrameChar_name, char_char_signature, F_SN)     \
++    do_name(    storeFrameChar_name,                             "storeFrameChar")                                      \
++  do_intrinsic(_storeFrameShort,          javax_stack_Continuation, storeFrameShort_name, short_short_signature, F_SN)  \
++    do_name(    storeFrameShort_name,                            "storeFrameShort")                                     \
++  do_intrinsic(_storeFrameInt,            javax_stack_Continuation, storeFrameInt_name, int_int_signature, F_SN)        \
++    do_name(    storeFrameInt_name,                              "storeFrameInt")                                       \
++  do_intrinsic(_storeFrameLong,           javax_stack_Continuation, storeFrameLong_name, long_long_signature, F_SN)     \
++    do_name(    storeFrameLong_name,                             "storeFrameLong")                                      \
++  do_intrinsic(_storeFrameFloat,          javax_stack_Continuation, storeFrameFloat_name, float_float_signature, F_SN)  \
++    do_name(    storeFrameFloat_name,                            "storeFrameFloat")                                     \
++  do_intrinsic(_storeFrameDouble,         javax_stack_Continuation, storeFrameDouble_name, double_double_signature, F_SN) \
++    do_name(    storeFrameDouble_name,                           "storeFrameDouble")                                    \
++  do_intrinsic(_continuation_unwind,      javax_stack_Continuation, continuation_unwind_name, throwable_throwable_signature, F_SN) \
++    do_name(    continuation_unwind_name,                        "unwind")                                              \
++  do_intrinsic(_startDelimited,           javax_stack_Continuation, startDelimited_name, startDelimited_signature, F_SN) \
++    do_name(    startDelimited_name,                             "startDelimited")                                      \
++    do_signature( startDelimited_signature,                      "(Ljavax/stack/DelimitedRunnable;Ljava/lang/Object;)Ljava/lang/Object;")	\
++  do_intrinsic(_continueDelimited,        javax_stack_Continuation, continueDelimited_name, continueDelimited_signature, F_SN) \
++    do_name(    continueDelimited_name,                          "continueDelimited")                                   \
++    do_signature( continueDelimited_signature,                   "(Ljavax/stack/Continuation;Ljava/lang/Object;)Ljava/lang/Object;") \
++  do_intrinsic(_startDelimitedInternal,           javax_stack_Continuation, startDelimitedInternal_name, startDelimited_signature, F_S) \
++    do_name(    startDelimitedInternal_name,                     "startDelimitedInternal")                              \
++  do_intrinsic(_continueDelimitedInternal,        javax_stack_Continuation, continueDelimitedInternal_name, continueDelimited_signature, F_S) \
++    do_name(    continueDelimitedInternal_name,                  "continueDelimitedInternal")                           \
+     /*== LAST_COMPILER_INLINE*/                                                                                         \
+     /*the compiler does have special inlining code for these; bytecode inline is just fine */                           \
+                                                                                                                         \
+diff --git a/src/share/vm/code/codeBlob.cpp b/src/share/vm/code/codeBlob.cpp
+--- a/src/share/vm/code/codeBlob.cpp
++++ b/src/share/vm/code/codeBlob.cpp
+@@ -46,7 +46,7 @@
+ 
+ 
+ // Creates a simple CodeBlob. Sets up the size of the different regions.
+-CodeBlob::CodeBlob(const char* name, int header_size, int size, int frame_complete, int locs_size) {
++CodeBlob::CodeBlob(const char* name, int header_size, int size, int frame_complete, int locs_size, CodeBlobType type) {
+   assert(size == round_to(size, oopSize), "unaligned size");
+   assert(locs_size == round_to(locs_size, oopSize), "unaligned size");
+   assert(header_size == round_to(header_size, oopSize), "unaligned size");
+@@ -60,6 +60,7 @@
+   //       off the use of this table (gri 7/6/2000).
+ 
+   _name                  = name;
++  _type                  = type;
+   _size                  = size;
+   _frame_complete_offset = frame_complete;
+   _header_size           = header_size;
+@@ -82,12 +83,14 @@
+   int         size,
+   int         frame_complete,
+   int         frame_size,
+-  OopMapSet*  oop_maps
++  OopMapSet*  oop_maps,
++  CodeBlobType type
+ ) {
+   assert(size == round_to(size, oopSize), "unaligned size");
+   assert(header_size == round_to(header_size, oopSize), "unaligned size");
+ 
+   _name                  = name;
++  _type                  = type;
+   _size                  = size;
+   _frame_complete_offset = frame_complete;
+   _header_size           = header_size;
+@@ -236,7 +239,7 @@
+ 
+ 
+ BufferBlob::BufferBlob(const char* name, int size)
+-: CodeBlob(name, sizeof(BufferBlob), size, CodeOffsets::frame_never_safe, /*locs_size:*/ 0)
++: CodeBlob(name, sizeof(BufferBlob), size, CodeOffsets::frame_never_safe, /*locs_size:*/ 0, _buffer)
+ {}
+ 
+ BufferBlob* BufferBlob::create(const char* name, int buffer_size) {
+@@ -261,7 +264,7 @@
+ 
+ 
+ BufferBlob::BufferBlob(const char* name, int size, CodeBuffer* cb)
+-  : CodeBlob(name, cb, sizeof(BufferBlob), size, CodeOffsets::frame_never_safe, 0, NULL)
++  : CodeBlob(name, cb, sizeof(BufferBlob), size, CodeOffsets::frame_never_safe, 0, NULL, _buffer)
+ {}
+ 
+ BufferBlob* BufferBlob::create(const char* name, CodeBuffer* cb) {
+@@ -314,7 +317,7 @@
+   OopMapSet*  oop_maps,
+   bool        caller_must_gc_arguments
+ )
+-: CodeBlob(name, cb, sizeof(RuntimeStub), size, frame_complete, frame_size, oop_maps)
++: CodeBlob(name, cb, sizeof(RuntimeStub), size, frame_complete, frame_size, oop_maps, _runtime_stub)
+ {
+   _caller_must_gc_arguments = caller_must_gc_arguments;
+ }
+@@ -377,7 +380,7 @@
+   int         unpack_with_reexecution_offset,
+   int         frame_size
+ )
+-: SingletonBlob("DeoptimizationBlob", cb, sizeof(DeoptimizationBlob), size, frame_size, oop_maps)
++: SingletonBlob("DeoptimizationBlob", cb, sizeof(DeoptimizationBlob), size, frame_size, oop_maps, _deoptimization_stub)
+ {
+   _unpack_offset           = unpack_offset;
+   _unpack_with_exception   = unpack_with_exception_offset;
+@@ -451,7 +454,7 @@
+   OopMapSet*  oop_maps,
+   int         frame_size
+ )
+-: SingletonBlob("UncommonTrapBlob", cb, sizeof(UncommonTrapBlob), size, frame_size, oop_maps)
++: SingletonBlob("UncommonTrapBlob", cb, sizeof(UncommonTrapBlob), size, frame_size, oop_maps, _uncommon_trap_stub)
+ {}
+ 
+ 
+@@ -511,7 +514,7 @@
+   OopMapSet*  oop_maps,
+   int         frame_size
+ )
+-: SingletonBlob("ExceptionBlob", cb, sizeof(ExceptionBlob), size, frame_size, oop_maps)
++: SingletonBlob("ExceptionBlob", cb, sizeof(ExceptionBlob), size, frame_size, oop_maps, _exception_stub)
+ {}
+ 
+ 
+@@ -570,7 +573,7 @@
+   OopMapSet*  oop_maps,
+   int         frame_size
+ )
+-: SingletonBlob("SafepointBlob", cb, sizeof(SafepointBlob), size, frame_size, oop_maps)
++: SingletonBlob("SafepointBlob", cb, sizeof(SafepointBlob), size, frame_size, oop_maps, _safepoint_stub)
+ {}
+ 
+ 
+diff --git a/src/share/vm/code/codeBlob.hpp b/src/share/vm/code/codeBlob.hpp
+--- a/src/share/vm/code/codeBlob.hpp
++++ b/src/share/vm/code/codeBlob.hpp
+@@ -43,8 +43,21 @@
+ 
+   friend class VMStructs;
+ 
++public:
++
++    enum CodeBlobType {
++      _buffer,
++      _nmethod,
++      _runtime_stub,
++      _deoptimization_stub,
++      _uncommon_trap_stub,
++      _exception_stub,
++      _safepoint_stub
++  };
++
+  private:
+   const char* _name;
++  CodeBlobType _type;                            // which kind of CodeBlob is this
+   int        _size;                              // total size of CodeBlob in bytes
+   int        _header_size;                       // size of header (depends on subclass)
+   int        _relocation_size;                   // size of relocation
+@@ -73,7 +86,7 @@
+   // a) simple CodeBlob
+   // frame_complete is the offset from the beginning of the instructions
+   // to where the frame setup (from stackwalk viewpoint) is complete.
+-  CodeBlob(const char* name, int header_size, int size, int frame_complete, int locs_size);
++  CodeBlob(const char* name, int header_size, int size, int frame_complete, int locs_size, CodeBlobType type);
+ 
+   // b) full CodeBlob
+   CodeBlob(
+@@ -83,22 +96,23 @@
+     int         size,
+     int         frame_complete,
+     int         frame_size,
+-    OopMapSet*  oop_maps
++    OopMapSet*  oop_maps,
++    CodeBlobType type
+   );
+ 
+   // Deletion
+   void flush();
+ 
+   // Typing
+-  virtual bool is_buffer_blob() const            { return false; }
+-  virtual bool is_nmethod() const                { return false; }
+-  virtual bool is_runtime_stub() const           { return false; }
+-  virtual bool is_deoptimization_stub() const    { return false; }
+-  virtual bool is_uncommon_trap_stub() const     { return false; }
+-  virtual bool is_exception_stub() const         { return false; }
+-  virtual bool is_safepoint_stub() const         { return false; }
++  bool is_buffer_blob() const            { return _type == _buffer; }
++  bool is_nmethod() const                { return _type == _nmethod; }
++  bool is_runtime_stub() const           { return _type == _runtime_stub; }
++  bool is_deoptimization_stub() const    { return _type == _deoptimization_stub; }
++  bool is_uncommon_trap_stub() const     { return _type == _uncommon_trap_stub; }
++  bool is_exception_stub() const         { return _type == _exception_stub; }
++  bool is_safepoint_stub() const         { return _type == _safepoint_stub; }
++
+   virtual bool is_adapter_blob() const           { return false; }
+-
+   virtual bool is_compiled_by_c2() const         { return false; }
+   virtual bool is_compiled_by_c1() const         { return false; }
+ 
+@@ -194,6 +208,9 @@
+   // Returns true, if the next frame is responsible for GC'ing oops passed as arguments
+   virtual bool caller_must_gc_arguments(JavaThread* thread) const { return false; }
+ 
++  static ByteSize frame_size_offset()            { return byte_offset_of(CodeBlob, _frame_size); }
++  static ByteSize type_offset()                  { return byte_offset_of(CodeBlob, _type); }
++
+   // Naming
+   const char* name() const                       { return _name; }
+   void set_name(const char* name)                { _name = name; }
+@@ -286,9 +303,6 @@
+     bool        caller_must_gc_arguments
+   );
+ 
+-  // Typing
+-  bool is_runtime_stub() const                   { return true; }
+-
+   // GC support
+   bool caller_must_gc_arguments(JavaThread* thread) const { return _caller_must_gc_arguments; }
+ 
+@@ -320,9 +334,10 @@
+      int         header_size,
+      int         size,
+      int         frame_size,
+-     OopMapSet*  oop_maps
++     OopMapSet*  oop_maps,
++     CodeBlobType type
+    )
+-   : CodeBlob(name, cb, header_size, size, CodeOffsets::frame_never_safe, frame_size, oop_maps)
++   : CodeBlob(name, cb, header_size, size, CodeOffsets::frame_never_safe, frame_size, oop_maps, type)
+    {};
+ 
+    bool is_alive() const                         { return true; }
+@@ -373,7 +388,6 @@
+   );
+ 
+   // Typing
+-  bool is_deoptimization_stub() const { return true; }
+   const DeoptimizationBlob *as_deoptimization_stub() const { return this; }
+   bool exception_address_is_unpack_entry(address pc) const {
+     address unpack_pc = unpack();
+@@ -438,9 +452,6 @@
+   // GC for args
+   void preserve_callee_argument_oops(frame fr, const RegisterMap *reg_map, OopClosure* f)  { /* nothing to do */ }
+ 
+-  // Typing
+-  bool is_uncommon_trap_stub() const             { return true; }
+-
+   // Iteration
+   void oops_do(OopClosure* f) {}
+ };
+@@ -473,9 +484,6 @@
+   // GC for args
+   void preserve_callee_argument_oops(frame fr, const RegisterMap* reg_map, OopClosure* f)  { /* nothing to do */ }
+ 
+-  // Typing
+-  bool is_exception_stub() const                 { return true; }
+-
+   // Iteration
+   void oops_do(OopClosure* f) {}
+ };
+@@ -509,9 +517,6 @@
+   // GC for args
+   void preserve_callee_argument_oops(frame fr, const RegisterMap* reg_map, OopClosure* f)  { /* nothing to do */ }
+ 
+-  // Typing
+-  bool is_safepoint_stub() const                 { return true; }
+-
+   // Iteration
+   void oops_do(OopClosure* f) {}
+ };
+diff --git a/src/share/vm/code/codeCache.hpp b/src/share/vm/code/codeCache.hpp
+--- a/src/share/vm/code/codeCache.hpp
++++ b/src/share/vm/code/codeCache.hpp
+@@ -148,6 +148,8 @@
+ 
+   // Deoptimization
+   static int  mark_for_deoptimization(DepChange& changes);
++
++  static CodeHeap* heap()                        { return _heap; }
+ #ifdef HOTSWAP
+   static int  mark_for_evol_deoptimization(instanceKlassHandle dependee);
+ #endif // HOTSWAP
+diff --git a/src/share/vm/code/exceptionHandlerTable.cpp b/src/share/vm/code/exceptionHandlerTable.cpp
+--- a/src/share/vm/code/exceptionHandlerTable.cpp
++++ b/src/share/vm/code/exceptionHandlerTable.cpp
+@@ -224,3 +224,59 @@
+        fatal1("Invalid offset in ImplicitExceptionTable at %lx", _data);
+   }
+ }
++
++
++// Continuation pc->stub table
++
++void ContinuationPcTable::add_entry(int pc_offset, int stub_offset) {
++  if ((_length+1) >= _size) {
++    // not enough space => grow the table (amortized growth, double its size)
++    int new_size = _size * 2;
++    _table = REALLOC_RESOURCE_ARRAY(int, _table, _size, new_size);
++    _size = new_size;
++  }
++  assert((_length+1) < _size, "sanity check");
++  _table[_length++] = pc_offset;
++  _table[_length++] = stub_offset;
++}
++
++void ContinuationPcTable::add_patch_entry(int pos) {
++  if ((_patch_length+1) >= _patch_size) {
++    // not enough space => grow the table (amortized growth, double its size)
++    int new_size = _patch_size * 2;
++    _patch_nmethod_table = REALLOC_RESOURCE_ARRAY(int, _patch_nmethod_table, _patch_size, new_size);
++    _patch_size = new_size;
++  }
++  assert(_patch_length < _patch_size, "sanity check");
++  _patch_nmethod_table[_patch_length++] = pos;
++}
++
++ContinuationPcTable::ContinuationPcTable(int initial_size) {
++  guarantee(initial_size > 0, "initial size must be > 0");
++  _table  = NEW_RESOURCE_ARRAY(int, initial_size);
++  _length = 0;
++  _size   = initial_size;
++  _patch_nmethod_table = NEW_RESOURCE_ARRAY(int, initial_size);
++  _patch_length = 0;
++  _patch_size = initial_size;
++}
++
++void ContinuationPcTable::copy_to(nmethod* nm) {
++  assert(size_in_bytes() == nm->continuation_pc_table_size(), "size of space allocated in nmethod incorrect");
++  address* dest = (address*)nm->continuation_pc_table_begin();
++  for( int i=0; i<_length; i++ )
++    dest[i] = _table[i] + nm->instructions_begin();
++  for( int i=0; i<_patch_length; i++ )
++    *(nmethod**)(nm->instructions_begin() +_patch_nmethod_table[i]) = nm;
++}
++
++void ContinuationPcTable::print() const {
++  tty->print_cr("ContinuationPcTable (size = %d bytes)", size_in_bytes());
++  int i = 0;
++  while (i < _length) {
++    int pc = _table[i++];
++    int stub = _table[i++];
++    tty->print(" %08x -> %08x", pc, stub);
++  }
++}
++
+diff --git a/src/share/vm/code/exceptionHandlerTable.hpp b/src/share/vm/code/exceptionHandlerTable.hpp
+--- a/src/share/vm/code/exceptionHandlerTable.hpp
++++ b/src/share/vm/code/exceptionHandlerTable.hpp
+@@ -154,3 +154,36 @@
+   void print(address base) const;
+   void verify(nmethod *nm) const;
+ };
++
++
++// Continuation pc->stub table
++
++class ContinuationPcTable VALUE_OBJ_CLASS_SPEC {
++ private:
++  int* _table;    // the table
++  int                _length;   // the current length of the table
++  int                _size;     // the number of allocated entries
++  ReallocMark        _nesting;  // assertion check for reallocations
++
++  int*      _patch_nmethod_table;
++  int       _patch_length;
++  int       _patch_size;
++
++ public:
++  // (compile-time) construction within compiler
++  ContinuationPcTable(int initial_size = 8);
++
++  // add the entry & grow the table if needed
++  void add_entry(int pc_offset, int stub_offset);
++
++  // add the entry & grow the table if needed
++  void add_patch_entry(int pos);
++
++  // nmethod support
++  int  size_in_bytes() const { return _length * sizeof(int); }
++  void copy_to(nmethod* nm);
++
++  // debugging
++  void print() const;
++};
++
+diff --git a/src/share/vm/code/nmethod.cpp b/src/share/vm/code/nmethod.cpp
+--- a/src/share/vm/code/nmethod.cpp
++++ b/src/share/vm/code/nmethod.cpp
+@@ -410,7 +410,8 @@
+     scopes_data_size()   +
+     scopes_pcs_size()    +
+     handler_table_size() +
+-    nul_chk_table_size();
++    nul_chk_table_size() +
++    continuation_pc_table_size();
+ }
+ 
+ const char* nmethod::compile_kind() const {
+@@ -500,10 +501,11 @@
+   int orig_pc_offset,
+   DebugInformationRecorder* debug_info,
+   Dependencies* dependencies,
+-  CodeBuffer* code_buffer, int frame_size,
++  CodeBuffer* code_buffer, int frame_size, int stack_param_words,
+   OopMapSet* oop_maps,
+   ExceptionHandlerTable* handler_table,
+   ImplicitExceptionTable* nul_chk_table,
++  ContinuationPcTable* continuation_pc_table,
+   AbstractCompiler* compiler,
+   int comp_level
+ )
+@@ -518,13 +520,15 @@
+       + round_to(dependencies->size_in_bytes() , oopSize)
+       + round_to(handler_table->size_in_bytes(), oopSize)
+       + round_to(nul_chk_table->size_in_bytes(), oopSize)
++      + continuation_pc_table->size_in_bytes()
+       + round_to(debug_info->data_size()       , oopSize);
+     nm = new (nmethod_size)
+       nmethod(method(), nmethod_size, compile_id, entry_bci, offsets,
+-              orig_pc_offset, debug_info, dependencies, code_buffer, frame_size,
++              orig_pc_offset, debug_info, dependencies, code_buffer, frame_size, stack_param_words,
+               oop_maps,
+               handler_table,
+               nul_chk_table,
++              continuation_pc_table,
+               compiler,
+               comp_level);
+     if (nm != NULL) {
+@@ -572,7 +576,7 @@
+   ByteSize basic_lock_sp_offset,
+   OopMapSet* oop_maps )
+   : CodeBlob("native nmethod", code_buffer, sizeof(nmethod),
+-             nmethod_size, offsets->value(CodeOffsets::Frame_Complete), frame_size, oop_maps),
++             nmethod_size, offsets->value(CodeOffsets::Frame_Complete), frame_size, oop_maps, _nmethod),
+   _compiled_synchronized_native_basic_lock_owner_sp_offset(basic_lock_owner_sp_offset),
+   _compiled_synchronized_native_basic_lock_sp_offset(basic_lock_sp_offset)
+ {
+@@ -594,6 +598,9 @@
+     _deoptimize_offset       = 0;
+     _deoptimize_mh_offset    = 0;
+     _orig_pc_offset          = 0;
++
++    _stack_parameter_words   = -1;
++    _activation_frame_size   = -1;
+ #ifdef HAVE_DTRACE_H
+     _trap_offset             = 0;
+ #endif // def HAVE_DTRACE_H
+@@ -604,7 +611,8 @@
+     _dependencies_offset     = _scopes_pcs_offset;
+     _handler_table_offset    = _dependencies_offset;
+     _nul_chk_table_offset    = _handler_table_offset;
+-    _nmethod_end_offset      = _nul_chk_table_offset;
++    _continuation_pc_table_offset = _nul_chk_table_offset;
++    _nmethod_end_offset      = _continuation_pc_table_offset;
+     _compile_id              = 0;  // default
+     _comp_level              = CompLevel_none;
+     _entry_point             = instructions_begin();
+@@ -663,7 +671,7 @@
+   CodeBuffer* code_buffer,
+   int frame_size)
+   : CodeBlob("dtrace nmethod", code_buffer, sizeof(nmethod),
+-             nmethod_size, offsets->value(CodeOffsets::Frame_Complete), frame_size, NULL),
++             nmethod_size, offsets->value(CodeOffsets::Frame_Complete), frame_size, NULL, _nmethod),
+   _compiled_synchronized_native_basic_lock_owner_sp_offset(in_ByteSize(-1)),
+   _compiled_synchronized_native_basic_lock_sp_offset(in_ByteSize(-1))
+ {
+@@ -693,7 +701,8 @@
+     _dependencies_offset     = _scopes_pcs_offset;
+     _handler_table_offset    = _dependencies_offset;
+     _nul_chk_table_offset    = _handler_table_offset;
+-    _nmethod_end_offset      = _nul_chk_table_offset;
++    _continuation_pc_table_offset = _nul_chk_table_offset;
++    _nmethod_end_offset      = _continuation_pc_table_offset;
+     _compile_id              = 0;  // default
+     _comp_level              = CompLevel_none;
+     _entry_point             = instructions_begin();
+@@ -761,14 +770,16 @@
+   Dependencies* dependencies,
+   CodeBuffer *code_buffer,
+   int frame_size,
++  int stack_param_words,
+   OopMapSet* oop_maps,
+   ExceptionHandlerTable* handler_table,
+   ImplicitExceptionTable* nul_chk_table,
++  ContinuationPcTable* continuation_pc_table,
+   AbstractCompiler* compiler,
+   int comp_level
+   )
+   : CodeBlob("nmethod", code_buffer, sizeof(nmethod),
+-             nmethod_size, offsets->value(CodeOffsets::Frame_Complete), frame_size, oop_maps),
++             nmethod_size, offsets->value(CodeOffsets::Frame_Complete), frame_size, oop_maps, _nmethod),
+   _compiled_synchronized_native_basic_lock_owner_sp_offset(in_ByteSize(-1)),
+   _compiled_synchronized_native_basic_lock_sp_offset(in_ByteSize(-1))
+ {
+@@ -788,6 +799,9 @@
+     _scavenge_root_state     = 0;
+     _compiler                = compiler;
+     _orig_pc_offset          = orig_pc_offset;
++
++    _stack_parameter_words   = stack_param_words;
++    _activation_frame_size   = align_object_size(activationFrameOopDesc::header_size() + stack_param_words + frame_size) * HeapWordSize;
+ #ifdef HAVE_DTRACE_H
+     _trap_offset             = 0;
+ #endif // def HAVE_DTRACE_H
+@@ -803,7 +817,8 @@
+     _dependencies_offset     = _scopes_pcs_offset    + adjust_pcs_size(debug_info->pcs_size());
+     _handler_table_offset    = _dependencies_offset  + round_to(dependencies->size_in_bytes (), oopSize);
+     _nul_chk_table_offset    = _handler_table_offset + round_to(handler_table->size_in_bytes(), oopSize);
+-    _nmethod_end_offset      = _nul_chk_table_offset + round_to(nul_chk_table->size_in_bytes(), oopSize);
++    _continuation_pc_table_offset = _nul_chk_table_offset + round_to(nul_chk_table->size_in_bytes(), oopSize);
++    _nmethod_end_offset      = _continuation_pc_table_offset + continuation_pc_table->size_in_bytes();
+ 
+     _entry_point             = instructions_begin();
+     _verified_entry_point    = instructions_begin() + offsets->value(CodeOffsets::Verified_Entry);
+@@ -836,6 +851,7 @@
+     // Copy contents of ExceptionHandlerTable to nmethod
+     handler_table->copy_to(this);
+     nul_chk_table->copy_to(this);
++    continuation_pc_table->copy_to(this);
+ 
+     // we use the information of entry points to find out if a method is
+     // static or non static
+diff --git a/src/share/vm/code/nmethod.hpp b/src/share/vm/code/nmethod.hpp
+--- a/src/share/vm/code/nmethod.hpp
++++ b/src/share/vm/code/nmethod.hpp
+@@ -116,9 +116,12 @@
+ //  - handler entry point array
+ //  [Implicit Null Pointer exception table]
+ //  - implicit null table array
++//  [Continuation stub table]
++//  - sorted pc->stub mapping array
+ 
+ class Dependencies;
+ class ExceptionHandlerTable;
++class ContinuationPcTable;
+ class ImplicitExceptionTable;
+ class AbstractCompiler;
+ class xmlStream;
+@@ -134,6 +137,9 @@
+   methodOop _method;
+   int       _entry_bci;        // != InvocationEntryBci if this nmethod is an on-stack replacement method
+ 
++  int       _stack_parameter_words;   // number of parameters that are passed via the stack
++  int       _activation_frame_size;   // aligned size of an activationFrameOop containing this frame (precalculated for performance)
++
+   // To support simple linked-list chaining of nmethods:
+   nmethod*  _osr_link;         // from instanceKlass::osr_nmethods_head
+   nmethod*  _scavenge_root_link; // from CodeCache::scavenge_root_nmethods
+@@ -161,6 +167,7 @@
+   int _dependencies_offset;
+   int _handler_table_offset;
+   int _nul_chk_table_offset;
++  int _continuation_pc_table_offset;
+   int _nmethod_end_offset;
+ 
+   // location in frame (offset for sp) that deopt can store the original
+@@ -247,9 +254,11 @@
+           Dependencies* dependencies,
+           CodeBuffer *code_buffer,
+           int frame_size,
++          int stack_param_words,
+           OopMapSet* oop_maps,
+           ExceptionHandlerTable* handler_table,
+           ImplicitExceptionTable* nul_chk_table,
++          ContinuationPcTable* continuation_pc_table,
+           AbstractCompiler* compiler,
+           int comp_level);
+ 
+@@ -283,9 +292,11 @@
+                               Dependencies* dependencies,
+                               CodeBuffer *code_buffer,
+                               int frame_size,
++                              int stack_param_words,
+                               OopMapSet* oop_maps,
+                               ExceptionHandlerTable* handler_table,
+                               ImplicitExceptionTable* nul_chk_table,
++                              ContinuationPcTable* continuation_pc_table,
+                               AbstractCompiler* compiler,
+                               int comp_level);
+ 
+@@ -324,7 +335,6 @@
+ #endif // NOT PRODUCT
+ 
+   // type info
+-  bool is_nmethod() const                         { return true; }
+   bool is_java_method() const                     { return !method()->is_native(); }
+   bool is_native_method() const                   { return method()->is_native(); }
+   bool is_osr_method() const                      { return _entry_bci != InvocationEntryBci; }
+@@ -351,7 +361,9 @@
+   address handler_table_begin   () const          { return           header_begin() + _handler_table_offset ; }
+   address handler_table_end     () const          { return           header_begin() + _nul_chk_table_offset ; }
+   address nul_chk_table_begin   () const          { return           header_begin() + _nul_chk_table_offset ; }
+-  address nul_chk_table_end     () const          { return           header_begin() + _nmethod_end_offset   ; }
++  address nul_chk_table_end     () const          { return           header_begin() + _continuation_pc_table_offset; }
++  address continuation_pc_table_begin() const     { return           header_begin() + _continuation_pc_table_offset; }
++  address continuation_pc_table_end() const       { return           header_begin() + _nmethod_end_offset   ; }
+ 
+   int code_size         () const                  { return      code_end         () -      code_begin         (); }
+   int stub_size         () const                  { return      stub_end         () -      stub_begin         (); }
+@@ -361,6 +373,7 @@
+   int dependencies_size () const                  { return      dependencies_end () -      dependencies_begin (); }
+   int handler_table_size() const                  { return      handler_table_end() -      handler_table_begin(); }
+   int nul_chk_table_size() const                  { return      nul_chk_table_end() -      nul_chk_table_begin(); }
++  int continuation_pc_table_size() const          { return continuation_pc_table_end() - continuation_pc_table_begin(); }
+ 
+   int total_size        () const;
+ 
+@@ -371,6 +384,7 @@
+   bool scopes_pcs_contains   (PcDesc* addr) const { return scopes_pcs_begin   () <= addr && addr < scopes_pcs_end   (); }
+   bool handler_table_contains(address addr) const { return handler_table_begin() <= addr && addr < handler_table_end(); }
+   bool nul_chk_table_contains(address addr) const { return nul_chk_table_begin() <= addr && addr < nul_chk_table_end(); }
++  bool continuation_pc_table_contains(address addr) const { return continuation_pc_table_begin() <= addr && addr < continuation_pc_table_end(); }
+ 
+   // entry points
+   address entry_point() const                     { return _entry_point;             } // normal entry point
+@@ -458,6 +472,9 @@
+   // implicit exceptions support
+   address continuation_for_implicit_exception(address pc);
+ 
++  int stack_parameter_words()                     { return _stack_parameter_words; }
++  int activation_frame_size()                     { return _activation_frame_size; }
++
+   // On-stack replacement support
+   int   osr_entry_bci() const                     { assert(_entry_bci != InvocationEntryBci, "wrong kind of nmethod"); return _entry_bci; }
+   address  osr_entry() const                      { assert(_entry_bci != InvocationEntryBci, "wrong kind of nmethod"); return _osr_entry_point; }
+@@ -641,6 +658,11 @@
+   static int verified_entry_point_offset()        { return offset_of(nmethod, _verified_entry_point); }
+   static int osr_entry_point_offset()             { return offset_of(nmethod, _osr_entry_point); }
+   static int entry_bci_offset()                   { return offset_of(nmethod, _entry_bci); }
++  static int method_offset()                      { return offset_of(nmethod, _method); }
++  static int stack_parameter_words_offset()       { return offset_of(nmethod, _stack_parameter_words); }
++  static int activation_frame_size_offset()       { return offset_of(nmethod, _activation_frame_size); }
++  static int continuation_pc_table_offset_offset(){ return offset_of(nmethod, _continuation_pc_table_offset); }
++  static int nmethod_end_offset_offset()          { return offset_of(nmethod, _nmethod_end_offset); }
+ 
+ };
+ 
+diff --git a/src/share/vm/compiler/compilerOracle.cpp b/src/share/vm/compiler/compilerOracle.cpp
+--- a/src/share/vm/compiler/compilerOracle.cpp
++++ b/src/share/vm/compiler/compilerOracle.cpp
+@@ -284,6 +284,10 @@
+     }
+   }
+ 
++  // stack manipulation/continuation: startDelimitedInternal can never be compiled
++  if (method->intrinsic_id() == vmIntrinsics::_startDelimitedInternal)
++    return true;
++
+   if (lists[CompileOnlyCommand] != NULL) {
+     return !lists[CompileOnlyCommand]->match(method);
+   }
+diff --git a/src/share/vm/gc_implementation/shared/markSweep.cpp b/src/share/vm/gc_implementation/shared/markSweep.cpp
+--- a/src/share/vm/gc_implementation/shared/markSweep.cpp
++++ b/src/share/vm/gc_implementation/shared/markSweep.cpp
+@@ -214,9 +214,9 @@
+   _adjusted_pointers->push(p);
+ }
+ 
+-class AdjusterTracker: public OopClosure {
++class MarkSweepAdjusterTracker: public OopClosure {
+  public:
+-  AdjusterTracker() {}
++  MarkSweepAdjusterTracker() {}
+   void do_oop(oop* o)       { MarkSweep::check_adjust_pointer(o); }
+   void do_oop(narrowOop* o) { MarkSweep::check_adjust_pointer(o); }
+ };
+@@ -226,7 +226,7 @@
+     _adjusted_pointers->clear();
+     _pointer_tracking = true;
+ 
+-    AdjusterTracker checker;
++    MarkSweepAdjusterTracker checker;
+     obj->oop_iterate(&checker);
+   }
+ }
+diff --git a/src/share/vm/includeDB_compiler1 b/src/share/vm/includeDB_compiler1
+--- a/src/share/vm/includeDB_compiler1
++++ b/src/share/vm/includeDB_compiler1
+@@ -53,6 +53,7 @@
+ c1_CodeStubs.hpp                        c1_LIR.hpp
+ c1_CodeStubs.hpp                        c1_Runtime1.hpp
+ 
++c1_CodeStubs_<arch>.cpp                 activationFrameOop.hpp
+ c1_CodeStubs_<arch>.cpp                 c1_CodeStubs.hpp
+ c1_CodeStubs_<arch>.cpp                 c1_FrameMap.hpp
+ c1_CodeStubs_<arch>.cpp                 c1_LIRAssembler.hpp
+@@ -222,6 +223,7 @@
+ c1_LIRAssembler.hpp                     methodDataOop.hpp
+ c1_LIRAssembler.hpp                     top.hpp
+ 
++c1_LIRAssembler_<arch>.cpp              activationFrameOop.hpp
+ c1_LIRAssembler_<arch>.cpp              barrierSet.hpp
+ c1_LIRAssembler_<arch>.cpp              c1_Compilation.hpp
+ c1_LIRAssembler_<arch>.cpp              c1_LIRAssembler.hpp
+diff --git a/src/share/vm/includeDB_core b/src/share/vm/includeDB_core
+--- a/src/share/vm/includeDB_core
++++ b/src/share/vm/includeDB_core
+@@ -134,6 +134,27 @@
+ accessFlags.hpp                         jvm.h
+ accessFlags.hpp                         top.hpp
+ 
++activationFrameKlass.cpp                activationFrameKlass.hpp
++activationFrameKlass.cpp                activationFrameOop.hpp
++activationFrameKlass.cpp                gcLocker.hpp
++activationFrameKlass.cpp                handles.inline.hpp
++activationFrameKlass.cpp                interpreter.hpp
++activationFrameKlass.cpp                markSweep.inline.hpp
++activationFrameKlass.cpp                oop.inline.hpp
++activationFrameKlass.cpp                oop.inline2.hpp
++activationFrameKlass.cpp                oopMapCache.hpp
++activationFrameKlass.cpp                resourceArea.hpp
++
++activationFrameKlass.hpp                oop.hpp
++activationFrameKlass.hpp                klass.hpp
++activationFrameKlass.hpp                orderAccess.hpp
++
++activationFrameOop.cpp                  activationFrameOop.hpp
++
++activationFrameOop.hpp                  nmethod.hpp
++activationFrameOop.hpp                  oop.hpp
++activationFrameOop.hpp                  typeArrayOop.hpp
++
+ allocation.cpp                          allocation.hpp
+ allocation.cpp                          allocation.inline.hpp
+ allocation.cpp                          os.hpp
+@@ -148,6 +169,15 @@
+ 
+ allocation.inline.hpp                   os.hpp
+ 
++annotationParser.cpp                    annotationParser.hpp
++annotationParser.cpp                    oopFactory.hpp
++
++annotationParser.hpp                    constantPoolOop.hpp
++annotationParser.hpp                    typeArrayOop.hpp
++annotationParser.hpp                    allocation.hpp
++annotationParser.hpp                    symbolOop.hpp
++annotationParser.hpp                    systemDictionary.hpp
++
+ aprofiler.cpp                           aprofiler.hpp
+ aprofiler.cpp                           collectedHeap.inline.hpp
+ aprofiler.cpp                           oop.inline.hpp
+@@ -880,6 +910,7 @@
+ classFileError.cpp                      verifier.hpp
+ 
+ classFileParser.cpp                     allocation.hpp
++classFileParser.cpp                     annotationParser.hpp
+ classFileParser.cpp                     classFileParser.hpp
+ classFileParser.cpp                     classLoader.hpp
+ classFileParser.cpp                     classLoadingService.hpp
+@@ -1926,6 +1957,7 @@
+ heap.cpp                                os.hpp
+ 
+ heap.hpp                                allocation.hpp
++heap.hpp                                sizes.hpp
+ heap.hpp                                virtualspace.hpp
+ 
+ // heapDumper is jck optional, put cpp deps in includeDB_features
+@@ -3014,6 +3046,7 @@
+ nativeLookup.hpp                        handles.hpp
+ nativeLookup.hpp                        top.hpp
+ 
++nmethod.cpp                             activationFrameOop.hpp
+ nmethod.cpp                             abstractCompiler.hpp
+ nmethod.cpp                             bytecode.hpp
+ nmethod.cpp                             codeCache.hpp
+@@ -3137,6 +3170,7 @@
+ oop.inline2.hpp                         permGen.hpp
+ oop.inline2.hpp                         universe.hpp
+ 
++oopFactory.cpp                          activationFrameKlass.hpp
+ oopFactory.cpp                          collectedHeap.inline.hpp
+ oopFactory.cpp                          compiledICHolderKlass.hpp
+ oopFactory.cpp                          constMethodKlass.hpp
+@@ -3756,6 +3790,7 @@
+ sharedRuntime.hpp                       resourceArea.hpp
+ sharedRuntime.hpp                       threadLocalStorage.hpp
+ 
++sharedRuntime_<arch_model>.cpp          activationFrameOop.hpp
+ sharedRuntime_<arch_model>.cpp          assembler.hpp
+ sharedRuntime_<arch_model>.cpp          assembler_<arch>.inline.hpp
+ sharedRuntime_<arch_model>.cpp          compiledICHolderOop.hpp
+@@ -4368,6 +4403,7 @@
+ unhandledOops.cpp                       unhandledOops.hpp
+ unhandledOops.cpp                       universe.hpp
+ 
++universe.cpp                            activationFrameKlass.hpp
+ universe.cpp                            aprofiler.hpp
+ universe.cpp                            arguments.hpp
+ universe.cpp                            arrayKlassKlass.hpp
+@@ -4432,17 +4468,30 @@
+ 
+ universe.inline.hpp                     universe.hpp
+ 
++unsafe.cpp                              activationFrameOop.hpp
++unsafe.cpp                              assembler.hpp
+ unsafe.cpp                              allocation.inline.hpp
++unsafe.cpp                              biasedLocking.hpp
+ unsafe.cpp                              copy.hpp
++unsafe.cpp                              deoptimization.hpp
+ unsafe.cpp                              globals.hpp
+ unsafe.cpp                              interfaceSupport.hpp
+ unsafe.cpp                              jni.h
+ unsafe.cpp                              jvm.h
+ unsafe.cpp                              reflection.hpp
+ unsafe.cpp                              reflectionCompat.hpp
++unsafe.cpp                              stackMapTable.hpp
+ unsafe.cpp                              synchronizer.hpp
+ unsafe.cpp                              threadService.hpp
+ unsafe.cpp                              vmSymbols.hpp
++unsafe.cpp                              oopMapCache.hpp
++
++unsafe.cpp                              oopFactory.hpp
++unsafe.cpp                              vframe.hpp
++unsafe.cpp                              vframe_hp.hpp
++unsafe.cpp                              vframeArray.hpp
++unsafe.cpp                              verificationType.hpp
++unsafe.cpp                              constMethodOop.hpp
+ 
+ utf8.cpp                                utf8.hpp
+ 
+@@ -4460,6 +4509,7 @@
+ verificationType.hpp                    symbolOop.hpp
+ verificationType.hpp                    systemDictionary.hpp
+ 
++verifier.cpp                            annotationParser.hpp
+ verifier.cpp                            bytecodeStream.hpp
+ verifier.cpp                            bytes_<arch>.hpp
+ verifier.cpp                            classFileStream.hpp
+@@ -4523,6 +4573,7 @@
+ vframe.hpp                              stackValueCollection.hpp
+ 
+ vframeArray.cpp                         allocation.inline.hpp
++vframeArray.cpp                         bytecode.hpp
+ vframeArray.cpp                         events.hpp
+ vframeArray.cpp                         handles.inline.hpp
+ vframeArray.cpp                         interpreter.hpp
+diff --git a/src/share/vm/includeDB_features b/src/share/vm/includeDB_features
+--- a/src/share/vm/includeDB_features
++++ b/src/share/vm/includeDB_features
+@@ -231,6 +231,7 @@
+ restore.cpp                             symbolTable.hpp
+ restore.cpp                             systemDictionary.hpp
+ 
++serialize.cpp                           activationFrameOop.hpp
+ serialize.cpp                           classify.hpp
+ serialize.cpp                           codeCache.hpp
+ serialize.cpp                           compactingPermGenGen.hpp
+@@ -241,6 +242,8 @@
+ serialize.cpp                           symbolTable.hpp
+ serialize.cpp                           systemDictionary.hpp
+ 
++vmStructs.cpp                           activationFrameKlass.hpp
++vmStructs.cpp                           activationFrameOop.hpp
+ vmStructs.cpp                           arguments.hpp
+ vmStructs.cpp                           arrayKlass.hpp
+ vmStructs.cpp                           arrayKlassKlass.hpp
+diff --git a/src/share/vm/memory/classify.cpp b/src/share/vm/memory/classify.cpp
+--- a/src/share/vm/memory/classify.cpp
++++ b/src/share/vm/memory/classify.cpp
+@@ -28,6 +28,7 @@
+ 
+ const char* ClassifyObjectClosure::object_type_name[number_object_types] = {
+   "unknown",
++  "activationFrame",
+   "instance",
+   "instanceRef",
+   "objArray",
+@@ -57,7 +58,9 @@
+     k->set_alloc_count(k->alloc_count() + 1);
+   }
+ 
+-  if (obj->is_instance()) {
++  if (obj->is_activationFrame()) {
++    type = activationFrame_type;
++  } else if (obj->is_instance()) {
+     if (k->oop_is_instanceRef()) {
+       type = instanceRef_type;
+     } else {
+@@ -147,7 +150,9 @@
+       const char *name;
+       if (k->name() == NULL) {
+ 
+-        if (obj == Universe::klassKlassObj()) {
++        if (obj == Universe::activationFrameKlassObj()) {
++          name = "_activationFrameKlassObj";
++        } else if (obj == Universe::klassKlassObj()) {
+           name = "_klassKlassObj";
+         } else if (obj == Universe::arrayKlassKlassObj()) {
+           name = "_arrayKlassKlassObj";
+diff --git a/src/share/vm/memory/classify.hpp b/src/share/vm/memory/classify.hpp
+--- a/src/share/vm/memory/classify.hpp
++++ b/src/share/vm/memory/classify.hpp
+@@ -24,6 +24,7 @@
+ 
+ typedef enum oop_type {
+   unknown_type,
++  activationFrame_type,
+   instance_type,
+   instanceRef_type,
+   objArray_type,
+diff --git a/src/share/vm/memory/heap.hpp b/src/share/vm/memory/heap.hpp
+--- a/src/share/vm/memory/heap.hpp
++++ b/src/share/vm/memory/heap.hpp
+@@ -52,6 +52,9 @@
+   void set_used()                                { _header._used = true; }
+   void set_free()                                { _header._used = false; }
+   bool free()                                    { return !_header._used; }
++  
++  static ByteSize used_offset()                  { return byte_offset_of(HeapBlock, _header._used ); }
++  static ByteSize allocated_offset()             { return in_ByteSize(sizeof(HeapBlock)); }
+ };
+ 
+ class FreeBlock: public HeapBlock {
+@@ -142,6 +145,9 @@
+   char *low_boundary() const                     { return _memory.low_boundary (); }
+   char *high_boundary() const                    { return _memory.high_boundary(); }
+ 
++  int log2_segment_size() const                  { return _log2_segment_size; }
++  const VirtualSpace& segmap() const             { return _segmap; }
++
+   // Iteration
+ 
+   // returns the first block or NULL
+diff --git a/src/share/vm/memory/heapInspection.cpp b/src/share/vm/memory/heapInspection.cpp
+--- a/src/share/vm/memory/heapInspection.cpp
++++ b/src/share/vm/memory/heapInspection.cpp
+@@ -56,6 +56,7 @@
+     if (_klass == Universe::shortArrayKlassObj())        name = "<shortArrayKlass>";        else
+     if (_klass == Universe::intArrayKlassObj())          name = "<intArrayKlass>";          else
+     if (_klass == Universe::longArrayKlassObj())         name = "<longArrayKlass>";         else
++    if (_klass == Universe::activationFrameKlassObj())   name = "<activationFrameKlass>";   else
+     if (_klass == Universe::methodKlassObj())            name = "<methodKlass>";            else
+     if (_klass == Universe::constMethodKlassObj())       name = "<constMethodKlass>";       else
+     if (_klass == Universe::methodDataKlassObj())        name = "<methodDataKlass>";        else
+diff --git a/src/share/vm/memory/oopFactory.cpp b/src/share/vm/memory/oopFactory.cpp
+--- a/src/share/vm/memory/oopFactory.cpp
++++ b/src/share/vm/memory/oopFactory.cpp
+@@ -121,6 +121,19 @@
+                        CHECK_NULL);
+ }
+ 
++activationFrameOop oopFactory::new_activationFrame(nmethod* method,
++                                                   TRAPS) {
++  klassOop cmkObj = Universe::activationFrameKlassObj();
++  activationFrameKlass* cmk = activationFrameKlass::cast(cmkObj);
++  return cmk->allocate(method, CHECK_NULL);
++}
++
++activationFrameOop oopFactory::new_activationFrame(int size,
++                                                   TRAPS) {
++  klassOop cmkObj = Universe::activationFrameKlassObj();
++  activationFrameKlass* cmk = activationFrameKlass::cast(cmkObj);
++  return cmk->allocate(size, CHECK_NULL);
++}
+ 
+ methodOop oopFactory::new_method(int byte_code_size, AccessFlags access_flags,
+                                  int compressed_line_number_size,
+diff --git a/src/share/vm/memory/oopFactory.hpp b/src/share/vm/memory/oopFactory.hpp
+--- a/src/share/vm/memory/oopFactory.hpp
++++ b/src/share/vm/memory/oopFactory.hpp
+@@ -114,6 +114,10 @@
+                                     bool is_conc_safe,
+                                     TRAPS);
+ 
++  static activationFrameOop  new_activationFrame(nmethod* method, TRAPS);
++
++  static activationFrameOop  new_activationFrame(int size, TRAPS);
++
+   // Method Data containers
+   static methodDataOop   new_methodData(methodHandle method, TRAPS);
+ 
+diff --git a/src/share/vm/memory/serialize.cpp b/src/share/vm/memory/serialize.cpp
+--- a/src/share/vm/memory/serialize.cpp
++++ b/src/share/vm/memory/serialize.cpp
+@@ -45,6 +45,7 @@
+   // Verify the sizes of various oops in the system.
+   soc->do_tag(sizeof(oopDesc));
+   soc->do_tag(sizeof(instanceOopDesc));
++  soc->do_tag(sizeof(activationFrameOopDesc));
+   soc->do_tag(sizeof(methodOopDesc));
+   soc->do_tag(sizeof(constMethodOopDesc));
+   soc->do_tag(sizeof(methodDataOopDesc));
+diff --git a/src/share/vm/memory/universe.cpp b/src/share/vm/memory/universe.cpp
+--- a/src/share/vm/memory/universe.cpp
++++ b/src/share/vm/memory/universe.cpp
+@@ -26,6 +26,7 @@
+ # include "incls/_universe.cpp.incl"
+ 
+ // Known objects
++klassOop Universe::_activationFrameKlassObj           = NULL;
+ klassOop Universe::_boolArrayKlassObj                 = NULL;
+ klassOop Universe::_byteArrayKlassObj                 = NULL;
+ klassOop Universe::_charArrayKlassObj                 = NULL;
+@@ -118,6 +119,7 @@
+ 
+ 
+ void Universe::system_classes_do(void f(klassOop)) {
++  f(activationFrameKlassObj());
+   f(symbolKlassObj());
+   f(methodKlassObj());
+   f(constMethodKlassObj());
+@@ -170,6 +172,7 @@
+       }
+     }
+   }
++  f->do_oop((oop*)&_activationFrameKlassObj);
+   f->do_oop((oop*)&_symbolKlassObj);
+   f->do_oop((oop*)&_methodKlassObj);
+   f->do_oop((oop*)&_constMethodKlassObj);
+@@ -262,6 +265,7 @@
+         _typeArrayKlassObjs[T_INT]     = _intArrayKlassObj;
+         _typeArrayKlassObjs[T_LONG]    = _longArrayKlassObj;
+ 
++        _activationFrameKlassObj    = activationFrameKlass::create_klass(CHECK);
+         _methodKlassObj             = methodKlass::create_klass(CHECK);
+         _constMethodKlassObj        = constMethodKlass::create_klass(CHECK);
+         _methodDataKlassObj         = methodDataKlass::create_klass(CHECK);
+@@ -457,6 +461,7 @@
+ void Universe::init_self_patching_vtbl_list(void** list, int count) {
+   int n = 0;
+   { klassKlass o;             add_vtable(list, &n, &o, count); }
++  { activationFrameKlass o;   add_vtable(list, &n, &o, count); }
+   { arrayKlassKlass o;        add_vtable(list, &n, &o, count); }
+   { objArrayKlassKlass o;     add_vtable(list, &n, &o, count); }
+   { instanceKlassKlass o;     add_vtable(list, &n, &o, count); }
+diff --git a/src/share/vm/memory/universe.hpp b/src/share/vm/memory/universe.hpp
+--- a/src/share/vm/memory/universe.hpp
++++ b/src/share/vm/memory/universe.hpp
+@@ -133,6 +133,7 @@
+ 
+   static klassOop _objectArrayKlassObj;
+ 
++  static klassOop _activationFrameKlassObj;
+   static klassOop _symbolKlassObj;
+   static klassOop _methodKlassObj;
+   static klassOop _constMethodKlassObj;
+@@ -267,9 +268,10 @@
+     return _typeArrayKlassObjs[t];
+   }
+ 
++  static klassOop activationFrameKlassObj()           { return _activationFrameKlassObj;   }
+   static klassOop symbolKlassObj()                    { return _symbolKlassObj;            }
+   static klassOop methodKlassObj()                    { return _methodKlassObj;            }
+-  static klassOop constMethodKlassObj()               { return _constMethodKlassObj;         }
++  static klassOop constMethodKlassObj()               { return _constMethodKlassObj;       }
+   static klassOop methodDataKlassObj()                { return _methodDataKlassObj;        }
+   static klassOop klassKlassObj()                     { return _klassKlassObj;             }
+   static klassOop arrayKlassKlassObj()                { return _arrayKlassKlassObj;        }
+diff --git a/src/share/vm/oops/activationFrameKlass.cpp b/src/share/vm/oops/activationFrameKlass.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/share/vm/oops/activationFrameKlass.cpp
+@@ -0,0 +1,283 @@
++/*
++ * Copyright 2003-2006 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ *
++ */
++
++# include "incls/_precompiled.incl"
++# include "incls/_activationFrameKlass.cpp.incl"
++
++
++klassOop activationFrameKlass::create_klass(TRAPS) {
++  activationFrameKlass o;
++  KlassHandle h_this_klass(THREAD, Universe::klassKlassObj());
++  KlassHandle k = base_create_klass(h_this_klass, header_size(), o.vtbl_value(), CHECK_NULL);
++  // Make sure size calculation is right
++  assert(k()->size() == align_object_size(header_size()), "wrong size for object");
++  return k();
++}
++
++int activationFrameKlass::oop_size(oop obj) const {
++  assert(obj->is_activationFrame(), "must be activationFrame oop");
++  return activationFrameOop(obj)->object_size();
++}
++
++bool activationFrameKlass::oop_is_parsable(oop obj) const {
++  assert(obj->is_activationFrame(), "must be activationFrame oop");
++  return activationFrameOop(obj)->object_is_parsable();
++}
++
++activationFrameOop activationFrameKlass::allocate(nmethod* method, TRAPS) {
++  int size = activationFrameOopDesc::object_size(method->stack_parameter_words(), method->frame_size());
++  KlassHandle h_k(THREAD, as_klassOop());
++  activationFrameOop af = (activationFrameOop)CollectedHeap::permanent_obj_allocate(h_k, size, CHECK_NULL);
++  assert(!af->is_parsable(), "Not yet safely parsable");
++  No_Safepoint_Verifier no_safepoint;
++  af->_next = NULL;
++  af->_nmethod = method;
++  af->_stack_pos = NULL;
++  af->_pc = NULL;
++  af->_thread = JavaThread::current();
++  af->_state = activationFrameOopDesc::_compiled_empty;
++  assert(af->is_parsable(), "Is safely parsable by gc");
++  return af;
++}
++
++activationFrameOop activationFrameKlass::allocate(int size, TRAPS) {
++  KlassHandle h_k(THREAD, as_klassOop());
++  activationFrameOop af = (activationFrameOop)CollectedHeap::permanent_obj_allocate(h_k, size, CHECK_NULL);
++  assert(!af->is_parsable(), "Not yet safely parsable");
++  return af;
++}
++
++class ActivationFrameInterpreterClosure : public OffsetClosure {
++ private:
++   activationFrameOop _af;
++   OopClosure* _f;
++
++ public:
++   ActivationFrameInterpreterClosure(activationFrameOop af, OopClosure* f) : _af(af), _f(f) {}
++
++  void offset_do(int offset) {
++    _f->do_oop((oop*)_af->get_value_addr(offset));
++  }
++};
++
++class ActivationFrameCodeBlobClosure : public CodeBlobClosure {
++ public:
++  // Called for each code blob.
++   virtual void do_code_blob(CodeBlob* cb){
++   }
++};
++
++inline int activationFrameKlass::do_oop_internal(oop obj, OopClosure& closure) {
++  assert(obj->is_activationFrame(), "must be activationFrame oop");
++  activationFrameOop af = activationFrameOop(obj);
++  int size = af->object_size();
++  switch(af->state()) {
++    case activationFrameOopDesc::_compiled_empty:
++    case activationFrameOopDesc::_dummy_invalid:
++    case activationFrameOopDesc::_dummy_delimited:
++      // nothing to do here...
++      break;
++    case activationFrameOopDesc::_compiled_filled: 
++      {
++        frame fr(af->frame_sp(), af->frame_fp(), af->pc());
++        RegisterMap map(af->thread());
++        map.set_include_argument_oops(false);
++        ActivationFrameCodeBlobClosure dummy;
++        fr.oops_do(&closure, &dummy, &map);
++        break;
++      }
++    case activationFrameOopDesc::_interpreted_empty:
++      closure.do_oop((oop*)&af->_methodOop);
++      break;
++    case activationFrameOopDesc::_interpreted_filled:
++      {
++        ActivationFrameInterpreterClosure blk(af, &closure);
++        // process locals & expression stack
++        Thread *thread = Thread::current();
++        methodHandle m (thread, af->_methodOop);
++        closure.do_oop((oop*)&af->_methodOop);
++        InterpreterOopMap mask;
++        m->mask_for(af->_bci, &mask);
++        mask.iterate_oop(&blk);
++        break;
++      }
++    default:
++      ShouldNotReachHere();
++  }
++  closure.do_oop((oop*)&af->_next);
++  return size;
++}
++
++class oop_follow_contentsClosure : public OopClosure {
++ public:
++  void do_oop(oop* p) {
++    MarkSweep::mark_and_push(p);
++  }
++  void do_oop(narrowOop* p) {
++    MarkSweep::mark_and_push(p);
++  }
++};
++
++void activationFrameKlass::oop_follow_contents(oop obj) {
++  oop_follow_contentsClosure closure;
++  do_oop_internal(obj, closure);
++}
++
++#ifndef SERIALGC
++
++class oop_follow_contents2Closure : public OopClosure {
++  ParCompactionManager* _cm;
++ public:
++   oop_follow_contents2Closure(ParCompactionManager* cm) : _cm(cm) {}
++  void do_oop(oop* p) {
++    PSParallelCompact::mark_and_push(_cm, p);
++  }
++  void do_oop(narrowOop* p) {
++    PSParallelCompact::mark_and_push(_cm, p);
++  }
++};
++
++void activationFrameKlass::oop_follow_contents(ParCompactionManager* cm, oop obj) {
++  oop_follow_contents2Closure closure(cm);
++  do_oop_internal(obj, closure);
++}
++#endif // SERIALGC
++
++int activationFrameKlass::oop_oop_iterate(oop obj, OopClosure* blk) {
++  return do_oop_internal(obj, *blk);
++}
++
++
++class oop_oop_iterate_mClosure : public OopClosure {
++  OopClosure* _closure;
++  MemRegion _mr;
++ public:
++   oop_oop_iterate_mClosure(OopClosure* closure, MemRegion mr) : _closure(closure), _mr(mr) {}
++  void do_oop(oop* p) {
++    if (_mr.contains(p)) _closure->do_oop(p);
++  }
++  void do_oop(narrowOop* p) {
++    if (_mr.contains(p)) _closure->do_oop(p);
++  }
++};
++
++int activationFrameKlass::oop_oop_iterate_m(oop obj, OopClosure* blk, MemRegion mr) {
++  oop_oop_iterate_mClosure closure(blk, mr);
++  return do_oop_internal(obj, closure);
++}
++
++
++class oop_adjust_pointersClosure : public OopClosure {
++ public:
++  void do_oop(oop* p) {
++    MarkSweep::adjust_pointer(p);
++  }
++  void do_oop(narrowOop* p) {
++    MarkSweep::adjust_pointer(p);
++  }
++};
++
++int activationFrameKlass::oop_adjust_pointers(oop obj) {
++  oop_adjust_pointersClosure closure;
++  return do_oop_internal(obj, closure);
++}
++
++#ifndef SERIALGC
++void activationFrameKlass::oop_copy_contents(PSPromotionManager* pm, oop obj) {
++  assert(obj->is_activationFrame(), "must be activationFrame oop");
++}
++
++void activationFrameKlass::oop_push_contents(PSPromotionManager* pm, oop obj) {
++  assert(obj->is_activationFrame(), "must be activationFrame oop");
++}
++
++class oop_update_pointersClosure : public OopClosure {
++public:
++  void do_oop(oop* p) {
++    PSParallelCompact::adjust_pointer(p);
++  }
++  void do_oop(narrowOop* p) {
++    PSParallelCompact::adjust_pointer(p);
++  }
++};
++
++int activationFrameKlass::oop_update_pointers(ParCompactionManager* cm, oop obj) {
++  oop_update_pointersClosure closure;
++  return do_oop_internal(obj, closure);
++}
++
++class oop_update_pointersClosure2 : public OopClosure {
++  oop* _begin;
++  oop* _end;
++public:
++  oop_update_pointersClosure2(HeapWord* begin, HeapWord* end) : _begin((oop*)begin), _end((oop*)end) {}
++
++  void do_oop(oop* p) {
++    if ( (p >= _begin) && (p <= _end) ) {
++      PSParallelCompact::adjust_pointer(p);
++    }
++  }
++  void do_oop(narrowOop* p) {
++    PSParallelCompact::adjust_pointer(p);
++  }
++};
++int activationFrameKlass::oop_update_pointers(ParCompactionManager* cm, oop obj,
++                                          HeapWord* beg_addr,
++                                          HeapWord* end_addr) {
++  oop_update_pointersClosure2 closure(beg_addr, end_addr);
++  // TODO this can be optimized... it currently ignores beg_addr and end_addr
++  return do_oop_internal(obj, closure);
++}
++#endif // SERIALGC
++
++#undef DO_OOP_ACTIVATION_FRAME
++
++#ifndef PRODUCT
++
++// Printing
++void activationFrameKlass::oop_print_on(oop obj, outputStream* st) {
++  ResourceMark rm;
++  assert(obj->is_activationFrame(), "must be activationFrame oop");
++  Klass::oop_print_on(obj, st);
++  activationFrameOop m = activationFrameOop(obj);/*
++  st->print(" - method:       " INTPTR_FORMAT " ", (address)m->const_method()->method());
++  m->const_method()->method()->print_value_on(st); st->cr();
++  st->print(" - callsites:    %i\n", m->callsite_count());
++  st->print(" - slots:        %i\n", m->slot_count());*/
++}
++
++
++// Short version - just print the name of the method it belongs to.
++void activationFrameKlass::oop_print_value_on(oop obj, outputStream* st) {
++  assert(obj->is_activationFrame(), "must be activationFrame oop");
++  activationFrameOop m = activationFrameOop(obj);/*
++  st->print(" callsite verification data of method " );
++  m->const_method()->method()->print_value_on(st);*/
++}
++
++#endif // PRODUCT
++
++const char* activationFrameKlass::internal_name() const {
++  return "{activationFrame}";
++}
+diff --git a/src/share/vm/oops/activationFrameKlass.hpp b/src/share/vm/oops/activationFrameKlass.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/share/vm/oops/activationFrameKlass.hpp
+@@ -0,0 +1,88 @@
++/*
++ * Copyright 2003-2006 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ *
++ */
++
++// A activationFrameKlass is the klass of a activationFrameOop
++
++class activationFrameKlass : public Klass {
++  friend class VMStructs;
++private:
++  juint    _alloc_size;        // allocation profiling support
++public:
++  // Testing
++  bool oop_is_activationFrame() const { return true; }
++  virtual bool oop_is_parsable(oop obj) const;
++
++  // Allocation
++  DEFINE_ALLOCATE_PERMANENT(activationFrameKlass);
++  activationFrameOop allocate(nmethod* method, TRAPS);
++  activationFrameOop allocate(int size, TRAPS);
++  static klassOop create_klass(TRAPS);
++
++  // Sizing
++  int oop_size(oop obj) const;
++  int klass_oop_size() const     { return object_size(); }
++
++  // Casting from klassOop
++  static activationFrameKlass* cast(klassOop k) {
++    assert(k->klass_part()->oop_is_activationFrame(), "cast to activationFrameKlass");
++    return (activationFrameKlass*) k->klass_part();
++  }
++
++  // Sizing
++  static int header_size() {
++    return oopDesc::header_size() + sizeof(activationFrameKlass)/HeapWordSize;
++  }
++  int object_size() const {
++    return align_object_size(header_size());
++  }
++
++  // Garbage collection
++  void oop_follow_contents(oop obj);
++  int  oop_adjust_pointers(oop obj);
++
++  // Parallel Scavenge and Parallel Old
++  PARALLEL_GC_DECLS
++
++  // Allocation profiling support
++  juint alloc_size() const              { return _alloc_size; }
++  void set_alloc_size(juint n)          { _alloc_size = n; }
++
++  // Iterators
++  int oop_oop_iterate(oop obj, OopClosure* blk);
++  int oop_oop_iterate_m(oop obj, OopClosure* blk, MemRegion mr);
++
++private:
++  int do_oop_internal(oop obj, OopClosure& closure);
++
++#ifndef PRODUCT
++ public:
++  // Printing
++  void oop_print_on      (oop obj, outputStream* st);
++  void oop_print_value_on(oop obj, outputStream* st);
++
++#endif
++
++ public:
++  const char* internal_name() const;
++};
+diff --git a/src/share/vm/oops/activationFrameOop.cpp b/src/share/vm/oops/activationFrameOop.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/share/vm/oops/activationFrameOop.cpp
+@@ -0,0 +1,34 @@
++/*
++ * Copyright 2003-2006 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ *
++ */
++
++# include "incls/_precompiled.incl"
++# include "incls/_activationFrameOop.cpp.incl"
++
++
++// How big must this Object be?
++
++int activationFrameOopDesc::object_size(int param_word_size, int data_word_size) {
++  int extra_words = param_word_size + data_word_size;
++  return align_object_size(header_size() + extra_words);
++}
+diff --git a/src/share/vm/oops/activationFrameOop.hpp b/src/share/vm/oops/activationFrameOop.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/share/vm/oops/activationFrameOop.hpp
+@@ -0,0 +1,198 @@
++/*
++ * Copyright 2003-2006 Sun Microsystems, Inc.  All Rights Reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
++ * CA 95054 USA or visit www.sun.com if you need additional information or
++ * have any questions.
++ *
++ */
++
++// An activationFrameOop stores the raw data for a continuation stack frame.
++// The next pointer allows the on-the-fly creation of a tree structure of frames.
++//
++// Memory layout (each line represents a word).
++//
++// |------------------------------------------------------|
++// | header                                               |
++// | klass                                                |
++// |------------------------------------------------------|
++
++// TBD
++
++// |                                                      |
++// |------------------------------------------------------|
++
++
++class nmethod;
++
++class activationFrameOopDesc : public oopDesc {
++  friend class activationFrameKlass;
++  friend class VMStructs;
++public:
++  enum FrameState {
++    _unparsable           = 0x000000,
++
++    _invalid              = 0x000001,
++    _empty                = 0x000002,
++    _filled               = 0x000004,
++    _delimited            = 0x000008,
++
++    _compiled_type        = 0x000100,
++    _interpreted_type     = 0x000200,
++    _dummy_type           = 0x000400,
++
++    _compiled_filled      = _compiled_type | _filled,
++    _compiled_empty       = _compiled_type | _empty,
++
++    _interpreted_filled   = _interpreted_type | _filled,
++    _interpreted_empty    = _interpreted_type | _empty,
++    
++    _dummy_invalid        = _dummy_type | _invalid,
++    _dummy_delimited      = _dummy_type | _delimited,
++
++    _state_mask           = 0x0000ff,
++    _type_mask            = 0x00ff00
++  };
++
++private:
++  FrameState          _state;
++  activationFrameOop  _next;
++  // for implementation reasons this is the base pointer of the next stack frame (== rsp - 2*HeapWordSize)
++  intptr_t*           _stack_pos;
++
++  union {
++    nmethod*          _nmethod;     // compiled
++    methodOop         _methodOop;   // interpreted
++  };
++
++  union {
++    address           _pc;          // compiled & interpreted
++    bool              _in_use;      // only delimited
++  };
++  int                 _bci;         // interpreted
++
++  union {
++    JavaThread*       _thread;      // compiled
++    int               _data_count;  // interpreted
++  };
++
++
++public:
++
++  FrameState state() const              { return _state; }
++  void set_state(FrameState state)      { _state = state; }
++
++  bool is_compiled() const              { return (_state & _type_mask) == _compiled_type; }
++  bool is_interpreted() const           { return (_state & _type_mask) == _interpreted_type; }
++  bool is_dummy() const                 { return (_state & _type_mask) == _dummy_type; }
++
++  bool is_invalid() const               { return (_state & _state_mask) == _invalid; }
++  bool is_empty() const                 { return (_state & _state_mask) == _empty; }
++  bool is_filled() const                { return (_state & _state_mask) == _filled; }
++  bool is_delimited() const             { return (_state & _state_mask) == _delimited; }
++
++  intptr_t* stack_pos() const           { return _stack_pos; }
++  void set_stack_pos(intptr_t* adr) {
++    assert((adr == NULL && is_filled()) || (adr == NULL && is_dummy()) || (adr != NULL && !is_filled()), "stack pos doesn't match filled state");
++    _stack_pos = adr; 
++  }
++
++  activationFrameOop  next() const      { return _next; }
++  void set_next(activationFrameOop oop) { _next = oop; }
++
++
++  address  pc() const                   { return _pc; }
++  void set_pc(address pc)               { _pc = pc; }
++
++  int bci() const                       { assert(is_interpreted(), "wrong type"); return _bci; }
++  void set_bci(int bci)                 { assert(is_interpreted(), "wrong type"); _bci = bci; }
++
++  nmethod* get_nmethod() const          { assert(is_compiled(), "wrong type"); return _nmethod; }
++  void set_nmethod(nmethod* method)     { assert(is_compiled(), "wrong type"); _nmethod = method; }
++
++  methodOop get_methodOop() const       { assert(is_interpreted(), "wrong type"); return _methodOop; }
++  void set_methodOop(methodOop oop)     { assert(is_interpreted(), "wrong type"); _methodOop = oop; }
++
++  JavaThread* thread() const            { assert(is_compiled(), "wrong type"); return _thread; }
++  void set_thread(JavaThread* thread)   { assert(is_compiled(), "wrong type"); _thread = thread; }
++
++  int data_count() const                { assert(is_interpreted(), "wrong type"); return _data_count; }
++  void set_data_count(int count)        { assert(is_interpreted(), "wrong type"); _data_count = count; }
++
++  bool in_use() const                   { assert(is_delimited(), "wrong type"); return _in_use; }
++  void set_in_use(bool in_use)          { assert(is_delimited(), "wrong type"); _in_use = in_use; }
++
++
++  intptr_t* frame_sp() const            { assert(is_compiled(), "wrong type"); return ((intptr_t*)this) + header_size(); }
++  intptr_t* frame_fp() const            { assert(is_compiled(), "wrong type"); return ((intptr_t*)this) + _nmethod->stack_parameter_words() - 2; }
++
++  void set_value(int index, intptr_t value) {
++    assert(is_interpreted(), "wrong type");
++    assert(index >= 0 && index < _data_count, "invalid index");
++    ((intptr_t*)this)[header_size() + index] = value;
++  }
++
++  intptr_t get_value(int index) {
++    assert(is_interpreted(), "wrong type");
++    assert(index >= 0 && index < _data_count, "invalid index");
++    return ((intptr_t*)this)[header_size() + index];
++  }
++
++  intptr_t* get_value_addr(int index) {
++    assert(is_interpreted(), "wrong type");
++    assert(index >= 0 && index < _data_count, "invalid index");
++    return ((intptr_t*)this) + (header_size() + index);
++  }
++
++  void mark_as_invalid() {
++    _state = (FrameState)((_state & ~_state_mask) | _invalid);
++  }
++
++  // Object size needed
++  static int object_size(int param_word_size, int data_word_size);
++
++  // Sizing
++  static int header_size()              { return sizeof(activationFrameOopDesc)/HeapWordSize; }
++  int object_size() const {
++    if (is_compiled())
++      return object_size(_nmethod->stack_parameter_words(), _nmethod->frame_size()); 
++    else if (is_interpreted())
++      return align_object_size(header_size() + _data_count * HeapWordSize);
++    else if (is_dummy())
++      return align_object_size(header_size());
++    else {
++      ShouldNotReachHere();
++    }
++  }
++
++  bool object_is_parsable() const       { return _state != _unparsable; }
++
++  // Garbage collection support
++  oop*  adr_methodOop() const              { return (oop*)&_methodOop; }
++
++  static ByteSize state_offset()        { return byte_offset_of(activationFrameOopDesc, _state     ); }
++  static ByteSize stack_pos_offset()    { return byte_offset_of(activationFrameOopDesc, _stack_pos ); }
++  static ByteSize pc_offset()           { return byte_offset_of(activationFrameOopDesc, _pc        ); }
++  static ByteSize bci_offset()          { return byte_offset_of(activationFrameOopDesc, _bci       ); }
++  static ByteSize method_offset()       { return byte_offset_of(activationFrameOopDesc, _nmethod   ); }
++  static ByteSize next_offset()         { return byte_offset_of(activationFrameOopDesc, _next      ); }
++  static ByteSize thread_offset()       { return byte_offset_of(activationFrameOopDesc, _thread    ); }
++  static ByteSize in_use_offset()       { return byte_offset_of(activationFrameOopDesc, _in_use    ); }
++  static ByteSize data_count_offset()   { return byte_offset_of(activationFrameOopDesc, _data_count); }
++
++};
+diff --git a/src/share/vm/oops/constMethodOop.hpp b/src/share/vm/oops/constMethodOop.hpp
+--- a/src/share/vm/oops/constMethodOop.hpp
++++ b/src/share/vm/oops/constMethodOop.hpp
+@@ -96,6 +96,15 @@
+     _has_checked_exceptions = 2,
+     _has_localvariable_table = 4
+   };
++public:
++  enum ContinuableFlag {
++    _not_continuable = 0,
++    _continuable_optimized,     // this method isn't defined continuable but has been included in continuations in the past
++    _continuable_hidden,        // defined as continuable, with "hidden" visibility 
++    _continuable_readonly,      // defined as continuable, with "readonly" visibility 
++    _continuable_readwrite      // defined as continuable, with "readwrite" visibility 
++  };
++private:
+ 
+   // Bit vector of signature
+   // Callers interpret 0=not initialized yet and
+@@ -134,6 +143,7 @@
+   jbyte             _interpreter_kind;
+   jbyte             _flags;
+ 
++private:
+   // Size of Java bytecodes allocated immediately after methodOop.
+   u2                _code_size;
+   u2                _name_index;                 // Method name (index in constant pool)
+@@ -143,6 +153,8 @@
+                                                  // but this may change with redefinition
+   u2                _generic_signature_index;    // Generic signature (index in constant pool, 0 if absent)
+ 
++  ContinuableFlag   _continuable;
++
+ public:
+   // Inlined tables
+   void set_inlined_tables_length(int checked_exceptions_len,
+@@ -158,6 +170,12 @@
+   bool has_localvariable_table() const
+     { return (_flags & _has_localvariable_table) != 0; }
+ 
++  bool is_continuable() const
++    { return _continuable != _not_continuable; }
++
++  void set_continuable(ContinuableFlag c)  { _continuable = c; }
++  ContinuableFlag continuable() const      { return _continuable; }
++
+   void set_interpreter_kind(int kind)      { _interpreter_kind = kind; }
+   int  interpreter_kind(void) const        { return _interpreter_kind; }
+ 
+diff --git a/src/share/vm/oops/klass.hpp b/src/share/vm/oops/klass.hpp
+--- a/src/share/vm/oops/klass.hpp
++++ b/src/share/vm/oops/klass.hpp
+@@ -557,6 +557,7 @@
+ 
+  public:
+   // type testing operations
++  virtual bool oop_is_activationFrame()     const { return false; }
+   virtual bool oop_is_instance_slow()       const { return false; }
+   virtual bool oop_is_instanceRef()         const { return false; }
+   virtual bool oop_is_array()               const { return false; }
+diff --git a/src/share/vm/oops/methodOop.cpp b/src/share/vm/oops/methodOop.cpp
+--- a/src/share/vm/oops/methodOop.cpp
++++ b/src/share/vm/oops/methodOop.cpp
+@@ -138,7 +138,7 @@
+ void methodOopDesc::mask_for(int bci, InterpreterOopMap* mask) {
+ 
+   Thread* myThread    = Thread::current();
+-  methodHandle h_this(myThread, this);
++  methodHandle h_this(myThread, this);/*
+ #ifdef ASSERT
+   bool has_capability = myThread->is_VM_thread() ||
+                         myThread->is_ConcurrentGC_thread() ||
+@@ -154,7 +154,7 @@
+       local_mask.print();
+     }
+   }
+-#endif
++#endif*/
+   instanceKlass::cast(method_holder())->mask_for(h_this, bci, mask);
+   return;
+ }
+diff --git a/src/share/vm/oops/oop.hpp b/src/share/vm/oops/oop.hpp
+--- a/src/share/vm/oops/oop.hpp
++++ b/src/share/vm/oops/oop.hpp
+@@ -115,6 +115,7 @@
+   bool is_conc_safe();
+ 
+   // type test operations (inlined in oop.inline.h)
++  bool is_activationFrame()    const;
+   bool is_instance()           const;
+   bool is_instanceRef()        const;
+   bool is_array()              const;
+diff --git a/src/share/vm/oops/oop.inline.hpp b/src/share/vm/oops/oop.inline.hpp
+--- a/src/share/vm/oops/oop.inline.hpp
++++ b/src/share/vm/oops/oop.inline.hpp
+@@ -103,6 +103,7 @@
+ 
+ inline bool oopDesc::is_a(klassOop k)        const { return blueprint()->is_subtype_of(k); }
+ 
++inline bool oopDesc::is_activationFrame()    const { return blueprint()->oop_is_activationFrame(); }
+ inline bool oopDesc::is_instance()           const { return blueprint()->oop_is_instance(); }
+ inline bool oopDesc::is_instanceRef()        const { return blueprint()->oop_is_instanceRef(); }
+ inline bool oopDesc::is_array()              const { return blueprint()->oop_is_array(); }
+diff --git a/src/share/vm/oops/oopsHierarchy.hpp b/src/share/vm/oops/oopsHierarchy.hpp
+--- a/src/share/vm/oops/oopsHierarchy.hpp
++++ b/src/share/vm/oops/oopsHierarchy.hpp
+@@ -34,6 +34,7 @@
+ #ifndef CHECK_UNHANDLED_OOPS
+ 
+ typedef class oopDesc*                            oop;
++typedef class   activationFrameOopDesc*           activationFrameOop;
+ typedef class   instanceOopDesc*            instanceOop;
+ typedef class   methodOopDesc*                    methodOop;
+ typedef class   constMethodOopDesc*            constMethodOop;
+@@ -151,6 +152,7 @@
+        }                                                                   \
+    };                                                                      \
+ 
++DEF_OOP(activationFrame);
+ DEF_OOP(instance);
+ DEF_OOP(method);
+ DEF_OOP(methodData);
+@@ -169,6 +171,7 @@
+ // The klass hierarchy is separate from the oop hierarchy.
+ 
+ class Klass;
++class   activationFrameKlass;
+ class   instanceKlass;
+ class     instanceRefKlass;
+ class   methodKlass;
+diff --git a/src/share/vm/prims/nativeLookup.cpp b/src/share/vm/prims/nativeLookup.cpp
+--- a/src/share/vm/prims/nativeLookup.cpp
++++ b/src/share/vm/prims/nativeLookup.cpp
+@@ -77,6 +77,7 @@
+ }
+ 
+ extern "C" {
++  void JNICALL JVM_RegisterContinuationMethods(JNIEnv* env, jclass contcls);
+   void JNICALL JVM_RegisterUnsafeMethods(JNIEnv *env, jclass unsafecls);
+   void JNICALL JVM_RegisterMethodHandleMethods(JNIEnv *env, jclass unsafecls);
+   void JNICALL JVM_RegisterPerfMethods(JNIEnv *env, jclass perfclass);
+@@ -95,6 +96,9 @@
+       return CAST_FROM_FN_PTR(address, JVM_SetPrimitiveFieldValues);
+     }
+   }
++  if (strstr(jni_name, "Java_javax_stack_Continuation_registerNatives") != NULL) {
++    return CAST_FROM_FN_PTR(address, JVM_RegisterContinuationMethods);
++  }
+   if (strstr(jni_name, "Java_sun_misc_Unsafe_registerNatives") != NULL) {
+     return CAST_FROM_FN_PTR(address, JVM_RegisterUnsafeMethods);
+   }
+diff --git a/src/share/vm/prims/unsafe.cpp b/src/share/vm/prims/unsafe.cpp
+--- a/src/share/vm/prims/unsafe.cpp
++++ b/src/share/vm/prims/unsafe.cpp
+@@ -1163,6 +1163,534 @@
+ UNSAFE_END
+ 
+ 
++void dump_compiledVFrame(compiledVFrame* frame) {
++  tty->print_cr("\t%s", frame->method()->name_and_sig_as_C_string());
++  tty->print("\tbci: %d ", frame->bci());
++  tty->print("locals: %d ", frame->locals()->size());
++  tty->print("expressions: %d\n", frame->expressions()->size());
++}
++
++
++class ActivationFrameInterpreterOopClosure : public OffsetClosure {
++ private:
++   activationFrameOop _af;
++
++ public:
++   ActivationFrameInterpreterOopClosure(activationFrameOop af) : _af(af) {}
++
++  void offset_do(int offset) {
++    oop value = *(oop*)_af->get_value_addr(offset);
++    if (value == NULL)
++      tty->print("null ");
++    else
++      tty->print("0x%08x (%s) ", value, value->blueprint()->name()->as_utf8());
++  }
++};
++
++class PrintOopsClosure : public OopClosure {
++public:
++  virtual void do_oop(oop* o) {
++    oop value = *o;
++    if (value == NULL)
++      tty->print("null ");
++    else
++      tty->print("0x%08x (%s) ", value, value->blueprint()->name()->as_utf8());
++  }
++  virtual void do_oop(narrowOop* o) {
++  }
++};
++
++class DummyCodeBlobClosure : public CodeBlobClosure {
++ public:
++  // Called for each code blob.
++   virtual void do_code_blob(CodeBlob* cb){
++   }
++};
++
++void dump_frame(activationFrameOop actFrame, JavaThread* thread) {
++  ResourceMark mark;
++  tty->print("frame 0x%08X ", actFrame);
++  if (actFrame->stack_pos() == NULL)
++    tty->print("(not present on stack) ", actFrame->stack_pos());
++  else
++    tty->print("(at stack pos %08x) ", actFrame->stack_pos());
++  if (actFrame->is_empty())
++    tty->print("empty ");
++  if (actFrame->is_filled())
++    tty->print("filled ");
++  if (actFrame->is_invalid())
++    tty->print("invalid ");
++  if (actFrame->is_delimited())
++    tty->print("delimited ");
++
++  if (actFrame->is_interpreted()) {
++    methodOop method = actFrame->get_methodOop();
++    tty->print("interpreted:\n");
++    tty->print_cr("\t%s", method->name_and_sig_as_C_string());
++    tty->print("\tbci: %d ", actFrame->bci());
++    tty->print("locals: %d ", method->max_locals());
++    tty->print("expressions: %d\n", actFrame->data_count() - method->max_locals());
++    tty->print("\toops: ");
++    {
++      ThreadInVMfromNative tivfn(JavaThread::current());
++      ActivationFrameInterpreterOopClosure blk(actFrame);
++      InterpreterOopMap mask;
++      actFrame->get_methodOop()->mask_for(actFrame->bci(), &mask);
++      mask.iterate_oop(&blk);
++    }
++    tty->cr();
++  }
++  if (actFrame->is_compiled()) {
++    tty->print("compiled: (pc: %08x)\n", actFrame->pc());
++    if (actFrame->is_filled()) {
++      frame fr(actFrame->frame_sp(), actFrame->frame_fp(), actFrame->pc());
++      RegisterMap map(thread);
++      vframe* frame = vframe::new_vframe(&fr, &map, thread);
++
++      dump_compiledVFrame((compiledVFrame*)frame);
++      while (!frame->is_top()) {
++        frame = frame->sender();
++        dump_compiledVFrame((compiledVFrame*)frame);
++      }
++    }
++    tty->print("\toops: ");
++    {
++      ThreadInVMfromNative tivfn(JavaThread::current());
++      PrintOopsClosure closure;
++      frame fr(actFrame->frame_sp(), actFrame->frame_fp(), actFrame->pc());
++      RegisterMap map(actFrame->thread());
++      map.set_include_argument_oops(false);
++      DummyCodeBlobClosure dummy;
++      fr.oops_do(&closure, &dummy, &map);
++    }
++    tty->cr();
++  }
++  if (actFrame->is_dummy()) {
++    tty->print("dummy frame\n");
++  }
++}
++
++
++jobject Continuation_dump(JNIEnv* env, jobject _this) {
++  tty->print("Continuation::dump\n");
++  oop simple_cont = JNIHandles::resolve(_this);
++  activationFrameOop frame = javax_stack_Continuation::data(simple_cont);
++  while (frame != NULL) {
++    dump_frame(frame, java_lang_Thread::thread(javax_stack_Continuation::thread(simple_cont)));
++    frame = frame->next();
++  }
++  klassOop k = SystemDictionary::Continuation_klass();
++  methodOop method = instanceKlass::cast(k)->find_method(vmSymbols::continueDelimitedInternal_name(), vmSymbols::continueDelimited_signature());
++  return NULL;
++}
++
++void Continuation_resume(JNIEnv* env, jobject _this, jobject value) {
++  JavaThread* THREAD = JavaThread::current();
++  ThreadInVMfromNative tivfm(THREAD);
++  
++  oop thisOop = JNIHandles::resolve(_this);
++  if (javax_stack_Continuation::data(thisOop) == NULL) {    
++    THROW_MSG(vmSymbols::java_lang_IllegalArgumentException(), "Cannot resume an empty Continuation");
++  }
++  if (javax_stack_Continuation::thread(thisOop) != THREAD->threadObj()) {
++    THROW_MSG(vmSymbols::java_lang_IllegalArgumentException(), "Cannot resume a Continuation that belongs to another thread");
++  }
++
++  oop valueOop = JNIHandles::resolve(value);
++  if (valueOop == javax_stack_Continuation::static_captured()) {
++    THROW_MSG(vmSymbols::java_lang_IllegalArgumentException(), "Cannot pass Continuation.CAPTURED to resume");
++  }
++  assert(THREAD->current_continuation_frame(), "current_continuation_frame shouldn't be NULL");
++
++  // this method is intended only for error handling - all sane cases are covered by the assembler implementation
++  ShouldNotReachHere();
++}
++
++
++inline activationFrameOop createAndPatchFrame(frame &fr, TRAPS) {
++  if (fr.is_compiled_frame()) {
++    nmethod* nm = (nmethod*)fr.cb();
++
++    // native and non-continuable lead to an invalid frame
++    if (nm->is_native_method() || !nm->method()->constMethod()->is_continuable()) {
++      goto create_dummy_frame;
++    }
++
++    if (fr.pc() != fr.raw_pc()) {
++      tty->print("different pc");
++    }
++
++    // determine the address to change the return address to
++    address adr = nm->continuation_pc_table_begin();
++    address* entry;
++    while( adr < nm->continuation_pc_table_end() ) {
++      entry = (address*)adr;
++      if (entry[0] == fr.pc()) {
++        ((address *)fr.sp())[-1] = entry[1];
++        break;
++      }
++      adr += sizeof(address) * 2;
++    }
++    assert(adr != nm->continuation_pc_table_end(), "no callsite found in continuable method");
++
++    int size = align_object_size(nm->frame_size() + nm->stack_parameter_words() + activationFrameOopDesc::header_size());
++    assert(size * HeapWordSize == nm->activation_frame_size(), "wrong size");
++
++    KlassHandle h_k(Universe::activationFrameKlassObj());
++    activationFrameOopDesc* af = (activationFrameOop)CollectedHeap::obj_allocate(h_k, size, CHECK_NULL);
++
++    af->set_state(activationFrameOopDesc::_compiled_empty);
++    af->set_nmethod(nm);
++    af->set_stack_pos(fr.fp());
++    af->set_thread((JavaThread*)THREAD);
++    af->set_pc(entry[1]);
++
++    assert(af->size() == size, "wrong size");
++    return af;
++  }
++  if (fr.is_interpreted_frame()) {
++    // method might be invalidated by a safepoint
++    methodHandle method(fr.interpreter_frame_method());
++
++    // native and non-continuable lead to an invalid frame
++    if (method->is_native() || !method->constMethod()->is_continuable()) {
++      goto create_dummy_frame;
++    }
++    assert(fr.interpreter_frame_monitor_begin() == fr.interpreter_frame_monitor_end(), "cannot handle monitors in continuations");
++
++    int data_count = method->max_locals() + fr.interpreter_frame_expression_stack_size();
++    int size = align_object_size(activationFrameOopDesc::header_size() + data_count * HeapWordSize);
++
++    KlassHandle h_k(Universe::activationFrameKlassObj());
++    activationFrameOopDesc* af = (activationFrameOop)CollectedHeap::obj_allocate(h_k, size, CHECK_NULL);
++
++    af->set_state(activationFrameOopDesc::_interpreted_empty);
++    af->set_stack_pos(fr.fp());
++    af->set_methodOop(method());
++    af->set_bci(fr.interpreter_frame_bci());
++    af->set_data_count(data_count);
++
++    assert(((intptr_t*)fr.pc())[-2] == Interpreter::return_sentinel || ((intptr_t*)fr.pc())[-2] == Interpreter::return_sentinel, "missing sentinel");
++    intptr_t patch_pc = ((intptr_t*)fr.pc())[-3];
++    ((intptr_t *)fr.sp())[-1] = patch_pc;
++    af->set_pc((address)patch_pc);
++
++    assert(af->size() == size, "wrong size");
++    return af;
++  }
++
++create_dummy_frame:
++  int size = align_object_size(activationFrameOopDesc::header_size());
++
++  KlassHandle h_k(Universe::activationFrameKlassObj());
++  activationFrameOopDesc* af = (activationFrameOop)CollectedHeap::obj_allocate(h_k, size, CHECK_NULL);
++
++  af->set_state(activationFrameOopDesc::_dummy_invalid);
++  af->set_stack_pos(fr.fp());
++  af->set_pc(fr.pc());
++
++  assert(af->size() == size, "wrong size");
++  return af;
++}
++
++int cnt1 = 0;
++
++jobject Continuation_save(JNIEnv* env, jobject _this) {
++  jobject ret = NULL;
++  {
++    JavaThread* THREAD = JavaThread::current();
++    ThreadInVMfromNative tivfm(THREAD);
++
++    ret = JNIHandles::make_local(THREAD, javax_stack_Continuation::static_captured());
++
++    RegisterMap map(THREAD, false);
++    frame fr = THREAD->last_frame();
++    // skip native nmethod
++    fr = fr.sender(&map);
++
++    activationFrameOop af = createAndPatchFrame(fr, CHECK_NULL);
++    if (af->is_invalid()) {
++      THROW_MSG_0(vmSymbols::java_lang_IllegalThreadStateException(), "Cannot store continuations in non-continuable methods");
++    }
++
++    activationFrameOopDesc* last = THREAD->current_continuation_frame();
++    af->set_next(last);
++    THREAD->set_current_continuation_frame(af);
++
++//    tty->print("save %i: %08x -> %08x\n", cnt1++, THREAD->current_continuation_frame(), THREAD->current_continuation_frame()->next());
++
++    if (_this != NULL) {
++      javax_stack_Continuation::set_data(JNIHandles::resolve(_this), af);
++      javax_stack_Continuation::set_thread(JNIHandles::resolve(_this), THREAD->threadObj());
++    }
++  }
++  return ret;
++}
++
++class MyObjClosure: public ObjectClosure {
++  virtual void do_object(oop obj) {
++    int* i = (int*)obj;
++    if (i == NULL)
++      return;
++    if (i[0] == (int)0xbaadbabe || i[1] == (int)0xbaadbabe) {
++      tty->print("bad");
++    }
++
++    int interp = 0;
++    int compiled = 0;
++    int dummy = 0;
++    if (obj->is_activationFrame()) {
++      activationFrameOop af = (activationFrameOop)obj;
++      if (af->is_interpreted())
++        interp++;
++      if (af->is_compiled())
++        compiled++;
++      if (af->is_dummy())
++        dummy++;
++    }
++    //tty->print("stats: %i interp, %i compiled, %i dummy\n", interp, compiled, dummy);
++  }
++};
++
++class MyOopClosure: public OopClosure {
++  virtual void do_oop(oop* obj) {
++    int* i = (int*)*obj;
++    if (i == NULL)
++      return;
++    if (i[0] == (int)0xbaadbabe || i[1] == (int)0xbaadbabe) {
++      tty->print("bad");
++    }
++  }
++  virtual void do_oop(narrowOop* obj) {
++  }
++};
++
++int cnt2 = 0;
++
++inline void Continuation_storeFrameGeneric(JNIEnv* env) {
++  JavaThread* THREAD = JavaThread::current();
++  ThreadInVMfromNative tivfm(THREAD);
++
++//  tty->print("storeframe %i: %08x -> %08x\n", cnt2++, THREAD->current_continuation_frame(), THREAD->current_continuation_frame()->next());
++  RegisterMap map(THREAD, false);
++  // skip native nmethod
++  frame fr = THREAD->last_frame().sender(&map);
++
++  // save the frame contents
++  activationFrameOopDesc* fill = THREAD->current_continuation_frame();
++  assert(fill, "Continuation_storeFrameGeneric called without current AF");
++
++  if (Universe::heap()->total_collections() > 10) {
++    MyOopClosure ocl;
++    MyObjClosure cl;
++//    Universe::heap()->oop_iterate(&ocl);
++//    Universe::heap()->object_iterate(&cl);
++  }
++
++  if (fill->is_filled()) {
++    // just mark the frame as "not on stack"
++    fill->set_stack_pos(NULL);
++
++  } else if (fill->is_empty()) {
++
++    if (fill->state() == activationFrameOopDesc::_compiled_empty) {
++      // copy the contents of a compiled frame
++
++      jint size = fill->get_nmethod()->frame_size() + fill->get_nmethod()->stack_parameter_words();
++      intptr_t* sp = fr.unextended_sp();
++      assert(fill->stack_pos() == fr.fp(), "trying to fill the wrong activationFrameOop");
++      memcpy(fill->frame_sp(), sp, size * HeapWordSize);
++      fill->set_state(activationFrameOopDesc::_compiled_filled);
++      fill->set_stack_pos(NULL);
++      // TODO this only works with simple cardset barriers...?
++      oopDesc::bs()->write_ref_field(fill->frame_sp(), NULL);
++
++    } else if (fill->state() == activationFrameOopDesc::_interpreted_empty) {
++      // copy the contents of an interpreted frame: locals, expression stack
++
++      assert(fill->data_count() == (fr.interpreter_frame_method()->max_locals() + fr.interpreter_frame_expression_stack_size()), "wrong data count");
++      assert(fill->stack_pos() == fr.fp(), "wrong actual frame");
++      int max_locals = fill->get_methodOop()->max_locals();
++      for (int i=0; i<max_locals; i++) {
++        fill->set_value(i, *fr.interpreter_frame_local_at(i));
++      }
++      for (int i=max_locals; i<fill->data_count(); i++) {
++        int entry = i - max_locals;
++        fill->set_value(i, *fr.interpreter_frame_expression_stack_at(entry));
++      }
++      fill->set_state(activationFrameOopDesc::_interpreted_filled);
++      fill->set_stack_pos(NULL);
++      oopDesc::bs()->write_ref_field(fill, NULL);
++
++    } else {
++      ShouldNotReachHere();
++    }
++
++  } else if (fill->is_invalid()) {
++
++    if (THREAD->resume_common_frame() != NULL) {
++      // we've encountered an invalid frame while resuming
++      THROW_MSG(vmSymbols::java_lang_IllegalArgumentException(), "Invalid frame encountered during resume");
++    } else {
++      // skip invalid frames
++      do {
++        fill->set_stack_pos(NULL);
++        fill = fill->next();
++//        tty->print("invalid frame encountered (normal operation)\n");
++      } while(fill->is_invalid());
++      THREAD->set_current_continuation_frame(fill);
++    }
++
++  }
++
++  activationFrameHandle first_frame;
++  activationFrameHandle current(fill);
++  do {
++    fr = fr.sender(&map);
++    if (current->next() != NULL && current->next()->stack_pos() == fr.fp()) {
++#ifdef ASSERT
++      activationFrameOop next = current->next();
++      if (next->is_interpreted() || next->is_compiled()) {
++        if (fr.raw_pc() != current->next()->pc()) {
++          tty->print("different pc");
++        }
++      }
++#endif
++      // the next activationFrame already corresponds to the next stackframe, nothing to do...
++      if (first_frame.is_null())
++        first_frame = current->next();
++      //tty->print("Continuation_storeFrameGeneric: no need to create new object\n");
++      break;
++    } else {
++      activationFrameOop af = createAndPatchFrame(fr, CHECK);
++
++      if (af->is_invalid() && THREAD->resume_common_frame() != NULL)
++        Exceptions::_throw_msg(THREAD_AND_LOCATION, vmSymbols::java_lang_IllegalArgumentException(), "Invalid frame encountered during resume");
++
++      af->set_next(current->next());
++      current->set_next(af);      
++      oopDesc::bs()->write_ref_field(((char*)current()) + in_bytes(activationFrameOopDesc::next_offset()), af);
++
++      if (first_frame.is_null())
++        first_frame = af;
++      current = af;
++    }
++  } while(current->is_invalid() && !fr.is_entry_frame());
++  THREAD->set_current_continuation_frame(first_frame());
++}
++
++jobject Continuation_storeFrameObject(JNIEnv* env, jclass klass, jobject retValue) {
++  Continuation_storeFrameGeneric(env);
++  return retValue;
++}
++
++void Continuation_storeFrameVoid(JNIEnv* env, jclass klass) {
++  Continuation_storeFrameGeneric(env);
++}
++
++jboolean Continuation_storeFrameBoolean(JNIEnv* env, jclass klass, jboolean retValue) {
++  Continuation_storeFrameGeneric(env);
++  return retValue;
++}
++
++jbyte Continuation_storeFrameByte(JNIEnv* env, jclass klass, jbyte retValue) {
++  Continuation_storeFrameGeneric(env);
++  return retValue;
++}
++
++jchar Continuation_storeFrameChar(JNIEnv* env, jclass klass, jchar retValue) {
++  Continuation_storeFrameGeneric(env);
++  return retValue;
++}
++
++jshort Continuation_storeFrameShort(JNIEnv* env, jclass klass, jshort retValue) {
++  Continuation_storeFrameGeneric(env);
++  return retValue;
++}
++
++jint Continuation_storeFrameInt(JNIEnv* env, jclass klass, jint retValue) {
++  Continuation_storeFrameGeneric(env);
++  return retValue;
++}
++
++jlong Continuation_storeFrameLong(JNIEnv* env, jclass klass, jlong retValue) {
++  Continuation_storeFrameGeneric(env);
++  return retValue;
++}
++
++jfloat Continuation_storeFrameFloat(JNIEnv* env, jclass klass, jfloat retValue) {
++  Continuation_storeFrameGeneric(env);
++  return retValue;
++}
++
++jdouble Continuation_storeFrameDouble(JNIEnv* env, jclass klass, jdouble retValue) {
++  Continuation_storeFrameGeneric(env);
++  return retValue;
++}
++
++jobject Continuation_unwind(JNIEnv* env, jclass klass, jobject exception) {
++  JavaThread* THREAD = JavaThread::current();
++  RegisterMap map(THREAD, false);
++  frame fr = THREAD->last_frame().sender(&map);
++  activationFrameOopDesc* fill = THREAD->current_continuation_frame();
++  if (fill->stack_pos() == fr.fp())
++    Continuation_storeFrameGeneric(env);
++
++  THROW_OOP_0(JNIHandles::resolve(exception));
++}
++
++jobject Continuation_startDelimited(JNIEnv* env, jclass klass, jobject runnable, jobject firstValue) {
++  ShouldNotReachHere();
++
++  // everything should be handled by the asm implementation
++  JavaThread* thread = JavaThread::current();
++
++  jmethodID method = env->GetStaticMethodID(klass, "startDelimitedInternal", "(Ljavax/stack/DelimitedRunnable;Ljava/lang/Object;)Ljava/lang/Object;");
++  jobject retValue = env->CallStaticObjectMethod(klass, method, runnable, firstValue);
++
++  activationFrameOop af = thread->current_continuation_frame();
++  assert(af->state() == activationFrameOopDesc::_dummy_invalid, "invalid frame state after startDelimitedInternal");
++
++  thread->set_current_continuation_frame(af->next());
++  af->set_state(activationFrameOopDesc::_dummy_delimited);
++  af->set_in_use(false);
++  af->set_stack_pos(NULL);
++  af->set_next(NULL);
++  oopDesc::bs()->write_ref_field(((char*)af) + in_bytes(activationFrameOopDesc::next_offset()), NULL);
++
++  return retValue;
++}
++
++jobject Continuation_continueDelimited(JNIEnv* env, jclass klass, jobject continuation, jobject value) {
++  JavaThread* THREAD = JavaThread::current();
++  DEBUG_ONLY(activationFrameHandle check_frame;)
++
++  oop contOop = JNIHandles::resolve(continuation);
++  if (javax_stack_Continuation::data(contOop) == NULL) {    
++    THROW_MSG_(vmSymbols::java_lang_IllegalArgumentException(), "Cannot resume an empty Continuation", NULL);
++  }
++  if (javax_stack_Continuation::thread(contOop) != THREAD->threadObj()) {
++    THROW_MSG_(vmSymbols::java_lang_IllegalArgumentException(), "Cannot resume a Continuation that belongs to another thread", NULL);
++  }
++
++  activationFrameOop af = javax_stack_Continuation::data(contOop);
++  while (af->next() != NULL) {
++    af = af->next();
++  }
++
++  if (af->state() != activationFrameOopDesc::_dummy_delimited) {
++    THROW_MSG_(vmSymbols::java_lang_IllegalArgumentException(), "Continuation is not delimited", NULL);
++  }
++  if (af->in_use()) {
++    THROW_MSG_(vmSymbols::java_lang_IllegalArgumentException(), "Nested delimited continuation", NULL);
++  }
++
++  ShouldNotReachHere();
++
++  return NULL;
++}
++
++
+ /// JVM_RegisterUnsafeMethods
+ 
+ #define ADR "J"
+@@ -1457,6 +1985,29 @@
+     {CC"defineAnonymousClass", CC"("DAC_Args")"CLS,      FN_PTR(Unsafe_DefineAnonymousClass)},
+ };
+ 
++#define CONT "Ljavax/stack/Continuation;"
++#define RUN "Ljavax/stack/DelimitedRunnable;"
++JNINativeMethod simple_cont_methods[] = {
++    {CC"save",               CC"()"OBJ,                 FN_PTR(Continuation_save)},
++    {CC"resume",             CC"("OBJ")V",              FN_PTR(Continuation_resume)},
++    {CC"dump",               CC"()"OBJ,                 FN_PTR(Continuation_dump)},
++    {CC"startDelimited",     CC"("RUN OBJ")"OBJ,        FN_PTR(Continuation_startDelimited)},
++    {CC"continueDelimited",  CC"("CONT OBJ")"OBJ,       FN_PTR(Continuation_continueDelimited)},
++    {CC"unwind",             CC"("THR")"THR,            FN_PTR(Continuation_unwind)},
++    {CC"storeFrameObject",   CC"("OBJ")"OBJ,            FN_PTR(Continuation_storeFrameObject)},
++    {CC"storeFrameVoid",     CC"()V",                   FN_PTR(Continuation_storeFrameVoid)},
++    {CC"storeFrameBoolean",  CC"(Z)Z",                  FN_PTR(Continuation_storeFrameBoolean)},
++    {CC"storeFrameByte",     CC"(B)B",                  FN_PTR(Continuation_storeFrameByte)},
++    {CC"storeFrameChar",     CC"(C)C",                  FN_PTR(Continuation_storeFrameChar)},
++    {CC"storeFrameShort",    CC"(S)S",                  FN_PTR(Continuation_storeFrameShort)},
++    {CC"storeFrameInt",      CC"(I)I",                  FN_PTR(Continuation_storeFrameInt)},
++    {CC"storeFrameLong",     CC"(J)J",                  FN_PTR(Continuation_storeFrameLong)},
++    {CC"storeFrameFloat",    CC"(F)F",                  FN_PTR(Continuation_storeFrameFloat)},
++    {CC"storeFrameDouble",   CC"(D)D",                  FN_PTR(Continuation_storeFrameDouble)}
++};
++#undef RUN
++#undef CONT
++
+ #undef CC
+ #undef FN_PTR
+ 
+@@ -1555,3 +2106,45 @@
+     guarantee(status == 0, "register unsafe natives");
+   }
+ JVM_END
++
++#define SIMPLE_CONT_METHOD_COUNT (sizeof(simple_cont_methods)/sizeof(JNINativeMethod))
++
++JVM_ENTRY(void, JVM_RegisterContinuationMethods(JNIEnv *env, jclass contcls))
++  UnsafeWrapper("JVM_RegisterContinuationMethods");
++  {
++    ThreadToNativeFromVM ttnfv(thread);
++    {
++      env->RegisterNatives(contcls, simple_cont_methods, sizeof(simple_cont_methods)/sizeof(JNINativeMethod));
++      if (env->ExceptionOccurred()) {
++        if (PrintMiscellaneous && (Verbose || WizardMode)) {
++          tty->print_cr("Warning:  SDK 1.7 Continuation classes not found.");
++        }
++        env->ExceptionClear();
++      } else {
++        // compile all native wrappers - the first three are instance methods, all other static
++        jmethodID ids[SIMPLE_CONT_METHOD_COUNT];
++        for (unsigned int i=0; i<SIMPLE_CONT_METHOD_COUNT; i++) {
++          if (i >= 3)
++            ids[i] = env->GetStaticMethodID(contcls, simple_cont_methods[i].name, simple_cont_methods[i].signature);
++          else
++            ids[i] = env->GetMethodID(contcls, simple_cont_methods[i].name, simple_cont_methods[i].signature);
++        }
++        {
++          ThreadInVMfromNative tivfn(thread);
++          for (unsigned int i=0; i<SIMPLE_CONT_METHOD_COUNT; i++) {
++            nmethod* nm = AdapterHandlerLibrary::create_native_wrapper(methodHandle(JNIHandles::resolve_jmethod_id(ids[i])));
++            if (strncmp("storeFrame", simple_cont_methods[i].name, 10) == 0)
++              javax_stack_Continuation::set_store_frames_nmethod(nm->method()->result_type(), nm);
++            if (strcmp("resume", simple_cont_methods[i].name) == 0)
++              javax_stack_Continuation::set_resume_nmethod(nm);
++            if (strcmp("save", simple_cont_methods[i].name) == 0)
++              javax_stack_Continuation::set_save_nmethod(nm);
++            if (strcmp("unwind", simple_cont_methods[i].name) == 0)
++              javax_stack_Continuation::set_unwind_nmethod(nm);
++
++          }
++        }
++      }
++    }
++  }
++JVM_END
+diff --git a/src/share/vm/runtime/annotationParser.cpp b/src/share/vm/runtime/annotationParser.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/share/vm/runtime/annotationParser.cpp
+@@ -0,0 +1,186 @@
++
++# include "incls/_precompiled.incl"
++# include "incls/_annotationParser.cpp.incl"
++
++bool ElementValue::verify(symbolOop value_signature, int offset, TRAPS) {
++  AnnotationParser* parser = _annotation->_parser;
++  if (parser->length() < _start + 3)
++    return false;
++  if (offset >= value_signature->utf8_length())
++    return false;
++
++  klassOop value_type;
++  if (value_signature->byte_at(offset) == 'L')
++    value_type = parser->get_klass(oopFactory::new_symbol((char*)value_signature->base() + offset, value_signature->utf8_length() - offset, THREAD), THREAD);
++  else
++    value_type = NULL;
++
++  switch(tag()) {
++    case 'B':
++    case 'C':
++    case 'I':
++    case 'S':
++    case 'Z':
++      return value_signature->byte_at(offset) == tag() && parser->get_tag(_start + 1).is_int();
++    case 'D':
++      return value_signature->byte_at(offset) == tag() && parser->get_tag(_start + 1).is_double();
++    case 'F':
++      return value_signature->byte_at(offset) == tag() && parser->get_tag(_start + 1).is_float();
++    case 'J':
++      return value_signature->byte_at(offset) == tag() && parser->get_tag(_start + 1).is_long();
++    case 's':
++      if (!parser->get_tag(_start + 1).is_utf8())
++        return false;
++      // check that the signature return type can hold a string
++      return value_type != NULL && SystemDictionary::String_klass()->klass_part()->is_subtype_of(value_type);
++    case 'c':
++      if (!parser->get_tag(_start + 1).is_utf8())
++        return false;
++      if (parser->get_klass(_start + 1, THREAD) == NULL)
++        return false;
++      // check that the signature return type can hold a class
++      return value_type != NULL && SystemDictionary::Class_klass()->klass_part()->is_subtype_of(value_type);
++    case 'e':
++      {
++        if (parser->length() < _start + 5)
++          return false;
++        if (!parser->get_tag(_start + 1).is_utf8() || !parser->get_tag(_start + 3).is_utf8())
++          return false;
++        klassOop enum_type = parser->get_klass(_start + 1, THREAD);
++        if (enum_type == NULL)
++          return false;
++        symbolOop enum_const_name = parser->get_symbol(_start + 3);
++        if (value_type == NULL || !enum_type->klass_part()->is_subtype_of(value_type))
++          return false;
++        if (!parser->has_enum_field(instanceKlass::cast(enum_type), enum_const_name))
++          return false;
++        return true;
++      }
++    case '@':
++      {
++        Annotation annotation;
++        annotation_const(annotation);
++        if (annotation.verify(THREAD)) {
++          return value_type != NULL && annotation.get_type(THREAD)->klass_part()->is_subtype_of(value_type);
++        } else
++          return false;
++      }
++    case '[':
++      {
++        if (value_signature->byte_at(offset) != '[')
++          return false;
++        ArrayValue array;
++        array_const(array);
++        return array.verify(value_signature, offset + 1, THREAD);
++      }
++    default:
++      return false;
++  }
++}
++
++bool ArrayValue::verify(symbolOop component_signature, int offset, TRAPS) {
++  AnnotationParser* parser = _value->_annotation->_parser;
++  if (parser->length() < _start + 2)
++    return false;
++  
++  ElementValue value = first_value();
++  for (int i=value_count(); i>0; i--) {
++    if (!value.verify(component_signature, offset, THREAD))
++      return false;
++    value = next_value(value, THREAD);
++  }
++  return true;
++}
++
++bool ElementValuePair::verify(instanceKlass* annotation_type, TRAPS) {
++  AnnotationParser* parser = _value._annotation->_parser;
++  if (parser->length() < start() + 2)
++    return false;
++
++  if (!parser->get_tag(start()).is_utf8())
++    return false;
++  methodOop value = parser->find_method(annotation_type, name());
++  if (value == NULL)
++    return false;
++  if (!value->is_abstract())
++    return false;
++  symbolOop signature = value->signature();
++  if (signature->byte_at(0) != '(' || signature->byte_at(1) != ')')
++    return false;
++
++  return _value.verify(signature, 2, THREAD);
++}
++
++bool Annotation::verify(TRAPS) {
++  if (_parser->length() < _start + 4)
++    return false;
++  
++  if (!_parser->get_tag(_start).is_utf8())
++    return false;
++  klassOop type = get_type(THREAD);
++  if (type == NULL)
++    return false;
++  instanceKlass* klass = instanceKlass::cast(type);
++  // type needs to be an annotation type
++  if ((klass->access_flags().get_flags() & JVM_ACC_ANNOTATION) == 0)
++    return false;
++
++  ElementValuePair value = first_value();
++  for (int i=value_count(); i>0; i--) {
++    if (!value.verify(klass, THREAD))
++      return false;
++    value = next_value(value, THREAD);
++  }
++  return true;
++}
++
++bool AnnotationParser::verify(TRAPS) {
++  if (length() < 2)
++    return false;
++  Annotation annotation = first_annotation();
++  for (int i=annotation_count(); i>0; i--) {
++    if (!annotation.verify(THREAD))
++      return false;
++    annotation = next_annotation(annotation, THREAD);
++  }
++  return annotation._start == length();
++}
++
++
++methodOop AnnotationParser::find_method(instanceKlass* klass, symbolOop name) {
++  objArrayOop methods = klass->methods();
++  int len = methods->length();
++  // methods are sorted, so do binary search
++  int l = 0;
++  int h = len - 1;
++  while (l <= h) {
++    int mid = (l + h) >> 1;
++    methodOop m = (methodOop)methods->obj_at(mid);
++    assert(m->is_method(), "must be method");
++    int res = m->name()->fast_compare(name);
++    if (res == 0) {
++      return m;
++    } else if (res < 0) {
++      l = mid + 1;
++    } else {
++      h = mid - 1;
++    }
++  }
++  return NULL;
++}
++
++bool AnnotationParser::has_enum_field(instanceKlass* klass, symbolOop name) {
++  typeArrayOop fields = klass->fields();
++  constantPoolOop constants = klass->constants();
++  const int n = fields->length();
++  for (int i = 0; i < n; i += instanceKlass::next_offset ) {
++    int name_index = fields->ushort_at(i + instanceKlass::name_index_offset);
++    symbolOop f_name = constants->symbol_at(name_index);
++    if (f_name == name) {
++      return (fields->ushort_at(i + instanceKlass::access_flags_offset) & JVM_ACC_ENUM) != 0;
++    }
++  }
++  return false;
++}
++
++
+diff --git a/src/share/vm/runtime/annotationParser.hpp b/src/share/vm/runtime/annotationParser.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/share/vm/runtime/annotationParser.hpp
+@@ -0,0 +1,316 @@
++
++class ElementValue;
++class ArrayValue;
++class ElementValuePair;
++class Annotation;
++class AnnotationParser;
++
++class ElementValue: public StackObj {
++ private:
++  int _start;
++  int _length;
++  Annotation* _annotation;
++
++  int length(TRAPS);
++  ElementValue(int start, Annotation* annotation) : _start(start), _length(-1), _annotation(annotation) { }
++  friend class ArrayValue;
++  friend class ElementValuePair;
++ public:
++
++  char tag();
++
++  jint int_const();
++  jlong long_const();
++  jfloat float_const();
++  jdouble double_const();
++  symbolOop string_const();
++  klassOop enum_const_type(TRAPS);
++  symbolOop enum_const_name();
++  klassOop klass_const(TRAPS);
++  // using output parameter to avoid circular dependency
++  void annotation_const(Annotation& annotation);
++  void array_const(ArrayValue& array);
++
++  bool verify(symbolOop value_signature, int offset, TRAPS);
++};
++
++class ArrayValue: public StackObj {
++ private:
++  int _start;
++  int _length;
++  ElementValue* _value;
++
++  int length(TRAPS);
++  ArrayValue() { }
++  ArrayValue(int start, ElementValue* value) : _start(start), _length(-1), _value(value) { }
++  friend class ElementValue;
++ public:
++
++  u2 value_count();
++  ElementValue first_value();
++  ElementValue next_value(ElementValue& value, TRAPS);
++
++  bool verify(symbolOop component_signature, int offset, TRAPS);
++};
++
++class ElementValuePair: public StackObj {
++ private:
++  ElementValue _value;
++
++  int start();
++  int length(TRAPS);
++  ElementValuePair(int start, Annotation* annotation) : _value(start + 2, annotation) { }
++  friend class Annotation;
++ public:
++
++  symbolOop name();
++  ElementValue& value();
++
++  bool verify(instanceKlass* annotation_type, TRAPS);
++};
++
++class Annotation: public StackObj {
++ private:
++  int _start;
++  int _length;
++  AnnotationParser* _parser;
++
++  int length(TRAPS);
++  Annotation() { }
++  Annotation(int start, AnnotationParser* parser) : _start(start), _length(-1), _parser(parser) { }
++  friend class AnnotationParser;
++  friend class ArrayValue;
++  friend class ElementValue;
++  friend class ElementValuePair;
++ public:
++  u2 value_count();
++  ElementValuePair first_value();
++  ElementValuePair next_value(ElementValuePair& value, TRAPS);
++
++  klassOop get_type(TRAPS);
++  symbolOop get_type_name();
++
++  bool verify(TRAPS);
++};
++
++class AnnotationParser: public StackObj {
++ private:
++  typeArrayHandle _array;
++  constantPoolHandle _constants;
++
++  int length() {
++    return _array->length();
++  }
++  u1 get_u1(int index) {
++    return _array->byte_at(index);
++  }
++  u2 get_u2(int index) {
++    return Bytes::get_Java_u2((u1*)_array->byte_at_addr(index));
++  }
++  symbolOop get_symbol(int index) {
++    return _constants->symbol_at(get_u2(index));
++  }
++  klassOop get_klass(int index, TRAPS) {
++    Klass* holder = _constants->pool_holder()->klass_part();
++    return SystemDictionary::resolve_or_null(get_symbol(index), holder->class_loader(), holder->protection_domain(), THREAD);
++  }
++  klassOop get_klass(symbolOop name, TRAPS) {
++    Klass* holder = _constants->pool_holder()->klass_part();
++    return SystemDictionary::resolve_or_null(name, holder->class_loader(), holder->protection_domain(), THREAD);
++  }
++
++  constantTag get_tag(int index) {
++    if (index < 0 || index >= length())
++      return constantTag(JVM_CONSTANT_Invalid);
++    else {
++      u2 cp_index = get_u2(index);
++      if (/*cp_index < 0 ||*/ cp_index >= _constants->length())
++        return constantTag(JVM_CONSTANT_Invalid);
++      else
++        return _constants->tag_at(cp_index);
++    }
++  }
++
++  friend class Annotation;
++  friend class ArrayValue;
++  friend class ElementValue;
++  friend class ElementValuePair;
++ public:
++  AnnotationParser(typeArrayHandle annotations, constantPoolHandle constants)
++    : _array(annotations), _constants(constants) {
++  }
++
++  u2 annotation_count() {
++    return get_u2(0);
++  }
++  Annotation first_annotation() {
++    return Annotation(2, this);
++  }
++  Annotation next_annotation(Annotation& ann, TRAPS) {
++    return Annotation(ann._start + ann.length(THREAD), this);
++  }
++
++  bool verify(TRAPS);
++
++  methodOop find_method(instanceKlass* klass, symbolOop name);
++  bool has_enum_field(instanceKlass* klass, symbolOop name);
++};
++
++
++// ElementValue inline functions
++
++inline int ElementValue::length(TRAPS) {
++  if (_length == -1) {
++    switch(tag()) {
++      case 'B':
++      case 'C':
++      case 'I':
++      case 'S':
++      case 'Z':
++      case 'D':
++      case 'F':
++      case 'J':
++      case 's':
++      case 'c':
++        _length = 3;
++        break;
++      case 'e':
++        _length = 5;
++        break;
++      case '@':
++        {
++          Annotation annotation;
++          annotation_const(annotation);
++          _length = annotation.length(THREAD) + 1;
++          break;
++        }     
++    case '[':
++      {
++        ArrayValue array;
++        array_const(array);
++        _length = array.length(THREAD) + 1;
++        break;
++      }
++      break;
++    default:
++      ShouldNotReachHere();
++      break;
++    }
++  }
++  return _length;
++}
++inline char ElementValue::tag() {
++  return _annotation->_parser->get_u1(_start);
++}
++inline jint ElementValue::int_const() {
++  return _annotation->_parser->_constants->int_at(_annotation->_parser->get_u2(_start + 1));
++}
++inline jlong ElementValue::long_const() {
++  return _annotation->_parser->_constants->long_at(_annotation->_parser->get_u2(_start + 1));
++}
++inline jfloat ElementValue::float_const() {
++  return _annotation->_parser->_constants->float_at(_annotation->_parser->get_u2(_start + 1));
++}
++inline jdouble ElementValue::double_const() {
++  return _annotation->_parser->_constants->double_at(_annotation->_parser->get_u2(_start + 1));
++}
++inline symbolOop ElementValue::string_const() {
++  return _annotation->_parser->_constants->symbol_at(_annotation->_parser->get_u2(_start + 1));
++}
++inline klassOop ElementValue::enum_const_type(TRAPS) {
++  return _annotation->_parser->get_klass(_start + 1, THREAD);
++}
++inline symbolOop ElementValue::enum_const_name() {
++  return _annotation->_parser->get_symbol(_start + 3);
++}
++inline klassOop ElementValue::klass_const(TRAPS) {
++  return _annotation->_parser->get_klass(_start + 1, THREAD);
++}
++inline void ElementValue::annotation_const(Annotation& annotation) {
++  annotation = Annotation(_start + 1, _annotation->_parser);
++}
++inline void ElementValue::array_const(ArrayValue& array) {
++  array = ArrayValue(_start + 1, this);
++}
++
++// ArrayValue inline functions
++
++inline u2 ArrayValue::value_count() {
++  return _value->_annotation->_parser->get_u2(_start);
++}
++inline int ArrayValue::length(TRAPS) {
++  if (_length == -1) {
++    // u2 num_values
++    _length = 2;
++    ElementValue value = first_value();
++    for (int i=value_count(); i>0; i--) {
++      _length += value.length(THREAD);
++      value = next_value(value, THREAD);
++    }
++  }
++  return _length;
++}
++inline ElementValue ArrayValue::first_value() {
++  return ElementValue(_start + 2, _value->_annotation);
++}
++inline ElementValue ArrayValue::next_value(ElementValue& value, TRAPS) {
++  return ElementValue(value._start + value.length(THREAD), _value->_annotation);
++}
++
++// ElementValuePair inline functions
++inline int ElementValuePair::start() {
++  return _value._start - 2;
++}
++inline int ElementValuePair::length(TRAPS) {
++  return _value.length(THREAD) + 2;
++}
++inline symbolOop ElementValuePair::name() {
++  return _value._annotation->_parser->get_symbol(start());
++}
++inline ElementValue& ElementValuePair::value() {
++  return _value;
++}
++
++// Annotation inline functions
++
++inline int Annotation::length(TRAPS) {
++  if (_length == -1) {
++    // u2 type_index and u2 num_element_value_pairs
++    _length = 4;
++    ElementValuePair value = first_value();
++    for (int i=value_count(); i>0; i--) {
++      _length += value.length(THREAD);
++      value = next_value(value, THREAD);
++    }
++  }
++  return _length;
++}
++inline u2 Annotation::value_count() {
++  return _parser->get_u2(_start + 2);
++}
++inline ElementValuePair Annotation::first_value() {
++  return ElementValuePair(_start + 4, this);
++}
++inline ElementValuePair Annotation::next_value(ElementValuePair& value, TRAPS) {
++  return ElementValuePair(value.start() + value.length(THREAD), this);
++}
++inline klassOop Annotation::get_type(TRAPS) {
++  return _parser->get_klass(_start, THREAD);
++}
++inline symbolOop Annotation::get_type_name() {
++  return _parser->get_symbol(_start);
++}
++
++
++
++
++
++
++
++
++
++
++
++
++
++
+diff --git a/src/share/vm/runtime/handles.hpp b/src/share/vm/runtime/handles.hpp
+--- a/src/share/vm/runtime/handles.hpp
++++ b/src/share/vm/runtime/handles.hpp
+@@ -180,6 +180,7 @@
+   };
+ 
+ 
++DEF_HANDLE(activationFrame  , is_activationFrame  )
+ DEF_HANDLE(instance         , is_instance         )
+ DEF_HANDLE(method           , is_method           )
+ DEF_HANDLE(constMethod      , is_constMethod      )
+@@ -216,6 +217,7 @@
+   };
+ 
+ 
++DEF_KLASS_HANDLE(activationFrameKlass  , oop_is_activationFrame )
+ DEF_KLASS_HANDLE(instanceKlass         , oop_is_instance_slow )
+ DEF_KLASS_HANDLE(methodKlass           , oop_is_method        )
+ DEF_KLASS_HANDLE(constMethodKlass      , oop_is_constMethod   )
+diff --git a/src/share/vm/runtime/thread.cpp b/src/share/vm/runtime/thread.cpp
+--- a/src/share/vm/runtime/thread.cpp
++++ b/src/share/vm/runtime/thread.cpp
+@@ -1177,6 +1177,10 @@
+   _interp_only_mode    = 0;
+   _special_runtime_exit_condition = _no_async_condition;
+   _pending_async_exception = NULL;
++  _current_continuation_frame = NULL;
++  _resume_continuation_frame = NULL;
++  _resume_common_frame = NULL;
++  _resume_return_value = NULL;
+   _is_compiling = false;
+   _thread_stat = NULL;
+   _thread_stat = new ThreadStatistics();
+@@ -2418,6 +2422,10 @@
+   f->do_oop((oop*) &_vm_result_2);
+   f->do_oop((oop*) &_exception_oop);
+   f->do_oop((oop*) &_pending_async_exception);
++  f->do_oop((oop*) &_current_continuation_frame);
++  f->do_oop((oop*) &_resume_continuation_frame);
++  f->do_oop((oop*) &_resume_common_frame);
++  f->do_oop((oop*) &_resume_return_value);
+ 
+   if (jvmti_thread_state() != NULL) {
+     jvmti_thread_state()->oops_do(f);
+@@ -3015,6 +3023,10 @@
+       warning("java.lang.String not initialized");
+     }
+ 
++    klassOop cont_klass = SystemDictionary::resolve_or_null(vmSymbolHandles::javax_stack_Continuation(), CHECK_0);
++    if (cont_klass != NULL)
++        instanceKlass::cast(cont_klass)->initialize(CHECK_0);
++
+     if (AggressiveOpts) {
+       {
+         // Forcibly initialize java/util/HashMap and mutate the private
+diff --git a/src/share/vm/runtime/thread.hpp b/src/share/vm/runtime/thread.hpp
+--- a/src/share/vm/runtime/thread.hpp
++++ b/src/share/vm/runtime/thread.hpp
+@@ -787,6 +787,32 @@
+   // This is set to popframe_pending to signal that top Java frame should be popped immediately
+   int _popframe_condition;
+ 
++  //// continuation support
++  activationFrameOop  _current_continuation_frame;
++  activationFrameOop  _resume_continuation_frame;
++  activationFrameOop  _resume_common_frame;
++  oop _resume_return_value;
++
++ public:
++  static ByteSize current_continuation_frame_offset()           { return byte_offset_of(JavaThread, _current_continuation_frame); }
++  static ByteSize resume_continuation_frame_offset()            { return byte_offset_of(JavaThread, _resume_continuation_frame); }
++  static ByteSize resume_common_frame_offset()                  { return byte_offset_of(JavaThread, _resume_common_frame); }
++  static ByteSize resume_return_value_offset()                  { return byte_offset_of(JavaThread, _resume_return_value); }
++
++  activationFrameOop  current_continuation_frame() const        { return _current_continuation_frame; }
++  void set_current_continuation_frame  (activationFrameOop x)   { _current_continuation_frame   = x; }
++
++  activationFrameOop  resume_continuation_frame() const         { return _resume_continuation_frame; }
++  void set_resume_continuation_frame  (activationFrameOop x)    { _resume_continuation_frame   = x; }
++
++  activationFrameOop  resume_common_frame() const               { return _resume_common_frame; }
++  void set_resume_common_frame  (activationFrameOop x)          { _resume_common_frame   = x; }
++
++  oop  resume_return_value() const                              { return _resume_return_value; }
++  void set_resume_return_value  (oop x)                         { _resume_return_value   = x; }
++
++ private:
++
+ #ifndef PRODUCT
+   int _jmp_ring_index;
+   struct {
+diff --git a/src/share/vm/runtime/vmStructs.cpp b/src/share/vm/runtime/vmStructs.cpp
+--- a/src/share/vm/runtime/vmStructs.cpp
++++ b/src/share/vm/runtime/vmStructs.cpp
+@@ -939,6 +939,8 @@
+            declare_type(methodKlass, Klass)                               \
+            declare_type(constMethodKlass, Klass)                          \
+            declare_type(methodOopDesc, oopDesc)                           \
++           declare_type(activationFrameKlass, Klass)                      \
++           declare_type(activationFrameOopDesc, oopDesc)                  \
+            declare_type(objArrayKlass, arrayKlass)                        \
+            declare_type(objArrayKlassKlass, arrayKlassKlass)              \
+            declare_type(objArrayOopDesc, arrayOopDesc)                    \
+@@ -953,6 +955,7 @@
+   /* Oops */                                                              \
+   /********/                                                              \
+                                                                           \
++  declare_oop_type(activationFrameOop)                                    \
+   declare_oop_type(constantPoolOop)                                       \
+   declare_oop_type(constantPoolCacheOop)                                  \
+   declare_oop_type(klassOop)                                              \

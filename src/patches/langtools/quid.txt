@@ -1,0 +1,51 @@
+6746458: writing libraries in Java for non-Java languages requires support for exotic identifiers
+Summary: token syntax (currently non-standard) for introducing exotic identifiers
+
+javac needs to support library development for non-Java langauges
+
+http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=6746458
+
+Features:
+- hash mark followed immediately by string literal creates an identifier of the given spelling
+- no other processing or interpretation is given to the identifier
+- #"foo" is indistinguishable from foo, if foo is a normal, non-keyword identifier
+- rejects exotic identifiers which may run into JVM limitations
+- rejects empty string and any string with one of "/.;<>["
+- user must mangle invalid symbols; see http://blogs.sun.com/jrose/entry/symbolic_freedom_in_the_vm
+
+Examples from the unit test:
+    class #"*86" {
+        String #"555-1212"() { return "[*86.555-1212]"; }
+    }
+    class #"int" extends Number {
+        final int #"int";
+        #"int"(int #"int") {
+            this.#"int" = #"int";
+        }
+        static #"int" valueOf(int #"int") {
+            return new #"int"(#"int");
+        }
+        public int intValue() { return #"int"; }
+        public long longValue() { return #"int"; }
+        public float floatValue() { return #"int"; }
+        public double doubleValue() { return #"int"; }
+        public String toString() { return String.valueOf(#"int"); }
+    }
+
+Authors:
+- John Rose (Sun)
+
+Tests:
+- unit tests test/tools/javac/quid/*
+
+Incremental testing:
+This does not require a full JDK build.
+
+$ cd .../langtools
+$ hg qpush quid.patch
+$ (cd make; make)
+$ ./dist/bootstrap/bin/javac -d dist test/tools/javac/quid/QuotedIdent.java
+$ java -version  # should print 1.6 or later
+$ java -cp dist quid.QuotedIdent  # should print OK
+$ ./dist/bootstrap/bin/javac -d dist -cp dist test/tools/javac/quid/QuotedIdent2.java
+$ java -cp dist quid.QuotedIdent2  # should print OK

@@ -1,0 +1,980 @@
+6812831: factor duplicated assembly code for megamorphic invokeinterface (for 6655638)
+Summary: Code in vtableStubs and templateTable moved into MacroAssembler.
+Reviewed-by: kvn
+
+diff --git a/src/cpu/sparc/vm/assembler_sparc.cpp b/src/cpu/sparc/vm/assembler_sparc.cpp
+--- a/src/cpu/sparc/vm/assembler_sparc.cpp
++++ b/src/cpu/sparc/vm/assembler_sparc.cpp
+@@ -2638,6 +2638,135 @@
+ }
+ 
+ 
++void MacroAssembler::regcon_inc_ptr( RegisterConstant& dest, RegisterConstant src, Register temp ) {
++  assert(dest.register_or_noreg() != G0, "lost side effect");
++  if ((src.is_constant() && src.as_constant() == 0) ||
++      (src.is_register() && src.as_register() == G0)) {
++    // do nothing
++  } else if (dest.is_register()) {
++    add(dest.as_register(), ensure_rs2(src, temp), dest.as_register());
++  } else if (src.is_constant()) {
++    intptr_t res = dest.as_constant() + src.as_constant();
++    dest = RegisterConstant(res); // side effect seen by caller
++  } else {
++    assert(temp != noreg, "cannot handle constant += register");
++    add(src.as_register(), ensure_rs2(dest, temp), temp);
++    dest = RegisterConstant(temp); // side effect seen by caller
++  }
++}
++
++void MacroAssembler::regcon_sll_ptr( RegisterConstant& dest, RegisterConstant src, Register temp ) {
++  assert(dest.register_or_noreg() != G0, "lost side effect");
++  if (!is_simm13(src.constant_or_zero()))
++    src = (src.as_constant() & 0xFF);
++  if ((src.is_constant() && src.as_constant() == 0) ||
++      (src.is_register() && src.as_register() == G0)) {
++    // do nothing
++  } else if (dest.is_register()) {
++    sll_ptr(dest.as_register(), src, dest.as_register());
++  } else if (src.is_constant()) {
++    intptr_t res = dest.as_constant() << src.as_constant();
++    dest = RegisterConstant(res); // side effect seen by caller
++  } else {
++    assert(temp != noreg, "cannot handle constant <<= register");
++    set(dest.as_constant(), temp);
++    sll_ptr(temp, src, temp);
++    dest = RegisterConstant(temp); // side effect seen by caller
++  }
++}
++
++
++// Look up the method for a megamorphic invokeinterface call.
++// The target method is determined by <intf_klass, itable_index>.
++// The receiver klass is in recv_klass.
++// On success, the result will be in method_result, and execution falls through.
++// On failure, execution transfers to the given label.
++void MacroAssembler::lookup_interface_method(Register recv_klass,
++                                             Register intf_klass,
++                                             RegisterConstant itable_index,
++                                             Register method_result,
++                                             Register scan_temp,
++                                             Register sethi_temp,
++                                             Label& L_no_such_interface) {
++  assert_different_registers(recv_klass, intf_klass, method_result, scan_temp);
++  assert(itable_index.is_constant() || itable_index.as_register() == method_result,
++         "caller must use same register for non-constant itable index as for method");
++
++  // Compute start of first itableOffsetEntry (which is at the end of the vtable)
++  int vtable_base = instanceKlass::vtable_start_offset() * wordSize;
++  int scan_step   = itableOffsetEntry::size() * wordSize;
++  int vte_size    = vtableEntry::size() * wordSize;
++
++  lduw(recv_klass, instanceKlass::vtable_length_offset() * wordSize, scan_temp);
++  // %%% We should store the aligned, prescaled offset in the klassoop.
++  // Then the next several instructions would fold away.
++
++  int round_to_unit = ((HeapWordsPerLong > 1) ? BytesPerLong : 0);
++  int itb_offset = vtable_base;
++  if (round_to_unit != 0) {
++    // hoist first instruction of round_to(scan_temp, BytesPerLong):
++    itb_offset += round_to_unit - wordSize;
++  }
++  int itb_scale = exact_log2(vtableEntry::size() * wordSize);
++  sll(scan_temp, itb_scale,  scan_temp);
++  add(scan_temp, itb_offset, scan_temp);
++  if (round_to_unit != 0) {
++    // Round up to align_object_offset boundary
++    // see code for instanceKlass::start_of_itable!
++    // Was: round_to(scan_temp, BytesPerLong);
++    // Hoisted: add(scan_temp, BytesPerLong-1, scan_temp);
++    and3(scan_temp, -round_to_unit, scan_temp);
++  }
++  add(recv_klass, scan_temp, scan_temp);
++
++  // Adjust recv_klass by scaled itable_index, so we can free itable_index.
++  RegisterConstant itable_offset = itable_index;
++  regcon_sll_ptr(itable_offset, exact_log2(itableMethodEntry::size() * wordSize));
++  regcon_inc_ptr(itable_offset, itableMethodEntry::method_offset_in_bytes());
++  add(recv_klass, ensure_rs2(itable_offset, sethi_temp), recv_klass);
++
++  // for (scan = klass->itable(); scan->interface() != NULL; scan += scan_step) {
++  //   if (scan->interface() == intf) {
++  //     result = (klass + scan->offset() + itable_index);
++  //   }
++  // }
++  Label search, found_method;
++
++  for (int peel = 1; peel >= 0; peel--) {
++    // %%%% Could load both offset and interface in one ldx, if they were
++    // in the opposite order.  This would save a load.
++    ld_ptr(scan_temp, itableOffsetEntry::interface_offset_in_bytes(), method_result);
++
++    // Check that this entry is non-null.  A null entry means that
++    // the receiver class doesn't implement the interface, and wasn't the
++    // same as when the caller was compiled.
++    bpr(Assembler::rc_z, false, Assembler::pn, method_result, L_no_such_interface);
++    delayed()->cmp(method_result, intf_klass);
++
++    if (peel) {
++      brx(Assembler::equal,    false, Assembler::pt, found_method);
++    } else {
++      brx(Assembler::notEqual, false, Assembler::pn, search);
++      // (invert the test to fall through to found_method...)
++    }
++    delayed()->add(scan_temp, scan_step, scan_temp);
++
++    if (!peel)  break;
++
++    bind(search);
++  }
++
++  bind(found_method);
++
++  // Got a hit.
++  int ito_offset = itableOffsetEntry::offset_offset_in_bytes();
++  // scan_temp[-scan_step] points to the vtable offset we need
++  ito_offset -= scan_step;
++  lduw(scan_temp, ito_offset, scan_temp);
++  ld_ptr(recv_klass, scan_temp, method_result);
++}
++
++
+ void MacroAssembler::biased_locking_enter(Register obj_reg, Register mark_reg,
+                                           Register temp_reg,
+                                           Label& done, Label* slow_case,
+diff --git a/src/cpu/sparc/vm/assembler_sparc.hpp b/src/cpu/sparc/vm/assembler_sparc.hpp
+--- a/src/cpu/sparc/vm/assembler_sparc.hpp
++++ b/src/cpu/sparc/vm/assembler_sparc.hpp
+@@ -1859,6 +1859,7 @@
+   // Functions for isolating 64 bit shifts for LP64
+   inline void sll_ptr( Register s1, Register s2, Register d );
+   inline void sll_ptr( Register s1, int imm6a,   Register d );
++  inline void sll_ptr( Register s1, RegisterConstant s2, Register d );
+   inline void srl_ptr( Register s1, Register s2, Register d );
+   inline void srl_ptr( Register s1, int imm6a,   Register d );
+ 
+@@ -1986,6 +1987,25 @@
+   void load_sized_value(Register s1, RegisterConstant s2, Register d,
+                         int size_in_bytes, bool is_signed);
+ 
++  // Helpers for address formation.
++  // They update the dest in place, whether it is a register or constant.
++  // They emit no code at all if src is a constant zero.
++  // If dest is a constant and src is a register, the temp argument
++  // is required, and becomes the result.
++  // If dest is a register and src is a non-simm13 constant,
++  // the temp argument is required, and is used to materialize the constant.
++  void regcon_inc_ptr( RegisterConstant& dest, RegisterConstant src,
++                       Register temp = noreg );
++  void regcon_sll_ptr( RegisterConstant& dest, RegisterConstant src,
++                       Register temp = noreg );
++  RegisterConstant ensure_rs2(RegisterConstant rs2, Register sethi_temp) {
++    guarantee(sethi_temp != noreg, "constant offset overflow");
++    if (is_simm13(rs2.constant_or_zero()))
++      return rs2;               // register or short constant
++    set(rs2.as_constant(), sethi_temp);
++    return sethi_temp;
++  }
++
+   // --------------------------------------------------
+ 
+  public:
+@@ -2299,6 +2319,14 @@
+   );
+   void tlab_refill(Label& retry_tlab, Label& try_eden, Label& slow_case);
+ 
++  // interface method calling
++  void lookup_interface_method(Register recv_klass,
++                               Register intf_klass,
++                               RegisterConstant itable_index,
++                               Register method_result,
++                               Register temp_reg, Register temp2_reg,
++                               Label& no_such_interface);
++
+   // Stack overflow checking
+ 
+   // Note: this clobbers G3_scratch
+diff --git a/src/cpu/sparc/vm/assembler_sparc.inline.hpp b/src/cpu/sparc/vm/assembler_sparc.inline.hpp
+--- a/src/cpu/sparc/vm/assembler_sparc.inline.hpp
++++ b/src/cpu/sparc/vm/assembler_sparc.inline.hpp
+@@ -455,6 +455,11 @@
+ #endif
+ }
+ 
++inline void MacroAssembler::sll_ptr( Register s1, RegisterConstant s2, Register d ) {
++  if (s2.is_register())  sll_ptr(s1, s2.as_register(), d);
++  else                   sll_ptr(s1, s2.as_constant(), d);
++}
++
+ // Use the right branch for the platform
+ 
+ inline void MacroAssembler::br( Condition c, bool a, Predict p, address d, relocInfo::relocType rt ) {
+diff --git a/src/cpu/sparc/vm/vtableStubs_sparc.cpp b/src/cpu/sparc/vm/vtableStubs_sparc.cpp
+--- a/src/cpu/sparc/vm/vtableStubs_sparc.cpp
++++ b/src/cpu/sparc/vm/vtableStubs_sparc.cpp
+@@ -106,6 +106,15 @@
+   __ delayed()->nop();
+ 
+   masm->flush();
++
++  if (PrintMiscellaneous && (WizardMode || Verbose)) {
++    tty->print_cr("vtable #%d at "PTR_FORMAT"[%d] left over: %d",
++                  vtable_index, s->entry_point(),
++                  (int)(s->code_end() - s->entry_point()),
++                  (int)(s->code_end() - __ pc()));
++  }
++  guarantee(__ pc() <= s->code_end(), "overflowed buffer");
++
+   s->set_exception_points(npe_addr, ame_addr);
+   return s;
+ }
+@@ -113,9 +122,9 @@
+ 
+ // NOTE:  %%%% if any change is made to this stub make sure that the function
+ //             pd_code_size_limit is changed to ensure the correct size for VtableStub
+-VtableStub* VtableStubs::create_itable_stub(int vtable_index) {
++VtableStub* VtableStubs::create_itable_stub(int itable_index) {
+   const int sparc_code_length = VtableStub::pd_code_size_limit(false);
+-  VtableStub* s = new(sparc_code_length) VtableStub(false, vtable_index);
++  VtableStub* s = new(sparc_code_length) VtableStub(false, itable_index);
+   ResourceMark rm;
+   CodeBuffer cb(s->entry_point(), sparc_code_length);
+   MacroAssembler* masm = new MacroAssembler(&cb);
+@@ -139,7 +148,6 @@
+   // are passed in the %o registers.  Instead, longs are passed in G1 and G4
+   // and so those registers are not available here.
+   __ save(SP,-frame::register_save_words*wordSize,SP);
+-  Register I0_receiver = I0;    // Location of receiver after save
+ 
+ #ifndef PRODUCT
+   if (CountCompiledCalls) {
+@@ -151,63 +159,31 @@
+   }
+ #endif /* PRODUCT */
+ 
+-  // load start of itable entries into L0 register
+-  const int base = instanceKlass::vtable_start_offset() * wordSize;
+-  __ ld(Address(G3_klassOop, 0, instanceKlass::vtable_length_offset() * wordSize), L0);
++  Label throw_icce;
+ 
+-  // %%% Could store the aligned, prescaled offset in the klassoop.
+-  __ sll(L0, exact_log2(vtableEntry::size() * wordSize), L0);
+-  // see code for instanceKlass::start_of_itable!
+-  const int vtable_alignment = align_object_offset(1);
+-  assert(vtable_alignment == 1 || vtable_alignment == 2, "");
+-  const int odd_bit = vtableEntry::size() * wordSize;
+-  if (vtable_alignment == 2) {
+-    __ and3(L0, odd_bit, L1);   // isolate the odd bit
+-  }
+-  __ add(G3_klassOop, L0, L0);
+-  if (vtable_alignment == 2) {
+-    __ add(L0, L1, L0);         // double the odd bit, to align up
+-  }
+-
+-  // Loop over all itable entries until desired interfaceOop (G5_interface) found
+-  __ bind(search);
+-
+-  // %%%% Could load both offset and interface in one ldx, if they were
+-  // in the opposite order.  This would save a load.
+-  __ ld_ptr(L0, base + itableOffsetEntry::interface_offset_in_bytes(), L1);
+-
+-  // If the entry is NULL then we've reached the end of the table
+-  // without finding the expected interface, so throw an exception
+-  Label throw_icce;
+-  __ bpr(Assembler::rc_z, false, Assembler::pn, L1, throw_icce);
+-  __ delayed()->cmp(G5_interface, L1);
+-  __ brx(Assembler::notEqual, true, Assembler::pn, search);
+-  __ delayed()->add(L0, itableOffsetEntry::size() * wordSize, L0);
+-
+-  // entry found and L0 points to it, move offset of vtable for interface into L0
+-  __ ld(L0, base + itableOffsetEntry::offset_offset_in_bytes(), L0);
+-
+-  // Compute itableMethodEntry and get methodOop(G5_method) and entrypoint(L0) for compiler
+-  const int method_offset = (itableMethodEntry::size() * wordSize * vtable_index) + itableMethodEntry::method_offset_in_bytes();
+-  __ add(G3_klassOop, L0, L1);
+-  __ ld_ptr(L1, method_offset, G5_method);
++  Register L5_method = L5;
++  __ lookup_interface_method(// inputs: rec. class, interface, itable index
++                             G3_klassOop, G5_interface, itable_index,
++                             // outputs: method, scan temp. reg
++                             L5_method, L2, L3,
++                             throw_icce);
+ 
+ #ifndef PRODUCT
+   if (DebugVtables) {
+     Label L01;
+-    __ ld_ptr(L1, method_offset, G5_method);
+-    __ bpr(Assembler::rc_nz, false, Assembler::pt, G5_method, L01);
++    __ bpr(Assembler::rc_nz, false, Assembler::pt, L5_method, L01);
+     __ delayed()->nop();
+     __ stop("methodOop is null");
+     __ bind(L01);
+-    __ verify_oop(G5_method);
++    __ verify_oop(L5_method);
+   }
+ #endif
+ 
+   // If the following load is through a NULL pointer, we'll take an OS
+   // exception that should translate into an AbstractMethodError.  We need the
+   // window count to be correct at that time.
+-  __ restore();                 // Restore registers BEFORE the AME point
++  __ restore(L5_method, 0, G5_method);
++  // Restore registers *before* the AME point.
+ 
+   address ame_addr = __ pc();   // if the vtable entry is null, the method is abstract
+   __ ld_ptr(G5_method, in_bytes(methodOopDesc::from_compiled_offset()), G3_scratch);
+@@ -225,6 +201,12 @@
+ 
+   masm->flush();
+ 
++  if (PrintMiscellaneous && (WizardMode || Verbose)) {
++    tty->print_cr("itable #%d at "PTR_FORMAT"[%d] left over: %d",
++                  itable_index, s->entry_point(),
++                  (int)(s->code_end() - s->entry_point()),
++                  (int)(s->code_end() - __ pc()));
++  }
+   guarantee(__ pc() <= s->code_end(), "overflowed buffer");
+ 
+   s->set_exception_points(npe_addr, ame_addr);
+@@ -243,8 +225,7 @@
+                         (UseCompressedOops ? 2*BytesPerInstWord : 0);
+       return basic + slop;
+     } else {
+-      // save, ld, ld, sll, and, add, add, ld, cmp, br, add, ld, add, ld, ld, jmp, restore, sethi, jmpl, restore
+-      const int basic = (20 LP64_ONLY(+ 6)) * BytesPerInstWord +
++      const int basic = (28 LP64_ONLY(+ 6)) * BytesPerInstWord +
+                         // shift;add for load_klass
+                         (UseCompressedOops ? 2*BytesPerInstWord : 0);
+       return (basic + slop);
+diff --git a/src/cpu/x86/vm/assembler_x86.cpp b/src/cpu/x86/vm/assembler_x86.cpp
+--- a/src/cpu/x86/vm/assembler_x86.cpp
++++ b/src/cpu/x86/vm/assembler_x86.cpp
+@@ -7075,6 +7075,81 @@
+ }
+ 
+ 
++// Look up the method for a megamorphic invokeinterface call.
++// The target method is determined by <intf_klass, itable_index>.
++// The receiver klass is in recv_klass.
++// On success, the result will be in method_result, and execution falls through.
++// On failure, execution transfers to the given label.
++void MacroAssembler::lookup_interface_method(Register recv_klass,
++                                             Register intf_klass,
++                                             RegisterConstant itable_index,
++                                             Register method_result,
++                                             Register scan_temp,
++                                             Label& L_no_such_interface) {
++  assert_different_registers(recv_klass, intf_klass, method_result, scan_temp);
++  assert(itable_index.is_constant() || itable_index.as_register() == method_result,
++         "caller must use same register for non-constant itable index as for method");
++
++  // Compute start of first itableOffsetEntry (which is at the end of the vtable)
++  int vtable_base = instanceKlass::vtable_start_offset() * wordSize;
++  int itentry_off = itableMethodEntry::method_offset_in_bytes();
++  int scan_step   = itableOffsetEntry::size() * wordSize;
++  int vte_size    = vtableEntry::size() * wordSize;
++  Address::ScaleFactor times_vte_scale = Address::times_ptr;
++  assert(vte_size == wordSize, "else adjust times_vte_scale");
++
++  movl(scan_temp, Address(recv_klass, instanceKlass::vtable_length_offset() * wordSize));
++
++  // %%% Could store the aligned, prescaled offset in the klassoop.
++  lea(scan_temp, Address(recv_klass, scan_temp, times_vte_scale, vtable_base));
++  if (HeapWordsPerLong > 1) {
++    // Round up to align_object_offset boundary
++    // see code for instanceKlass::start_of_itable!
++    round_to(scan_temp, BytesPerLong);
++  }
++
++  // Adjust recv_klass by scaled itable_index, so we can free itable_index.
++  assert(itableMethodEntry::size() * wordSize == wordSize, "adjust the scaling in the code below");
++  lea(recv_klass, Address(recv_klass, itable_index, Address::times_ptr, itentry_off));
++
++  // for (scan = klass->itable(); scan->interface() != NULL; scan += scan_step) {
++  //   if (scan->interface() == intf) {
++  //     result = (klass + scan->offset() + itable_index);
++  //   }
++  // }
++  Label search, found_method;
++
++  for (int peel = 1; peel >= 0; peel--) {
++    movptr(method_result, Address(scan_temp, itableOffsetEntry::interface_offset_in_bytes()));
++    cmpptr(intf_klass, method_result);
++
++    if (peel) {
++      jccb(Assembler::equal, found_method);
++    } else {
++      jccb(Assembler::notEqual, search);
++      // (invert the test to fall through to found_method...)
++    }
++
++    if (!peel)  break;
++
++    bind(search);
++
++    // Check that the previous entry is non-null.  A null entry means that
++    // the receiver class doesn't implement the interface, and wasn't the
++    // same as when the caller was compiled.
++    testptr(method_result, method_result);
++    jcc(Assembler::zero, L_no_such_interface);
++    addptr(scan_temp, scan_step);
++  }
++
++  bind(found_method);
++
++  // Got a hit.
++  movl(scan_temp, Address(scan_temp, itableOffsetEntry::offset_offset_in_bytes()));
++  movptr(method_result, Address(recv_klass, scan_temp, Address::times_1));
++}
++
++
+ void MacroAssembler::ucomisd(XMMRegister dst, AddressLiteral src) {
+   ucomisd(dst, as_Address(src));
+ }
+diff --git a/src/cpu/x86/vm/assembler_x86.hpp b/src/cpu/x86/vm/assembler_x86.hpp
+--- a/src/cpu/x86/vm/assembler_x86.hpp
++++ b/src/cpu/x86/vm/assembler_x86.hpp
+@@ -1765,6 +1765,14 @@
+   );
+   void tlab_refill(Label& retry_tlab, Label& try_eden, Label& slow_case);
+ 
++  // interface method calling
++  void lookup_interface_method(Register recv_klass,
++                               Register intf_klass,
++                               RegisterConstant itable_index,
++                               Register method_result,
++                               Register scan_temp,
++                               Label& no_such_interface);
++
+   //----
+   void set_word_if_not_zero(Register reg); // sets reg to 1 if not zero, otherwise 0
+ 
+diff --git a/src/cpu/x86/vm/templateTable_x86_32.cpp b/src/cpu/x86/vm/templateTable_x86_32.cpp
+--- a/src/cpu/x86/vm/templateTable_x86_32.cpp
++++ b/src/cpu/x86/vm/templateTable_x86_32.cpp
+@@ -3055,35 +3055,44 @@
+   // profile this call
+   __ profile_virtual_call(rdx, rsi, rdi);
+ 
+-  __ mov(rdi, rdx); // Save klassOop in rdi
++  Label no_such_interface, no_such_method;
+ 
+-  // Compute start of first itableOffsetEntry (which is at the end of the vtable)
+-  const int base = instanceKlass::vtable_start_offset() * wordSize;
+-  assert(vtableEntry::size() * wordSize == (1 << (int)Address::times_ptr), "adjust the scaling in the code below");
+-  __ movl(rsi, Address(rdx, instanceKlass::vtable_length_offset() * wordSize)); // Get length of vtable
+-  __ lea(rdx, Address(rdx, rsi, Address::times_4, base));
+-  if (HeapWordsPerLong > 1) {
+-    // Round up to align_object_offset boundary
+-    __ round_to(rdx, BytesPerLong);
+-  }
++  __ lookup_interface_method(// inputs: rec. class, interface, itable index
++                             rdx, rax, rbx,
++                             // outputs: method, scan temp. reg
++                             rbx, rsi,
++                             no_such_interface);
+ 
+-  Label entry, search, interface_ok;
++  // rbx,: methodOop to call
++  // rcx: receiver
++  // Check for abstract method error
++  // Note: This should be done more efficiently via a throw_abstract_method_error
++  //       interpreter entry point and a conditional jump to it in case of a null
++  //       method.
++  __ testptr(rbx, rbx);
++  __ jcc(Assembler::zero, no_such_method);
+ 
+-  __ jmpb(entry);
+-  __ bind(search);
+-  __ addptr(rdx, itableOffsetEntry::size() * wordSize);
++  // do the call
++  // rcx: receiver
++  // rbx,: methodOop
++  __ jump_from_interpreted(rbx, rdx);
++  __ should_not_reach_here();
+ 
+-  __ bind(entry);
++  // exception handling code follows...
++  // note: must restore interpreter registers to canonical
++  //       state for exception handling to work correctly!
+ 
+-  // Check that the entry is non-null.  A null entry means that the receiver
+-  // class doesn't implement the interface, and wasn't the same as the
+-  // receiver class checked when the interface was resolved.
+-  __ push(rdx);
+-  __ movptr(rdx, Address(rdx, itableOffsetEntry::interface_offset_in_bytes()));
+-  __ testptr(rdx, rdx);
+-  __ jcc(Assembler::notZero, interface_ok);
++  __ bind(no_such_method);
+   // throw exception
+-  __ pop(rdx);           // pop saved register first.
++  __ pop(rbx);           // pop return address (pushed by prepare_invoke)
++  __ restore_bcp();      // rsi must be correct for exception handler   (was destroyed)
++  __ restore_locals();   // make sure locals pointer is correct as well (was destroyed)
++  __ call_VM(noreg, CAST_FROM_FN_PTR(address, InterpreterRuntime::throw_AbstractMethodError));
++  // the call_VM checks for exception, so we should never return here.
++  __ should_not_reach_here();
++
++  __ bind(no_such_interface);
++  // throw exception
+   __ pop(rbx);           // pop return address (pushed by prepare_invoke)
+   __ restore_bcp();      // rsi must be correct for exception handler   (was destroyed)
+   __ restore_locals();   // make sure locals pointer is correct as well (was destroyed)
+@@ -3091,42 +3100,6 @@
+                    InterpreterRuntime::throw_IncompatibleClassChangeError));
+   // the call_VM checks for exception, so we should never return here.
+   __ should_not_reach_here();
+-  __ bind(interface_ok);
+-
+-    __ pop(rdx);
+-
+-    __ cmpptr(rax, Address(rdx, itableOffsetEntry::interface_offset_in_bytes()));
+-    __ jcc(Assembler::notEqual, search);
+-
+-    __ movl(rdx, Address(rdx, itableOffsetEntry::offset_offset_in_bytes()));
+-    __ addptr(rdx, rdi); // Add offset to klassOop
+-    assert(itableMethodEntry::size() * wordSize == (1 << (int)Address::times_ptr), "adjust the scaling in the code below");
+-    __ movptr(rbx, Address(rdx, rbx, Address::times_ptr));
+-    // rbx,: methodOop to call
+-    // rcx: receiver
+-    // Check for abstract method error
+-    // Note: This should be done more efficiently via a throw_abstract_method_error
+-    //       interpreter entry point and a conditional jump to it in case of a null
+-    //       method.
+-    { Label L;
+-      __ testptr(rbx, rbx);
+-      __ jcc(Assembler::notZero, L);
+-      // throw exception
+-          // note: must restore interpreter registers to canonical
+-          //       state for exception handling to work correctly!
+-          __ pop(rbx);           // pop return address (pushed by prepare_invoke)
+-          __ restore_bcp();      // rsi must be correct for exception handler   (was destroyed)
+-          __ restore_locals();   // make sure locals pointer is correct as well (was destroyed)
+-      __ call_VM(noreg, CAST_FROM_FN_PTR(address, InterpreterRuntime::throw_AbstractMethodError));
+-      // the call_VM checks for exception, so we should never return here.
+-      __ should_not_reach_here();
+-      __ bind(L);
+-    }
+-
+-  // do the call
+-  // rcx: receiver
+-  // rbx,: methodOop
+-  __ jump_from_interpreted(rbx, rdx);
+ }
+ 
+ //----------------------------------------------------------------------------------------------------
+diff --git a/src/cpu/x86/vm/templateTable_x86_64.cpp b/src/cpu/x86/vm/templateTable_x86_64.cpp
+--- a/src/cpu/x86/vm/templateTable_x86_64.cpp
++++ b/src/cpu/x86/vm/templateTable_x86_64.cpp
+@@ -3010,96 +3010,54 @@
+   // profile this call
+   __ profile_virtual_call(rdx, r13, r14);
+ 
+-  __ mov(r14, rdx); // Save klassOop in r14
++  Label no_such_interface, no_such_method;
+ 
+-  // Compute start of first itableOffsetEntry (which is at the end of
+-  // the vtable)
+-  const int base = instanceKlass::vtable_start_offset() * wordSize;
+-  // Get length of vtable
+-  assert(vtableEntry::size() * wordSize == 8,
+-         "adjust the scaling in the code below");
+-  __ movl(r13, Address(rdx,
+-                       instanceKlass::vtable_length_offset() * wordSize));
+-  __ lea(rdx, Address(rdx, r13, Address::times_8, base));
++  __ lookup_interface_method(// inputs: rec. class, interface, itable index
++                             rdx, rax, rbx,
++                             // outputs: method, scan temp. reg
++                             rbx, r13,
++                             no_such_interface);
+ 
+-  if (HeapWordsPerLong > 1) {
+-    // Round up to align_object_offset boundary
+-    __ round_to(rdx, BytesPerLong);
+-  }
++  // rbx,: methodOop to call
++  // rcx: receiver
++  // Check for abstract method error
++  // Note: This should be done more efficiently via a throw_abstract_method_error
++  //       interpreter entry point and a conditional jump to it in case of a null
++  //       method.
++  __ testptr(rbx, rbx);
++  __ jcc(Assembler::zero, no_such_method);
+ 
+-  Label entry, search, interface_ok;
++  // do the call
++  // rcx: receiver
++  // rbx,: methodOop
++  __ jump_from_interpreted(rbx, rdx);
++  __ should_not_reach_here();
+ 
+-  __ jmpb(entry);
+-  __ bind(search);
+-  __ addptr(rdx, itableOffsetEntry::size() * wordSize);
++  // exception handling code follows...
++  // note: must restore interpreter registers to canonical
++  //       state for exception handling to work correctly!
+ 
+-  __ bind(entry);
++  __ bind(no_such_method);
++  // throw exception
++  __ pop(rbx);           // pop return address (pushed by prepare_invoke)
++  __ restore_bcp();      // r13 must be correct for exception handler   (was destroyed)
++  __ restore_locals();   // make sure locals pointer is correct as well (was destroyed)
++  __ call_VM(noreg, CAST_FROM_FN_PTR(address, InterpreterRuntime::throw_AbstractMethodError));
++  // the call_VM checks for exception, so we should never return here.
++  __ should_not_reach_here();
+ 
+-  // Check that the entry is non-null.  A null entry means that the
+-  // receiver class doesn't implement the interface, and wasn't the
+-  // same as the receiver class checked when the interface was
+-  // resolved.
+-  __ push(rdx);
+-  __ movptr(rdx, Address(rdx, itableOffsetEntry::interface_offset_in_bytes()));
+-  __ testptr(rdx, rdx);
+-  __ jcc(Assembler::notZero, interface_ok);
++  __ bind(no_such_interface);
+   // throw exception
+-  __ pop(rdx); // pop saved register first.
+-  __ pop(rbx); // pop return address (pushed by prepare_invoke)
+-  __ restore_bcp(); // r13 must be correct for exception handler (was
+-                    // destroyed)
+-  __ restore_locals(); // make sure locals pointer is correct as well
+-                       // (was destroyed)
++  __ pop(rbx);           // pop return address (pushed by prepare_invoke)
++  __ restore_bcp();      // r13 must be correct for exception handler   (was destroyed)
++  __ restore_locals();   // make sure locals pointer is correct as well (was destroyed)
+   __ call_VM(noreg, CAST_FROM_FN_PTR(address,
+                    InterpreterRuntime::throw_IncompatibleClassChangeError));
+   // the call_VM checks for exception, so we should never return here.
+   __ should_not_reach_here();
+-  __ bind(interface_ok);
++  return;
++}
+ 
+-  __ pop(rdx);
+-
+-  __ cmpptr(rax, Address(rdx, itableOffsetEntry::interface_offset_in_bytes()));
+-  __ jcc(Assembler::notEqual, search);
+-
+-  __ movl(rdx, Address(rdx, itableOffsetEntry::offset_offset_in_bytes()));
+-
+-  __ addptr(rdx, r14); // Add offset to klassOop
+-  assert(itableMethodEntry::size() * wordSize == 8,
+-         "adjust the scaling in the code below");
+-  __ movptr(rbx, Address(rdx, rbx, Address::times_8));
+-  // rbx: methodOop to call
+-  // rcx: receiver
+-  // Check for abstract method error
+-  // Note: This should be done more efficiently via a
+-  // throw_abstract_method_error interpreter entry point and a
+-  // conditional jump to it in case of a null method.
+-  {
+-    Label L;
+-    __ testptr(rbx, rbx);
+-    __ jcc(Assembler::notZero, L);
+-    // throw exception
+-    // note: must restore interpreter registers to canonical
+-    //       state for exception handling to work correctly!
+-    __ pop(rbx);  // pop return address (pushed by prepare_invoke)
+-    __ restore_bcp(); // r13 must be correct for exception handler
+-                      // (was destroyed)
+-    __ restore_locals(); // make sure locals pointer is correct as
+-                         // well (was destroyed)
+-    __ call_VM(noreg,
+-               CAST_FROM_FN_PTR(address,
+-                             InterpreterRuntime::throw_AbstractMethodError));
+-    // the call_VM checks for exception, so we should never return here.
+-    __ should_not_reach_here();
+-    __ bind(L);
+-  }
+-
+-  __ movptr(rcx, Address(rbx, methodOopDesc::interpreter_entry_offset()));
+-
+-  // do the call
+-  // rcx: receiver
+-  // rbx: methodOop
+-  __ jump_from_interpreted(rbx, rdx);
+-}
+ 
+ //-----------------------------------------------------------------------------
+ // Allocation
+diff --git a/src/cpu/x86/vm/vtableStubs_x86_32.cpp b/src/cpu/x86/vm/vtableStubs_x86_32.cpp
+--- a/src/cpu/x86/vm/vtableStubs_x86_32.cpp
++++ b/src/cpu/x86/vm/vtableStubs_x86_32.cpp
+@@ -34,10 +34,16 @@
+ extern "C" void bad_compiled_vtable_index(JavaThread* thread, oop receiver, int index);
+ #endif
+ 
+-// used by compiler only; may use only caller saved registers rax, rbx, rcx.
+-// rdx holds first int arg, rsi, rdi, rbp are callee-save & must be preserved.
+-// Leave receiver in rcx; required behavior when +OptoArgsInRegisters
+-// is modifed to put first oop in rcx.
++// These stubs are used by the compiler only.
++// Argument registers, which must be preserved:
++//   rcx - receiver (always first argument)
++//   rdx - second argument (if any)
++// Other registers that might be usable:
++//   rax - inline cache register (is interface for itable stub)
++//   rbx - method (used when calling out to interpreter)
++// Available now, but may become callee-save at some point:
++//   rsi, rdi
++// Note that rax and rdx are also used for return values.
+ //
+ VtableStub* VtableStubs::create_vtable_stub(int vtable_index) {
+   const int i486_code_length = VtableStub::pd_code_size_limit(true);
+@@ -94,16 +100,25 @@
+   __ jmp( Address(method, methodOopDesc::from_compiled_offset()));
+ 
+   masm->flush();
++
++  if (PrintMiscellaneous && (WizardMode || Verbose)) {
++    tty->print_cr("vtable #%d at "PTR_FORMAT"[%d] left over: %d",
++                  vtable_index, s->entry_point(),
++                  (int)(s->code_end() - s->entry_point()),
++                  (int)(s->code_end() - __ pc()));
++  }
++  guarantee(__ pc() <= s->code_end(), "overflowed buffer");
++
+   s->set_exception_points(npe_addr, ame_addr);
+   return s;
+ }
+ 
+ 
+-VtableStub* VtableStubs::create_itable_stub(int vtable_index) {
++VtableStub* VtableStubs::create_itable_stub(int itable_index) {
+   // Note well: pd_code_size_limit is the absolute minimum we can get away with.  If you
+   //            add code here, bump the code stub size returned by pd_code_size_limit!
+   const int i486_code_length = VtableStub::pd_code_size_limit(false);
+-  VtableStub* s = new(i486_code_length) VtableStub(false, vtable_index);
++  VtableStub* s = new(i486_code_length) VtableStub(false, itable_index);
+   ResourceMark rm;
+   CodeBuffer cb(s->entry_point(), i486_code_length);
+   MacroAssembler* masm = new MacroAssembler(&cb);
+@@ -123,50 +138,19 @@
+ 
+   // get receiver klass (also an implicit null-check)
+   address npe_addr = __ pc();
+-  __ movptr(rbx, Address(rcx, oopDesc::klass_offset_in_bytes()));
++  __ movptr(rsi, Address(rcx, oopDesc::klass_offset_in_bytes()));
+ 
+-  __ mov(rsi, rbx);   // Save klass in free register
+-  // Most registers are in use, so save a few
+-  __ push(rdx);
+-  // compute itable entry offset (in words)
+-  const int base = instanceKlass::vtable_start_offset() * wordSize;
+-  assert(vtableEntry::size() * wordSize == 4, "adjust the scaling in the code below");
+-  __ movl(rdx, Address(rbx, instanceKlass::vtable_length_offset() * wordSize)); // Get length of vtable
+-  __ lea(rbx, Address(rbx, rdx, Address::times_ptr, base));
+-  if (HeapWordsPerLong > 1) {
+-    // Round up to align_object_offset boundary
+-    __ round_to(rbx, BytesPerLong);
+-  }
+-
+-  Label hit, next, entry, throw_icce;
+-
+-  __ jmpb(entry);
+-
+-  __ bind(next);
+-  __ addptr(rbx, itableOffsetEntry::size() * wordSize);
+-
+-  __ bind(entry);
+-
+-  // If the entry is NULL then we've reached the end of the table
+-  // without finding the expected interface, so throw an exception
+-  __ movptr(rdx, Address(rbx, itableOffsetEntry::interface_offset_in_bytes()));
+-  __ testptr(rdx, rdx);
+-  __ jcc(Assembler::zero, throw_icce);
+-  __ cmpptr(rax, rdx);
+-  __ jcc(Assembler::notEqual, next);
+-
+-  // We found a hit, move offset into rbx,
+-  __ movl(rdx, Address(rbx, itableOffsetEntry::offset_offset_in_bytes()));
+-
+-  // Compute itableMethodEntry.
+-  const int method_offset = (itableMethodEntry::size() * wordSize * vtable_index) + itableMethodEntry::method_offset_in_bytes();
++  // Most registers are in use; we'll use rax, rbx, rsi, rdi
++  // (If we need to make rsi, rdi callee-save, do a push/pop here.)
++  const Register method = rbx;
++  Label throw_icce;
+ 
+   // Get methodOop and entrypoint for compiler
+-  const Register method = rbx;
+-  __ movptr(method, Address(rsi, rdx, Address::times_1, method_offset));
+-
+-  // Restore saved register, before possible trap.
+-  __ pop(rdx);
++  __ lookup_interface_method(// inputs: rec. class, interface, itable index
++                             rsi, rax, itable_index,
++                             // outputs: method, scan temp. reg
++                             method, rdi,
++                             throw_icce);
+ 
+   // method (rbx): methodOop
+   // rcx: receiver
+@@ -187,12 +171,15 @@
+   __ jmp(Address(method, methodOopDesc::from_compiled_offset()));
+ 
+   __ bind(throw_icce);
+-  // Restore saved register
+-  __ pop(rdx);
+   __ jump(RuntimeAddress(StubRoutines::throw_IncompatibleClassChangeError_entry()));
+-
+   masm->flush();
+ 
++  if (PrintMiscellaneous && (WizardMode || Verbose)) {
++    tty->print_cr("itable #%d at "PTR_FORMAT"[%d] left over: %d",
++                  itable_index, s->entry_point(),
++                  (int)(s->code_end() - s->entry_point()),
++                  (int)(s->code_end() - __ pc()));
++  }
+   guarantee(__ pc() <= s->code_end(), "overflowed buffer");
+ 
+   s->set_exception_points(npe_addr, ame_addr);
+@@ -207,7 +194,7 @@
+     return (DebugVtables ? 210 : 16) + (CountCompiledCalls ? 6 : 0);
+   } else {
+     // Itable stub size
+-    return (DebugVtables ? 144 : 64) + (CountCompiledCalls ? 6 : 0);
++    return (DebugVtables ? 256 : 66) + (CountCompiledCalls ? 6 : 0);
+   }
+ }
+ 
+diff --git a/src/cpu/x86/vm/vtableStubs_x86_64.cpp b/src/cpu/x86/vm/vtableStubs_x86_64.cpp
+--- a/src/cpu/x86/vm/vtableStubs_x86_64.cpp
++++ b/src/cpu/x86/vm/vtableStubs_x86_64.cpp
+@@ -98,17 +98,26 @@
+   __ jmp( Address(rbx, methodOopDesc::from_compiled_offset()));
+ 
+   __ flush();
++
++  if (PrintMiscellaneous && (WizardMode || Verbose)) {
++    tty->print_cr("vtable #%d at "PTR_FORMAT"[%d] left over: %d",
++                  vtable_index, s->entry_point(),
++                  (int)(s->code_end() - s->entry_point()),
++                  (int)(s->code_end() - __ pc()));
++  }
++  guarantee(__ pc() <= s->code_end(), "overflowed buffer");
++
+   s->set_exception_points(npe_addr, ame_addr);
+   return s;
+ }
+ 
+ 
+-VtableStub* VtableStubs::create_itable_stub(int vtable_index) {
++VtableStub* VtableStubs::create_itable_stub(int itable_index) {
+   // Note well: pd_code_size_limit is the absolute minimum we can get
+   // away with.  If you add code here, bump the code stub size
+   // returned by pd_code_size_limit!
+   const int amd64_code_length = VtableStub::pd_code_size_limit(false);
+-  VtableStub* s = new(amd64_code_length) VtableStub(false, vtable_index);
++  VtableStub* s = new(amd64_code_length) VtableStub(false, itable_index);
+   ResourceMark rm;
+   CodeBuffer cb(s->entry_point(), amd64_code_length);
+   MacroAssembler* masm = new MacroAssembler(&cb);
+@@ -131,68 +140,28 @@
+   // get receiver klass (also an implicit null-check)
+   address npe_addr = __ pc();
+ 
+-  __ load_klass(rbx, j_rarg0);
++  // Most registers are in use; we'll use rax, rbx, r10, r11
++  // (various calling sequences use r[cd]x, r[sd]i, r[89]; stay away from them)
++  __ load_klass(r10, j_rarg0);
+ 
+   // If we take a trap while this arg is on the stack we will not
+   // be able to walk the stack properly. This is not an issue except
+   // when there are mistakes in this assembly code that could generate
+   // a spurious fault. Ask me how I know...
+ 
+-  __ push(j_rarg1);     // Most registers are in use, so save one
+-
+-  // compute itable entry offset (in words)
+-  const int base = instanceKlass::vtable_start_offset() * wordSize;
+-  assert(vtableEntry::size() * wordSize == 8,
+-         "adjust the scaling in the code below");
+-  // Get length of vtable
+-  __ movl(j_rarg1,
+-          Address(rbx, instanceKlass::vtable_length_offset() * wordSize));
+-  __ lea(rbx, Address(rbx, j_rarg1, Address::times_8, base));
+-
+-  if (HeapWordsPerLong > 1) {
+-    // Round up to align_object_offset boundary
+-    __ round_to(rbx, BytesPerLong);
+-  }
+-  Label hit, next, entry, throw_icce;
+-
+-  __ jmpb(entry);
+-
+-  __ bind(next);
+-  __ addptr(rbx, itableOffsetEntry::size() * wordSize);
+-
+-  __ bind(entry);
+-
+-  // If the entry is NULL then we've reached the end of the table
+-  // without finding the expected interface, so throw an exception
+-  __ movptr(j_rarg1, Address(rbx, itableOffsetEntry::interface_offset_in_bytes()));
+-  __ testptr(j_rarg1, j_rarg1);
+-  __ jcc(Assembler::zero, throw_icce);
+-  __ cmpptr(rax, j_rarg1);
+-  __ jccb(Assembler::notEqual, next);
+-
+-  // We found a hit, move offset into j_rarg1
+-  __ movl(j_rarg1, Address(rbx, itableOffsetEntry::offset_offset_in_bytes()));
+-
+-  // Compute itableMethodEntry
+-  const int method_offset =
+-    (itableMethodEntry::size() * wordSize * vtable_index) +
+-    itableMethodEntry::method_offset_in_bytes();
++  const Register method = rbx;
++  Label throw_icce;
+ 
+   // Get methodOop and entrypoint for compiler
+-
+-  // Get klass pointer again
+-  __ load_klass(rax, j_rarg0);
+-
+-  const Register method = rbx;
+-  __ movptr(method, Address(rax, j_rarg1, Address::times_1, method_offset));
+-
+-  // Restore saved register, before possible trap.
+-  __ pop(j_rarg1);
++  __ lookup_interface_method(// inputs: rec. class, interface, itable index
++                             r10, rax, itable_index,
++                             // outputs: method, scan temp. reg
++                             method, r11,
++                             throw_icce);
+ 
+   // method (rbx): methodOop
+   // j_rarg0: receiver
+ 
+-
+ #ifdef ASSERT
+   if (DebugVtables) {
+     Label L2;
+@@ -211,12 +180,16 @@
+   __ jmp(Address(method, methodOopDesc::from_compiled_offset()));
+ 
+   __ bind(throw_icce);
+-  // Restore saved register
+-  __ pop(j_rarg1);
+   __ jump(RuntimeAddress(StubRoutines::throw_IncompatibleClassChangeError_entry()));
+ 
+   __ flush();
+ 
++  if (PrintMiscellaneous && (WizardMode || Verbose)) {
++    tty->print_cr("itable #%d at "PTR_FORMAT"[%d] left over: %d",
++                  itable_index, s->entry_point(),
++                  (int)(s->code_end() - s->entry_point()),
++                  (int)(s->code_end() - __ pc()));
++  }
+   guarantee(__ pc() <= s->code_end(), "overflowed buffer");
+ 
+   s->set_exception_points(npe_addr, ame_addr);
+@@ -230,7 +203,7 @@
+            (UseCompressedOops ? 16 : 0);  // 1 leaq can be 3 bytes + 1 long
+   } else {
+     // Itable stub size
+-    return (DebugVtables ? 636 : 72) + (CountCompiledCalls ? 13 : 0) +
++    return (DebugVtables ? 512 : 72) + (CountCompiledCalls ? 13 : 0) +
+            (UseCompressedOops ? 32 : 0);  // 2 leaqs
+   }
+ }

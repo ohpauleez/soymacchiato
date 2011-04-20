@@ -1,0 +1,428 @@
+6912064: type profiles need to be exploited more for dynamic language support
+Reviewed-by: kvn
+
+diff --git a/src/share/vm/includeDB_compiler2 b/src/share/vm/includeDB_compiler2
+--- a/src/share/vm/includeDB_compiler2
++++ b/src/share/vm/includeDB_compiler2
+@@ -488,6 +488,7 @@
+ graphKit.hpp                            callnode.hpp
+ graphKit.hpp                            cfgnode.hpp
+ graphKit.hpp                            ciEnv.hpp
++graphKit.hpp                            ciMethodData.hpp
+ graphKit.hpp                            divnode.hpp
+ graphKit.hpp                            compile.hpp
+ graphKit.hpp                            deoptimization.hpp
+diff --git a/src/share/vm/opto/graphKit.cpp b/src/share/vm/opto/graphKit.cpp
+--- a/src/share/vm/opto/graphKit.cpp
++++ b/src/share/vm/opto/graphKit.cpp
+@@ -2419,11 +2419,79 @@
+ }
+ 
+ 
++//------------------------------seems_never_null-------------------------------
++// Use null_seen information if it is available from the profile.
++// If we see an unexpected null at a type check we record it and force a
++// recompile; the offending check will be recompiled to handle NULLs.
++// If we see several offending BCIs, then all checks in the
++// method will be recompiled.
++bool GraphKit::seems_never_null(Node* obj, ciProfileData* data) {
++  if (UncommonNullCast               // Cutout for this technique
++      && obj != null()               // And not the -Xcomp stupid case?
++      && !too_many_traps(Deoptimization::Reason_null_check)
++      ) {
++    if (data == NULL)
++      // Edge case:  no mature data.  Be optimistic here.
++      return true;
++    // If the profile has not seen a null, assume it won't happen.
++    assert(java_bc() == Bytecodes::_checkcast ||
++           java_bc() == Bytecodes::_instanceof ||
++           java_bc() == Bytecodes::_aastore, "MDO must collect null_seen bit here");
++    return !data->as_BitData()->null_seen();
++  }
++  return false;
++}
++
++//------------------------maybe_cast_profiled_receiver-------------------------
++// If the profile has seen exactly one type, narrow to exactly that type.
++// Subsequent type checks will always fold up.
++Node* GraphKit::maybe_cast_profiled_receiver(Node* not_null_obj,
++                                             ciProfileData* data,
++                                             ciKlass* require_klass) {
++  if (!UseTypeProfile || !TypeProfileCasts) return NULL;
++  if (data == NULL)  return NULL;
++
++  // Make sure we haven't already deoptimized from this tactic.
++  if (too_many_traps(Deoptimization::Reason_class_check))
++    return NULL;
++
++  // (No, this isn't a call, but it's enough like a virtual call
++  // to use the same ciMethod accessor to get the profile info...)
++  ciCallProfile profile = method()->call_profile_at_bci(bci());
++  if (profile.count() >= 0 &&         // no cast failures here
++      profile.has_receiver(0) &&
++      profile.morphism() == 1) {
++    ciKlass* exact_kls = profile.receiver(0);
++    if (require_klass == NULL ||
++        static_subtype_check(require_klass, exact_kls) == SSC_always_true) {
++      // If we narrow the type to match what the type profile sees,
++      // we can then remove the rest of the cast.
++      // This is a win, even if the exact_kls is very specific,
++      // because downstream operations, such as method calls,
++      // will often benefit from the sharper type.
++      Node* exact_obj = not_null_obj; // will get updated in place...
++      Node* slow_ctl  = type_check_receiver(exact_obj, exact_kls, 1.0,
++                                            &exact_obj);
++      { PreserveJVMState pjvms(this);
++        set_control(slow_ctl);
++        uncommon_trap(Deoptimization::Reason_class_check,
++                      Deoptimization::Action_maybe_recompile);
++      }
++      replace_in_map(not_null_obj, exact_obj);
++      return exact_obj;
++    }
++    // assert(ssc == SSC_always_true)... except maybe the profile lied to us.
++  }
++
++  return NULL;
++}
++
++
+ //-------------------------------gen_instanceof--------------------------------
+ // Generate an instance-of idiom.  Used by both the instance-of bytecode
+ // and the reflective instance-of call.
+-Node* GraphKit::gen_instanceof( Node *subobj, Node* superklass ) {
+-  C->set_has_split_ifs(true); // Has chance for split-if optimization
++Node* GraphKit::gen_instanceof(Node* obj, Node* superklass) {
++  kill_dead_locals();           // Benefit all the uncommon traps
+   assert( !stopped(), "dead parse path should be checked in callers" );
+   assert(!TypePtr::NULL_PTR->higher_equal(_gvn.type(superklass)->is_klassptr()),
+          "must check for not-null not-dead klass in callers");
+@@ -2434,9 +2502,16 @@
+   Node*       phi    = new(C, PATH_LIMIT) PhiNode(region, TypeInt::BOOL);
+   C->set_has_split_ifs(true); // Has chance for split-if optimization
+ 
++  ciProfileData* data = NULL;
++  if (java_bc() == Bytecodes::_instanceof) {  // Only for the bytecode
++    data = method()->method_data()->bci_to_data(bci());
++  }
++  bool never_see_null = (ProfileDynamicTypes  // aggressive use of profile
++                         && seems_never_null(obj, data));
++
+   // Null check; get casted pointer; set region slot 3
+   Node* null_ctl = top();
+-  Node* not_null_obj = null_check_oop(subobj, &null_ctl);
++  Node* not_null_obj = null_check_oop(obj, &null_ctl, never_see_null);
+ 
+   // If not_null_obj is dead, only null-path is taken
+   if (stopped()) {              // Doing instance-of on a NULL?
+@@ -2445,6 +2520,23 @@
+   }
+   region->init_req(_null_path, null_ctl);
+   phi   ->init_req(_null_path, intcon(0)); // Set null path value
++  if (null_ctl == top()) {
++    // Do this eagerly, so that pattern matches like is_diamond_phi
++    // will work even during parsing.
++    assert(_null_path == PATH_LIMIT-1, "delete last");
++    region->del_req(_null_path);
++    phi   ->del_req(_null_path);
++  }
++
++  if (ProfileDynamicTypes && data != NULL) {
++    Node* cast_obj = maybe_cast_profiled_receiver(not_null_obj, data, NULL);
++    if (stopped()) {            // Profile disagrees with this path.
++      set_control(null_ctl);    // Null is the only remaining possibility.
++      return intcon(0);
++    }
++    if (cast_obj != NULL)
++      not_null_obj = cast_obj;
++  }
+ 
+   // Load the object's klass
+   Node* obj_klass = load_object_klass(not_null_obj);
+@@ -2514,20 +2602,8 @@
+   C->set_has_split_ifs(true); // Has chance for split-if optimization
+ 
+   // Use null-cast information if it is available
+-  bool never_see_null = false;
+-  // If we see an unexpected null at a check-cast we record it and force a
+-  // recompile; the offending check-cast will be compiled to handle NULLs.
+-  // If we see several offending BCIs, then all checkcasts in the
+-  // method will be compiled to handle NULLs.
+-  if (UncommonNullCast            // Cutout for this technique
+-      && failure_control == NULL  // regular case
+-      && obj != null()            // And not the -Xcomp stupid case?
+-      && !too_many_traps(Deoptimization::Reason_null_check)) {
+-    // Finally, check the "null_seen" bit from the interpreter.
+-    if (data == NULL || !data->as_BitData()->null_seen()) {
+-      never_see_null = true;
+-    }
+-  }
++  bool never_see_null = ((failure_control == NULL)  // regular case only
++                         && seems_never_null(obj, data));
+ 
+   // Null check; get casted pointer; set region slot 3
+   Node* null_ctl = top();
+@@ -2540,47 +2616,26 @@
+   }
+   region->init_req(_null_path, null_ctl);
+   phi   ->init_req(_null_path, null());  // Set null path value
++  if (null_ctl == top()) {
++    // Do this eagerly, so that pattern matches like is_diamond_phi
++    // will work even during parsing.
++    assert(_null_path == PATH_LIMIT-1, "delete last");
++    region->del_req(_null_path);
++    phi   ->del_req(_null_path);
++  }
+ 
+-  Node* cast_obj = NULL;        // the casted version of the object
+-
+-  // If the profile has seen exactly one type, narrow to that type.
+-  // (The subsequent subtype check will always fold up.)
+-  if (UseTypeProfile && TypeProfileCasts && data != NULL &&
++  Node* cast_obj = NULL;
++  if (data != NULL &&
+       // Counter has never been decremented (due to cast failure).
+       // ...This is a reasonable thing to expect.  It is true of
+       // all casts inserted by javac to implement generic types.
+-      data->as_CounterData()->count() >= 0 &&
+-      !too_many_traps(Deoptimization::Reason_class_check)) {
+-    // (No, this isn't a call, but it's enough like a virtual call
+-    // to use the same ciMethod accessor to get the profile info...)
+-    ciCallProfile profile = method()->call_profile_at_bci(bci());
+-    if (profile.count() >= 0 &&         // no cast failures here
+-        profile.has_receiver(0) &&
+-        profile.morphism() == 1) {
+-      ciKlass* exact_kls = profile.receiver(0);
+-      int ssc = static_subtype_check(tk->klass(), exact_kls);
+-      if (ssc == SSC_always_true) {
+-        // If we narrow the type to match what the type profile sees,
+-        // we can then remove the rest of the cast.
+-        // This is a win, even if the exact_kls is very specific,
+-        // because downstream operations, such as method calls,
+-        // will often benefit from the sharper type.
+-        Node* exact_obj = not_null_obj; // will get updated in place...
+-        Node* slow_ctl  = type_check_receiver(exact_obj, exact_kls, 1.0,
+-                                              &exact_obj);
+-        { PreserveJVMState pjvms(this);
+-          set_control(slow_ctl);
+-          uncommon_trap(Deoptimization::Reason_class_check,
+-                        Deoptimization::Action_maybe_recompile);
+-        }
+-        if (failure_control != NULL) // failure is now impossible
+-          (*failure_control) = top();
+-        replace_in_map(not_null_obj, exact_obj);
+-        // adjust the type of the phi to the exact klass:
+-        phi->raise_bottom_type(_gvn.type(exact_obj)->meet(TypePtr::NULL_PTR));
+-        cast_obj = exact_obj;
+-      }
+-      // assert(cast_obj != NULL)... except maybe the profile lied to us.
++      data->as_CounterData()->count() >= 0) {
++    cast_obj = maybe_cast_profiled_receiver(not_null_obj, data, tk->klass());
++    if (cast_obj != NULL) {
++      if (failure_control != NULL) // failure is now impossible
++        (*failure_control) = top();
++      // adjust the type of the phi to the exact klass:
++      phi->raise_bottom_type(_gvn.type(cast_obj)->meet(TypePtr::NULL_PTR));
+     }
+   }
+ 
+diff --git a/src/share/vm/opto/graphKit.hpp b/src/share/vm/opto/graphKit.hpp
+--- a/src/share/vm/opto/graphKit.hpp
++++ b/src/share/vm/opto/graphKit.hpp
+@@ -336,6 +336,14 @@
+   Node* null_check_oop(Node* value, Node* *null_control,
+                        bool never_see_null = false);
+ 
++  // Check the null_seen bit.
++  bool seems_never_null(Node* obj, ciProfileData* data);
++
++  // Use the type profile to narrow an object type.
++  Node* maybe_cast_profiled_receiver(Node* not_null_obj,
++                                     ciProfileData* data,
++                                     ciKlass* require_klass);
++
+   // Cast obj to not-null on this path
+   Node* cast_not_null(Node* obj, bool do_replace_in_map = true);
+   // Replace all occurrences of one node by another.
+diff --git a/src/share/vm/opto/library_call.cpp b/src/share/vm/opto/library_call.cpp
+--- a/src/share/vm/opto/library_call.cpp
++++ b/src/share/vm/opto/library_call.cpp
+@@ -906,7 +906,8 @@
+   const int count_offset = java_lang_String::count_offset_in_bytes();
+   const int offset_offset = java_lang_String::offset_offset_in_bytes();
+ 
+-  _sp += 2;
++  int nargs = 2;
++  _sp += nargs;
+   Node* argument = pop();  // pop non-receiver first:  it was pushed second
+   Node* receiver = pop();
+ 
+@@ -914,11 +915,11 @@
+   // null check technically happens in the wrong place, which can lead to
+   // invalid stack traces when string compare is inlined into a method
+   // which handles NullPointerExceptions.
+-  _sp += 2;
++  _sp += nargs;
+   receiver = do_null_check(receiver, T_OBJECT);
+   //should not do null check for argument for String.equals(), because spec
+   //allows to specify NULL as argument.
+-  _sp -= 2;
++  _sp -= nargs;
+ 
+   if (stopped()) {
+     return true;
+@@ -943,7 +944,9 @@
+   ciInstanceKlass* klass = env()->String_klass();
+ 
+   if (!stopped()) {
++    _sp += nargs;          // gen_instanceof might do an uncommon trap
+     Node* inst = gen_instanceof(argument, makecon(TypeKlassPtr::make(klass)));
++    _sp -= nargs;
+     Node* cmp  = _gvn.transform(new (C, 3) CmpINode(inst, intcon(1)));
+     Node* bol  = _gvn.transform(new (C, 2) BoolNode(cmp, BoolTest::ne));
+ 
+@@ -2920,7 +2923,9 @@
+   switch (id) {
+   case vmIntrinsics::_isInstance:
+     // nothing is an instance of a primitive type
++    _sp += nargs;          // gen_instanceof might do an uncommon trap
+     query_value = gen_instanceof(obj, kls);
++    _sp -= nargs;
+     break;
+ 
+   case vmIntrinsics::_getModifiers:
+diff --git a/src/share/vm/opto/parse.hpp b/src/share/vm/opto/parse.hpp
+--- a/src/share/vm/opto/parse.hpp
++++ b/src/share/vm/opto/parse.hpp
+@@ -493,6 +493,7 @@
+   float   dynamic_branch_prediction(float &cnt);
+   float   branch_prediction(float &cnt, BoolTest::mask btest, int target_bci);
+   bool    seems_never_taken(float prob);
++  bool    seems_stable_comparison(BoolTest::mask btest, Node* c);
+ 
+   void    do_ifnull(BoolTest::mask btest, Node* c);
+   void    do_if(BoolTest::mask btest, Node* c);
+diff --git a/src/share/vm/opto/parse2.cpp b/src/share/vm/opto/parse2.cpp
+--- a/src/share/vm/opto/parse2.cpp
++++ b/src/share/vm/opto/parse2.cpp
+@@ -892,6 +892,62 @@
+   return prob < PROB_MIN;
+ }
+ 
++// True if the comparison seems to be the kind that will not change its
++// statistics from true to false.  See comments in adjust_map_after_if.
++// This question is only asked along paths which are already
++// classifed as untaken (by seems_never_taken), so really,
++// if a path is never taken, its controlling comparison is
++// already acting in a stable fashion.  If the comparison
++// seems stable, we will put an expensive uncommon trap
++// on the untaken path.  To be conservative, and to allow
++// partially executed counted loops to be compiled fully,
++// we will plant uncommon traps only after pointer comparisons.
++bool Parse::seems_stable_comparison(BoolTest::mask btest, Node* cmp) {
++  for (int depth = 4; depth > 0; depth--) {
++    // The following switch can find CmpP here over half the time for
++    // dynamic language code rich with type tests.
++    // Code using counted loops or array manipulations (typical
++    // of benchmarks) will have many (>80%) CmpI instructions.
++    switch (cmp->Opcode()) {
++    case Op_CmpP:
++      // A never-taken null check looks like CmpP/BoolTest::eq.
++      // These certainly should be closed off as uncommon traps.
++      if (btest == BoolTest::eq)
++        return true;
++      // A never-failed type check looks like CmpP/BoolTest::ne.
++      // Let's put traps on those, too, so that we don't have to compile
++      // unused paths with indeterminate dynamic type information.
++      if (ProfileDynamicTypes)
++        return true;
++      return false;
++
++    case Op_CmpI:
++      // A small minority (< 10%) of CmpP are masked as CmpI,
++      // as if by boolean conversion ((p == q? 1: 0) != 0).
++      // Detect that here, even if it hasn't optimized away yet.
++      // Specifically, this covers the 'instanceof' operator.
++      if (btest == BoolTest::ne || btest == BoolTest::eq) {
++        if (_gvn.type(cmp->in(2))->singleton() &&
++            cmp->in(1)->is_Phi()) {
++          PhiNode* phi = cmp->in(1)->as_Phi();
++          int true_path = phi->is_diamond_phi();
++          if (true_path > 0 &&
++              _gvn.type(phi->in(1))->singleton() &&
++              _gvn.type(phi->in(2))->singleton()) {
++            // phi->region->if_proj->ifnode->bool->cmp
++            BoolNode* bol = phi->in(0)->in(1)->in(0)->in(1)->as_Bool();
++            btest = bol->_test._test;
++            cmp = bol->in(1);
++            continue;
++          }
++        }
++      }
++      return false;
++    }
++  }
++  return false;
++}
++
+ //-------------------------------repush_if_args--------------------------------
+ // Push arguments of an "if" bytecode back onto the stack by adjusting _sp.
+ inline int Parse::repush_if_args() {
+@@ -1137,19 +1193,22 @@
+ 
+   bool is_fallthrough = (path == successor_for_bci(iter().next_bci()));
+ 
+-  int cop = c->Opcode();
+-  if (seems_never_taken(prob) && cop == Op_CmpP && btest == BoolTest::eq) {
+-    // (An earlier version of do_if omitted '&& btest == BoolTest::eq'.)
+-    //
++  if (seems_never_taken(prob) && seems_stable_comparison(btest, c)) {
+     // If this might possibly turn into an implicit null check,
+     // and the null has never yet been seen, we need to generate
+     // an uncommon trap, so as to recompile instead of suffering
+     // with very slow branches.  (We'll get the slow branches if
+     // the program ever changes phase and starts seeing nulls here.)
+     //
+-    // The tests we worry about are of the form (p == null).
+-    // We do not simply inspect for a null constant, since a node may
++    // We do not inspect for a null constant, since a node may
+     // optimize to 'null' later on.
++    //
++    // Null checks, and other tests which expect inequality,
++    // show btest == BoolTest::eq along the non-taken branch.
++    // On the other hand, type tests, must-be-null tests,
++    // and other tests which expect pointer equality,
++    // show btest == BoolTest::ne along the non-taken branch.
++    // We prune both types of branches if they look unused.
+     repush_if_args();
+     // We need to mark this branch as taken so that if we recompile we will
+     // see that it is possible. In the tiered system the interpreter doesn't
+diff --git a/src/share/vm/opto/parseHelper.cpp b/src/share/vm/opto/parseHelper.cpp
+--- a/src/share/vm/opto/parseHelper.cpp
++++ b/src/share/vm/opto/parseHelper.cpp
+@@ -119,7 +119,11 @@
+   }
+ 
+   // Push the bool result back on stack
+-  push( gen_instanceof( pop(), makecon(TypeKlassPtr::make(klass)) ) );
++  Node* res = gen_instanceof(peek(), makecon(TypeKlassPtr::make(klass)));
++
++  // Pop from stack AFTER gen_instanceof because it can uncommon trap.
++  pop();
++  push(res);
+ }
+ 
+ //------------------------------array_store_check------------------------------
+diff --git a/src/share/vm/runtime/globals.hpp b/src/share/vm/runtime/globals.hpp
+--- a/src/share/vm/runtime/globals.hpp
++++ b/src/share/vm/runtime/globals.hpp
+@@ -2433,6 +2433,9 @@
+   develop(bool, MonomorphicArrayCheck, true,                                \
+           "Uncommon-trap array store checks that require full type check")  \
+                                                                             \
++  diagnostic(bool, ProfileDynamicTypes, true,                               \
++          "do extra type profiling and use it more aggressively")           \
++                                                                            \
+   develop(bool, DelayCompilationDuringStartup, true,                        \
+           "Delay invoking the compiler until main application class is "    \
+           "loaded")                                                         \
