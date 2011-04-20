@@ -11,7 +11,7 @@ The SoyMacchiato binaries are bundled in the repo, but can also be downloaded fr
 
 *  64-bit JDK for Mac OS X 10.5 (Latest Build): [Latest Build](http://www.pauldee.org/soymacchiato/soymacchiato-amd64-latest.tar.bz2)
 *  64-bit JDK for Mac OS X 10.5: [soymacchiato-amd64-1.0.0](http://www.pauldee.org/soymacchiato/soymacchiato-amd64-1.0.0.tar.bz2)
-*  64-bit MLVM(DaVinci) JDK for Mac OS X: [soymacchiato-mlvm-amd64-1.0.0](http://www.pauldee.org/soymacchiato/soymacchiato-mlvm-amd64-1.0.0.tar.gz)
+*  64-bit MLVM(DaVinci) JDK for Mac OS X: [soymacchiato-mlvm-amd64-1.0.0](http://www.pauldee.org/soymacchiato/soymacchiato-mlvm-amd64-1.0.0.tar.bz2)
 
 
 Building
